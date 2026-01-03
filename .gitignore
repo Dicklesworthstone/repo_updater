@@ -1,0 +1,38 @@
+# User's private repo list examples (development only)
+je_*.txt
+
+# XDG runtime files (if accidentally placed here)
+*.log
+logs/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.Trash-*
+
+# Temporary files
+*.tmp
+*.temp
+
+# Test artifacts
+test-repos/
+/tmp/
+
+# Debug artifacts
+*.debug
+
+# Node modules (if ever used for testing)
+node_modules/
+
+# Vim session
+Session.vim
