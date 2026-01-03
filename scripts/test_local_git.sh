@@ -122,11 +122,13 @@ init_repo_with_commit() {
     cd "$work_dir"
     git config user.email "test@test.com"
     git config user.name "Test User"
+    # Explicitly create main branch (cloning empty repo has no branch)
+    git checkout -b main 2>/dev/null || true
     echo "initial content" > file.txt
     git add file.txt
     git commit -m "Initial commit" >/dev/null 2>&1
-    git push origin HEAD:main >/dev/null 2>&1
-    git branch --set-upstream-to=origin/main main 2>/dev/null || true
+    # Use -u to set upstream tracking in one command
+    git push -u origin main >/dev/null 2>&1
     cd - >/dev/null
 }
 
@@ -218,7 +220,7 @@ test_status_behind() {
     # Create initial repo
     init_repo_with_commit "$remote" "$dev_dir"
 
-    # Clone to projects dir
+    # Clone to projects dir (repo now has content, so tracking works)
     git clone "$remote" "$work_dir" >/dev/null 2>&1
     cd "$work_dir" && git config user.email "test@test.com" && git config user.name "Test" && cd - >/dev/null
 
@@ -270,7 +272,7 @@ test_status_diverged() {
     # Create initial repo
     init_repo_with_commit "$remote" "$dev_dir"
 
-    # Clone to projects dir
+    # Clone to projects dir (repo now has content, so tracking works)
     git clone "$remote" "$work_dir" >/dev/null 2>&1
     cd "$work_dir" && git config user.email "test@test.com" && git config user.name "Test" && cd - >/dev/null
 
@@ -323,7 +325,7 @@ test_do_pull() {
     # Create initial repo
     init_repo_with_commit "$remote" "$dev_dir"
 
-    # Clone to projects dir
+    # Clone to projects dir (repo now has content, so tracking works)
     git clone "$remote" "$work_dir" >/dev/null 2>&1
     cd "$work_dir" && git config user.email "test@test.com" && git config user.name "Test" && cd - >/dev/null
 
