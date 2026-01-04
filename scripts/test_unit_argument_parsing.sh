@@ -198,11 +198,27 @@ test_parallel_flag() {
     assert_equals "4" "$PARALLEL" "--parallel sets PARALLEL"
 }
 
+test_parallel_equals_flag_before_command() {
+    reset_globals
+    parse_args --parallel=4 sync
+
+    assert_equals "sync" "$COMMAND" "Command parsed after --parallel= form"
+    assert_equals "4" "$PARALLEL" "--parallel= sets PARALLEL when provided before command"
+}
+
 test_j_flag() {
     reset_globals
     parse_args -j 8
 
     assert_equals "8" "$PARALLEL" "-j sets PARALLEL"
+}
+
+test_j_compact_flag_before_command() {
+    reset_globals
+    parse_args -j8 sync
+
+    assert_equals "sync" "$COMMAND" "Command parsed after -jN form"
+    assert_equals "8" "$PARALLEL" "-jN sets PARALLEL when provided before command"
 }
 
 test_parallel_and_j_equivalent() {
@@ -502,7 +518,9 @@ run_test test_example_flag
 run_test test_dir_flag
 run_test test_timeout_flag
 run_test test_parallel_flag
+run_test test_parallel_equals_flag_before_command
 run_test test_j_flag
+run_test test_j_compact_flag_before_command
 run_test test_parallel_and_j_equivalent
 
 # Commands
