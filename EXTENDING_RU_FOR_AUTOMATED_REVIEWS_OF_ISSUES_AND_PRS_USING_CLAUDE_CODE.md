@@ -1806,7 +1806,7 @@ steps:
       Questions (interactive coordination):
       - When you need maintainer input, use the `AskUserQuestion` tool (see Section 8.2).
       - Provide 2–4 options with `label` + `description`, set `multiSelect=false`.
-      - Mirror any asked question into `review-plan.json` under `questions[]` with `answered=false`.
+      - Mirror any asked question into `.ru/review-plan.json` under `questions[]` with `answered=false`.
         If the maintainer answers during the same run, set `answered=true`, add `answer` + `answered_at`.
 
       Use ultrathink.
