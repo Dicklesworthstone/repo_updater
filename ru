@@ -1793,8 +1793,12 @@ cmd_status() {
             fi
             [[ "$first" == "true" ]] || echo ","
             first="false"
+            # Escape path for JSON safety (may contain special characters)
+            local safe_path safe_branch
+            safe_path=$(json_escape "$local_path")
+            safe_branch=$(json_escape "$branch_name")
             printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s}' \
-                "$repo_name" "$local_path" "$status" "$branch_name" "$ahead" "$behind" "$dirty"
+                "$repo_name" "$safe_path" "$status" "$safe_branch" "$ahead" "$behind" "$dirty"
         done
         echo "]"
     else

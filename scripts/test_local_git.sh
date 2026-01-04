@@ -223,7 +223,8 @@ test_status_behind() {
 
     # Clone to projects dir (repo now has content, so tracking works)
     git clone "$remote" "$work_dir" >/dev/null 2>&1
-    cd "$work_dir" && git config user.email "test@test.com" && git config user.name "Test" && cd - >/dev/null
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
 
     # Make new commit in dev (simulating someone else pushing)
     add_commit_and_push "$dev_dir" "New commit"
@@ -275,7 +276,8 @@ test_status_diverged() {
 
     # Clone to projects dir (repo now has content, so tracking works)
     git clone "$remote" "$work_dir" >/dev/null 2>&1
-    cd "$work_dir" && git config user.email "test@test.com" && git config user.name "Test" && cd - >/dev/null
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
 
     # Make local commit
     add_local_commit "$work_dir" "Local change"
@@ -328,7 +330,8 @@ test_do_pull() {
 
     # Clone to projects dir (repo now has content, so tracking works)
     git clone "$remote" "$work_dir" >/dev/null 2>&1
-    cd "$work_dir" && git config user.email "test@test.com" && git config user.name "Test" && cd - >/dev/null
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
 
     # Make new commit in dev
     add_commit_and_push "$dev_dir" "New commit for pull test"
