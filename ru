@@ -1585,7 +1585,7 @@ print_conflict_help() {
 
     local num=0
     while IFS= read -r line; do
-        local repo status
+        local repo status path
         if [[ "$line" =~ \"repo\":\"([^\"]+)\" ]]; then
             repo="${BASH_REMATCH[1]}"
         else
@@ -1596,8 +1596,12 @@ print_conflict_help() {
         else
             continue
         fi
-
-        local path="$PROJECTS_DIR/$repo"
+        # Extract path from JSON (falls back to $PROJECTS_DIR/$repo for backwards compat)
+        if [[ "$line" =~ \"path\":\"([^\"]+)\" ]]; then
+            path="${BASH_REMATCH[1]}"
+        else
+            path="$PROJECTS_DIR/$repo"
+        fi
 
         case "$status" in
             dirty)
@@ -1980,14 +1984,14 @@ cmd_sync() {
             if ! is_git_repo "$local_path"; then
                 log_warn "Not a git repo: $local_path"
                 ((conflicts++))
-                write_result "$repo_name" "skip" "not_git" "0" ""
+                write_result "$repo_name" "skip" "not_git" "0" "" "$local_path"
                 continue
             fi
 
             if check_remote_mismatch "$local_path" "$url"; then
                 log_warn "Remote mismatch: $repo_name"
                 ((conflicts++))
-                write_result "$repo_name" "pull" "mismatch" "0" ""
+                write_result "$repo_name" "pull" "mismatch" "0" "" "$local_path"
                 continue
             fi
 
@@ -1999,21 +2003,21 @@ cmd_sync() {
             if [[ "$dirty" == "true" && "$AUTOSTASH" != "true" ]]; then
                 log_warn "Dirty: $repo_name (uncommitted changes)"
                 ((conflicts++))
-                write_result "$repo_name" "pull" "dirty" "0" ""
+                write_result "$repo_name" "pull" "dirty" "0" "" "$local_path"
                 continue
             fi
 
             if [[ "$status" == "current" ]]; then
                 log_info "Current: $repo_name"
                 ((skipped++))
-                write_result "$repo_name" "pull" "current" "0" ""
+                write_result "$repo_name" "pull" "current" "0" "" "$local_path"
                 continue
             fi
 
             if [[ "$status" == "diverged" ]]; then
                 log_warn "Diverged: $repo_name"
                 ((conflicts++))
-                write_result "$repo_name" "pull" "diverged" "0" ""
+                write_result "$repo_name" "pull" "diverged" "0" "" "$local_path"
                 continue
             fi
 
