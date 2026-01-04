@@ -189,10 +189,15 @@ make_dirty() {
 init_ru_config() {
     "$RU_SCRIPT" init >/dev/null 2>&1
 
-    # Set projects dir
+    # Set projects dir (use temp file for macOS/Linux compatibility)
     local config_file="$XDG_CONFIG_HOME/ru/config"
-    sed -i "s|^PROJECTS_DIR=.*|PROJECTS_DIR=$TEST_PROJECTS_DIR|" "$config_file" 2>/dev/null || true
-    grep -q "^PROJECTS_DIR=" "$config_file" 2>/dev/null || echo "PROJECTS_DIR=$TEST_PROJECTS_DIR" >> "$config_file"
+    local tmp_file="$config_file.tmp"
+
+    if grep -q "^PROJECTS_DIR=" "$config_file" 2>/dev/null; then
+        sed "s|^PROJECTS_DIR=.*|PROJECTS_DIR=$TEST_PROJECTS_DIR|" "$config_file" > "$tmp_file" && mv "$tmp_file" "$config_file"
+    else
+        echo "PROJECTS_DIR=$TEST_PROJECTS_DIR" >> "$config_file"
+    fi
 }
 
 # Create a test repo setup: bare remote + cloned local repo
@@ -225,11 +230,19 @@ test_pull_clean_repo_current() {
     # Test git pull directly (using git -C to avoid changing directory)
     local output
     output=$(git -C "$TEST_PROJECTS_DIR/cleanrepo" pull 2>&1)
+    local exit_code=$?
 
-    if echo "$output" | grep -qi "already up to date\|Already up-to-date"; then
-        pass "Clean repo reports already up to date"
+    # Pull should succeed (exit 0)
+    if [[ $exit_code -eq 0 ]]; then
+        # Should report already up to date since we just cloned
+        if echo "$output" | grep -qi "already up to date\|Already up-to-date"; then
+            pass "Clean repo reports already up to date"
+        else
+            # Pull succeeded but didn't report "up to date" - still valid
+            pass "Clean repo pull completed successfully"
+        fi
     else
-        pass "Clean repo pull completed successfully"
+        fail "Clean repo pull failed with exit code $exit_code"
     fi
 
     cleanup_test_env

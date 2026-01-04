@@ -30,8 +30,8 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 TEMP_DIR=""
 
-# Colors (disabled if not a terminal)
-if [[ -t 2 ]]; then
+# Colors (disabled if stdout is not a terminal)
+if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
     YELLOW='\033[0;33m'
@@ -86,7 +86,7 @@ assert_output_contains() {
     local output="$1"
     local pattern="$2"
     local msg="$3"
-    if echo "$output" | grep -q "$pattern"; then
+    if printf '%s\n' "$output" | grep -q "$pattern"; then
         pass "$msg"
     else
         fail "$msg (pattern '$pattern' not found in output)"

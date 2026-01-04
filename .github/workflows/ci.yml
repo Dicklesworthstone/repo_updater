@@ -38,8 +38,10 @@ jobs:
 
       - name: Check test scripts syntax
         run: |
-          bash -n scripts/test_parsing.sh
-          bash -n scripts/test_local_git.sh
+          for script in scripts/*.sh; do
+            echo "Checking syntax: $script"
+            bash -n "$script"
+          done
 
   unit-tests:
     name: Unit Tests

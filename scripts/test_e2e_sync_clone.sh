@@ -134,10 +134,28 @@ assert_output_contains() {
 assert_json_valid() {
     local json="$1"
     local msg="$2"
-    if echo "$json" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
-        pass "$msg"
+    # Try jq first (fast), then python3, then basic pattern check
+    if command -v jq >/dev/null 2>&1; then
+        if echo "$json" | jq . >/dev/null 2>&1; then
+            pass "$msg"
+        else
+            fail "$msg (invalid JSON)"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if echo "$json" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
+            pass "$msg"
+        else
+            fail "$msg (invalid JSON)"
+        fi
     else
-        fail "$msg (invalid JSON)"
+        # Fallback: basic structure check (starts with { or [, ends with } or ])
+        local trimmed
+        trimmed=$(echo "$json" | tr -d '[:space:]')
+        if [[ "$trimmed" =~ ^[\{\[] && "$trimmed" =~ [\}\]]$ ]]; then
+            pass "$msg (basic check - install jq for full validation)"
+        else
+            fail "$msg (invalid JSON structure)"
+        fi
     fi
 }
 
@@ -145,10 +163,26 @@ assert_json_has_field() {
     local json="$1"
     local field="$2"
     local msg="$3"
-    if echo "$json" | python3 -c "import sys, json; d=json.load(sys.stdin); assert '$field' in d" 2>/dev/null; then
-        pass "$msg"
+    # Try jq first, then python3, then grep fallback
+    if command -v jq >/dev/null 2>&1; then
+        if echo "$json" | jq -e ".$field" >/dev/null 2>&1; then
+            pass "$msg"
+        else
+            fail "$msg (field '$field' not found in JSON)"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if echo "$json" | python3 -c "import sys, json; d=json.load(sys.stdin); assert '$field' in d" 2>/dev/null; then
+            pass "$msg"
+        else
+            fail "$msg (field '$field' not found in JSON)"
+        fi
     else
-        fail "$msg (field '$field' not found in JSON)"
+        # Fallback: grep for the field name (not precise but works for simple cases)
+        if echo "$json" | grep -q "\"$field\""; then
+            pass "$msg (basic check)"
+        else
+            fail "$msg (field '$field' not found in JSON)"
+        fi
     fi
 }
 
@@ -164,13 +198,22 @@ init_test_config() {
     "$RU_SCRIPT" init >/dev/null 2>&1
 
     # Set layout and projects dir directly in config file
+    # Use temp file approach for macOS/Linux compatibility (sed -i differs)
     local config_file="$XDG_CONFIG_HOME/ru/config"
-    sed -i "s|^LAYOUT=.*|LAYOUT=$layout|" "$config_file" 2>/dev/null || true
-    sed -i "s|^PROJECTS_DIR=.*|PROJECTS_DIR=$TEST_PROJECTS_DIR|" "$config_file" 2>/dev/null || true
+    local tmp_file="$config_file.tmp"
 
-    # Add if not present
-    grep -q "^LAYOUT=" "$config_file" 2>/dev/null || echo "LAYOUT=$layout" >> "$config_file"
-    grep -q "^PROJECTS_DIR=" "$config_file" 2>/dev/null || echo "PROJECTS_DIR=$TEST_PROJECTS_DIR" >> "$config_file"
+    # Update existing values or add new ones
+    if grep -q "^LAYOUT=" "$config_file" 2>/dev/null; then
+        sed "s|^LAYOUT=.*|LAYOUT=$layout|" "$config_file" > "$tmp_file" && mv "$tmp_file" "$config_file"
+    else
+        echo "LAYOUT=$layout" >> "$config_file"
+    fi
+
+    if grep -q "^PROJECTS_DIR=" "$config_file" 2>/dev/null; then
+        sed "s|^PROJECTS_DIR=.*|PROJECTS_DIR=$TEST_PROJECTS_DIR|" "$config_file" > "$tmp_file" && mv "$tmp_file" "$config_file"
+    else
+        echo "PROJECTS_DIR=$TEST_PROJECTS_DIR" >> "$config_file"
+    fi
 }
 
 # Add a test repo to the config
@@ -333,8 +376,24 @@ test_sync_json_summary_counts() {
     local json_output
     json_output=$("$RU_SCRIPT" sync --dry-run --json --non-interactive 2>/dev/null)
 
-    # Check summary contains count fields
-    if echo "$json_output" | python3 -c "import sys, json; d=json.load(sys.stdin); assert 'total' in d.get('summary', {})" 2>/dev/null; then
+    # Check summary contains count fields (with fallbacks for different tools)
+    local has_total="false"
+    if command -v jq >/dev/null 2>&1; then
+        if echo "$json_output" | jq -e '.summary.total' >/dev/null 2>&1; then
+            has_total="true"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if echo "$json_output" | python3 -c "import sys, json; d=json.load(sys.stdin); assert 'total' in d.get('summary', {})" 2>/dev/null; then
+            has_total="true"
+        fi
+    else
+        # Fallback: grep for pattern
+        if echo "$json_output" | grep -q '"total"'; then
+            has_total="true"
+        fi
+    fi
+
+    if [[ "$has_total" == "true" ]]; then
         pass "JSON summary has 'total' field"
     else
         fail "JSON summary missing 'total' field"
