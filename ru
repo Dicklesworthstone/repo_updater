@@ -7557,12 +7557,21 @@ repo_spec_to_github_id() {
 }
 
 # Discover work items from GitHub using GraphQL batching
-# Args: result_array_name, priority_filter, max_repos
+# Args: result_array_name, priority_filter, max_repos, allowed_repo_ids(optional)
 discover_work_items() {
     local -n _items_ref=$1
     # shellcheck disable=SC2034  # Used in bd-5jph (priority scoring)
     local priority_filter="$2"
     local max_repos="$3"
+    local allowed_repos="${4:-}"
+
+    local -A allowed_repo_map=()
+    if [[ -n "$allowed_repos" ]]; then
+        local allowed_repo
+        for allowed_repo in $allowed_repos; do
+            allowed_repo_map["$allowed_repo"]=1
+        done
+    fi
 
     _items_ref=()
 
@@ -7595,6 +7604,9 @@ discover_work_items() {
         local github_id
         github_id=$(repo_spec_to_github_id "$spec")
         if [[ -n "$github_id" ]]; then
+            if [[ ${#allowed_repo_map[@]} -gt 0 && -z "${allowed_repo_map[$github_id]:-}" ]]; then
+                continue
+            fi
             github_repos+=("$github_id")
         fi
     done
@@ -9138,6 +9150,318 @@ update_plan_with_gates() {
     ' "$plan_file")
 
     echo "$updated_plan" > "$plan_file"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# execute_gh_actions: Execute GitHub mutations from review-plan.json (bd-vcr9)
+#
+# Supports:
+# - comment (issue/pr)
+# - close (issue/pr)
+# - label (issue only)
+#
+# Notes:
+# - merge is intentionally not supported by policy (skipped with warning)
+# - idempotence: actions with status "ok" are not re-executed (JSONL audit log)
+#------------------------------------------------------------------------------
+
+get_gh_actions_log_file() {
+    echo "$(get_review_state_dir)/gh-actions.jsonl"
+}
+
+canonicalize_gh_action() {
+    local action_json="$1"
+    echo "$action_json" | jq -cS '.' 2>/dev/null
+}
+
+gh_action_already_executed() {
+    local repo_id="$1"
+    local action_canon="$2"
+    local log_file
+    log_file=$(get_gh_actions_log_file)
+
+    [[ -f "$log_file" ]] || return 1
+    command -v jq &>/dev/null || return 1
+
+    jq -s \
+        --arg repo "$repo_id" \
+        --arg action "$action_canon" \
+        'map(select(.repo == $repo and .action == $action and .status == "ok")) | length > 0' \
+        "$log_file" >/dev/null 2>&1
+}
+
+record_gh_action_log() {
+    local repo_id="$1"
+    local action_canon="$2"
+    local status="$3"          # ok|failed|skipped|blocked
+    local message="${4:-}"
+
+    local state_dir
+    state_dir=$(get_review_state_dir)
+    ensure_dir "$state_dir"
+
+    local log_file
+    log_file=$(get_gh_actions_log_file)
+
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Append a single JSON object per line (JSONL)
+    jq -nc \
+        --arg ts "$now" \
+        --arg repo "$repo_id" \
+        --arg action "$action_canon" \
+        --arg status "$status" \
+        --arg message "$message" \
+        '{ts:$ts, repo:$repo, action:$action, status:$status, message:$message}' \
+        >> "$log_file"
+}
+
+parse_gh_action_target() {
+    local target="$1"
+    local -n _type_ref=$2
+    local -n _number_ref=$3
+
+    if [[ "$target" =~ ^(issue|pr)#[0-9]+$ ]]; then
+        _type_ref="${target%%#*}"
+        _number_ref="${target##*#}"
+        return 0
+    fi
+
+    return 1
+}
+
+execute_gh_action_comment() {
+    local repo_id="$1"
+    local target_type="$2"
+    local number="$3"
+    local body="$4"
+
+    local output exit_code
+    if [[ "$target_type" == "issue" ]]; then
+        if output=$(printf '%s' "$body" | gh issue comment "$number" -R "$repo_id" --body-file - 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+    else
+        if output=$(printf '%s' "$body" | gh pr comment "$number" -R "$repo_id" --body-file - 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "gh comment failed for $repo_id $target_type#$number: $output"
+        return "$exit_code"
+    fi
+
+    return 0
+}
+
+execute_gh_action_close() {
+    local repo_id="$1"
+    local target_type="$2"
+    local number="$3"
+    local reason="$4"
+    local comment="${5:-}"
+
+    local output exit_code
+    if [[ "$target_type" == "issue" ]]; then
+        if output=$(gh issue close "$number" -R "$repo_id" --reason "$reason" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+    else
+        # gh pr close uses --comment (optional)
+        if [[ -n "$comment" ]]; then
+            if output=$(gh pr close "$number" -R "$repo_id" --comment "$comment" 2>&1); then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+        else
+            if output=$(gh pr close "$number" -R "$repo_id" 2>&1); then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+        fi
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "gh close failed for $repo_id $target_type#$number: $output"
+        return "$exit_code"
+    fi
+
+    return 0
+}
+
+execute_gh_action_label() {
+    local repo_id="$1"
+    local number="$2"
+    local labels_csv="$3"
+
+    local output exit_code
+    if output=$(gh issue edit "$number" -R "$repo_id" --add-label "$labels_csv" 2>&1); then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "gh label failed for $repo_id issue#$number: $output"
+        return "$exit_code"
+    fi
+
+    return 0
+}
+
+execute_gh_actions() {
+    local repo_id="$1"
+    local plan_file="$2"
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Plan file not found: $plan_file"
+        return 1
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required to execute gh_actions"
+        return 1
+    fi
+
+    if ! command -v gh &>/dev/null; then
+        log_error "gh CLI is required to execute gh_actions"
+        return 1
+    fi
+
+    local actions_count
+    if ! actions_count=$(jq '.gh_actions // [] | length' "$plan_file" 2>/dev/null); then
+        log_warn "Failed to read gh_actions from plan: $plan_file"
+        return 1
+    fi
+
+    if [[ "$actions_count" -eq 0 ]]; then
+        log_verbose "No gh_actions in plan"
+        return 0
+    fi
+
+    local any_failed=false
+
+    while IFS= read -r action_json; do
+        [[ -n "$action_json" ]] || continue
+
+        local action_canon
+        action_canon=$(canonicalize_gh_action "$action_json")
+        if [[ -z "$action_canon" ]]; then
+            log_warn "Skipping invalid gh_action JSON"
+            continue
+        fi
+
+        # Parse operation and target
+        local op target
+        op=$(echo "$action_json" | jq -r '.op // ""')
+        target=$(echo "$action_json" | jq -r '.target // ""')
+
+        local target_type number
+        if ! parse_gh_action_target "$target" target_type number; then
+            record_gh_action_log "$repo_id" "$action_canon" "failed" "Invalid target: $target"
+            log_error "Invalid gh_action target: $target"
+            any_failed=true
+            continue
+        fi
+
+        # Idempotence: skip actions already recorded as successful
+        if gh_action_already_executed "$repo_id" "$action_canon"; then
+            record_gh_action_log "$repo_id" "$action_canon" "skipped" "Already executed"
+            log_verbose "Skipping already executed gh_action: $op $target"
+            continue
+        fi
+
+        case "$op" in
+            comment)
+                local body
+                body=$(echo "$action_json" | jq -r '.body // ""')
+                if [[ -z "$body" ]]; then
+                    record_gh_action_log "$repo_id" "$action_canon" "failed" "Missing body for comment"
+                    log_error "gh_action comment missing body: $target"
+                    any_failed=true
+                    continue
+                fi
+
+                log_step "Commenting on $repo_id $target"
+                if execute_gh_action_comment "$repo_id" "$target_type" "$number" "$body"; then
+                    record_gh_action_log "$repo_id" "$action_canon" "ok" ""
+                else
+                    record_gh_action_log "$repo_id" "$action_canon" "failed" "gh comment failed"
+                    any_failed=true
+                fi
+                ;;
+
+            close)
+                local reason comment
+                reason=$(echo "$action_json" | jq -r '.reason // "completed"')
+                comment=$(echo "$action_json" | jq -r '.comment // ""')
+                if [[ -z "$comment" ]] && [[ "$target_type" == "pr" ]]; then
+                    comment="Closing: $reason"
+                fi
+
+                log_step "Closing $repo_id $target"
+                if execute_gh_action_close "$repo_id" "$target_type" "$number" "$reason" "$comment"; then
+                    record_gh_action_log "$repo_id" "$action_canon" "ok" ""
+                else
+                    record_gh_action_log "$repo_id" "$action_canon" "failed" "gh close failed"
+                    any_failed=true
+                fi
+                ;;
+
+            label)
+                if [[ "$target_type" != "issue" ]]; then
+                    record_gh_action_log "$repo_id" "$action_canon" "failed" "Labels supported only for issues"
+                    log_error "gh_action label unsupported target: $target"
+                    any_failed=true
+                    continue
+                fi
+
+                local labels_csv
+                labels_csv=$(echo "$action_json" | jq -r '.labels // [] | map(tostring) | join(",")')
+                if [[ -z "$labels_csv" || "$labels_csv" == "null" ]]; then
+                    record_gh_action_log "$repo_id" "$action_canon" "failed" "Missing labels"
+                    log_error "gh_action label missing labels: $target"
+                    any_failed=true
+                    continue
+                fi
+
+                log_step "Adding labels to $repo_id $target: $labels_csv"
+                if execute_gh_action_label "$repo_id" "$number" "$labels_csv"; then
+                    record_gh_action_log "$repo_id" "$action_canon" "ok" ""
+                else
+                    record_gh_action_log "$repo_id" "$action_canon" "failed" "gh label failed"
+                    any_failed=true
+                fi
+                ;;
+
+            merge)
+                record_gh_action_log "$repo_id" "$action_canon" "blocked" "merge not supported by policy"
+                log_warn "Skipping gh_action merge for $repo_id $target (policy blocked)"
+                any_failed=true
+                ;;
+
+            *)
+                record_gh_action_log "$repo_id" "$action_canon" "failed" "Unknown op: $op"
+                log_warn "Unknown gh_action op: $op"
+                any_failed=true
+                ;;
+        esac
+    done < <(jq -c '.gh_actions[]?' "$plan_file" 2>/dev/null)
+
+    if [[ "$any_failed" == "true" ]]; then
+        return 1
+    fi
     return 0
 }
 
