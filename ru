@@ -340,6 +340,7 @@ SYNC OPTIONS:
     --rebase             Use git pull --rebase
     --dry-run            Show what would happen without making changes
     --dir PATH           Override projects directory
+    --parallel N, -j N   Sync N repos concurrently (default: 1, sequential)
     --resume             Resume an interrupted sync from where it left off
     --restart            Discard interrupted sync state and start fresh
     --timeout SECONDS    Network timeout for slow operations (default: 30)
@@ -1358,6 +1359,208 @@ is_repo_completed() {
 }
 
 #==============================================================================
+# SECTION 10.6: PARALLEL SYNC SUPPORT
+#==============================================================================
+
+# Process a single repo spec (used by both sequential and parallel modes)
+# Writes result status to stdout (for aggregation)
+# Args: repo_spec current total projects_dir layout update_strategy autostash clone_only pull_only fetch_remotes
+process_single_repo_worker() {
+    local repo_spec="$1"
+    local projects_dir="$2"
+    local layout="$3"
+    local update_strategy="$4"
+    local autostash="$5"
+    local clone_only="$6"
+    local pull_only="$7"
+    local fetch_remotes="$8"
+
+    # Parse the repo spec
+    local url branch custom_name local_path repo_name
+    parse_repo_spec "$repo_spec" url branch custom_name
+
+    # Calculate local path based on custom name or URL
+    if [[ -n "$custom_name" ]]; then
+        local_path="${projects_dir}/${custom_name}"
+    else
+        local_path=$(url_to_local_path "$url" "$projects_dir" "$layout")
+    fi
+    repo_name=$(basename "$local_path")
+
+    # Check if repo exists locally
+    if [[ ! -d "$local_path" ]]; then
+        if [[ "$pull_only" == "true" ]]; then
+            echo "SKIP:skipped:$repo_name"
+            return 0
+        fi
+
+        if do_clone "$url" "$local_path" "$repo_name" >/dev/null 2>&1; then
+            echo "OK:cloned:$repo_name"
+        else
+            echo "FAIL:failed:$repo_name"
+        fi
+    else
+        if [[ "$clone_only" == "true" ]]; then
+            echo "SKIP:skipped:$repo_name"
+            return 0
+        fi
+
+        if ! is_git_repo "$local_path"; then
+            echo "CONFLICT:not_git:$repo_name"
+            return 0
+        fi
+
+        if check_remote_mismatch "$local_path" "$url"; then
+            echo "CONFLICT:mismatch:$repo_name"
+            return 0
+        fi
+
+        local status_info dirty status
+        status_info=$(get_repo_status "$local_path" "$fetch_remotes")
+        status=$(echo "$status_info" | sed 's/.*STATUS=\([^ ]*\).*/\1/')
+        dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
+
+        if [[ "$dirty" == "true" && "$autostash" != "true" ]]; then
+            echo "CONFLICT:dirty:$repo_name"
+            return 0
+        fi
+
+        if [[ "$status" == "current" ]]; then
+            echo "OK:current:$repo_name"
+            return 0
+        fi
+
+        if [[ "$status" == "diverged" ]]; then
+            echo "CONFLICT:diverged:$repo_name"
+            return 0
+        fi
+
+        if do_pull "$local_path" "$repo_name" "$update_strategy" "$autostash" >/dev/null 2>&1; then
+            echo "OK:updated:$repo_name"
+        else
+            echo "FAIL:failed:$repo_name"
+        fi
+    fi
+}
+
+# Run parallel sync with worker pool
+# Args: pending_repos array ref, parallel count
+run_parallel_sync() {
+    local -n repos_ref=$1
+    local parallel_count=$2
+
+    # Validate parallel count
+    if [[ ! "$parallel_count" =~ ^[0-9]+$ ]] || [[ "$parallel_count" -lt 1 ]]; then
+        log_error "Invalid parallel count: $parallel_count (must be >= 1)"
+        return 4
+    fi
+
+    local total=${#repos_ref[@]}
+    if [[ $total -eq 0 ]]; then
+        return 0
+    fi
+
+    # Limit parallel count to total repos
+    if [[ $parallel_count -gt $total ]]; then
+        parallel_count=$total
+    fi
+
+    log_info "Syncing $total repositories with $parallel_count workers..."
+    echo "" >&2
+
+    # Create temporary files for work queue and results
+    local work_queue results_file lock_file progress_file
+    work_queue=$(mktemp)
+    results_file=$(mktemp)
+    lock_file=$(mktemp)
+    progress_file=$(mktemp)
+
+    # Write repos to work queue
+    printf '%s\n' "${repos_ref[@]}" > "$work_queue"
+
+    # Initialize progress counter
+    echo "0" > "$progress_file"
+
+    # Launch workers
+    local worker_pids=()
+    for ((i=0; i<parallel_count; i++)); do
+        (
+            while true; do
+                # Atomically get next repo from queue
+                local repo_spec
+                {
+                    flock -x 200
+                    repo_spec=$(head -1 "$work_queue" 2>/dev/null)
+                    if [[ -n "$repo_spec" ]]; then
+                        # Remove from queue (portable sed)
+                        tail -n +2 "$work_queue" > "${work_queue}.tmp" 2>/dev/null
+                        mv "${work_queue}.tmp" "$work_queue" 2>/dev/null
+                    fi
+                } 200>"$lock_file"
+
+                # Exit if no more work
+                [[ -z "$repo_spec" ]] && break
+
+                # Process the repo
+                local result
+                result=$(process_single_repo_worker "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
+                    "$UPDATE_STRATEGY" "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES")
+
+                # Append result atomically
+                echo "$result" >> "$results_file"
+
+                # Update progress atomically
+                {
+                    flock -x 201
+                    local current
+                    current=$(cat "$progress_file")
+                    echo $((current + 1)) > "$progress_file"
+                    # Print progress
+                    echo -ne "\r→ Progress: $((current + 1))/$total" >&2
+                } 201>"${lock_file}.progress"
+            done
+        ) &
+        worker_pids+=($!)
+    done
+
+    # Wait for all workers
+    for pid in "${worker_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    echo "" >&2  # New line after progress
+
+    # Parse results
+    local cloned=0 updated=0 skipped=0 failed=0 conflicts=0
+    while IFS=: read -r status reason repo_name; do
+        case "$status" in
+            OK)
+                case "$reason" in
+                    cloned) ((cloned++)) ;;
+                    updated) ((updated++)) ;;
+                    current) ((skipped++)) ;;
+                esac
+                ;;
+            SKIP) ((skipped++)) ;;
+            FAIL) ((failed++)) ;;
+            CONFLICT) ((conflicts++)) ;;
+        esac
+    done < "$results_file"
+
+    # Cleanup temp files
+    rm -f "$work_queue" "$results_file" "$lock_file" "${lock_file}.progress" "$progress_file" 2>/dev/null
+
+    # Return results via global variables (for summary)
+    PARALLEL_CLONED=$cloned
+    PARALLEL_UPDATED=$updated
+    PARALLEL_SKIPPED=$skipped
+    PARALLEL_FAILED=$failed
+    PARALLEL_CONFLICTS=$conflicts
+
+    return 0
+}
+
+#==============================================================================
 # SECTION 11: EXIT TRAP AND CLEANUP
 #==============================================================================
 
@@ -1450,6 +1653,14 @@ parse_args() {
                 ;;
             --timeout)
                 GIT_TIMEOUT="$2"
+                shift 2
+                ;;
+            --parallel)
+                PARALLEL="$2"
+                shift 2
+                ;;
+            -j)
+                PARALLEL="$2"
                 shift 2
                 ;;
             --example)
@@ -1965,17 +2176,38 @@ cmd_sync() {
     fi
 
     local pending_count=${#pending_repos[@]}
-    if [[ $resumed -gt 0 ]]; then
-        log_info "Syncing $pending_count repositories ($resumed already completed)..."
-    else
-        log_info "Syncing $total repositories..."
-    fi
-    echo "" >&2
 
     # Only iterate if there are pending repos
     if [[ ${#pending_repos[@]} -eq 0 ]]; then
         log_info "No repositories to sync."
     fi
+
+    # Check for parallel mode
+    local parallel_count="${PARALLEL:-1}"
+    if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
+        # Parallel mode: use worker pool
+        if [[ $resumed -gt 0 ]]; then
+            log_info "Parallel sync: $pending_count repositories ($resumed already completed) with $parallel_count workers"
+        fi
+
+        run_parallel_sync pending_repos "$parallel_count"
+
+        # Get results from global variables set by run_parallel_sync
+        cloned=$PARALLEL_CLONED
+        updated=$PARALLEL_UPDATED
+        skipped=$PARALLEL_SKIPPED
+        failed=$PARALLEL_FAILED
+        conflicts=$PARALLEL_CONFLICTS
+
+        # Skip state management for parallel mode (simpler, no resume support yet)
+    else
+        # Sequential mode (original behavior)
+        if [[ $resumed -gt 0 ]]; then
+            log_info "Syncing $pending_count repositories ($resumed already completed)..."
+        else
+            log_info "Syncing $total repositories..."
+        fi
+        echo "" >&2
 
     for repo_spec in "${pending_repos[@]+"${pending_repos[@]}"}"; do
         [[ -z "$repo_spec" ]] && continue
@@ -2078,6 +2310,7 @@ cmd_sync() {
         # Save state after each repo (enables resume on interrupt)
         save_sync_state "in_progress" SYNC_COMPLETED pending_names
     done
+    fi  # End of sequential mode else block
 
     echo "" >&2
 
@@ -2410,6 +2643,128 @@ cmd_list() {
             echo "$url"
         fi
     done
+}
+
+cmd_prune() {
+    # Parse options
+    local action="list"
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --archive) action="archive" ;;
+            --delete)  action="delete" ;;
+        esac
+    done
+
+    # Ensure config exists
+    if [[ ! -d "$RU_CONFIG_DIR" ]]; then
+        log_info "No configuration found. Run: ru init"
+        exit 0
+    fi
+
+    # Ensure projects directory exists
+    if [[ ! -d "$PROJECTS_DIR" ]]; then
+        log_info "Projects directory does not exist: $PROJECTS_DIR"
+        exit 0
+    fi
+
+    log_step "Scanning for orphan repositories..."
+
+    # Get all configured repo paths
+    local configured_paths
+    configured_paths=$(mktemp)
+    while IFS= read -r spec; do
+        local url branch custom_name local_path
+        parse_repo_spec "$spec" url branch custom_name
+        if [[ -n "$custom_name" ]]; then
+            local_path="${PROJECTS_DIR}/${custom_name}"
+        else
+            local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        fi
+        echo "$local_path"
+    done < <(get_all_repos) | sort -u > "$configured_paths"
+
+    # Find all git repos in PROJECTS_DIR (max depth 3 to handle owner/repo layout)
+    local actual_repos
+    actual_repos=$(mktemp)
+    find "$PROJECTS_DIR" -maxdepth 3 -name .git -type d 2>/dev/null | \
+        while read -r gitdir; do
+            dirname "$gitdir"
+        done | sort -u > "$actual_repos"
+
+    # Find orphans (repos that exist but aren't configured)
+    local orphans
+    orphans=$(comm -23 "$actual_repos" "$configured_paths")
+
+    # Clean up temp files
+    rm -f "$configured_paths" "$actual_repos"
+
+    if [[ -z "$orphans" ]]; then
+        log_success "No orphan repositories found"
+        return 0
+    fi
+
+    # Count orphans
+    local orphan_count
+    orphan_count=$(echo "$orphans" | wc -l | tr -d ' ')
+
+    log_warn "Found $orphan_count orphan repository(ies):"
+    echo "" >&2
+
+    # List orphans
+    echo "$orphans" | while read -r path; do
+        echo -e "  ${YELLOW}•${RESET} $path" >&2
+        echo "$path"  # Also output to stdout for scripting
+    done
+
+    echo "" >&2
+
+    case "$action" in
+        list)
+            log_info "Use --archive to move orphans to archive, or --delete to remove them."
+            ;;
+        archive)
+            local archive_dir="${RU_STATE_DIR}/archived/$(date +%Y-%m-%d_%H%M%S)"
+            mkdir -p "$archive_dir"
+
+            log_step "Archiving orphans to: $archive_dir"
+            echo "$orphans" | while read -r path; do
+                local name
+                name=$(basename "$path")
+                if mv "$path" "$archive_dir/$name" 2>/dev/null; then
+                    log_success "Archived: $name"
+                else
+                    log_error "Failed to archive: $path"
+                fi
+            done
+            log_success "Done. Orphans moved to: $archive_dir"
+            ;;
+        delete)
+            # Require confirmation for delete
+            if [[ "$NON_INTERACTIVE" == "true" ]]; then
+                log_error "Cannot delete in non-interactive mode without explicit confirmation"
+                log_info "Use interactive mode or archive instead"
+                exit 1
+            fi
+
+            echo -e "${RED}WARNING: This will permanently delete $orphan_count repository(ies)!${RESET}" >&2
+            echo "" >&2
+
+            if gum_confirm "Are you sure you want to delete these orphan repositories?"; then
+                echo "$orphans" | while read -r path; do
+                    local name
+                    name=$(basename "$path")
+                    if rm -rf "$path" 2>/dev/null; then
+                        log_success "Deleted: $name"
+                    else
+                        log_error "Failed to delete: $path"
+                    fi
+                done
+                log_success "Done. Deleted $orphan_count orphan repository(ies)"
+            else
+                log_info "Cancelled. No repositories were deleted."
+            fi
+            ;;
+    esac
 }
 
 cmd_doctor() {
