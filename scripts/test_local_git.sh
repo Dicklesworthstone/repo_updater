@@ -41,6 +41,7 @@ log_verbose() { [[ "$VERBOSE" == "true" ]] && echo "VERBOSE: $*"; }
 
 # Source core functions from ru
 source <(sed -n '/^ensure_dir()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^json_escape()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^write_result()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^get_repo_log_path()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^is_git_repo()/,/^}/p' "$PROJECT_DIR/ru")
@@ -125,17 +126,15 @@ init_repo_with_commit() {
     local work_dir="$2"
 
     git clone "$remote_dir" "$work_dir" >/dev/null 2>&1
-    cd "$work_dir"
-    git config user.email "test@test.com"
-    git config user.name "Test User"
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test User"
     # Explicitly create main branch (cloning empty repo has no branch)
-    git checkout -b main 2>/dev/null || true
-    echo "initial content" > file.txt
-    git add file.txt
-    git commit -m "Initial commit" >/dev/null 2>&1
+    git -C "$work_dir" checkout -b main 2>/dev/null || true
+    echo "initial content" > "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+    git -C "$work_dir" commit -m "Initial commit" >/dev/null 2>&1
     # Use -u to set upstream tracking in one command
-    git push -u origin main >/dev/null 2>&1
-    cd - >/dev/null
+    git -C "$work_dir" push -u origin main >/dev/null 2>&1
 }
 
 # Add a commit to a repo and push
@@ -143,12 +142,10 @@ add_commit_and_push() {
     local work_dir="$1"
     local msg="$2"
 
-    cd "$work_dir"
-    echo "$msg" >> file.txt
-    git add file.txt
-    git commit -m "$msg" >/dev/null 2>&1
-    git push >/dev/null 2>&1
-    cd - >/dev/null
+    echo "$msg" >> "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+    git -C "$work_dir" commit -m "$msg" >/dev/null 2>&1
+    git -C "$work_dir" push >/dev/null 2>&1
 }
 
 # Add a local commit (don't push)
@@ -156,11 +153,9 @@ add_local_commit() {
     local work_dir="$1"
     local msg="$2"
 
-    cd "$work_dir"
-    echo "$msg" >> file.txt
-    git add file.txt
-    git commit -m "$msg" >/dev/null 2>&1
-    cd - >/dev/null
+    echo "$msg" >> "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+    git -C "$work_dir" commit -m "$msg" >/dev/null 2>&1
 }
 
 # Make repo dirty (uncommitted changes)
