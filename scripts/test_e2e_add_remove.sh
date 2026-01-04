@@ -338,6 +338,102 @@ test_remove_preserves_comments() {
 }
 
 #==============================================================================
+# Tests: Private repos (--private flag)
+#==============================================================================
+
+test_add_private_repo() {
+    echo "Test: ru add --private adds to private.txt"
+    setup_test_env
+
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local private_file="$XDG_CONFIG_HOME/ru/repos.d/private.txt"
+
+    local output
+    output=$("$RU_SCRIPT" add --private secret/repo 2>&1)
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "ru add --private exits with code 0"
+    assert_output_contains "$output" "Added" "Output confirms repo added"
+    assert_output_contains "$output" "private" "Output mentions private"
+    assert_file_not_contains "$repos_file" "secret/repo" "repos.txt does NOT contain the private repo"
+
+    if [[ -f "$private_file" ]] && grep -q "secret/repo" "$private_file"; then
+        pass "private.txt contains the private repo"
+    else
+        fail "private.txt should contain secret/repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_list_public_filter() {
+    echo "Test: ru list --public shows only public repos"
+    setup_test_env
+
+    "$RU_SCRIPT" add public/repo1 public/repo2 2>&1
+    "$RU_SCRIPT" add --private private/repo 2>&1
+
+    local output
+    output=$("$RU_SCRIPT" list --public 2>&1)
+
+    assert_output_contains "$output" "public/repo1" "Shows public repo1"
+    assert_output_contains "$output" "public/repo2" "Shows public repo2"
+    if printf '%s\n' "$output" | grep -q "private/repo"; then
+        fail "list --public should not show private repo"
+    else
+        pass "list --public excludes private repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_list_private_filter() {
+    echo "Test: ru list --private shows only private repos"
+    setup_test_env
+
+    "$RU_SCRIPT" add public/repo 2>&1
+    "$RU_SCRIPT" add --private private/repo1 private/repo2 2>&1
+
+    local output
+    output=$("$RU_SCRIPT" list --private 2>&1)
+
+    assert_output_contains "$output" "private/repo1" "Shows private repo1"
+    assert_output_contains "$output" "private/repo2" "Shows private repo2"
+    if printf '%s\n' "$output" | grep -q "public/repo"; then
+        fail "list --private should not show public repo"
+    else
+        pass "list --private excludes public repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_remove_from_private() {
+    echo "Test: ru remove can remove from private.txt"
+    setup_test_env
+
+    local private_file="$XDG_CONFIG_HOME/ru/repos.d/private.txt"
+
+    "$RU_SCRIPT" add --private secret/repo 2>&1
+
+    local output
+    output=$("$RU_SCRIPT" remove secret/repo 2>&1)
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "ru remove exits with code 0 for private repo"
+    assert_output_contains "$output" "Removed" "Output confirms repo removed"
+    assert_output_contains "$output" "private" "Output mentions it was from private"
+
+    if [[ -f "$private_file" ]] && grep -q "secret/repo" "$private_file"; then
+        fail "private.txt should no longer contain secret/repo"
+    else
+        pass "secret/repo removed from private.txt"
+    fi
+
+    cleanup_test_env
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -378,6 +474,16 @@ echo ""
 test_remove_no_args
 echo ""
 test_remove_preserves_comments
+echo ""
+
+# Private repo tests
+test_add_private_repo
+echo ""
+test_list_public_filter
+echo ""
+test_list_private_filter
+echo ""
+test_remove_from_private
 echo ""
 
 echo "============================================"
