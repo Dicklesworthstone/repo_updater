@@ -3986,9 +3986,10 @@ load_review_driver() {
 
     case "$driver" in
         ntm)
-            # ntm driver will be implemented in bd-k1kx
+            # ntm driver uses robot mode API for advanced orchestration
             log_verbose "Loading ntm driver"
             LOADED_DRIVER="ntm"
+            _enable_ntm_driver
             ;;
         local)
             # Local driver (tmux + stream-json)
@@ -4542,6 +4543,294 @@ local_driver_session_alive() {
 
     tmux has-session -t "$session_id" 2>/dev/null
     return $?
+}
+
+#------------------------------------------------------------------------------
+# NTM DRIVER IMPLEMENTATION
+# Uses ntm robot mode API for advanced session orchestration
+#------------------------------------------------------------------------------
+
+# Check if ntm is available and working
+ntm_is_available() {
+    if ! command -v ntm &>/dev/null; then
+        return 1
+    fi
+    # Verify ntm responds to status query
+    if ! ntm --robot-status &>/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# ntm driver: Start a new Claude Code session
+ntm_driver_start_session() {
+    local wt_path="$1"
+    local session_name="$2"
+    local prompt="$3"
+
+    # Validate ntm is available
+    if ! ntm_is_available; then
+        log_error "ntm is not available or not responding"
+        return 1
+    fi
+
+    # Create .ru directory for session artifacts
+    local ru_dir="$wt_path/.ru"
+    ensure_dir "$ru_dir"
+
+    local state_file="$ru_dir/session.state"
+    local log_file="$ru_dir/session.log"
+
+    # Initialize state file
+    cat > "$state_file" <<EOF
+{
+  "session_id": "$session_name",
+  "state": "starting",
+  "driver": "ntm",
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+    # Use ntm robot-spawn to create session
+    local spawn_result
+    if ! spawn_result=$(ntm --robot-spawn "$session_name" --dir "$wt_path" --prompt "$prompt" 2>&1); then
+        log_error "ntm spawn failed: $spawn_result"
+        return 1
+    fi
+
+    # Parse spawn result for pane info
+    local pane_id
+    pane_id=$(echo "$spawn_result" | jq -r '.panes[0] // empty' 2>/dev/null)
+
+    if [[ -z "$pane_id" ]]; then
+        pane_id=$(tmux list-panes -t "$session_name" -F "#{pane_id}" 2>/dev/null | head -1)
+    fi
+
+    # Update state to running
+    cat > "$state_file" <<EOF
+{
+  "session_id": "$session_name",
+  "pane_id": "${pane_id:-unknown}",
+  "state": "generating",
+  "driver": "ntm",
+  "worktree": "$wt_path",
+  "log_file": "$log_file",
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+    cat "$state_file"
+    return 0
+}
+
+# ntm driver: Send a message to an existing session
+ntm_driver_send_to_session() {
+    local session_id="$1"
+    local message="$2"
+
+    # Get pane ID from ntm status
+    local pane_id
+    pane_id=$(ntm --robot-status 2>/dev/null | jq -r ".sessions[\"$session_id\"].panes[0] // empty" 2>/dev/null)
+
+    if [[ -z "$pane_id" ]]; then
+        pane_id=$(tmux list-panes -t "$session_id" -F "#{pane_id}" 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$pane_id" ]]; then
+        log_error "Cannot find pane for session: $session_id"
+        return 1
+    fi
+
+    # Use ntm robot-send for delivery confirmation
+    local send_result
+    if send_result=$(ntm --robot-send --pane="$pane_id" --msg="$message" 2>&1); then
+        local delivered
+        delivered=$(echo "$send_result" | jq -r '.delivered // false' 2>/dev/null)
+        if [[ "$delivered" == "true" ]]; then
+            return 0
+        fi
+    fi
+
+    # Fallback: direct tmux send
+    log_verbose "Falling back to direct tmux send for $session_id"
+    tmux send-keys -t "$session_id" "$message" Enter
+    return $?
+}
+
+# Map ntm activity state to unified state
+ntm_map_state() {
+    local ntm_state="$1"
+    case "${ntm_state^^}" in
+        GENERATING) echo "generating" ;;
+        WAITING)    echo "waiting" ;;
+        THINKING)   echo "thinking" ;;
+        STALLED)    echo "stalled" ;;
+        ERROR)      echo "error" ;;
+        IDLE)       echo "idle" ;;
+        *)          echo "unknown" ;;
+    esac
+}
+
+# ntm driver: Get current session state with enhanced activity detection
+ntm_driver_get_session_state() {
+    local session_id="$1"
+
+    if ! tmux has-session -t "$session_id" 2>/dev/null; then
+        cat <<EOF
+{
+  "session_id": "$session_id",
+  "state": "dead",
+  "driver": "ntm",
+  "reason": "session not found"
+}
+EOF
+        return 0
+    fi
+
+    local pane_id
+    pane_id=$(ntm --robot-status 2>/dev/null | jq -r ".sessions[\"$session_id\"].panes[0] // empty" 2>/dev/null)
+    if [[ -z "$pane_id" ]]; then
+        pane_id=$(tmux list-panes -t "$session_id" -F "#{pane_id}" 2>/dev/null | head -1)
+    fi
+
+    local activity_json
+    if activity_json=$(ntm --robot-activity="$pane_id" 2>/dev/null); then
+        local ntm_state velocity confidence unified_state
+        ntm_state=$(echo "$activity_json" | jq -r '.state // "UNKNOWN"')
+        velocity=$(echo "$activity_json" | jq -r '.velocity // 0')
+        confidence=$(echo "$activity_json" | jq -r '.confidence // 0')
+        unified_state=$(ntm_map_state "$ntm_state")
+
+        cat <<EOF
+{
+  "session_id": "$session_id",
+  "pane_id": "$pane_id",
+  "state": "$unified_state",
+  "driver": "ntm",
+  "ntm_state": "$ntm_state",
+  "velocity": $velocity,
+  "confidence": $confidence
+}
+EOF
+    else
+        cat <<EOF
+{
+  "session_id": "$session_id",
+  "pane_id": "$pane_id",
+  "state": "unknown",
+  "driver": "ntm",
+  "reason": "ntm activity query failed"
+}
+EOF
+    fi
+    return 0
+}
+
+# ntm driver: Stop a session
+ntm_driver_stop_session() {
+    local session_id="$1"
+    if tmux has-session -t "$session_id" 2>/dev/null; then
+        tmux kill-session -t "$session_id" 2>/dev/null
+        return $?
+    fi
+    return 0
+}
+
+# ntm driver: Interrupt/pause a session
+ntm_driver_interrupt_session() {
+    local session_id="$1"
+    if tmux has-session -t "$session_id" 2>/dev/null; then
+        tmux send-keys -t "$session_id" C-c
+        return $?
+    fi
+    return 1
+}
+
+# ntm driver: Stream events from session (polling-based)
+# shellcheck disable=SC2034  # Variables used by implementation
+ntm_driver_stream_events() {
+    local session_id="$1" callback="$2"
+    local poll_interval="${3:-2}"
+    local last_state="" pane_id
+
+    pane_id=$(ntm --robot-status 2>/dev/null | jq -r ".sessions[\"$session_id\"].panes[0] // empty" 2>/dev/null)
+
+    while true; do
+        if ! tmux has-session -t "$session_id" 2>/dev/null; then
+            $callback "session_end" '{"reason": "session terminated"}'
+            break
+        fi
+
+        local activity_json
+        if activity_json=$(ntm --robot-activity="$pane_id" 2>/dev/null); then
+            local current_state
+            current_state=$(echo "$activity_json" | jq -r '.state // "UNKNOWN"')
+
+            if [[ "$current_state" != "$last_state" ]]; then
+                local unified_state
+                unified_state=$(ntm_map_state "$current_state")
+                $callback "state_change" "{\"state\": \"$unified_state\", \"ntm_state\": \"$current_state\"}"
+
+                if [[ "$current_state" == "WAITING" ]]; then
+                    $callback "waiting" "$activity_json"
+                fi
+                last_state="$current_state"
+            fi
+        fi
+
+        local health_json
+        if health_json=$(ntm --robot-health="$session_id" 2>/dev/null); then
+            local alert_count
+            alert_count=$(echo "$health_json" | jq '.alerts | length' 2>/dev/null || echo "0")
+            if [[ "$alert_count" -gt 0 ]]; then
+                $callback "health_alert" "$(echo "$health_json" | jq -c '.alerts')"
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
+}
+
+# ntm driver: List all sessions managed by ntm
+ntm_driver_list_sessions() {
+    local status_json
+    if ! status_json=$(ntm --robot-status 2>/dev/null); then
+        return 1
+    fi
+    echo "$status_json" | jq -r '.sessions | keys[]' 2>/dev/null
+}
+
+# ntm driver: Check if session is alive
+ntm_driver_session_alive() {
+    local session_id="$1"
+    tmux has-session -t "$session_id" 2>/dev/null
+    return $?
+}
+
+# Override stub functions when ntm driver is loaded
+_enable_ntm_driver() {
+    driver_start_session() { ntm_driver_start_session "$@"; }
+    driver_send_to_session() { ntm_driver_send_to_session "$@"; }
+    driver_get_session_state() { ntm_driver_get_session_state "$@"; }
+    driver_stop_session() { ntm_driver_stop_session "$@"; }
+    driver_interrupt_session() { ntm_driver_interrupt_session "$@"; }
+    driver_stream_events() { ntm_driver_stream_events "$@"; }
+    driver_list_sessions() { ntm_driver_list_sessions "$@"; }
+    driver_session_alive() { ntm_driver_session_alive "$@"; }
+
+    driver_capabilities() {
+        cat <<EOF
+{
+  "name": "ntm",
+  "parallel_sessions": true,
+  "activity_detection": true,
+  "health_monitoring": true,
+  "question_routing": true,
+  "velocity_based": true,
+  "max_concurrent": 8
+}
+EOF
+    }
 }
 
 #------------------------------------------------------------------------------
