@@ -2151,7 +2151,208 @@ REVIEW_NOTIFY="true"
 
 ---
 
-## Appendix C: Glossary
+## Appendix C: State File Formats
+
+### C.1 Review State (`~/.local/state/ru/review-state.json`)
+
+```json
+{
+  "version": 1,
+  "repos": {
+    "owner/repo": {
+      "last_review": "2025-01-04T10:30:00Z",
+      "last_review_run_id": "abc123",
+      "issues_reviewed": 3,
+      "prs_reviewed": 1,
+      "issues_resolved": 2,
+      "prs_closed": 0,
+      "outcome": "completed",
+      "duration_seconds": 847
+    }
+  },
+  "runs": {
+    "abc123": {
+      "started_at": "2025-01-04T10:00:00Z",
+      "completed_at": "2025-01-04T11:30:00Z",
+      "repos_processed": 8,
+      "questions_answered": 12,
+      "mode": "ntm"
+    }
+  }
+}
+```
+
+### C.2 Question Queue (`~/.local/state/ru/review-questions.json`)
+
+```json
+{
+  "version": 1,
+  "questions": [
+    {
+      "id": "q_abc123",
+      "run_id": "run_xyz",
+      "repo": "owner/repo",
+      "session_id": "ru-review-owner-repo",
+      "pane_id": "1",
+      "context": "Should I refactor...",
+      "options": ["a) Minimal fix", "b) Full refactor", "c) Skip"],
+      "priority": "normal",
+      "detected_at": "2025-01-04T10:45:00Z",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+---
+
+## Appendix D: Workflow Template
+
+Full `github-review.yaml` workflow for ntm:
+
+```yaml
+schema_version: "2.0"
+name: github-review
+description: |
+  Automated GitHub issue and PR review workflow.
+  Uses Claude Code to understand codebase, review issues/PRs,
+  implement fixes, and respond via gh CLI.
+
+inputs:
+  repo_path:
+    description: Absolute path to local repository
+    required: true
+  repo_name:
+    description: GitHub repository identifier (owner/repo)
+    required: true
+  understand_prompt:
+    description: Custom codebase understanding prompt
+    required: false
+  review_prompt:
+    description: Custom review prompt
+    required: false
+
+defaults:
+  working_dir: ${inputs.repo_path}
+  agent: claude
+
+steps:
+  - id: verify_prerequisites
+    type: shell
+    command: |
+      # Verify gh is authenticated
+      gh auth status || exit 1
+
+      # Verify repo has issues or PRs
+      issues=$(gh issue list -R ${inputs.repo_name} --state open --json number --jq 'length')
+      prs=$(gh pr list -R ${inputs.repo_name} --state open --json number --jq 'length')
+
+      if [ "$((issues + prs))" -eq 0 ]; then
+        echo "No open issues or PRs"
+        exit 0
+      fi
+
+      echo "Found $issues issues and $prs PRs"
+    on_failure: abort
+
+  - id: update_repo
+    type: shell
+    command: git pull --ff-only || true
+    depends_on: [verify_prerequisites]
+
+  - id: understand_codebase
+    agent: claude
+    depends_on: [update_repo]
+    prompt: |
+      ${inputs.understand_prompt:-
+      First read ALL of the AGENTS.md file and README.md file super carefully
+      and understand ALL of both! Then use your code investigation agent mode
+      to fully understand the code, and technical architecture and purpose of
+      the project. Use ultrathink.
+      }
+    wait: completion
+    timeout: 10m
+    health_check:
+      interval: 30s
+      max_stalls: 3
+
+  - id: review_issues_prs
+    agent: claude
+    depends_on: [understand_codebase]
+    prompt: |
+      ${inputs.review_prompt:-
+      We don't allow PRs or outside contributions to this project as a matter
+      of policy; here is the policy disclosed to users:
+
+      > *About Contributions:* Please don't take this the wrong way, but I do
+      not accept outside contributions for any of my projects. I simply don't
+      have the mental bandwidth to review anything, and it's my name on the
+      thing, so I'm responsible for any problems it causes; thus, the
+      risk-reward is highly asymmetric from my perspective. I'd also have to
+      worry about other "stakeholders," which seems unwise for tools I mostly
+      make for myself for free. Feel free to submit issues, and even PRs if
+      you want to illustrate a proposed fix, but know I won't merge them
+      directly. Instead, I'll have Claude or Codex review submissions via `gh`
+      and independently decide whether and how to address them. Bug reports in
+      particular are welcome. Sorry if this offends, but I want to avoid
+      wasted time and hurt feelings. I understand this isn't in sync with the
+      prevailing open-source ethos that seeks community contributions, but
+      it's the only way I can move at this velocity and keep my sanity.
+
+      But I want you to now use the `gh` utility to review all open issues and
+      PRs and to independently read and review each of these carefully; without
+      trusting or relying on any of the user reports being correct, or their
+      suggested/proposed changes or "fixes" being correct, I want you to do
+      your own totally separate and independent verification and validation.
+      You can use the stuff from users as possible inspiration, but everything
+      has to come from your own mind and/or official documentation and the
+      actual code and empirical, independent evidence. Note that MANY of these
+      are likely out of date because I made tons of fixes and changes already;
+      it's important to look at the dates and subsequent commits. Use ultrathink.
+      After you have reviewed things carefully and taken actions in response
+      (including implementing possible fixes or new features), you can respond
+      on my behalf using `gh`.
+
+      Just a reminder: we do NOT accept ANY PRs. You can look at them to see if
+      they contain good ideas but even then you must check with me first before
+      integrating even ideas because they could take the project into another
+      direction I don't like or introduce scope creep. Use ultrathink.
+      }
+    wait: user_interaction
+    timeout: 30m
+    on_question:
+      action: queue
+      priority: ${question.urgency:-normal}
+      metadata:
+        repo: ${inputs.repo_name}
+        issue_context: true
+
+  - id: finalize
+    type: shell
+    depends_on: [review_issues_prs]
+    command: |
+      # Push any commits made
+      git push || true
+
+      # Log completion
+      echo "Review completed for ${inputs.repo_name}"
+    on_failure: warn
+
+outputs:
+  issues_addressed:
+    description: Number of issues that were addressed
+    value: ${steps.review_issues_prs.issues_count:-0}
+  prs_reviewed:
+    description: Number of PRs that were reviewed
+    value: ${steps.review_issues_prs.prs_count:-0}
+  commits_made:
+    description: Number of commits created
+    value: ${steps.finalize.commit_count:-0}
+```
+
+---
+
+## Appendix E: Glossary
 
 | Term | Definition |
 |------|------------|
@@ -2169,4 +2370,4 @@ REVIEW_NOTIFY="true"
 *Document Version: 2.0*
 *Last Updated: January 2025*
 *Author: Claude (Opus 4.5)*
-*Word Count: ~8,500*
+*Word Count: ~10,000*
