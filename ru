@@ -1626,6 +1626,7 @@ process_single_repo_worker() {
     # Parse and resolve the repo spec
     local url branch custom_name local_path repo_id
     if ! resolve_repo_spec "$repo_spec" "$projects_dir" "$layout" url branch custom_name local_path repo_id; then
+        write_result "$repo_spec" "skip" "invalid" "0" "invalid repo spec" ""
         echo "FAIL:invalid:$repo_spec"
         return 1
     fi
@@ -2344,7 +2345,11 @@ cmd_sync() {
                 do_clone "$url" "$path" "$repo_label" "$branch"
             fi
         done
-        exit 0
+
+        # Aggregate results and compute proper exit code
+        eval "$(aggregate_results)"
+        compute_exit_code "$FAILED" "$CONFLICTS" "$SYSTEM_ERRORS"
+        exit $?
     fi
 
     # Load all repos from config (checks all .txt files in repos.d/)
@@ -2503,10 +2508,12 @@ cmd_sync() {
         local url branch custom_name local_path repo_id repo_label
         if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
             log_warn "Invalid repo spec: $repo_spec"
+            write_result "$repo_spec" "skip" "invalid" "0" "invalid repo spec" ""
             ((failed++))
             continue
         fi
-        repo_label="${repo_id}${custom_name:+ (as $custom_name)}"
+        repo_label="$repo_id"
+        [[ -n "$custom_name" ]] && repo_label="${repo_id} as ${custom_name}"
 
         log_step "[$current/$pending_count] $repo_label"
 
@@ -2515,6 +2522,7 @@ cmd_sync() {
             if [[ "$PULL_ONLY" == "true" ]]; then
                 log_verbose "  Skipping clone (--pull-only)"
                 ((skipped++))
+                write_result "$repo_label" "skip" "skipped" "0" "pull-only mode" "$local_path"
                 continue
             fi
 
@@ -2527,6 +2535,7 @@ cmd_sync() {
             if [[ "$CLONE_ONLY" == "true" ]]; then
                 log_verbose "  Skipping pull (--clone-only)"
                 ((skipped++))
+                write_result "$repo_label" "skip" "skipped" "0" "clone-only mode" "$local_path"
                 continue
             fi
 
