@@ -1947,9 +1947,11 @@ cmd_remove() {
             fi
 
             # Parse the line to extract URL and compare owner/repo
+            # shellcheck disable=SC2034  # line_branch and line_custom_name are set by nameref but unused here
             local line_url line_branch line_custom_name
             parse_repo_spec "$line" line_url line_branch line_custom_name
 
+            # shellcheck disable=SC2034  # line_host is set by nameref but unused here
             local line_host line_owner line_repo
             local should_remove="false"
             if parse_repo_url "$line_url" line_host line_owner line_repo; then

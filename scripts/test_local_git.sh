@@ -5,6 +5,7 @@
 #
 # shellcheck disable=SC2034  # Variables are used by sourced functions from ru
 # shellcheck disable=SC1090  # Dynamic sourcing is intentional
+# shellcheck disable=SC2155  # Declare and assign separately - acceptable in tests
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
