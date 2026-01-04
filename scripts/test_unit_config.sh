@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+#
+# Unit tests: Config management
+# (get_config_value, set_config_value, resolve_config, ensure_config_exists)
+#
+# Tests configuration priority (CLI > env > file > default), file operations,
+# and directory structure creation.
+#
+# shellcheck disable=SC2034  # Variables used by sourced functions
+# shellcheck disable=SC1091  # Sourced files checked separately
+# shellcheck disable=SC2317  # Test functions invoked indirectly via run_test
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source the test framework
+source "$SCRIPT_DIR/test_framework.sh"
+
+# Source the specific functions we need to test
+source_ru_function "ensure_dir"
+source_ru_function "get_config_value"
+source_ru_function "set_config_value"
+source_ru_function "ensure_config_exists"
+source_ru_function "log_verbose"
+
+# Set XDG defaults for sourcing (we override in tests anyway)
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/ru-test-config}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-/tmp/ru-test-state}"
+
+# Source defaults from ru (we need DEFAULT_* variables)
+eval "$(grep -E '^DEFAULT_' "$PROJECT_DIR/ru" | head -20)"
+
+# These will be overridden in each test
+RU_CONFIG_DIR="$XDG_CONFIG_HOME/ru"
+RU_STATE_DIR="$XDG_STATE_HOME/ru"
+RU_LOG_DIR="$RU_STATE_DIR/logs"
+
+# Initialize other global variables that functions depend on
+VERBOSE="false"
+GUM_AVAILABLE="false"
+
+#==============================================================================
+# Tests: get_config_value
+#==============================================================================
+
+test_get_config_value_cli_priority() {
+    local test_name="get_config_value: CLI argument takes priority"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    # Set up environment for this test
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config file with a value
+    echo "TESTKEY=file_value" > "$RU_CONFIG_DIR/config"
+
+    # Set environment variable
+    export RU_TESTKEY="env_value"
+
+    # CLI value should take priority
+    local result
+    result=$(get_config_value "TESTKEY" "default_value" "cli_value")
+
+    assert_equals "cli_value" "$result" "CLI argument should take priority"
+
+    unset RU_TESTKEY
+    log_test_pass "$test_name"
+}
+
+test_get_config_value_env_priority() {
+    local test_name="get_config_value: Environment variable takes second priority"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config file with a value
+    echo "TESTKEY=file_value" > "$RU_CONFIG_DIR/config"
+
+    # Set environment variable
+    export RU_TESTKEY="env_value"
+
+    # No CLI value - env should take priority over file
+    local result
+    result=$(get_config_value "TESTKEY" "default_value" "")
+
+    assert_equals "env_value" "$result" "Environment variable should take priority over config file"
+
+    unset RU_TESTKEY
+    log_test_pass "$test_name"
+}
+
+test_get_config_value_file_priority() {
+    local test_name="get_config_value: Config file takes third priority"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config file with a value
+    echo "TESTKEY=file_value" > "$RU_CONFIG_DIR/config"
+
+    # No CLI, no env - file should be used
+    unset RU_TESTKEY 2>/dev/null || true
+
+    local result
+    result=$(get_config_value "TESTKEY" "default_value" "")
+
+    assert_equals "file_value" "$result" "Config file value should be used when no CLI or env"
+
+    log_test_pass "$test_name"
+}
+
+test_get_config_value_default_fallback() {
+    local test_name="get_config_value: Default is used when nothing else set"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Empty config file - no TESTKEY
+    echo "# empty" > "$RU_CONFIG_DIR/config"
+
+    # No CLI, no env, no file value - default should be used
+    unset RU_TESTKEY 2>/dev/null || true
+
+    local result
+    result=$(get_config_value "TESTKEY" "default_value" "")
+
+    assert_equals "default_value" "$result" "Default value should be used as fallback"
+
+    log_test_pass "$test_name"
+}
+
+test_get_config_value_handles_quoted_values() {
+    local test_name="get_config_value: Strips quotes from file values"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Config with quoted value
+    echo 'QUOTED_KEY="quoted value"' > "$RU_CONFIG_DIR/config"
+
+    unset RU_QUOTED_KEY 2>/dev/null || true
+
+    local result
+    result=$(get_config_value "QUOTED_KEY" "" "")
+
+    assert_equals "quoted value" "$result" "Quotes should be stripped from file values"
+
+    log_test_pass "$test_name"
+}
+
+test_get_config_value_handles_paths_with_slashes() {
+    local test_name="get_config_value: Handles paths with slashes"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Config with path value
+    echo "PROJECTS_DIR=/home/user/my projects/repos" > "$RU_CONFIG_DIR/config"
+
+    unset RU_PROJECTS_DIR 2>/dev/null || true
+
+    local result
+    result=$(get_config_value "PROJECTS_DIR" "/default" "")
+
+    assert_equals "/home/user/my projects/repos" "$result" "Paths with slashes should work"
+
+    log_test_pass "$test_name"
+}
+
+test_get_config_value_no_config_file() {
+    local test_name="get_config_value: Works when no config file exists"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    # Don't create the config file
+
+    unset RU_NOFILE_KEY 2>/dev/null || true
+
+    local result
+    result=$(get_config_value "NOFILE_KEY" "fallback_default" "")
+
+    assert_equals "fallback_default" "$result" "Should return default when no config file exists"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: set_config_value
+#==============================================================================
+
+test_set_config_value_creates_new_key() {
+    local test_name="set_config_value: Creates new key in config file"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create empty config
+    echo "# config" > "$RU_CONFIG_DIR/config"
+
+    # Set a new value
+    set_config_value "NEWKEY" "newvalue"
+
+    # Check it was added
+    assert_file_contains "$RU_CONFIG_DIR/config" "NEWKEY=newvalue" "New key should be appended"
+
+    log_test_pass "$test_name"
+}
+
+test_set_config_value_updates_existing_key() {
+    local test_name="set_config_value: Updates existing key in config file"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config with existing key
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+# config
+EXISTING_KEY=old_value
+OTHER_KEY=other
+EOF
+
+    # Update the existing key
+    set_config_value "EXISTING_KEY" "new_value"
+
+    # Check it was updated
+    local content
+    content=$(cat "$RU_CONFIG_DIR/config")
+
+    assert_contains "$content" "EXISTING_KEY=new_value" "Key should be updated to new value"
+    assert_not_contains "$content" "old_value" "Old value should be gone"
+    assert_contains "$content" "OTHER_KEY=other" "Other keys should be preserved"
+
+    log_test_pass "$test_name"
+}
+
+test_set_config_value_creates_config_file() {
+    local test_name="set_config_value: Creates config file if it doesn't exist"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Don't create config file
+    assert_file_not_exists "$RU_CONFIG_DIR/config" "Config file should not exist initially"
+
+    # Set a value - should create the file
+    set_config_value "CREATED_KEY" "created_value"
+
+    assert_file_exists "$RU_CONFIG_DIR/config" "Config file should be created"
+    assert_file_contains "$RU_CONFIG_DIR/config" "CREATED_KEY=created_value" "Key should be in new file"
+
+    log_test_pass "$test_name"
+}
+
+test_set_config_value_handles_paths() {
+    local test_name="set_config_value: Handles paths with special characters"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    echo "# config" > "$RU_CONFIG_DIR/config"
+
+    # Set a path value with slashes
+    set_config_value "PROJECTS_DIR" "/home/user/my-repos/github"
+
+    assert_file_contains "$RU_CONFIG_DIR/config" "PROJECTS_DIR=/home/user/my-repos/github" "Path should be stored correctly"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: ensure_config_exists
+#==============================================================================
+
+test_ensure_config_exists_creates_directories() {
+    local test_name="ensure_config_exists: Creates config and repos.d directories"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_temp_dir)
+
+    # Use a fresh directory that create_test_env hasn't touched
+    export RU_CONFIG_DIR="$test_env/fresh_config/ru"
+    export RU_STATE_DIR="$test_env/fresh_state/ru"
+    export RU_LOG_DIR="$RU_STATE_DIR/logs"
+    export DEFAULT_PROJECTS_DIR="$test_env/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # Nothing should exist
+    assert_dir_not_exists "$RU_CONFIG_DIR" "Config dir should not exist initially"
+
+    # Run ensure_config_exists
+    ensure_config_exists >/dev/null 2>&1
+
+    # Directories should now exist
+    assert_dir_exists "$RU_CONFIG_DIR" "Config directory should be created"
+    assert_dir_exists "$RU_CONFIG_DIR/repos.d" "repos.d directory should be created"
+
+    log_test_pass "$test_name"
+}
+
+test_ensure_config_exists_creates_config_file() {
+    local test_name="ensure_config_exists: Creates config file with defaults"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_temp_dir)
+
+    export RU_CONFIG_DIR="$test_env/fresh_config/ru"
+    export RU_STATE_DIR="$test_env/fresh_state/ru"
+    export RU_LOG_DIR="$RU_STATE_DIR/logs"
+    export DEFAULT_PROJECTS_DIR="$test_env/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    ensure_config_exists >/dev/null 2>&1
+
+    # Config file should exist
+    local config_file="$RU_CONFIG_DIR/config"
+    assert_file_exists "$config_file" "Config file should be created"
+
+    # Should contain expected keys
+    assert_file_contains "$config_file" "PROJECTS_DIR=" "Should have PROJECTS_DIR"
+    assert_file_contains "$config_file" "LAYOUT=" "Should have LAYOUT"
+    assert_file_contains "$config_file" "UPDATE_STRATEGY=" "Should have UPDATE_STRATEGY"
+    assert_file_contains "$config_file" "AUTOSTASH=" "Should have AUTOSTASH"
+
+    log_test_pass "$test_name"
+}
+
+test_ensure_config_exists_creates_repos_file() {
+    local test_name="ensure_config_exists: Creates repos.txt template"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_temp_dir)
+
+    export RU_CONFIG_DIR="$test_env/fresh_config/ru"
+    export RU_STATE_DIR="$test_env/fresh_state/ru"
+    export RU_LOG_DIR="$RU_STATE_DIR/logs"
+    export DEFAULT_PROJECTS_DIR="$test_env/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    ensure_config_exists >/dev/null 2>&1
+
+    # repos.txt should exist
+    local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
+    assert_file_exists "$repos_file" "repos.txt should be created"
+
+    # Should contain format examples
+    assert_file_contains "$repos_file" "owner/repo" "Should have format examples"
+    assert_file_contains "$repos_file" "@branch" "Should document branch pinning"
+
+    log_test_pass "$test_name"
+}
+
+test_ensure_config_exists_idempotent() {
+    local test_name="ensure_config_exists: Is idempotent (doesn't overwrite)"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_temp_dir)
+
+    export RU_CONFIG_DIR="$test_env/fresh_config/ru"
+    export RU_STATE_DIR="$test_env/fresh_state/ru"
+    export RU_LOG_DIR="$RU_STATE_DIR/logs"
+    export DEFAULT_PROJECTS_DIR="$test_env/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # First call creates everything
+    ensure_config_exists >/dev/null 2>&1
+
+    # Add a marker to config
+    echo "# MARKER: Custom content" >> "$RU_CONFIG_DIR/config"
+
+    # Second call should not overwrite
+    ensure_config_exists >/dev/null 2>&1
+
+    # Marker should still be there
+    assert_file_contains "$RU_CONFIG_DIR/config" "MARKER: Custom content" "Config should not be overwritten"
+
+    log_test_pass "$test_name"
+}
+
+test_ensure_config_exists_creates_state_dirs() {
+    local test_name="ensure_config_exists: Creates state directories"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_temp_dir)
+
+    export RU_CONFIG_DIR="$test_env/fresh_config/ru"
+    export RU_STATE_DIR="$test_env/fresh_state/ru"
+    export RU_LOG_DIR="$RU_STATE_DIR/logs"
+    export DEFAULT_PROJECTS_DIR="$test_env/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    assert_dir_not_exists "$RU_STATE_DIR" "State dir should not exist initially"
+
+    ensure_config_exists >/dev/null 2>&1
+
+    assert_dir_exists "$RU_STATE_DIR" "State directory should be created"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Run All Tests
+#==============================================================================
+
+# get_config_value tests
+run_test test_get_config_value_cli_priority
+run_test test_get_config_value_env_priority
+run_test test_get_config_value_file_priority
+run_test test_get_config_value_default_fallback
+run_test test_get_config_value_handles_quoted_values
+run_test test_get_config_value_handles_paths_with_slashes
+run_test test_get_config_value_no_config_file
+
+# set_config_value tests
+run_test test_set_config_value_creates_new_key
+run_test test_set_config_value_updates_existing_key
+run_test test_set_config_value_creates_config_file
+run_test test_set_config_value_handles_paths
+
+# ensure_config_exists tests
+run_test test_ensure_config_exists_creates_directories
+run_test test_ensure_config_exists_creates_config_file
+run_test test_ensure_config_exists_creates_repos_file
+run_test test_ensure_config_exists_idempotent
+run_test test_ensure_config_exists_creates_state_dirs
+
+print_results
