@@ -6852,9 +6852,9 @@ show_discovery_summary_json() {
             score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft" "$repo_id" "$number")
             level=$(get_priority_level "$score")
 
-            # Escape title for JSON
+            # Escape title for JSON (use --arg to avoid trailing newline from echo)
             local escaped_title
-            escaped_title=$(echo "$title" | jq -Rs '.')
+            escaped_title=$(jq -n --arg t "$title" '$t')
 
             [[ -n "$item_list" ]] && item_list+=","
             item_list+="{\"repo\":\"$repo_id\",\"type\":\"$item_type\",\"number\":$number,\"title\":$escaped_title,\"score\":$score,\"level\":\"$level\"}"
