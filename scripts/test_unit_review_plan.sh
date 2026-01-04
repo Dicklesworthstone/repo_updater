@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+#
+# Unit tests: Review plan validation
+# (validate_review_plan, summarize_review_plan, get_review_plan_json_summary)
+#
+# Tests the review plan artifact schema validation and summary generation.
+#
+# shellcheck disable=SC2034  # Variables used by sourced functions
+# shellcheck disable=SC1091  # Sourced files checked separately
+# shellcheck disable=SC2317  # Test functions invoked indirectly via run_test
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source the test framework
+source "$SCRIPT_DIR/test_framework.sh"
+
+# Source helpers
+source_ru_function "json_escape"
+
+# Mock log functions for testing
+log_warn() { :; }
+log_error() { :; }
+log_info() { :; }
+log_verbose() { :; }
+
+#==============================================================================
+# Review Plan Validation Functions (to be added to ru)
+# We define them here for testing before integration
+#==============================================================================
+
+validate_review_plan() {
+    local plan_file="$1"
+
+    # Must exist
+    if [[ ! -f "$plan_file" ]]; then
+        echo "Plan file not found: $plan_file"
+        return 1
+    fi
+
+    # Must be valid JSON
+    if ! jq empty "$plan_file" 2>/dev/null; then
+        echo "Invalid JSON syntax"
+        return 1
+    fi
+
+    # Required top-level fields: schema_version, repo, items
+    if ! jq -e '.schema_version and .repo and .items' "$plan_file" >/dev/null 2>&1; then
+        echo "Missing required fields: schema_version, repo, or items"
+        return 1
+    fi
+
+    # Schema version check
+    local version
+    version=$(jq -r '.schema_version' "$plan_file")
+    if [[ "$version" != "1" ]]; then
+        echo "Unsupported schema version: $version (expected: 1)"
+        return 1
+    fi
+
+    # Items array validation
+    local items_count
+    items_count=$(jq '.items | length' "$plan_file")
+    if [[ "$items_count" -lt 0 ]]; then
+        echo "Invalid items array"
+        return 1
+    fi
+
+    # Items must have required fields: type, number, decision
+    if ! jq -e '.items | if length == 0 then true else all(.type and .number and .decision) end' "$plan_file" >/dev/null 2>&1; then
+        echo "Items missing required fields: type, number, or decision"
+        return 1
+    fi
+
+    # Validate item type values (must be "issue" or "pr")
+    local invalid_types
+    invalid_types=$(jq -r '.items[] | select(.type | IN("issue","pr") | not) | .type' "$plan_file" 2>/dev/null)
+    if [[ -n "$invalid_types" ]]; then
+        echo "Invalid item type values: $invalid_types (expected: issue or pr)"
+        return 1
+    fi
+
+    # Validate decision values (must be fix, skip, needs-info, or closed)
+    local invalid_decisions
+    invalid_decisions=$(jq -r '.items[] | select(.decision | IN("fix","skip","needs-info","closed") | not) | .decision' "$plan_file" 2>/dev/null)
+    if [[ -n "$invalid_decisions" ]]; then
+        echo "Invalid decision values: $invalid_decisions (expected: fix, skip, needs-info, or closed)"
+        return 1
+    fi
+
+    # Validate gh_actions if present
+    if jq -e '.gh_actions' "$plan_file" >/dev/null 2>&1; then
+        # gh_actions must have op and target fields
+        if ! jq -e '.gh_actions | if length == 0 then true else all(.op and .target) end' "$plan_file" >/dev/null 2>&1; then
+            echo "gh_actions missing required fields: op or target"
+            return 1
+        fi
+
+        # Validate op values (must be comment, close, label, or merge)
+        local invalid_ops
+        invalid_ops=$(jq -r '.gh_actions[] | select(.op | IN("comment","close","label","merge") | not) | .op' "$plan_file" 2>/dev/null)
+        if [[ -n "$invalid_ops" ]]; then
+            echo "Invalid gh_action op values: $invalid_ops (expected: comment, close, label, or merge)"
+            return 1
+        fi
+
+        # Validate target format (must be issue#N or pr#N)
+        local invalid_targets
+        invalid_targets=$(jq -r '.gh_actions[] | select(.target | test("^(issue|pr)#[0-9]+$") | not) | .target' "$plan_file" 2>/dev/null)
+        if [[ -n "$invalid_targets" ]]; then
+            echo "Invalid gh_action target format: $invalid_targets (expected: issue#N or pr#N)"
+            return 1
+        fi
+    fi
+
+    # Validate questions if present
+    if jq -e '.questions' "$plan_file" >/dev/null 2>&1; then
+        # Questions must have id, prompt, and answered fields
+        if ! jq -e '.questions | if length == 0 then true else all(.id and .prompt and (.answered != null)) end' "$plan_file" >/dev/null 2>&1; then
+            echo "Questions missing required fields: id, prompt, or answered"
+            return 1
+        fi
+    fi
+
+    echo "Valid"
+    return 0
+}
+
+summarize_review_plan() {
+    local plan_file="$1"
+
+    # Validate first
+    local validation_result
+    validation_result=$(validate_review_plan "$plan_file")
+    if [[ "$validation_result" != "Valid" ]]; then
+        echo "Cannot summarize invalid plan: $validation_result"
+        return 1
+    fi
+
+    # Generate summary using jq
+    jq -r '
+        "Repository: \(.repo)",
+        "Run ID: \(.run_id // "N/A")",
+        "",
+        "Items reviewed: \(.items | length)",
+        "  - Fixed: \([.items[] | select(.decision == "fix")] | length)",
+        "  - Skipped: \([.items[] | select(.decision == "skip")] | length)",
+        "  - Needs info: \([.items[] | select(.decision == "needs-info")] | length)",
+        "  - Closed: \([.items[] | select(.decision == "closed")] | length)",
+        "",
+        "By type:",
+        "  - Issues: \([.items[] | select(.type == "issue")] | length)",
+        "  - PRs: \([.items[] | select(.type == "pr")] | length)",
+        "",
+        "Git changes:",
+        "  - Commits: \(.git.commits // [] | length)",
+        "  - Tests: \(if .git.tests.ok == true then "PASS" elif .git.tests.ok == false then "FAIL" else "NOT RUN" end)",
+        "",
+        "gh_actions pending: \(.gh_actions // [] | length)",
+        "Questions: \(.questions // [] | length) (\([.questions // [] | .[] | select(.answered == true)] | length) answered)"
+    ' "$plan_file"
+}
+
+get_review_plan_json_summary() {
+    local plan_file="$1"
+
+    # Validate first
+    local validation_result
+    validation_result=$(validate_review_plan "$plan_file")
+    if [[ "$validation_result" != "Valid" ]]; then
+        echo "{\"error\": \"Invalid plan: $(json_escape "$validation_result")\"}"
+        return 1
+    fi
+
+    jq '{
+        repo: .repo,
+        run_id: (.run_id // null),
+        worktree_path: (.worktree_path // null),
+        summary: {
+            total_items: (.items | length),
+            by_decision: {
+                fix: ([.items[] | select(.decision == "fix")] | length),
+                skip: ([.items[] | select(.decision == "skip")] | length),
+                needs_info: ([.items[] | select(.decision == "needs-info")] | length),
+                closed: ([.items[] | select(.decision == "closed")] | length)
+            },
+            by_type: {
+                issues: ([.items[] | select(.type == "issue")] | length),
+                prs: ([.items[] | select(.type == "pr")] | length)
+            }
+        },
+        git: {
+            commits: (.git.commits // [] | length),
+            tests_passed: (.git.tests.ok // null)
+        },
+        gh_actions_count: (.gh_actions // [] | length),
+        questions: {
+            total: (.questions // [] | length),
+            answered: ([.questions // [] | .[] | select(.answered == true)] | length),
+            pending: ([.questions // [] | .[] | select(.answered == false or .answered == null)] | length)
+        },
+        metadata: (.metadata // null)
+    }' "$plan_file"
+}
+
+#==============================================================================
+# Test Fixtures
+#==============================================================================
+
+create_valid_plan() {
+    local plan_file="$1"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "run_id": "20250104-103000-12345",
+  "repo": "owner/repo",
+  "worktree_path": "/tmp/test-worktree",
+  "items": [
+    {
+      "type": "issue",
+      "number": 42,
+      "title": "Authentication fails on Windows",
+      "priority": "high",
+      "decision": "fix",
+      "notes": "Root cause: path separator in auth.py:234",
+      "risk_level": "low",
+      "files_changed": ["src/auth.py"],
+      "lines_changed": 5
+    },
+    {
+      "type": "pr",
+      "number": 15,
+      "title": "Add Redis caching",
+      "priority": "normal",
+      "decision": "skip",
+      "notes": "Out of scope - adds external dependency"
+    }
+  ],
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Should I refactor all path handling or just fix this case?",
+      "options": [
+        {"label": "Quick fix", "description": "Fix only auth.py (5 lines)"},
+        {"label": "Full refactor", "description": "Modernize all paths (45 lines)"}
+      ],
+      "recommended": "Quick fix",
+      "answered": true,
+      "answer": "Quick fix",
+      "answered_at": "2025-01-04T10:35:00Z"
+    }
+  ],
+  "git": {
+    "branch": "ru/review/20250104-103000-12345/owner-repo",
+    "base_ref": "main",
+    "commits": [
+      {
+        "sha": "abc123def456",
+        "subject": "Fix Windows path handling in auth.py",
+        "files": ["src/auth.py"],
+        "insertions": 3,
+        "deletions": 2
+      }
+    ],
+    "tests": {
+      "ran": true,
+      "ok": true,
+      "command": "make test",
+      "output_summary": "12 tests passed",
+      "duration_seconds": 45
+    }
+  },
+  "gh_actions": [
+    {
+      "op": "comment",
+      "target": "issue#42",
+      "body": "Fixed in commit abc123."
+    },
+    {
+      "op": "close",
+      "target": "issue#42",
+      "reason": "completed"
+    }
+  ],
+  "metadata": {
+    "started_at": "2025-01-04T10:30:00Z",
+    "completed_at": "2025-01-04T10:45:00Z",
+    "duration_seconds": 900,
+    "model": "claude-sonnet-4",
+    "driver": "local"
+  }
+}
+EOF
+}
+
+create_minimal_valid_plan() {
+    local plan_file="$1"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "repo": "owner/repo",
+  "items": []
+}
+EOF
+}
+
+#==============================================================================
+# Tests: validate_review_plan
+#==============================================================================
+
+test_validate_plan_file_not_found() {
+    local test_name="validate_review_plan: missing file returns error"
+    log_test_start "$test_name"
+
+    local result
+    result=$(validate_review_plan "/nonexistent/path/plan.json")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "not found" "Should report file not found"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_invalid_json() {
+    local test_name="validate_review_plan: invalid JSON returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/invalid.json"
+    echo "{ not valid json }" > "$plan_file"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Invalid JSON" "Should report invalid JSON"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_missing_schema_version() {
+    local test_name="validate_review_plan: missing schema_version returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    echo '{"repo": "owner/repo", "items": []}' > "$plan_file"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Missing required fields" "Should report missing fields"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_wrong_schema_version() {
+    local test_name="validate_review_plan: unsupported schema version returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    echo '{"schema_version": 99, "repo": "owner/repo", "items": []}' > "$plan_file"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Unsupported schema version" "Should report unsupported version"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_missing_item_fields() {
+    local test_name="validate_review_plan: items missing required fields returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "repo": "owner/repo",
+  "items": [{"type": "issue"}]
+}
+EOF
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Items missing required fields" "Should report missing item fields"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_invalid_item_type() {
+    local test_name="validate_review_plan: invalid item type returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "repo": "owner/repo",
+  "items": [{"type": "bug", "number": 1, "decision": "fix"}]
+}
+EOF
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Invalid item type" "Should report invalid type"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_invalid_decision() {
+    local test_name="validate_review_plan: invalid decision returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "repo": "owner/repo",
+  "items": [{"type": "issue", "number": 1, "decision": "maybe"}]
+}
+EOF
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Invalid decision" "Should report invalid decision"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_invalid_gh_action_op() {
+    local test_name="validate_review_plan: invalid gh_action op returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "repo": "owner/repo",
+  "items": [],
+  "gh_actions": [{"op": "delete", "target": "issue#1"}]
+}
+EOF
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Invalid gh_action op" "Should report invalid op"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_invalid_gh_action_target() {
+    local test_name="validate_review_plan: invalid gh_action target format returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    cat > "$plan_file" << 'EOF'
+{
+  "schema_version": 1,
+  "repo": "owner/repo",
+  "items": [],
+  "gh_actions": [{"op": "comment", "target": "bug42"}]
+}
+EOF
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Invalid gh_action target" "Should report invalid target format"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_valid_minimal() {
+    local test_name="validate_review_plan: minimal valid plan passes"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    create_minimal_valid_plan "$plan_file"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_equals 0 "$exit_code" "Should return zero exit code"
+    assert_equals "Valid" "$result" "Should report Valid"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_plan_valid_full() {
+    local test_name="validate_review_plan: full valid plan passes"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    create_valid_plan "$plan_file"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_equals 0 "$exit_code" "Should return zero exit code"
+    assert_equals "Valid" "$result" "Should report Valid"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: summarize_review_plan
+#==============================================================================
+
+test_summarize_invalid_plan() {
+    local test_name="summarize_review_plan: invalid plan returns error"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    echo '{}' > "$plan_file"
+
+    local result
+    result=$(summarize_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_not_equals 0 "$exit_code" "Should return non-zero exit code"
+    assert_contains "$result" "Cannot summarize invalid plan" "Should report invalid plan"
+
+    log_test_pass "$test_name"
+}
+
+test_summarize_valid_plan() {
+    local test_name="summarize_review_plan: valid plan produces summary"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    create_valid_plan "$plan_file"
+
+    local result
+    result=$(summarize_review_plan "$plan_file")
+    local exit_code=$?
+
+    assert_equals 0 "$exit_code" "Should return zero exit code"
+    assert_contains "$result" "Repository: owner/repo" "Should include repository"
+    assert_contains "$result" "Items reviewed: 2" "Should count items"
+    assert_contains "$result" "Fixed: 1" "Should count fixed"
+    assert_contains "$result" "Skipped: 1" "Should count skipped"
+    assert_contains "$result" "Issues: 1" "Should count issues"
+    assert_contains "$result" "PRs: 1" "Should count PRs"
+    assert_contains "$result" "Commits: 1" "Should count commits"
+    assert_contains "$result" "Tests: PASS" "Should show test status"
+    assert_contains "$result" "gh_actions pending: 2" "Should count gh_actions"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: get_review_plan_json_summary
+#==============================================================================
+
+test_json_summary_valid_plan() {
+    local test_name="get_review_plan_json_summary: valid plan produces JSON"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local plan_file="$test_env/plan.json"
+    create_valid_plan "$plan_file"
+
+    local result
+    result=$(get_review_plan_json_summary "$plan_file")
+    local exit_code=$?
+
+    assert_equals 0 "$exit_code" "Should return zero exit code"
+
+    # Verify JSON is valid
+    if ! echo "$result" | jq empty 2>/dev/null; then
+        fail "Output should be valid JSON"
+    fi
+
+    # Check JSON content
+    local repo total_items fix_count
+    repo=$(echo "$result" | jq -r '.repo')
+    total_items=$(echo "$result" | jq -r '.summary.total_items')
+    fix_count=$(echo "$result" | jq -r '.summary.by_decision.fix')
+
+    assert_equals "owner/repo" "$repo" "Should have correct repo"
+    assert_equals "2" "$total_items" "Should have correct item count"
+    assert_equals "1" "$fix_count" "Should have correct fix count"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Main
+#==============================================================================
+
+run_all_tests() {
+    log_suite_start "Review Plan Validation"
+
+    # validate_review_plan tests
+    run_test test_validate_plan_file_not_found
+    run_test test_validate_plan_invalid_json
+    run_test test_validate_plan_missing_schema_version
+    run_test test_validate_plan_wrong_schema_version
+    run_test test_validate_plan_missing_item_fields
+    run_test test_validate_plan_invalid_item_type
+    run_test test_validate_plan_invalid_decision
+    run_test test_validate_plan_invalid_gh_action_op
+    run_test test_validate_plan_invalid_gh_action_target
+    run_test test_validate_plan_valid_minimal
+    run_test test_validate_plan_valid_full
+
+    # summarize_review_plan tests
+    run_test test_summarize_invalid_plan
+    run_test test_summarize_valid_plan
+
+    # get_review_plan_json_summary tests
+    run_test test_json_summary_valid_plan
+
+    print_results
+    return $TF_TESTS_FAILED
+}
+
+run_all_tests
