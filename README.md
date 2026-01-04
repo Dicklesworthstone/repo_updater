@@ -164,7 +164,7 @@ One-liner installer handles everything:
 
 ### Automation-Grade Design
 Built for scripting and CI from day one:
-- Meaningful exit codes (0/1/2/3/4)
+- Meaningful exit codes (0-5)
 - `--json` mode for structured output
 - `--non-interactive` for unattended runs
 - `--dry-run` to preview changes
@@ -213,6 +213,28 @@ Actionable commands for every issue:
 - Diverged branches? Rebase/merge/push options
 - Auth failed? Token/login instructions
 - Copy-paste ready commands
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+### Parallel & Resumable Syncs
+Efficient handling of large repo collections:
+- `--parallel N` for concurrent operations
+- Worker pool with flock-based coordination
+- `--resume` to continue interrupted syncs
+- State tracking for reliable restarts
+
+</td>
+<td width="50%">
+
+### Orphan Repository Management
+Keep your projects directory clean:
+- `ru prune` detects orphan repositories
+- `--archive` for non-destructive cleanup
+- Layout-aware directory scanning
+- Respects custom-named repos in config
 
 </td>
 </tr>
@@ -1155,6 +1177,89 @@ fi
 # Non-interactive mode: fail clearly
 log_error "gh not installed. Run with --install-deps or install manually."
 exit 3
+```
+
+---
+
+## 🧪 Testing
+
+ru includes a comprehensive test suite to ensure reliability across updates.
+
+### Test Structure
+
+```
+scripts/
+├── test_framework.sh         # Shared test utilities
+├── test_parsing.sh           # URL and repo spec parsing
+├── test_unit_config.sh       # Configuration handling
+├── test_unit_gum_wrappers.sh # Gum fallback behavior
+├── test_e2e_init.sh          # Init workflow
+├── test_e2e_add.sh           # Add command
+├── test_e2e_sync.sh          # Sync workflow
+├── test_e2e_status.sh        # Status command
+├── test_e2e_prune.sh         # Prune command
+└── test_e2e_self_update.sh   # Self-update workflow
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+./scripts/test_all.sh
+
+# Run specific test file
+./scripts/test_parsing.sh
+
+# Run with verbose output
+./scripts/test_e2e_sync.sh
+```
+
+### Test Categories
+
+**Unit Tests** — Test individual functions in isolation:
+- URL parsing (`parse_repo_url`, `normalize_url`)
+- Repo spec parsing (`parse_repo_spec` with `@branch as name`)
+- Configuration resolution
+- Gum wrapper fallback behavior
+
+**E2E Tests** — Test complete workflows with real file operations:
+- Full init → add → sync → status cycle
+- Prune detection and archive/delete modes
+- Self-update version checking
+- Error handling and edge cases
+
+### Test Framework Features
+
+The test framework (`test_framework.sh`) provides:
+
+- **Isolation** — Each test runs in a fresh temporary directory
+- **TAP output** — Machine-readable test results
+- **Assertions** — `assert_equals`, `assert_contains`, `assert_file_exists`, etc.
+- **Function extraction** — Sources individual functions from `ru` for unit testing
+- **Cleanup** — Automatic cleanup of temporary directories
+
+### Writing Tests
+
+```bash
+# Example unit test
+test_parse_url_https_basic() {
+    assert_parse_url "https://github.com/owner/repo" \
+        "github.com" "owner" "repo" \
+        "HTTPS basic URL"
+}
+
+# Example E2E test
+test_sync_clones_missing_repo() {
+    setup_initialized_env
+    "$RU_SCRIPT" add owner/repo >/dev/null 2>&1
+
+    local output
+    output=$("$RU_SCRIPT" sync 2>&1)
+
+    assert_contains "$output" "Cloning" "Should report cloning"
+    assert_dir_exists "$RU_PROJECTS_DIR/repo" "Repo directory created"
+    cleanup_test_env
+}
 ```
 
 ---
