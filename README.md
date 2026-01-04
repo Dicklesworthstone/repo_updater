@@ -550,6 +550,31 @@ owner/repo
 
 > **Note:** `flat` layout is the default for backwards compatibility with existing `/data/projects` structures. Use `owner-repo` if you have repos with the same name from different owners.
 
+### Path Collision Detection
+
+When using `flat` layout, different owners may have repositories with the same name. ru automatically detects these collisions:
+
+```
+⚠️  Path collision detected:
+    user1/myapp -> /data/projects/myapp
+    user2/myapp -> /data/projects/myapp
+
+Only the first repository will be synced to this path.
+Consider using: ru config --set LAYOUT=owner-repo
+```
+
+**How collision detection works:**
+
+1. Before syncing, ru resolves all repo URLs to local paths
+2. If multiple repos resolve to the same path, a warning is shown
+3. The first occurrence in your config wins (subsequent duplicates are skipped)
+4. Using `owner-repo` or `full` layout eliminates collisions
+
+**Resolution options:**
+- Use `owner-repo` layout: `ru config --set LAYOUT=owner-repo`
+- Use custom names: `user2/myapp as myapp-user2`
+- Remove the duplicate from your config
+
 ---
 
 ## 🔄 Sync Workflow
@@ -1109,6 +1134,37 @@ ru (bash, ~800-1000 LOC)
              │   Summary   │           │    JSON     │
              │  (stderr)   │           │  (stdout)   │
              └─────────────┘           └─────────────┘
+```
+
+### NDJSON Results Logging
+
+ru tracks per-repo results in Newline-Delimited JSON (NDJSON) format for easy parsing and CI integration:
+
+```json
+{"repo":"mcp_agent_mail","path":"/data/projects/mcp_agent_mail","action":"pull","status":"updated","duration":2,"message":"","timestamp":"2025-01-03T14:30:00Z"}
+{"repo":"beads_viewer","path":"/data/projects/beads_viewer","action":"clone","status":"cloned","duration":5,"message":"","timestamp":"2025-01-03T14:30:05Z"}
+{"repo":"repo_updater","path":"/data/projects/repo_updater","action":"skip","status":"current","duration":0,"message":"Already up to date","timestamp":"2025-01-03T14:30:05Z"}
+```
+
+**Fields:**
+
+| Field | Description |
+|-------|-------------|
+| `repo` | Repository name |
+| `path` | Local filesystem path |
+| `action` | What was attempted: `clone`, `pull`, `skip`, `fail` |
+| `status` | Result: `cloned`, `updated`, `current`, `conflict`, `failed` |
+| `duration` | Seconds taken |
+| `message` | Error message if failed, empty otherwise |
+| `timestamp` | ISO-8601 timestamp |
+
+**Use with jq:**
+```bash
+# Count by status
+cat ~/.local/state/ru/logs/latest/results.ndjson | jq -s 'group_by(.status) | map({status: .[0].status, count: length})'
+
+# Find failures
+cat ~/.local/state/ru/logs/latest/results.ndjson | jq -r 'select(.status == "failed") | "\(.repo): \(.message)"'
 ```
 
 ---

@@ -1498,7 +1498,7 @@ process_single_repo_worker() {
             return 0
         fi
 
-        if do_pull "$local_path" "$repo_name" "$update_strategy" "$autostash" >/dev/null 2>&1; then
+        if do_pull "$local_path" "$repo_name" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
             echo "OK:updated:$repo_name"
         else
             echo "FAIL:failed:$repo_name"
@@ -2120,9 +2120,16 @@ cmd_sync() {
     if [[ ${#ARGS[@]} -gt 0 ]]; then
         # User passed repo URLs directly - sync them ad-hoc
         log_step "Syncing ${#ARGS[@]} repo(s)..."
-        local url path repo_name
-        for url in "${ARGS[@]}"; do
-            path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        local repo_spec url branch custom_name path repo_name
+        for repo_spec in "${ARGS[@]}"; do
+            # Parse the repo spec (supports @branch and 'as name' syntax)
+            parse_repo_spec "$repo_spec" url branch custom_name
+
+            if [[ -n "$custom_name" ]]; then
+                path="${PROJECTS_DIR}/${custom_name}"
+            else
+                path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            fi
             repo_name=$(basename "$path")
 
             if [[ -d "$path" ]]; then
@@ -2132,10 +2139,10 @@ cmd_sync() {
                     write_result "$repo_name" "skip" "not_git" "0" "" "$path"
                     continue
                 fi
-                do_pull "$path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH"
+                do_pull "$path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"
             else
                 # Missing - clone
-                do_clone "$url" "$path" "$repo_name"
+                do_clone "$url" "$path" "$repo_name" "$branch"
             fi
         done
         exit 0
