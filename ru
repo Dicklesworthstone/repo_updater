@@ -5590,16 +5590,17 @@ DASH_BG_GRAY=$'\033[100m'
 DASHBOARD_OLD_STTY=""
 
 # Get terminal dimensions
+# Outputs: cols rows (space-separated) to stdout
 get_terminal_size() {
-    local -n _cols=$1
-    local -n _rows=$2
+    local cols rows
     if command -v tput &>/dev/null; then
-        _cols=$(tput cols)
-        _rows=$(tput lines)
+        cols=$(tput cols 2>/dev/null) || cols=80
+        rows=$(tput lines 2>/dev/null) || rows=24
     else
-        _cols=80
-        _rows=24
+        cols=80
+        rows=24
     fi
+    echo "$cols $rows"
 }
 
 # Enter alternate screen buffer
@@ -5650,6 +5651,13 @@ draw_hline() {
 truncate_string() {
     local str="$1"
     local max_width="$2"
+
+    # Guard against invalid width
+    if [[ $max_width -lt 4 ]]; then
+        echo "${str:0:$max_width}"
+        return
+    fi
+
     if [[ ${#str} -gt $max_width ]]; then
         echo "${str:0:$((max_width - 3))}..."
     else
@@ -5783,7 +5791,8 @@ render_questions_panel() {
     local questions_json="$3"
 
     local count
-    count=$(echo "$questions_json" | jq 'length')
+    count=$(echo "$questions_json" | jq 'length' 2>/dev/null) || count=0
+    [[ -z "$count" || ! "$count" =~ ^[0-9]+$ ]] && count=0
     local selected_idx="${DASHBOARD_STATE[selected_index]}"
 
     # Panel header
@@ -5806,7 +5815,8 @@ render_questions_panel() {
     local i
     for ((i = scroll_offset; i < end_idx; i++)); do
         local question
-        question=$(echo "$questions_json" | jq ".[$i]")
+        question=$(echo "$questions_json" | jq ".[$i]" 2>/dev/null) || continue
+        [[ -z "$question" || "$question" == "null" ]] && continue
         local is_selected="false"
         local is_expanded="false"
         [[ $i -eq $selected_idx ]] && is_selected="true"
@@ -5827,7 +5837,8 @@ render_sessions_panel() {
     local sessions_json="$2"
 
     local count
-    count=$(echo "$sessions_json" | jq 'length')
+    count=$(echo "$sessions_json" | jq 'length' 2>/dev/null) || count=0
+    [[ -z "$count" || ! "$count" =~ ^[0-9]+$ ]] && count=0
 
     # Panel header
     printf '\n  %sACTIVE SESSIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
@@ -5845,8 +5856,9 @@ render_sessions_panel() {
         "${DASH_DIM}" "Repo" "State" "Progress" "Health" "${DASH_RESET}"
 
     # Render sessions
-    echo "$sessions_json" | jq -r '.[] | "\(.repo)\t\(.state)\t\(.progress)\t\(.health)"' | \
+    echo "$sessions_json" | jq -r '.[] | "\(.repo // "unknown")\t\(.state // "unknown")\t\(.progress // "0/0")\t\(.health // "Unknown")"' 2>/dev/null | \
     while IFS=$'\t' read -r repo state progress health; do
+        [[ -z "$repo" ]] && continue
         # State colors
         local state_color="$DASH_RESET"
         case "$state" in
@@ -5909,17 +5921,18 @@ render_dashboard() {
     local sessions_json="$4"
     local stats_json="$5"
 
-    local cols rows
-    get_terminal_size cols rows
+    local cols rows term_size
+    term_size=$(get_terminal_size)
+    read -r cols rows <<< "$term_size"
 
-    # Parse stats
+    # Parse stats with fallbacks
     local completed issues prs commits progress_current progress_total
-    completed=$(echo "$stats_json" | jq -r '.completed // 0')
-    issues=$(echo "$stats_json" | jq -r '.issues // 0')
-    prs=$(echo "$stats_json" | jq -r '.prs // 0')
-    commits=$(echo "$stats_json" | jq -r '.commits // 0')
-    progress_current=$(echo "$stats_json" | jq -r '.current // 0')
-    progress_total=$(echo "$stats_json" | jq -r '.total // 0')
+    completed=$(echo "$stats_json" | jq -r '.completed // 0' 2>/dev/null) || completed=0
+    issues=$(echo "$stats_json" | jq -r '.issues // 0' 2>/dev/null) || issues=0
+    prs=$(echo "$stats_json" | jq -r '.prs // 0' 2>/dev/null) || prs=0
+    commits=$(echo "$stats_json" | jq -r '.commits // 0' 2>/dev/null) || commits=0
+    progress_current=$(echo "$stats_json" | jq -r '.current // 0' 2>/dev/null) || progress_current=0
+    progress_total=$(echo "$stats_json" | jq -r '.total // 0' 2>/dev/null) || progress_total=0
 
     clear_screen
 
@@ -6016,6 +6029,12 @@ run_dashboard() {
     local run_id="$1"
     local start_time="$2"
     local interrupted="false"
+
+    # Dashboard requires jq for JSON parsing
+    if ! command -v jq &>/dev/null; then
+        log_error "Dashboard requires 'jq' for JSON parsing. Please install jq."
+        return 3
+    fi
 
     # Save/override traps while dashboard is active
     local old_trap_int old_trap_term old_trap_winch
