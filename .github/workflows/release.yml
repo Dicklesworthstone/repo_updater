@@ -53,8 +53,8 @@ jobs:
       - name: Compute SHA256 checksums
         run: |
           echo "Computing checksums..."
-          sha256sum ru install.sh > checksums.sha256
-          cat checksums.sha256
+          sha256sum ru install.sh > checksums.txt
+          cat checksums.txt
 
       - name: Create individual checksum files
         run: |
@@ -81,7 +81,7 @@ echo "$(curl -fsSL https://github.com/Dicklesworthstone/repo_updater/releases/do
 
 ## Checksums
 
-SHA256 checksums for this release are attached as `checksums.sha256`.
+SHA256 checksums for this release are attached as `checksums.txt`.
 EOF
 
       - name: Create GitHub Release
@@ -92,7 +92,7 @@ EOF
           files: |
             ru
             install.sh
-            checksums.sha256
+            checksums.txt
             ru.sha256
             install.sh.sha256
           generate_release_notes: true

@@ -1747,13 +1747,14 @@ generate_json_report() {
             [[ "$line" =~ \"status\":\"([^\"]+)\" ]] && status="${BASH_REMATCH[1]}"
             [[ "$line" =~ \"duration\":([0-9]+) ]] && repo_duration="${BASH_REMATCH[1]}"
             # Extract path from NDJSON (falls back to computed path for backwards compat)
-            if [[ "$line" =~ \"path\":\"([^\"]+)\" ]]; then
-                path="${BASH_REMATCH[1]}"
-            else
-                path="$PROJECTS_DIR/$repo"
-            fi
             local safe_path
-            safe_path=$(json_escape "$path")
+            if [[ "$line" =~ \"path\":\"([^\"]+)\" ]]; then
+                # Path from NDJSON is already JSON-escaped, use directly
+                safe_path="${BASH_REMATCH[1]}"
+            else
+                # Fallback path needs escaping
+                safe_path=$(json_escape "$PROJECTS_DIR/$repo")
+            fi
 
             repos_json+="{\"name\":\"$repo\",\"path\":\"$safe_path\",\"action\":\"$action\",\"status\":\"$status\",\"duration\":${repo_duration:-0}}"
         done < "$RESULTS_FILE"

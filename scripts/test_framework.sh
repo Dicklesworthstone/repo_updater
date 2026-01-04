@@ -56,6 +56,164 @@ TF_CURRENT_TEST=""
 TF_TEMP_DIRS=()
 
 #==============================================================================
+# Structured Logging
+#==============================================================================
+
+# Log levels (lower = more verbose)
+readonly TF_LOG_DEBUG=0
+readonly TF_LOG_INFO=1
+readonly TF_LOG_WARN=2
+readonly TF_LOG_ERROR=3
+readonly TF_LOG_NONE=4
+
+# Current log level (default: INFO)
+TF_LOG_LEVEL="${TF_LOG_LEVEL:-1}"
+
+# Optional log file (set to enable file logging)
+TF_LOG_FILE="${TF_LOG_FILE:-}"
+
+# Test start time (for duration tracking)
+TF_TEST_START_TIME=""
+
+# Get ISO-8601 timestamp
+_tf_timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Get elapsed time since test start (in ms)
+_tf_elapsed_ms() {
+    if [[ -n "$TF_TEST_START_TIME" ]]; then
+        local now
+        now=$(date +%s%N 2>/dev/null || echo "0")
+        if [[ "$now" != "0" && "$TF_TEST_START_TIME" != "0" ]]; then
+            echo $(( (now - TF_TEST_START_TIME) / 1000000 ))
+        else
+            echo "0"
+        fi
+    else
+        echo "0"
+    fi
+}
+
+# Internal log function
+# Usage: _tf_log level prefix message
+_tf_log() {
+    local level="$1"
+    local prefix="$2"
+    local msg="$3"
+    local color="${4:-}"
+
+    # Check log level
+    if [[ "$level" -lt "$TF_LOG_LEVEL" ]]; then
+        return 0
+    fi
+
+    local timestamp
+    timestamp=$(_tf_timestamp)
+    local formatted_msg="[$timestamp] $prefix: $msg"
+
+    # Write to stderr with optional color
+    if [[ -n "$color" ]]; then
+        echo "${color}${formatted_msg}${TF_RESET}" >&2
+    else
+        echo "$formatted_msg" >&2
+    fi
+
+    # Write to log file if configured
+    if [[ -n "$TF_LOG_FILE" ]]; then
+        echo "$formatted_msg" >> "$TF_LOG_FILE"
+    fi
+}
+
+# Log a debug message
+log_debug() {
+    _tf_log "$TF_LOG_DEBUG" "DEBUG" "$1" "$TF_BLUE"
+}
+
+# Log an info message
+log_info() {
+    _tf_log "$TF_LOG_INFO" "INFO" "$1"
+}
+
+# Log a warning message
+log_warn() {
+    _tf_log "$TF_LOG_WARN" "WARN" "$1" "$TF_YELLOW"
+}
+
+# Log an error message
+log_error() {
+    _tf_log "$TF_LOG_ERROR" "ERROR" "$1" "$TF_RED"
+}
+
+# Log test start - called at beginning of each test
+# Usage: log_test_start "test_name"
+log_test_start() {
+    local test_name="$1"
+    TF_TEST_START_TIME=$(date +%s%N 2>/dev/null || echo "0")
+    _tf_log "$TF_LOG_INFO" "TEST" "Starting: $test_name" "$TF_BOLD"
+}
+
+# Log test pass - called when test succeeds
+# Usage: log_test_pass "test_name"
+log_test_pass() {
+    local test_name="$1"
+    local elapsed
+    elapsed=$(_tf_elapsed_ms)
+    _tf_log "$TF_LOG_INFO" "PASS" "$test_name (${elapsed}ms)" "$TF_GREEN"
+    TF_TEST_START_TIME=""
+}
+
+# Log test fail - called when test fails
+# Usage: log_test_fail "test_name" "reason"
+log_test_fail() {
+    local test_name="$1"
+    local reason="${2:-}"
+    local elapsed
+    elapsed=$(_tf_elapsed_ms)
+    if [[ -n "$reason" ]]; then
+        _tf_log "$TF_LOG_ERROR" "FAIL" "$test_name (${elapsed}ms): $reason" "$TF_RED"
+    else
+        _tf_log "$TF_LOG_ERROR" "FAIL" "$test_name (${elapsed}ms)" "$TF_RED"
+    fi
+    TF_TEST_START_TIME=""
+}
+
+# Log test skip - called when test is skipped
+# Usage: log_test_skip "test_name" "reason"
+log_test_skip() {
+    local test_name="$1"
+    local reason="${2:-}"
+    if [[ -n "$reason" ]]; then
+        _tf_log "$TF_LOG_WARN" "SKIP" "$test_name: $reason" "$TF_YELLOW"
+    else
+        _tf_log "$TF_LOG_WARN" "SKIP" "$test_name" "$TF_YELLOW"
+    fi
+}
+
+# Initialize log file
+# Usage: init_log_file "/path/to/log"
+init_log_file() {
+    TF_LOG_FILE="$1"
+    local log_dir
+    log_dir=$(dirname "$TF_LOG_FILE")
+    mkdir -p "$log_dir"
+    echo "# Test log started at $(_tf_timestamp)" > "$TF_LOG_FILE"
+}
+
+# Set log level
+# Usage: set_log_level debug|info|warn|error|none
+set_log_level() {
+    case "${1,,}" in
+        debug) TF_LOG_LEVEL=$TF_LOG_DEBUG ;;
+        info)  TF_LOG_LEVEL=$TF_LOG_INFO ;;
+        warn)  TF_LOG_LEVEL=$TF_LOG_WARN ;;
+        error) TF_LOG_LEVEL=$TF_LOG_ERROR ;;
+        none)  TF_LOG_LEVEL=$TF_LOG_NONE ;;
+        *)     log_warn "Unknown log level: $1" ;;
+    esac
+}
+
+#==============================================================================
 # Core Assertion Functions
 #==============================================================================
 
@@ -586,7 +744,10 @@ export -f assert_file_exists assert_file_not_exists
 export -f assert_dir_exists assert_dir_not_exists
 export -f assert_not_empty assert_empty
 export -f assert_true assert_false assert_matches assert_file_contains
-export -f _tf_pass _tf_fail
+export -f _tf_pass _tf_fail _tf_log _tf_timestamp _tf_elapsed_ms
+export -f log_debug log_info log_warn log_error
+export -f log_test_start log_test_pass log_test_fail log_test_skip
+export -f init_log_file set_log_level
 export -f create_temp_dir cleanup_temp_dirs reset_test_env create_test_env get_test_env_root
 export -f run_test skip_test print_results get_exit_code
 export -f get_project_dir source_ru_function

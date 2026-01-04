@@ -130,6 +130,50 @@ test_create_test_env() {
     assert_not_empty "${GIT_AUTHOR_NAME:-}" "Git author should be set"
 }
 
+test_structured_logging() {
+    # Test timestamp format
+    local ts
+    ts=$(_tf_timestamp)
+    assert_matches "$ts" "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}" "Timestamp should be ISO format"
+
+    # Test log level setting
+    set_log_level "debug"
+    assert_equals "$TF_LOG_DEBUG" "$TF_LOG_LEVEL" "Log level should be DEBUG"
+    set_log_level "warn"
+    assert_equals "$TF_LOG_WARN" "$TF_LOG_LEVEL" "Log level should be WARN"
+    set_log_level "info"  # Reset to default
+
+    # Test log file initialization
+    local temp_log
+    temp_log=$(create_temp_dir)/test.log
+    init_log_file "$temp_log"
+    assert_file_exists "$temp_log" "Log file should be created"
+    assert_file_contains "$temp_log" "Test log started" "Log file should have header"
+
+    # Test log functions produce output (just verify no errors)
+    log_debug "Debug message" 2>/dev/null
+    log_info "Info message" 2>/dev/null
+    log_warn "Warn message" 2>/dev/null
+    log_error "Error message" 2>/dev/null
+    _tf_pass "Logging functions work without errors"
+}
+
+test_log_test_lifecycle() {
+    # Test the log_test_* functions
+    log_test_start "example_test" 2>/dev/null
+    assert_not_empty "$TF_TEST_START_TIME" "Test start time should be set"
+
+    log_test_pass "example_test" 2>/dev/null
+    assert_empty "$TF_TEST_START_TIME" "Test start time should be cleared after pass"
+
+    log_test_start "failing_test" 2>/dev/null
+    log_test_fail "failing_test" "Expected failure" 2>/dev/null
+    assert_empty "$TF_TEST_START_TIME" "Test start time should be cleared after fail"
+
+    log_test_skip "skipped_test" "Not applicable" 2>/dev/null
+    _tf_pass "Test lifecycle logging works"
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -158,6 +202,8 @@ run_test test_temp_dir_creation
 run_test test_mock_repo_creation
 run_test test_bare_repo_creation
 run_test test_create_test_env
+run_test test_structured_logging
+run_test test_log_test_lifecycle
 
 print_results
 exit "$(get_exit_code)"
