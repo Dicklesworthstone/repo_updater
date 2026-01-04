@@ -334,7 +334,7 @@ test_write_result_appends_multiple() {
 
     # Count lines (each result should be one line)
     local line_count
-    line_count=$(wc -l < "$results_file")
+    line_count=$(wc -l < "$results_file" | tr -d ' ')
 
     assert_equals "3" "$line_count" "Should have 3 result lines"
 
