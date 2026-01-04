@@ -154,12 +154,22 @@ cc    # alias for claude-code CLI
 
 ### 3.2 The Prompts
 
-**Prompt 1: Codebase Understanding**
+**Prompt 1: Codebase Understanding (Incremental Digest)**
 ```
-First read ALL of the AGENTS.md file and README.md file super carefully
-and understand ALL of both! Then use your code investigation agent mode
-to fully understand the code, and technical architecture and purpose of
-the project. Use ultrathink.
+First read ALL of AGENTS.md and README.md carefully.
+
+If a prior repo digest exists at .ru/repo-digest.md, read it first.
+Then update it based on changes since last review:
+  • inspect git log since the last review timestamp
+  • inspect changed files and any new architecture decisions
+
+If no prior digest exists, create a comprehensive repo digest covering:
+  • Project purpose and architecture
+  • Key files and modules
+  • Patterns and conventions used
+
+Write the updated digest to .ru/repo-digest.md.
+Use ultrathink.
 ```
 
 **Prompt 2: Issue/PR Review**
@@ -218,55 +228,75 @@ direction I don't like or introduce scope creep. Use ultrathink.
 
 ## 4. Desired Automated Workflow
 
-### 4.1 High-Level Vision
+### 4.1 High-Level Vision (Work Items First, Plan → Apply)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              ru review                                       │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ PHASE 1: Discovery & Prioritization                                     ││
-│  │  • Scan all repos for open issues/PRs via gh API                       ││
-│  │  • Check last-review timestamps                                         ││
-│  │  • Calculate priority scores                                            ││
-│  │  • Build prioritized work queue                                         ││
+│  │ PHASE 1: Discovery & Prioritization (GraphQL Batched)                   ││
+│  │  • Scan all repos via batched GraphQL (alias chunks, not O(n) calls)   ││
+│  │  • Build a WORK ITEM list (issue/PR objects with full metadata)        ││
+│  │  • Score items individually (security/bug/recency/engagement)          ││
+│  │  • Derive repo scheduling from top items + capacity                    ││
+│  │  • Filter: skip archived, forks, recently-reviewed                     ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                     │                                        │
 │                                     ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ PHASE 2: Parallel Orchestration                                         ││
-│  │  • Launch Claude Code sessions (stream-json mode)                       ││
-│  │  • Send understanding prompts                                           ││
-│  │  • Monitor via ntm activity detection                                   ││
-│  │  • Send review prompts upon completion                                  ││
+│  │ PHASE 2: Preparation & Isolation                                        ││
+│  │  • Ensure repos exist locally (auto-clone if needed via ru sync)       ││
+│  │  • Create git worktrees for isolation (branch: ru/review/<run_id>)     ││
+│  │  • Load/update repo digest cache (incremental understanding)           ││
+│  │  • Respect branch pins from repo spec                                  ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                     │                                        │
 │                                     ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ PHASE 3: Question Aggregation                                           ││
-│  │  • Detect AskUserQuestion tool calls in stream                          ││
-│  │  • Extract question context and options                                 ││
-│  │  • Score and prioritize questions                                       ││
-│  │  • Queue for human review                                               ││
+│  │ PHASE 3: Parallel Orchestration (Plan Mode - No Mutations)             ││
+│  │  • Launch Claude Code sessions via unified Session Driver              ││
+│  │  • Provide repo digest + delta (incremental understanding)             ││
+│  │  • Agent produces local patches + review-plan.json artifact            ││
+│  │  • NO direct GitHub mutations (comment/close/label) in this phase      ││
+│  │  • Monitor via activity detection + rate-limit governor                ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                     │                                        │
 │                                     ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ PHASE 4: Unified TUI                                                    ││
-│  │  • Present aggregated questions with context                            ││
-│  │  • Allow drill-down to full session                                     ││
+│  │ PHASE 4: Question Aggregation (Three Wait Reasons)                      ││
+│  │  • Detect AskUserQuestion tool calls (structured)                       ││
+│  │  • Detect agent text questions at prompt (heuristic)                    ││
+│  │  • Detect external prompts (git conflict, auth, shell)                  ││
+│  │  • Queue with context, options, recommended action, risk level          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                     │                                        │
+│                                     ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ PHASE 5: Unified TUI (Enhanced UX)                                      ││
+│  │  • Present aggregated questions with patch summaries                    ││
+│  │  • Show: changed files, LOC, test status from plan artifact             ││
+│  │  • Actions: answer, drill-down, snooze, template, bulk-apply            ││
 │  │  • Route answers back to sessions                                       ││
-│  │  • Track decisions for future learning                                  ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                     │                                        │
 │                                     ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ PHASE 5: Completion & Reporting                                         ││
-│  │  • Wait for session completion                                          ││
-│  │  • Update review timestamps                                             ││
-│  │  • Generate summary report                                              ││
-│  │  • Clean up sessions                                                    ││
-│  │  • Update analytics                                                     ││
+│  │ PHASE 6: Apply (Optional, Explicit)                                     ││
+│  │  • Consume review-plan.json artifacts                                   ││
+│  │  • Run quality gates (tests/lint) - block if failing                    ││
+│  │  • Execute approved gh_actions (comment, close, label)                  ││
+│  │  • Push changes only with --apply --push (safe default: no push)        ││
+│  │  • Merge worktree changes to main branch                                ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                     │                                        │
+│                                     ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ PHASE 7: Completion & Reporting                                         ││
+│  │  • Update item-level outcomes in state                                  ││
+│  │  • Update repo digest cache                                             ││
+│  │  • Generate summary report + analytics                                  ││
+│  │  • Clean up worktrees (or preserve for investigation)                   ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -276,16 +306,24 @@ direction I don't like or introduce scope creep. Use ultrathink.
 
 | Requirement | Description | Priority |
 |-------------|-------------|----------|
-| **Selective Processing** | Only process repos with new/open issues or PRs | P0 |
-| **Parallel Execution** | Run multiple reviews concurrently | P0 |
-| **Question Aggregation** | Collect questions from all sessions | P0 |
-| **Priority Scoring** | Handle important issues first | P1 |
-| **Context Preservation** | Show enough context for decisions | P0 |
+| **Work Item Model** | Score issues/PRs individually, not just repos | P0 |
+| **GraphQL Batching** | Efficient discovery (10-100× fewer API calls) | P0 |
+| **Plan → Apply Split** | Safe defaults; mutations only with explicit --apply | P0 |
+| **Worktree Isolation** | Each review in isolated git worktree | P0 |
+| **Question Aggregation** | Collect all wait reasons (AskUser, text, external) | P0 |
+| **Unified Session Driver** | Same interface for ntm and local modes | P0 |
+| **Review Plan Artifact** | Structured JSON output for apply phase | P0 |
+| **Quality Gates** | Tests/lint must pass before push | P0 |
+| **Rate-Limit Governor** | Adaptive concurrency based on real limits | P1 |
+| **Repo Digest Cache** | Incremental understanding across runs | P1 |
+| **Parallel Execution** | Run multiple reviews concurrently | P1 |
+| **Item-Level Outcomes** | Track decisions per issue/PR, not just repo | P1 |
+| **Context Preservation** | Show patch summaries, test status, risk level | P1 |
 | **Drill-Down** | View full session for more detail | P1 |
-| **State Persistence** | Resume after interruption | P1 |
-| **Progress Tracking** | Show overall progress | P1 |
-| **Error Recovery** | Handle Claude crashes, rate limits | P0 |
+| **State Persistence** | Atomic writes, locking, resume after interruption | P1 |
+| **TUI Enhancements** | Snooze, templates, bulk-apply, patch preview | P2 |
 | **Metrics Collection** | Learn from decisions over time | P2 |
+| **Cost Budget** | --max-repos, --max-runtime, --max-questions | P2 |
 
 ### 4.3 User Experience Goal
 
@@ -476,7 +514,7 @@ func main() {
 
 ## 6. Recommended Architecture
 
-### 6.1 Component Architecture
+### 6.1 Component Architecture (Unified Session Driver)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -487,11 +525,25 @@ func main() {
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         ru (Bash Layer)                                      │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  • Repo configuration and git operations                              │  │
-│  │  • GitHub API queries via gh CLI                                      │  │
-│  │  • Priority scoring and queue building                                │  │
-│  │  • State persistence (review-state.json)                              │  │
-│  │  • Mode detection (ntm vs basic)                                      │  │
+│  │  • GraphQL batched discovery (alias chunks)                           │  │
+│  │  • Work Item queue + item-level scoring                               │  │
+│  │  • Worktree preparation (isolation)                                   │  │
+│  │  • Repo digest cache management                                       │  │
+│  │  • State persistence (atomic, locked, item-level)                     │  │
+│  │  • Rate-limit governor integration                                    │  │
+│  │  • Driver detection (ntm vs local)                                    │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Session Driver Interface (Unified)                       │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  start(repo_ctx) -> session_handle                                    │  │
+│  │  send(session, message)                                               │  │
+│  │  stream(session) -> normalized_events                                 │  │
+│  │  interrupt(session)                                                   │  │
+│  │  stop(session)                                                        │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
@@ -499,54 +551,81 @@ func main() {
                     │                             │
                     ▼                             ▼
 ┌───────────────────────────────────┐ ┌───────────────────────────────────────┐
-│      Basic Mode (no ntm)          │ │         ntm Mode (full power)         │
+│      Local Driver (no ntm)        │ │         ntm Driver (full power)       │
 │  ┌─────────────────────────────┐  │ │  ┌─────────────────────────────────┐  │
-│  │ • Sequential processing     │  │ │  │ • Parallel sessions             │  │
-│  │ • tmux + claude -p          │  │ │  │ • Stream-json monitoring        │  │
-│  │ • Simple gum prompts        │  │ │  │ • Activity detection            │  │
-│  │ • Regex output parsing      │  │ │  │ • Robot mode API                │  │
-│  └─────────────────────────────┘  │ │  │ • Rich TUI dashboard            │  │
-└───────────────────────────────────┘ │  │ • Health monitoring             │  │
-                                      │  │ • Workflow pipelines            │  │
-                                      │  └─────────────────────────────────┘  │
+│  │ • tmux + stream-json        │  │ │  │ • Robot mode API                │  │
+│  │ • Interactive Q/A routing   │  │ │  │ • Activity detection            │  │
+│  │ • Same event schema as ntm  │  │ │  │ • Health monitoring             │  │
+│  │ • Parallel via tmux panes   │  │ │  │ • Workflow pipelines            │  │
+│  └─────────────────────────────┘  │ │  │ • Same event schema as local    │  │
+└───────────────────────────────────┘ │  └─────────────────────────────────┘  │
                                       └───────────────────────────────────────┘
-                                                       │
-                                                       ▼
-                                      ┌───────────────────────────────────────┐
-                                      │        Claude Code Sessions           │
-                                      │  ┌─────────────────────────────────┐  │
-                                      │  │ claude -p --output-format       │  │
-                                      │  │   stream-json                   │  │
-                                      │  │                                 │  │
-                                      │  │ Events:                         │  │
-                                      │  │ • assistant (text, tool_use)    │  │
-                                      │  │ • user (tool_result)            │  │
-                                      │  │ • result (completion)           │  │
-                                      │  └─────────────────────────────────┘  │
-                                      └───────────────────────────────────────┘
+                    │                             │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Claude Code Sessions (stream-json)                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ claude -p --output-format stream-json                                 │  │
+│  │                                                                       │  │
+│  │ Normalized Events (both drivers emit same schema):                    │  │
+│  │ • init: session started                                               │  │
+│  │ • generating: active output (velocity > 10 chars/sec)                 │  │
+│  │ • waiting: {reason: ask_user_question|agent_question|external_prompt} │  │
+│  │ • complete: session finished                                          │  │
+│  │ • error: error detected                                               │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Review Plan Artifact (.ru/)                           │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ review-plan.json: items, questions, git, gh_actions                   │  │
+│  │ repo-digest.md: cached codebase understanding                         │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 Data Flow
+### 6.2 Data Flow (Work Item Queue → Plan → Apply)
 
 ```
-┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐
-│ GitHub API │───▶│  Priority  │───▶│  Session   │───▶│  Question  │
-│  (gh CLI)  │    │  Scoring   │    │ Launcher   │    │  Detector  │
-└────────────┘    └────────────┘    └────────────┘    └─────┬──────┘
-                                                            │
-┌────────────┐    ┌────────────┐    ┌────────────┐          │
-│  Metrics   │◀───│   Answer   │◀───│    TUI     │◀─────────┘
-│  Storage   │    │   Router   │    │  Display   │
-└────────────┘    └────────────┘    └────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ GitHub API   │───▶│ Work Item    │───▶│ Worktree     │───▶│ Session      │
+│ (GraphQL     │    │ Queue+Score  │    │ Preparation  │    │ Driver       │
+│  Batched)    │    │ (Item-Level) │    │ (Isolation)  │    │ (Unified)    │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────┬───────┘
+                                                                   │
+                    ┌──────────────────────────────────────────────┤
+                    ▼                                              ▼
+            ┌──────────────┐                              ┌──────────────┐
+            │ Rate-Limit   │◀────────────────────────────▶│ Question     │
+            │ Governor     │                              │ Detector     │
+            │ (Adaptive)   │                              │ (3 Reasons)  │
+            └──────────────┘                              └──────┬───────┘
+                                                                 │
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐         │
+│ Apply Phase  │◀───│ Plan         │◀───│ TUI + Answer │◀────────┘
+│ (Quality     │    │ Artifact     │    │ Router       │
+│  Gates+Push) │    │ (.ru/*.json) │    │ (Enhanced)   │
+└──────┬───────┘    └──────────────┘    └──────────────┘
+       │
+       ▼
+┌──────────────┐    ┌──────────────┐
+│ Item-Level   │───▶│ Repo Digest  │
+│ Outcomes     │    │ Cache Update │
+│ (State)      │    │              │
+└──────────────┘    └──────────────┘
 ```
 
 ---
 
 ## 7. Implementation Plan
 
-### 7.1 Phase 1: Core Infrastructure (Week 1-2)
+### 7.1 Phase 1: Core Infrastructure (Worktrees, GraphQL Batching, Work Items)
 
-#### 7.1.1 Add `ru review` Command
+#### 7.1.1 Add `ru review` Command (Plan → Apply, Worktrees)
 
 ```bash
 # In ru script - new command
@@ -555,7 +634,12 @@ cmd_review() {
     local parallel=4
     local dry_run="false"
     local resume="false"
-    local priority_threshold="all"  # all, normal, high
+    local apply="false"
+    local push="false"
+    local priority_threshold="all"  # all, normal, high, critical
+    local max_repos=""              # Cost budget: limit repos
+    local max_runtime=""            # Cost budget: limit runtime
+    local max_questions=""          # Cost budget: limit questions
 
     # Parse arguments
     parse_review_args
@@ -563,155 +647,393 @@ cmd_review() {
     # Check prerequisites
     check_review_prerequisites || exit 3
 
-    # Auto-detect mode
+    # Generate unique run ID
+    REVIEW_RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+
+    # Acquire global lock (prevents concurrent ru review runs)
+    acquire_review_lock || { log_error "Another review is running"; exit 1; }
+
+    # Auto-detect driver
     if [[ "$mode" == "auto" ]]; then
-        mode=$(detect_review_mode)
+        mode=$(detect_review_driver)  # returns "ntm" or "local"
     fi
 
-    # Discovery phase
-    log_step "Scanning repositories for open issues and PRs..."
-    local -a repos_needing_review
-    discover_repos_needing_review repos_needing_review "$priority_threshold"
+    # Discovery phase (GraphQL batched)
+    log_step "Scanning repositories for open issues and PRs (batched)..."
+    local -a work_items
+    discover_work_items work_items "$priority_threshold" "$max_repos"
 
-    if [[ ${#repos_needing_review[@]} -eq 0 ]]; then
-        log_success "No repositories need review"
+    if [[ ${#work_items[@]} -eq 0 ]]; then
+        log_success "No work items need review"
+        release_review_lock
         return 0
     fi
 
-    # Show discovery summary
-    show_discovery_summary "${repos_needing_review[@]}"
+    # Show discovery summary (item-level)
+    show_discovery_summary "${work_items[@]}"
 
-    # Dispatch to mode
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "Dry run - exiting without starting sessions"
+        release_review_lock
+        return 0
+    fi
+
+    # Derive repos from top work items
+    local -a repos_to_review
+    derive_repos_from_items repos_to_review "${work_items[@]}"
+
+    # Ensure repos exist locally (auto-clone if needed)
+    ensure_repos_exist "${repos_to_review[@]}"
+
+    # Prepare isolated worktrees for each repo
+    log_step "Preparing isolated worktrees..."
+    prepare_review_worktrees "${repos_to_review[@]}"
+
+    # Load/update repo digest cache for incremental understanding
+    prepare_repo_digests "${repos_to_review[@]}"
+
+    # Dispatch to driver (Plan Mode - no mutations)
     case "$mode" in
-        ntm)   run_review_ntm_mode "${repos_needing_review[@]}" ;;
-        basic) run_review_basic_mode "${repos_needing_review[@]}" ;;
+        ntm)   run_review_ntm_driver "${repos_to_review[@]}" ;;
+        local) run_review_local_driver "${repos_to_review[@]}" ;;
     esac
+
+    # Apply phase (optional, explicit)
+    if [[ "$apply" == "true" ]]; then
+        log_step "Apply phase: executing approved actions..."
+        run_apply_phase "$push" "${repos_to_review[@]}"
+    else
+        log_info "Plan mode complete. Run with --apply to execute actions."
+    fi
+
+    # Update state with item-level outcomes
+    update_review_state "${repos_to_review[@]}"
+
+    # Cleanup
+    release_review_lock
 }
-```
 
-#### 7.1.2 GitHub Activity Detection
+# Create per-repo worktrees to isolate AI edits
+prepare_review_worktrees() {
+    local repos=("$@")
+    local base="$RU_STATE_DIR/worktrees/$REVIEW_RUN_ID"
+    mkdir -p "$base"
 
-```bash
-# Efficient batch query using gh
-get_repos_with_activity() {
-    local -n result_array=$1
-    local repos_json
+    for repo_info in "${repos[@]}"; do
+        local repo_spec issues prs updated_at oldest
+        IFS='|' read -r repo_spec issues prs updated_at oldest <<< "$repo_info"
 
-    # Get all configured repos
-    local all_repos=()
-    while IFS= read -r spec; do
-        [[ -n "$spec" ]] && all_repos+=("$spec")
-    done < <(get_all_repos)
+        local url branch custom_name local_path repo_id
+        resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
+            url branch custom_name local_path repo_id
 
-    # Batch query GitHub (up to 100 repos per query)
-    local batch_size=100
-    local batch_start=0
+        # Refuse to run on dirty trees
+        ensure_clean_or_fail "$local_path"
 
-    while [[ $batch_start -lt ${#all_repos[@]} ]]; do
-        local batch=("${all_repos[@]:batch_start:batch_size}")
+        local wt_path="$base/${repo_id//\//_}"
+        local wt_branch="ru/review/$REVIEW_RUN_ID/${repo_id//\//-}"
 
-        for repo_spec in "${batch[@]}"; do
-            local url branch custom_name local_path repo_id
-            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
-                url branch custom_name local_path repo_id; then
-                continue
-            fi
+        # Fetch latest and create worktree
+        git -C "$local_path" fetch --quiet 2>/dev/null || true
 
-            # Get issue and PR counts with minimal API calls
-            local activity
-            activity=$(get_repo_activity_cached "$repo_id")
+        # Respect branch pins from repo spec
+        local base_ref="${branch:-HEAD}"
+        git -C "$local_path" worktree add -b "$wt_branch" "$wt_path" "$base_ref" >/dev/null
 
-            local issues prs
-            issues=$(echo "$activity" | jq -r '.issues')
-            prs=$(echo "$activity" | jq -r '.prs')
+        # Create .ru directory for artifacts
+        mkdir -p "$wt_path/.ru"
 
-            if [[ $((issues + prs)) -gt 0 ]]; then
-                # Check if needs review (not recently reviewed)
-                if needs_review "$repo_id" "$activity"; then
-                    result_array+=("$repo_spec|$issues|$prs")
-                fi
-            fi
-        done
-
-        ((batch_start += batch_size))
+        record_worktree_mapping "$repo_id" "$wt_path" "$wt_branch"
     done
 }
 
-# Cache GitHub API responses (5-minute TTL)
-get_repo_activity_cached() {
-    local repo_id="$1"
-    local cache_file="$RU_CACHE_DIR/activity/${repo_id//\//_}.json"
-    local cache_ttl=300  # 5 minutes
+# Apply phase: consume review-plan.json, run quality gates, execute mutations
+run_apply_phase() {
+    local push="$1"
+    shift
+    local repos=("$@")
 
-    # Check cache
-    if [[ -f "$cache_file" ]]; then
-        local cache_age
-        cache_age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file")))
-        if [[ $cache_age -lt $cache_ttl ]]; then
-            cat "$cache_file"
-            return 0
+    for repo_info in "${repos[@]}"; do
+        local repo_id wt_path
+        get_worktree_mapping "$repo_info" repo_id wt_path
+
+        local plan_file="$wt_path/.ru/review-plan.json"
+        if [[ ! -f "$plan_file" ]]; then
+            log_warn "$repo_id: No review plan found, skipping"
+            continue
         fi
-    fi
 
-    # Fetch fresh data
-    mkdir -p "$(dirname "$cache_file")"
-    local issues prs
+        # Run quality gates (tests/lint)
+        if ! run_quality_gates "$wt_path" "$plan_file"; then
+            log_error "$repo_id: Quality gates failed, skipping apply"
+            queue_question "quality_failed" "$repo_id" "Tests failed, proceed anyway?"
+            continue
+        fi
 
-    issues=$(gh issue list -R "$repo_id" --state open --json number,title,createdAt,labels,author \
-        --jq 'length' 2>/dev/null || echo "0")
-    prs=$(gh pr list -R "$repo_id" --state open --json number,title,createdAt,labels,author \
-        --jq 'length' 2>/dev/null || echo "0")
+        # Execute gh_actions from plan (comment, close, label)
+        execute_gh_actions "$repo_id" "$plan_file"
 
-    local result
-    printf -v result '{"issues":%d,"prs":%d,"fetched_at":"%s"}' \
-        "$issues" "$prs" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-    echo "$result" > "$cache_file"
-    echo "$result"
+        # Push if allowed
+        if [[ "$push" == "true" ]]; then
+            push_worktree_changes "$repo_id" "$wt_path"
+        fi
+    done
 }
 ```
 
-#### 7.1.3 Priority Scoring
+#### 7.1.2 GitHub Activity Detection (True Batch, GraphQL Alias Chunks)
 
 ```bash
-# Calculate priority score for a repository
-calculate_priority_score() {
-    local repo_id="$1"
-    local issues="$2"
-    local prs="$3"
+# Discover work items using GraphQL alias batching (10-100× fewer API calls)
+discover_work_items() {
+    local -n result_array=$1
+    local priority_threshold="$2"
+    local max_repos="${3:-}"
+
+    local -a all_specs=()
+    while IFS= read -r spec; do
+        [[ -n "$spec" ]] && all_specs+=("$spec")
+    done < <(get_all_repos)
+
+    # Resolve specs -> owner/repo ids (skip non-GitHub hosts in discovery)
+    local -a repo_ids=()
+    local -A spec_by_repo=()
+    for repo_spec in "${all_specs[@]}"; do
+        local url branch custom_name local_path repo_id host
+        if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
+            url branch custom_name local_path repo_id; then
+            continue
+        fi
+        host=$(detect_repo_host "$url")
+        [[ "$host" != "github" ]] && continue
+        repo_ids+=("$repo_id")
+        spec_by_repo["$repo_id"]="$repo_spec"
+    done
+
+    # GraphQL alias batching: query in chunks of 25 repos each
+    local chunk_size=25
+    local -a items=()
+
+    for chunk in $(chunk_repo_ids "$chunk_size" "${repo_ids[@]}"); do
+        local resp
+        resp=$(gh_api_graphql_repo_batch "$chunk") || continue
+
+        # Extract work items (issues + PRs) in one pass
+        while IFS=$'\t' read -r repo_id item_type number title labels created_at updated_at is_draft; do
+            # Skip archived repos (already filtered in query but double-check)
+            [[ -z "$repo_id" ]] && continue
+
+            # Calculate item-level priority score
+            local score
+            score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft")
+
+            # Apply threshold filter
+            local level
+            level=$(get_priority_level "$score")
+            if ! passes_priority_threshold "$level" "$priority_threshold"; then
+                continue
+            fi
+
+            # Format: repo_id|type|number|title|score|level|created_at|updated_at
+            items+=("${repo_id}|${item_type}|${number}|${title}|${score}|${level}|${created_at}|${updated_at}")
+        done < <(parse_graphql_work_items "$resp")
+    done
+
+    # Sort by priority score (descending) and apply max_repos limit
+    local sorted_items
+    sorted_items=$(printf '%s\n' "${items[@]}" | sort -t'|' -k5 -rn)
+
+    if [[ -n "$max_repos" ]]; then
+        # Derive unique repos from top items, limit to max_repos
+        local -A seen_repos=()
+        while IFS= read -r item; do
+            local repo_id="${item%%|*}"
+            if [[ -z "${seen_repos[$repo_id]:-}" ]]; then
+                seen_repos["$repo_id"]=1
+                if [[ ${#seen_repos[@]} -gt $max_repos ]]; then
+                    break
+                fi
+            fi
+            result_array+=("$item")
+        done <<< "$sorted_items"
+    else
+        while IFS= read -r item; do
+            [[ -n "$item" ]] && result_array+=("$item")
+        done <<< "$sorted_items"
+    fi
+}
+
+# GraphQL alias batching: build query with repo0/repo1/... aliases
+# Returns issues + PRs with full metadata in one API call
+gh_api_graphql_repo_batch() {
+    local chunk="$1"
+    local q="query {"
+    local i=0
+
+    while IFS= read -r repo_id; do
+        [[ -z "$repo_id" ]] && continue
+        local owner="${repo_id%%/*}"
+        local name="${repo_id#*/}"
+
+        q+=" repo${i}: repository(owner:\"${owner}\", name:\"${name}\") {"
+        q+=" nameWithOwner isArchived isFork updatedAt"
+        # Issues with metadata for scoring
+        q+=" issues(states:OPEN, first:50, orderBy:{field:CREATED_AT, direction:DESC}) {"
+        q+="   nodes { number title createdAt updatedAt"
+        q+="     labels(first:10) { nodes { name } }"
+        q+="   }"
+        q+=" }"
+        # PRs with metadata for scoring
+        q+=" pullRequests(states:OPEN, first:20, orderBy:{field:CREATED_AT, direction:DESC}) {"
+        q+="   nodes { number title createdAt updatedAt isDraft"
+        q+="     labels(first:10) { nodes { name } }"
+        q+="   }"
+        q+=" }"
+        # Oldest open issue for staleness scoring
+        q+=" oldestIssue: issues(states:OPEN, first:1, orderBy:{field:CREATED_AT, direction:ASC}) {"
+        q+="   nodes { createdAt }"
+        q+=" }"
+        q+=" }"
+        ((i++))
+    done <<< "$chunk"
+
+    q+=" }"
+
+    # Execute GraphQL query
+    gh api graphql -f query="$q" 2>/dev/null
+}
+
+# Parse GraphQL response into work items (TSV format for easy Bash parsing)
+parse_graphql_work_items() {
+    local resp="$1"
+
+    # Use jq to flatten the response into TSV lines
+    echo "$resp" | jq -r '
+        .data | to_entries[] | select(.value != null) |
+        select(.value.isArchived != true) |
+        select(.value.isFork != true) |
+        .value as $repo |
+        (
+            # Issues
+            ($repo.issues.nodes // [])[] |
+            [$repo.nameWithOwner, "issue", .number, .title,
+             ([.labels.nodes[].name] | join(",")),
+             .createdAt, .updatedAt, "false"] | @tsv
+        ),
+        (
+            # PRs
+            ($repo.pullRequests.nodes // [])[] |
+            [$repo.nameWithOwner, "pr", .number, .title,
+             ([.labels.nodes[].name] | join(",")),
+             .createdAt, .updatedAt, (.isDraft | tostring)] | @tsv
+        )
+    ' 2>/dev/null
+}
+```
+
+#### 7.1.3 Priority Scoring (Item-Level)
+
+```bash
+# Calculate priority score for an individual work item (issue or PR)
+# This is the primary scoring function - repo priority is derived from top items
+calculate_item_priority_score() {
+    local item_type="$1"        # issue or pr
+    local labels="$2"           # comma-separated labels
+    local created_at="$3"       # ISO timestamp
+    local updated_at="$4"       # ISO timestamp
+    local is_draft="${5:-false}"
 
     local score=0
 
-    # Base score from volume
-    score=$((score + issues * 10))
-    score=$((score + prs * 20))  # PRs weighted higher
-
-    # Check for high-priority labels
-    local high_priority_labels
-    high_priority_labels=$(gh issue list -R "$repo_id" --state open \
-        --label "bug,critical,security,urgent" --json number --jq 'length' 2>/dev/null || echo "0")
-    score=$((score + high_priority_labels * 50))
-
-    # Check issue age (older = higher priority)
-    local oldest_issue_days
-    oldest_issue_days=$(gh issue list -R "$repo_id" --state open --json createdAt \
-        --jq 'map(.createdAt | fromdateiso8601) | min | (now - .) / 86400 | floor' 2>/dev/null || echo "0")
-    if [[ $oldest_issue_days -gt 30 ]]; then
-        score=$((score + 30))
-    elif [[ $oldest_issue_days -gt 7 ]]; then
-        score=$((score + 15))
-    fi
-
-    # Boost for repos not reviewed recently
-    local days_since_review
-    days_since_review=$(get_days_since_review "$repo_id")
-    if [[ $days_since_review -gt 30 ]]; then
-        score=$((score + 40))
-    elif [[ $days_since_review -gt 14 ]]; then
+    # Component 1: Type importance (0-20 points)
+    # PRs indicate someone invested effort
+    if [[ "$item_type" == "pr" ]]; then
         score=$((score + 20))
+        # Draft PRs get penalized
+        [[ "$is_draft" == "true" ]] && score=$((score - 15))
+    else
+        score=$((score + 10))
     fi
+
+    # Component 2: Label-based priority (0-50 points)
+    if echo "$labels" | grep -qiE 'security|critical'; then
+        score=$((score + 50))
+    elif echo "$labels" | grep -qiE 'bug|urgent'; then
+        score=$((score + 30))
+    elif echo "$labels" | grep -qiE 'enhancement|feature'; then
+        score=$((score + 10))
+    fi
+
+    # Component 3: Age factor (0-50 points for bugs, penalty for old features)
+    local age_days
+    age_days=$(days_since_timestamp "$created_at")
+
+    # Bug/security items: older = more urgent
+    if echo "$labels" | grep -qiE 'bug|security|critical'; then
+        if [[ $age_days -gt 60 ]]; then
+            score=$((score + 50))
+        elif [[ $age_days -gt 30 ]]; then
+            score=$((score + 30))
+        elif [[ $age_days -gt 14 ]]; then
+            score=$((score + 15))
+        fi
+    else
+        # Feature requests: very old ones should not dominate
+        if [[ $age_days -gt 180 ]]; then
+            score=$((score - 10))
+        fi
+    fi
+
+    # Component 4: Recency bonus (0-15 points)
+    # Recently updated items have active engagement
+    local updated_days
+    updated_days=$(days_since_timestamp "$updated_at")
+    if [[ $updated_days -lt 3 ]]; then
+        score=$((score + 15))
+    elif [[ $updated_days -lt 7 ]]; then
+        score=$((score + 10))
+    fi
+
+    # Component 5: Staleness penalty - already reviewed items (-20 points)
+    local item_key="${repo_id}#${item_type}-${number}"
+    if item_recently_reviewed "$item_key"; then
+        score=$((score - 20))
+    fi
+
+    # Ensure non-negative
+    [[ $score -lt 0 ]] && score=0
 
     echo "$score"
+}
+
+# Derive repo priority from its top work items
+calculate_repo_priority() {
+    local repo_id="$1"
+    local -a item_scores=("${@:2}")
+
+    # Repo priority = max(item_priority) + volume bonus
+    local max_score=0
+    local count=${#item_scores[@]}
+
+    for score in "${item_scores[@]}"; do
+        [[ $score -gt $max_score ]] && max_score=$score
+    done
+
+    # Volume bonus (capped at 30)
+    local volume_bonus=$((count * 5))
+    [[ $volume_bonus -gt 30 ]] && volume_bonus=30
+
+    echo $((max_score + volume_bonus))
+}
+
+# Helper: days since ISO timestamp
+days_since_timestamp() {
+    local ts="$1"
+    local now
+    now=$(date +%s)
+    local then
+    then=$(date -d "$ts" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || echo "$now")
+    echo $(( (now - then) / 86400 ))
 }
 ```
 
@@ -1036,6 +1358,122 @@ send_answer_to_session() {
 | Long thinking periods (10+ min) | Set `--max-turns`, implement timeout |
 | Slash commands not available in `-p` mode | Describe task instead |
 
+### 8.5 Review Plan Artifact (Required Output Contract)
+
+Each repo review session MUST produce a machine-readable plan file at:
+  `.ru/review-plan.json`
+
+This file is the **single source of truth** for what happened in the session.
+ru uses it to:
+- Drive the Apply phase (push + gh mutations)
+- Resume safely after interruption
+- Compute metrics without transcript scraping
+- Audit what was done
+
+**Schema (v1):**
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "20250104-103000-12345",
+  "repo": "owner/repo",
+  "worktree_path": "/home/user/.local/state/ru/worktrees/20250104-103000-12345/owner_repo",
+
+  "items": [
+    {
+      "type": "issue",
+      "number": 42,
+      "title": "Authentication fails on Windows",
+      "priority": "high",
+      "decision": "fix",
+      "notes": "Root cause: path separator in auth.py:234",
+      "risk_level": "low"
+    },
+    {
+      "type": "pr",
+      "number": 15,
+      "title": "Add Redis caching",
+      "priority": "normal",
+      "decision": "skip",
+      "notes": "Out of scope - adds dependency",
+      "risk_level": "n/a"
+    }
+  ],
+
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Should I refactor all path handling or just fix this specific case?",
+      "options": [
+        {"label": "Quick fix", "description": "Fix only auth.py (5 lines)"},
+        {"label": "Full refactor", "description": "Modernize all path handling (45 lines)"},
+        {"label": "Skip", "description": "Not a priority"}
+      ],
+      "recommended": "Quick fix",
+      "answered": true,
+      "answer": "Quick fix"
+    }
+  ],
+
+  "git": {
+    "branch": "ru/review/20250104-103000-12345/owner-repo",
+    "base_ref": "main",
+    "commits": [
+      {"sha": "abc123", "subject": "Fix Windows path handling in auth.py"}
+    ],
+    "tests": {
+      "ran": true,
+      "ok": true,
+      "command": "make test",
+      "output_summary": "12 tests passed"
+    }
+  },
+
+  "gh_actions": [
+    {
+      "op": "comment",
+      "target": "issue#42",
+      "body": "Fixed in commit abc123. The issue was path separators..."
+    },
+    {
+      "op": "close",
+      "target": "issue#42",
+      "reason": "completed"
+    },
+    {
+      "op": "comment",
+      "target": "pr#15",
+      "body": "Thank you for the suggestion. After review, I've decided..."
+    }
+  ],
+
+  "metadata": {
+    "started_at": "2025-01-04T10:30:00Z",
+    "completed_at": "2025-01-04T10:45:00Z",
+    "duration_seconds": 900,
+    "context_usage_percent": 45
+  }
+}
+```
+
+**Validation:**
+```bash
+validate_review_plan() {
+    local plan_file="$1"
+
+    # Must be valid JSON
+    jq empty "$plan_file" || return 1
+
+    # Must have required fields
+    jq -e '.schema_version and .repo and .items' "$plan_file" >/dev/null || return 1
+
+    # Items must have required fields
+    jq -e '.items | all(.type and .number and .decision)' "$plan_file" >/dev/null || return 1
+
+    return 0
+}
+```
+
 ---
 
 ## 9. Technical Deep Dive: ntm Integration
@@ -1063,20 +1501,29 @@ ntm detects these conditions automatically:
 | **Auth Failure** | Pattern: "unauthorized", "invalid.*key" | Alert user |
 | **Network Error** | Pattern: "connection refused", "timed out" | Retry with backoff |
 
-### 9.3 Workflow Pipeline for Reviews
+### 9.3 Workflow Pipeline for Reviews (Plan Mode - No Direct Mutations)
 
 ```yaml
 # ~/.config/ntm/workflows/github-review.yaml
 schema_version: "2.0"
 name: github-review
-description: Review GitHub issues and PRs for a repository
+description: |
+  Automated GitHub issue and PR review workflow (Plan Mode).
+  Agent produces local patches + review-plan.json artifact.
+  NO direct GitHub mutations - ru applies approved actions separately.
 
 inputs:
-  repo_path:
-    description: Path to local repository
+  worktree_path:
+    description: Path to isolated worktree (not main repo)
     required: true
   repo_name:
     description: GitHub repo identifier (owner/repo)
+    required: true
+  repo_digest_path:
+    description: Path to cached repo digest (if exists)
+    required: false
+  work_items:
+    description: JSON array of work items to review
     required: true
 
 settings:
@@ -1089,25 +1536,32 @@ steps:
     type: shell
     command: |
       gh auth status || exit 1
-      issues=$(gh issue list -R ${inputs.repo_name} --state open --json number --jq 'length')
-      prs=$(gh pr list -R ${inputs.repo_name} --state open --json number --jq 'length')
-      [ "$((issues + prs))" -gt 0 ] || { echo "No activity"; exit 0; }
+      # Verify worktree exists and is clean
+      test -d "${inputs.worktree_path}/.git" || exit 1
+      test -d "${inputs.worktree_path}/.ru" || mkdir -p "${inputs.worktree_path}/.ru"
     on_failure: abort
-
-  - id: update_repo
-    type: shell
-    command: git -C "${inputs.repo_path}" pull --ff-only 2>/dev/null || true
-    depends_on: [verify_prerequisites]
 
   - id: understand_codebase
     agent: claude
-    depends_on: [update_repo]
+    depends_on: [verify_prerequisites]
     prompt: |
-      First read ALL of the AGENTS.md file and README.md file super carefully
-      and understand ALL of both! Then use your code investigation agent mode
-      to fully understand the code, and technical architecture and purpose of
-      the project. Use ultrathink.
-    working_dir: ${inputs.repo_path}
+      First read ALL of AGENTS.md and README.md carefully.
+
+      ${inputs.repo_digest_path ? "
+      A prior repo digest exists at .ru/repo-digest.md - read it first.
+      Then update it based on changes since last review:
+        • inspect git log since the last review timestamp
+        • inspect changed files and any new architecture decisions
+      " : "
+      No prior digest exists. Create a comprehensive repo digest covering:
+        • Project purpose and architecture
+        • Key files and modules
+        • Patterns and conventions used
+      "}
+
+      Write the updated digest to .ru/repo-digest.md.
+      Use ultrathink.
+    working_dir: ${inputs.worktree_path}
     wait: completion
     timeout: 10m
     health_check:
@@ -1118,60 +1572,94 @@ steps:
     agent: claude
     depends_on: [understand_codebase]
     prompt: |
-      We don't allow PRs or outside contributions to this project as a matter
-      of policy; here is the policy disclosed to users:
+      POLICY: We don't allow PRs or outside contributions. The maintainer's
+      disclosed policy:
 
-      > *About Contributions:* Please don't take this the wrong way, but I do
-      not accept outside contributions for any of my projects. I simply don't
+      > *About Contributions:* I do not accept outside contributions. I don't
       have the mental bandwidth to review anything, and it's my name on the
-      thing, so I'm responsible for any problems it causes; thus, the
-      risk-reward is highly asymmetric from my perspective. I'd also have to
-      worry about other "stakeholders," which seems unwise for tools I mostly
-      make for myself for free. Feel free to submit issues, and even PRs if
-      you want to illustrate a proposed fix, but know I won't merge them
-      directly. Instead, I'll have Claude or Codex review submissions via `gh`
-      and independently decide whether and how to address them. Bug reports in
-      particular are welcome. Sorry if this offends, but I want to avoid
-      wasted time and hurt feelings. I understand this isn't in sync with the
-      prevailing open-source ethos that seeks community contributions, but
-      it's the only way I can move at this velocity and keep my sanity.
+      thing. Feel free to submit issues and PRs to illustrate fixes, but I
+      won't merge them directly. Claude will review and independently decide
+      whether and how to address them. Bug reports are welcome.
 
-      But I want you to now use the `gh` utility to review all open issues and
-      PRs and to independently read and review each of these carefully; without
-      trusting or relying on any of the user reports being correct, or their
-      suggested/proposed changes or "fixes" being correct, I want you to do
-      your own totally separate and independent verification and validation.
-      You can use the stuff from users as possible inspiration, but everything
-      has to come from your own mind and/or official documentation and the
-      actual code and empirical, independent evidence. Note that MANY of these
-      are likely out of date because I made tons of fixes and changes already;
-      it's important to look at the dates and subsequent commits. Use ultrathink.
-      After you have reviewed things carefully and taken actions in response
-      (including implementing possible fixes or new features), you can respond
-      on my behalf using `gh`.
+      TASK: Review the following work items using `gh` to read details:
+      ${inputs.work_items}
 
-      Just a reminder: we do NOT accept ANY PRs. You can look at them to see if
-      they contain good ideas but even then you must check with me first before
-      integrating even ideas because they could take the project into another
-      direction I don't like or introduce scope creep. Use ultrathink.
-    working_dir: ${inputs.repo_path}
+      For each item:
+      1. Read the issue/PR independently via `gh issue view` or `gh pr view`
+      2. Verify claims independently - don't trust user reports blindly
+      3. Check dates against recent commits (many issues may be stale)
+      4. If actionable: create local commits with fixes/features
+      5. If needs clarification: prepare a question for the maintainer
+
+      CRITICAL RESTRICTIONS:
+      - DO NOT run `gh issue comment`, `gh issue close`, `gh pr comment`, etc.
+      - DO NOT push any changes
+      - Only use `gh` for READ operations (view, list)
+      - All mutations will be applied by ru in a separate phase
+
+      REQUIRED OUTPUT:
+      You MUST produce a structured review plan artifact at:
+        .ru/review-plan.json
+
+      Schema:
+      {
+        "schema_version": 1,
+        "run_id": "${env.REVIEW_RUN_ID}",
+        "repo": "${inputs.repo_name}",
+        "items": [
+          {"type": "issue|pr", "number": N, "priority": "...",
+           "decision": "fix|close|needs-info|skip", "notes": "..."}
+        ],
+        "questions": [
+          {"id": "q1", "prompt": "...", "options": [...], "recommended": "a"}
+        ],
+        "git": {
+          "branch": "current branch name",
+          "commits": [{"sha": "...", "subject": "..."}],
+          "tests": {"ran": true|false, "ok": true|false, "command": "..."}
+        },
+        "gh_actions": [
+          {"op": "comment", "target": "issue#42", "body": "..."},
+          {"op": "close", "target": "issue#42", "reason": "completed"}
+        ]
+      }
+
+      Use ultrathink.
+    working_dir: ${inputs.worktree_path}
     wait: user_interaction
     timeout: 30m
     on_question:
       action: queue
-      priority: normal
+      priority: ${question.urgency:-normal}
+      metadata:
+        repo: ${inputs.repo_name}
+        worktree: ${inputs.worktree_path}
 
-  - id: push_changes
+  - id: finalize_artifacts
     type: shell
     depends_on: [review_issues_prs]
-    command: git -C "${inputs.repo_path}" push 2>/dev/null || true
-    on_failure: warn
+    command: |
+      # Verify review plan was created
+      test -f "${inputs.worktree_path}/.ru/review-plan.json" || {
+        echo "ERROR: Missing review plan artifact"
+        exit 1
+      }
+      # Validate JSON
+      jq empty "${inputs.worktree_path}/.ru/review-plan.json" || {
+        echo "ERROR: Invalid JSON in review plan"
+        exit 1
+      }
+      echo "Artifacts ready for apply phase"
+    on_failure: abort
 
 outputs:
-  issues_addressed:
-    value: ${steps.review_issues_prs.issues_count:-0}
-  prs_reviewed:
-    value: ${steps.review_issues_prs.prs_count:-0}
+  plan_path:
+    value: ${inputs.worktree_path}/.ru/review-plan.json
+  digest_path:
+    value: ${inputs.worktree_path}/.ru/repo-digest.md
+  items_reviewed:
+    description: Number of items reviewed
+    value: ${steps.review_issues_prs.items_count:-0}
 ```
 
 ### 9.4 New ntm Components Needed
@@ -1263,7 +1751,7 @@ func RouteAnswer(question *Question, answer string) error {
 }
 ```
 
-### 9.8 Activity Detection (ntm Go Code)
+### 9.8 Activity Detection (ntm Go Code + Wait Reasons)
 
 ```go
 // Activity states for Claude Code
@@ -1272,29 +1760,127 @@ const (
     StateWaiting    = "WAITING"     // Idle at prompt, ready for input
     StateThinking   = "THINKING"    // Low velocity, processing
     StateError      = "ERROR"       // Error patterns detected
+    StateStalled    = "STALLED"     // No output for extended period
 )
 
-// Detection heuristics
-func DetectClaudeState(pane *Pane) string {
+// Wait reasons: WHY the system believes we are waiting
+// This is critical for proper question routing and UX
+const (
+    WaitAskUserQuestion = "ask_user_question"  // Structured tool call detected
+    WaitAgentQuestion   = "agent_question_text" // Text-based question at prompt
+    WaitExternalPrompt  = "external_prompt"     // Shell, git, auth prompt
+    WaitUnknown         = "unknown"             // Waiting but reason unclear
+)
+
+// WaitInfo provides context about why a session is waiting
+type WaitInfo struct {
+    Reason      string   // One of Wait* constants
+    Context     string   // Relevant output context
+    Options     []string // Detected options if any
+    Recommended string   // Suggested response if determinable
+    RiskLevel   string   // low, medium, high
+}
+
+// Detection heuristics with wait reason extraction
+func DetectClaudeState(pane *Pane) (state string, waitInfo *WaitInfo) {
     output := pane.CaptureLastN(50)  // Last 50 lines
     velocity := pane.OutputVelocity()
+    lastActivity := pane.LastActivityTime()
 
-    // Check for error patterns
+    // Check for error patterns first (highest priority)
     if containsErrorPattern(output) {
-        return StateError
+        return StateError, nil
     }
 
-    // Check for waiting patterns (prompt visible, no activity)
+    // Check for stall (no output for 5+ minutes while previously active)
+    if velocity == 0 && time.Since(lastActivity) > 5*time.Minute {
+        return StateStalled, nil
+    }
+
+    // Check for waiting state with reason detection
     if velocity < 1.0 && containsPromptPattern(output) {
-        return StateWaiting
+        waitInfo := &WaitInfo{RiskLevel: "low"}
+
+        // Priority 1: Structured AskUserQuestion tool call
+        if askUserQ := extractAskUserQuestion(output); askUserQ != nil {
+            waitInfo.Reason = WaitAskUserQuestion
+            waitInfo.Context = askUserQ.Question
+            waitInfo.Options = askUserQ.Options
+            waitInfo.Recommended = askUserQ.Recommended
+            return StateWaiting, waitInfo
+        }
+
+        // Priority 2: Agent asking a text-based question
+        if questionText := extractQuestionText(output); questionText != "" {
+            waitInfo.Reason = WaitAgentQuestion
+            waitInfo.Context = questionText
+            waitInfo.Options = extractInlineOptions(output)
+            return StateWaiting, waitInfo
+        }
+
+        // Priority 3: External prompt (git conflict, auth, shell)
+        if extPrompt := detectExternalPrompt(output); extPrompt != "" {
+            waitInfo.Reason = WaitExternalPrompt
+            waitInfo.Context = extPrompt
+            waitInfo.RiskLevel = classifyExternalPromptRisk(extPrompt)
+            return StateWaiting, waitInfo
+        }
+
+        // Unknown wait state
+        waitInfo.Reason = WaitUnknown
+        waitInfo.Context = output[len(output)-min(len(output), 500):]
+        return StateWaiting, waitInfo
     }
 
     // Check for active generation
     if velocity > 10.0 {
-        return StateGenerating
+        return StateGenerating, nil
     }
 
-    return StateThinking
+    return StateThinking, nil
+}
+
+// Detect external prompts that might block the agent
+func detectExternalPrompt(output string) string {
+    externalPatterns := []struct {
+        pattern string
+        desc    string
+    }{
+        {`CONFLICT.*Merge conflict`, "git merge conflict"},
+        {`Please enter.*commit message`, "git commit prompt"},
+        {`Enter passphrase`, "SSH key passphrase"},
+        {`Password:`, "password prompt"},
+        {`\(yes/no\)`, "SSH host verification"},
+        {`error: cannot pull with rebase`, "git rebase conflict"},
+        {`Username for`, "git credentials prompt"},
+        {`gh auth login`, "gh auth required"},
+    }
+
+    for _, p := range externalPatterns {
+        if regexp.MustCompile(p.pattern).MatchString(output) {
+            return p.desc
+        }
+    }
+    return ""
+}
+
+// Classify risk level of external prompts
+func classifyExternalPromptRisk(prompt string) string {
+    highRisk := []string{"password", "passphrase", "credential", "auth"}
+    mediumRisk := []string{"conflict", "merge", "rebase"}
+
+    lower := strings.ToLower(prompt)
+    for _, pattern := range highRisk {
+        if strings.Contains(lower, pattern) {
+            return "high"
+        }
+    }
+    for _, pattern := range mediumRisk {
+        if strings.Contains(lower, pattern) {
+            return "medium"
+        }
+    }
+    return "low"
 }
 
 // Patterns indicating Claude is waiting for input
@@ -1307,7 +1893,7 @@ var waitingPatterns = []string{
     `Press Enter to continue`,     // Continuation prompt
 }
 
-// Patterns indicating a question
+// Patterns indicating a question in agent text
 var questionPatterns = []string{
     `Should I`,
     `Do you want`,
@@ -1320,11 +1906,12 @@ var questionPatterns = []string{
 }
 ```
 
-### 9.9 Fallback When ntm Unavailable
+### 9.9 Driver Selection (Unified Interface)
 
 ```bash
-# Check for ntm and gracefully degrade
+# Detect best available driver and validate prerequisites
 check_review_prerequisites() {
+    # Required: GitHub CLI
     if ! command -v gh &>/dev/null; then
         log_error "GitHub CLI (gh) is required for reviews"
         log_info "Install: https://cli.github.com/"
@@ -1337,80 +1924,246 @@ check_review_prerequisites() {
         return 3
     fi
 
-    # ntm is optional but recommended
-    if ! command -v ntm &>/dev/null; then
-        log_warn "ntm not found - using basic mode (sequential, limited TUI)"
-        log_info "For enhanced experience, install ntm: https://github.com/..."
-        REVIEW_MODE="basic"
-        return 0
+    # Required: Claude CLI with stream-json support
+    if ! command -v claude &>/dev/null; then
+        log_error "Claude CLI is required for reviews"
+        log_info "Install: https://github.com/anthropics/claude-code"
+        return 3
     fi
 
-    # Verify ntm version supports robot mode
-    if ! ntm --robot-status &>/dev/null; then
-        log_warn "ntm version doesn't support robot mode - using basic mode"
-        REVIEW_MODE="basic"
-        return 0
+    # Required for local driver: tmux
+    if ! command -v tmux &>/dev/null; then
+        log_error "tmux is required for local driver"
+        log_info "Install: brew install tmux (macOS) or apt install tmux (Linux)"
+        return 3
     fi
 
-    REVIEW_MODE="ntm"
     return 0
 }
+
+# Select the best available driver
+# Both drivers implement the same interface and emit the same normalized events
+detect_review_driver() {
+    # Try ntm first (preferred - has advanced features)
+    if command -v ntm &>/dev/null; then
+        if ntm --robot-status &>/dev/null 2>&1; then
+            log_verbose "Using ntm driver (robot mode available)"
+            echo "ntm"
+            return
+        fi
+        log_verbose "ntm found but robot mode unavailable"
+    fi
+
+    # Fall back to local driver (tmux + stream-json)
+    if command -v tmux &>/dev/null && claude --version &>/dev/null; then
+        log_verbose "Using local driver (tmux + stream-json)"
+        echo "local"
+        return
+    fi
+
+    log_error "No suitable driver available"
+    echo "unsupported"
+}
+
+# Session Driver Interface (Bash implementation sketch)
+# Both ntm and local drivers implement this interface
+
+# start_session(repo_ctx) -> session_id
+# send_to_session(session_id, message)
+# stream_session(session_id) -> normalized events via callback
+# interrupt_session(session_id)
+# stop_session(session_id)
+
+# Local driver implementation (tmux + stream-json)
+local_driver_start() {
+    local worktree_path="$1"
+    local session_name="$2"
+    local prompt="$3"
+
+    # Create tmux session with Claude in stream-json mode
+    tmux new-session -d -s "$session_name" -c "$worktree_path" \
+        "claude -p '$prompt' --output-format stream-json 2>&1 | tee .ru/session.log"
+
+    # Start background event parser
+    start_event_parser "$session_name" "$worktree_path/.ru/session.log" &
+
+    echo "$session_name"
+}
+
+local_driver_send() {
+    local session_id="$1"
+    local message="$2"
+    tmux send-keys -t "$session_id" "$message" Enter
+}
+
+# Normalized event schema (same for both drivers)
+# {
+#   "type": "init|generating|waiting|complete|error",
+#   "session_id": "...",
+#   "wait_info": {          # only if type=waiting
+#     "reason": "ask_user_question|agent_question_text|external_prompt|unknown",
+#     "context": "...",
+#     "options": [...],
+#     "recommended": "...",
+#     "risk_level": "low|medium|high"
+#   },
+#   "timestamp": "..."
+# }
 ```
 
 ---
 
 ## 10. Performance Optimization Strategies
 
-### 10.1 GitHub API Optimization
+### 10.1 GitHub API Optimization (GraphQL Alias Batching)
+
+Note: Discovery now uses true GraphQL alias batching (see Section 7.1.2).
+This replaces the per-repo O(n) approach with chunked batch queries.
 
 ```bash
-# Batch queries to reduce API calls
-batch_fetch_repo_activity() {
-    local repos=("$@")
+# GraphQL alias batching is implemented in gh_api_graphql_repo_batch()
+# Key benefits:
+# - 10-100× fewer API calls
+# - Single round-trip per chunk of 25 repos
+# - Returns all metadata needed for scoring in one response
 
-    # Use GraphQL for batch queries (much faster than REST)
-    local query='query($repos: [String!]!) {
-      repositories: nodes(ids: $repos) {
-        ... on Repository {
-          nameWithOwner
-          issues(states: OPEN) { totalCount }
-          pullRequests(states: OPEN) { totalCount }
-        }
-      }
-    }'
-
-    # Execute batch query
-    gh api graphql -f query="$query" \
-        -f repos="$(printf '%s\n' "${repos[@]}" | jq -R . | jq -s .)"
+# Cache discovery results (invalidated on config change)
+CACHE_TTL_DISCOVERY=300  # 5 minutes
+get_discovery_cache_key() {
+    # Hash of repo list + config
+    local config_hash
+    config_hash=$(get_config_hash)
+    echo "discovery-${config_hash}"
 }
-
-# Cache with intelligent TTL
-CACHE_TTL_ACTIVE=300     # 5 min for repos with activity
-CACHE_TTL_INACTIVE=3600  # 1 hour for repos without activity
 ```
 
 ### 10.2 Parallel Session Management
 
 ```bash
-# Optimal parallelism calculation
+# Initial parallelism calculation (adjusted by governor)
 calculate_optimal_parallelism() {
     local total_repos="$1"
 
+    # The real source of truth is the rate-limit governor (see 10.2.1)
+    # This provides a starting point
+
     # Factors:
-    # - API rate limits (5000/hour for authenticated)
-    # - Claude rate limits (varies by tier)
+    # - API rate limits (read from gh api rate_limit, not guessed)
+    # - Claude rate limits (detected via 429 responses)
     # - System resources (memory, CPU)
     # - Context quality (too many sessions = divided attention)
 
-    local max_by_rate_limit=10      # Conservative API limit
     local max_by_resources=8        # Based on typical system
     local max_by_quality=6          # Optimal for attention
 
     local optimal=$((total_repos < max_by_quality ? total_repos : max_by_quality))
     optimal=$((optimal < max_by_resources ? optimal : max_by_resources))
-    optimal=$((optimal < max_by_rate_limit ? optimal : max_by_rate_limit))
 
     echo "$optimal"
+}
+```
+
+### 10.2.1 Adaptive Rate-Limit Governor (GitHub + Model)
+
+The scheduler runs with a governor that dynamically adjusts concurrency based on
+real rate limit data, not static heuristics.
+
+```bash
+# Governor state
+declare -A GOVERNOR_STATE=(
+    [github_remaining]=5000
+    [github_reset]=0
+    [model_in_backoff]=false
+    [model_backoff_until]=0
+    [effective_parallelism]=4
+    [circuit_breaker_open]=false
+)
+
+# Start governor loop (runs in background during review)
+start_rate_limit_governor() {
+    local check_interval=30  # seconds
+
+    while [[ -f "$RU_STATE_DIR/review.lock" ]]; do
+        update_github_rate_limit
+        check_model_rate_limit
+        adjust_parallelism
+        sleep "$check_interval"
+    done &
+    GOVERNOR_PID=$!
+}
+
+# Query actual GitHub rate limit
+update_github_rate_limit() {
+    local rate_info
+    rate_info=$(gh api rate_limit 2>/dev/null) || return 1
+
+    GOVERNOR_STATE[github_remaining]=$(echo "$rate_info" | jq '.resources.core.remaining')
+    GOVERNOR_STATE[github_reset]=$(echo "$rate_info" | jq '.resources.core.reset')
+
+    # Check if approaching limit
+    if [[ ${GOVERNOR_STATE[github_remaining]} -lt 500 ]]; then
+        log_warn "GitHub API rate limit low: ${GOVERNOR_STATE[github_remaining]} remaining"
+        GOVERNOR_STATE[effective_parallelism]=1
+    fi
+}
+
+# Detect model rate limits from session streams
+check_model_rate_limit() {
+    local now
+    now=$(date +%s)
+
+    # Check for recent 429 errors in session logs
+    local recent_429s
+    recent_429s=$(grep -l "rate.limit\|429\|quota.exceeded" \
+        "$RU_STATE_DIR/worktrees/$REVIEW_RUN_ID"/*/.ru/session.log 2>/dev/null | wc -l)
+
+    if [[ $recent_429s -gt 2 ]]; then
+        GOVERNOR_STATE[model_in_backoff]=true
+        GOVERNOR_STATE[model_backoff_until]=$((now + 60))
+        log_warn "Model rate limit detected, backing off for 60s"
+    elif [[ ${GOVERNOR_STATE[model_in_backoff]} == "true" ]] && \
+         [[ $now -gt ${GOVERNOR_STATE[model_backoff_until]} ]]; then
+        GOVERNOR_STATE[model_in_backoff]=false
+    fi
+}
+
+# Adjust parallelism based on current conditions
+adjust_parallelism() {
+    local target=${REVIEW_PARALLEL:-4}
+
+    # Reduce if GitHub rate limit low
+    if [[ ${GOVERNOR_STATE[github_remaining]} -lt 1000 ]]; then
+        target=$((target / 2))
+        [[ $target -lt 1 ]] && target=1
+    fi
+
+    # Reduce if model in backoff
+    if [[ ${GOVERNOR_STATE[model_in_backoff]} == "true" ]]; then
+        target=1
+    fi
+
+    # Circuit breaker: too many errors in sliding window
+    local recent_errors
+    recent_errors=$(count_recent_session_errors 300)  # last 5 minutes
+    if [[ $recent_errors -gt 5 ]]; then
+        GOVERNOR_STATE[circuit_breaker_open]=true
+        target=0
+        log_error "Circuit breaker open: too many errors, pausing new sessions"
+    fi
+
+    GOVERNOR_STATE[effective_parallelism]=$target
+}
+
+# Called by scheduler before starting new session
+can_start_new_session() {
+    [[ ${GOVERNOR_STATE[circuit_breaker_open]} == "true" ]] && return 1
+    [[ ${GOVERNOR_STATE[model_in_backoff]} == "true" ]] && return 1
+
+    local active_sessions
+    active_sessions=$(count_active_sessions)
+    [[ $active_sessions -ge ${GOVERNOR_STATE[effective_parallelism]} ]] && return 1
+
+    return 0
 }
 ```
 
@@ -1740,7 +2493,7 @@ show_question_basic_mode() {
 }
 ```
 
-### 12.4 Keyboard Shortcuts
+### 12.4 Keyboard Shortcuts (Enhanced)
 
 | Key | Action | Context |
 |-----|--------|---------|
@@ -1749,16 +2502,170 @@ show_question_basic_mode() {
 | `d` | Drill-down to full session | Main |
 | `s` | Skip current question | Main |
 | `S` | Skip all questions (with confirm) | Main |
+| `z` | Snooze item/question (1d/7d/30d) | Main |
+| `t` | Insert response template | Main |
+| `b` | Bulk apply safe approvals (low-risk + tests pass) | Main |
+| `a` | Apply approved changes (Plan → Apply) | Main |
 | `p` | Pause new sessions | Main |
 | `r` | Resume paused sessions | Main |
 | `h` | Show help overlay | Any |
 | `q` | Quit (with confirm if active) | Any |
 | `Esc` | Back / Cancel | Drill-down |
 | `v` | View raw session output | Drill-down |
+| `P` | View patch summary (changed files, LOC, test status) | Drill-down |
 | `a`/`b`/`c` | Quick answer selection | Drill-down |
 | `j`/`k` or `↑`/`↓` | Navigate questions | Main |
 | `/` | Search questions | Main |
 | `Tab` | Switch between panels | Main |
+
+### 12.4.1 Snooze Feature
+
+Snooze allows deferring items without skipping them permanently:
+
+```bash
+# Snooze durations
+SNOOZE_1D=86400      # 1 day
+SNOOZE_7D=604800     # 7 days
+SNOOZE_30D=2592000   # 30 days
+
+snooze_item() {
+    local item_key="$1"
+    local duration="$2"
+
+    local until_ts
+    until_ts=$(($(date +%s) + duration))
+
+    write_json_atomic "$RU_STATE_DIR/snoozed.json" \
+        "$(jq --arg key "$item_key" --arg until "$until_ts" \
+            '.[$key] = $until' "$RU_STATE_DIR/snoozed.json")"
+}
+
+is_snoozed() {
+    local item_key="$1"
+    local now
+    now=$(date +%s)
+
+    local until_ts
+    until_ts=$(jq -r --arg key "$item_key" '.[$key] // 0' "$RU_STATE_DIR/snoozed.json")
+
+    [[ $until_ts -gt $now ]]
+}
+```
+
+### 12.4.2 Response Templates
+
+Pre-configured responses for common patterns:
+
+```bash
+# ~/.config/ru/templates/
+# ├── stale-issue.md
+# ├── duplicate.md
+# ├── needs-info.md
+# ├── wontfix.md
+# └── thank-you.md
+
+load_response_templates() {
+    local templates_dir="$RU_CONFIG_DIR/templates"
+    declare -gA RESPONSE_TEMPLATES
+
+    for file in "$templates_dir"/*.md; do
+        [[ -f "$file" ]] || continue
+        local name="${file##*/}"
+        name="${name%.md}"
+        RESPONSE_TEMPLATES["$name"]=$(cat "$file")
+    done
+}
+
+show_template_picker() {
+    local selected
+    selected=$(printf '%s\n' "${!RESPONSE_TEMPLATES[@]}" | gum choose)
+    echo "${RESPONSE_TEMPLATES[$selected]}"
+}
+```
+
+### 12.4.3 Bulk Apply (Safe Approvals)
+
+Apply all low-risk changes that pass quality gates:
+
+```bash
+bulk_apply_safe() {
+    local -a safe_plans=()
+
+    # Find plans that are safe to auto-apply
+    for plan_file in "$RU_STATE_DIR/worktrees/$REVIEW_RUN_ID"/*/.ru/review-plan.json; do
+        [[ -f "$plan_file" ]] || continue
+
+        local risk_level tests_ok
+        risk_level=$(jq -r '.git.tests.risk_level // "medium"' "$plan_file")
+        tests_ok=$(jq -r '.git.tests.ok // false' "$plan_file")
+
+        # Only auto-apply if:
+        # - All items are low-risk
+        # - Tests ran and passed
+        # - No unanswered questions
+        if [[ "$risk_level" == "low" ]] && [[ "$tests_ok" == "true" ]]; then
+            local unanswered
+            unanswered=$(jq '[.questions[] | select(.answered != true)] | length' "$plan_file")
+            if [[ $unanswered -eq 0 ]]; then
+                safe_plans+=("$plan_file")
+            fi
+        fi
+    done
+
+    if [[ ${#safe_plans[@]} -eq 0 ]]; then
+        log_info "No plans qualify for bulk apply"
+        return 0
+    fi
+
+    log_info "Found ${#safe_plans[@]} plans eligible for bulk apply"
+
+    if gum_confirm "Apply ${#safe_plans[@]} safe plans?"; then
+        for plan_file in "${safe_plans[@]}"; do
+            local wt_path="${plan_file%/.ru/review-plan.json}"
+            apply_single_plan "$wt_path" "$plan_file"
+        done
+    fi
+}
+```
+
+### 12.4.4 Patch Summary View
+
+Show what changed before approving:
+
+```bash
+show_patch_summary() {
+    local plan_file="$1"
+    local wt_path="${plan_file%/.ru/review-plan.json}"
+
+    # Extract summary from plan
+    local branch commits_count files_changed lines_added lines_removed test_status
+
+    branch=$(jq -r '.git.branch' "$plan_file")
+    commits_count=$(jq '.git.commits | length' "$plan_file")
+    test_status=$(jq -r 'if .git.tests.ok then "PASS" else "FAIL" end' "$plan_file")
+
+    # Get diff stats
+    local diff_stat
+    diff_stat=$(git -C "$wt_path" diff --stat HEAD~"$commits_count"..HEAD 2>/dev/null || echo "No changes")
+
+    gum style --border rounded --padding "1 2" << EOF
+PATCH SUMMARY: $(basename "$wt_path")
+═══════════════════════════════════════════════════════════════
+
+Branch: $branch
+Commits: $commits_count
+Tests: $test_status
+
+Changed Files:
+$diff_stat
+
+Items Addressed:
+$(jq -r '.items[] | "  • \(.type) #\(.number): \(.decision)"' "$plan_file")
+
+gh_actions Pending:
+$(jq -r '.gh_actions[] | "  • \(.op) \(.target)"' "$plan_file")
+EOF
+}
 
 ### 12.5 Accessibility Considerations
 
@@ -1905,29 +2812,161 @@ select_best_mode() {
 | Anthropic API | System keychain | High | Environment variable, not file |
 | ntm sessions | Local only | Low | Tmux session security |
 
-### 14.2 Code Execution Safety
+### 14.2 Code Execution Safety (Plan Mode Restrictions)
+
+Claude operates under an explicit execution policy enforced by the workflow:
+
+**Plan Mode (default):**
+- Read/Write/Edit files in the isolated worktree only
+- Run local commands (git, grep, make, npm test, etc.)
+- `gh` is READ-ONLY: `gh issue view`, `gh pr view`, `gh issue list` allowed
+- `gh` MUTATIONS BLOCKED: `gh issue comment`, `gh issue close`, `gh pr merge` etc.
+- NO direct push to remote
+- All mutations are deferred to Apply phase
+
+**Apply Mode (--apply):**
+- ru (not the agent) executes approved actions from review-plan.json
+- Quality gates run before any push
+- Human confirmation required for high-risk operations
 
 ```bash
-# Claude operates in sandboxed repos
-# - Only allowed tools: Read, Write, Edit, Bash, gh
-# - Bash commands reviewed before execution
-# - No network access except gh API
-# - Changes are local until pushed
+# Safe Bash command allowlist for agent
+SAFE_BASH_COMMANDS=(
+    "git" "grep" "rg" "ag" "find" "ls" "cat" "head" "tail"
+    "make" "npm" "yarn" "pnpm" "cargo" "go" "python" "pytest"
+    "shellcheck" "eslint" "prettier" "black" "ruff"
+    "jq" "yq" "sed" "awk" "sort" "uniq" "wc" "diff"
+)
 
-# Validation before push
-validate_before_push() {
-    local repo_path="$1"
+# Commands that require human approval
+APPROVAL_REQUIRED_COMMANDS=(
+    "rm" "mv" "cp"  # File operations
+    "curl" "wget"   # Network operations
+    "docker" "kubectl"  # Container operations
+)
 
-    # Check for sensitive patterns
-    if git -C "$repo_path" diff --cached | grep -qiE 'password|secret|api.?key|token'; then
-        log_warn "Potential sensitive data detected in changes"
-        return 1
+# Blocked commands (never allowed)
+BLOCKED_COMMANDS=(
+    "sudo" "su"
+    "chmod +x" "chown"
+    "eval" "exec"
+)
+
+# Validate command before execution (called by pre-exec hook)
+validate_agent_command() {
+    local cmd="$1"
+    local first_word="${cmd%% *}"
+
+    # Check blocked list
+    for blocked in "${BLOCKED_COMMANDS[@]}"; do
+        if [[ "$cmd" == *"$blocked"* ]]; then
+            log_error "Blocked command: $cmd"
+            return 1
+        fi
+    done
+
+    # Check gh mutations
+    if [[ "$first_word" == "gh" ]]; then
+        if echo "$cmd" | grep -qE 'comment|close|merge|label|edit|delete'; then
+            log_error "gh mutations blocked in Plan mode: $cmd"
+            return 1
+        fi
     fi
 
-    # Run any configured pre-push hooks
-    if [[ -x "$repo_path/.git/hooks/pre-push" ]]; then
-        "$repo_path/.git/hooks/pre-push"
+    # Check approval required
+    for approval in "${APPROVAL_REQUIRED_COMMANDS[@]}"; do
+        if [[ "$first_word" == "$approval" ]]; then
+            queue_command_approval_question "$cmd"
+            return 2  # Pending approval
+        fi
+    done
+
+    return 0
+}
+```
+
+### 14.2.1 Quality Gates Before Push (Tests/Lint)
+
+ru supports per-repo quality gates that must pass before pushing:
+
+```bash
+# Quality gate configuration (per-repo or global)
+# ~/.config/ru/review-policies.d/<owner>_<repo>.conf
+# or ~/.config/ru/config
+
+# Example:
+# REVIEW_TEST_CMD="make test"
+# REVIEW_LINT_CMD="npm run lint"
+# REVIEW_REQUIRE_TESTS=true
+
+run_quality_gates() {
+    local wt_path="$1"
+    local plan_file="$2"
+
+    # Load per-repo policy if exists
+    local repo_id
+    repo_id=$(jq -r '.repo' "$plan_file")
+    local policy_file="$RU_CONFIG_DIR/review-policies.d/${repo_id//\//_}.conf"
+    [[ -f "$policy_file" ]] && source "$policy_file"
+
+    local test_cmd="${REVIEW_TEST_CMD:-}"
+    local lint_cmd="${REVIEW_LINT_CMD:-}"
+    local require_tests="${REVIEW_REQUIRE_TESTS:-false}"
+
+    # Run lint if configured
+    if [[ -n "$lint_cmd" ]]; then
+        log_step "Running lint: $lint_cmd"
+        if ! (cd "$wt_path" && eval "$lint_cmd"); then
+            log_error "Lint failed"
+            return 1
+        fi
     fi
+
+    # Run tests if configured
+    if [[ -n "$test_cmd" ]]; then
+        log_step "Running tests: $test_cmd"
+        if ! (cd "$wt_path" && eval "$test_cmd"); then
+            log_error "Tests failed"
+            return 1
+        fi
+    elif [[ "$require_tests" == "true" ]]; then
+        # Auto-detect test command
+        if [[ -f "$wt_path/Makefile" ]] && grep -q "^test:" "$wt_path/Makefile"; then
+            test_cmd="make test"
+        elif [[ -f "$wt_path/package.json" ]]; then
+            test_cmd="npm test"
+        elif [[ -f "$wt_path/Cargo.toml" ]]; then
+            test_cmd="cargo test"
+        fi
+
+        if [[ -n "$test_cmd" ]]; then
+            log_step "Auto-detected test command: $test_cmd"
+            if ! (cd "$wt_path" && eval "$test_cmd"); then
+                log_error "Tests failed"
+                return 1
+            fi
+        fi
+    fi
+
+    # Secret scanning (optional: use gitleaks if available)
+    if command -v gitleaks &>/dev/null; then
+        log_step "Scanning for secrets with gitleaks"
+        if ! gitleaks detect --source "$wt_path" --no-git; then
+            log_error "Secrets detected in changes"
+            return 1
+        fi
+    else
+        # Fallback to regex scan
+        if git -C "$wt_path" diff HEAD~1..HEAD | grep -qiE \
+            'password\s*=|api.?key\s*=|secret\s*=|token\s*=|private.?key'; then
+            log_warn "Potential secrets detected (install gitleaks for better detection)"
+            queue_question "secrets_warning" "$repo_id" "Potential secrets detected. Review and proceed?"
+            return 2  # Pending human review
+        fi
+    fi
+
+    log_success "Quality gates passed"
+    return 0
 }
 ```
 
@@ -2294,7 +3333,7 @@ Claude's approach:
 
 ## Appendix A: Command Reference
 
-### A.1 `ru review`
+### A.1 `ru review` (Plan → Apply)
 
 ```
 ru review - Review GitHub issues and PRs using Claude Code
@@ -2302,24 +3341,36 @@ ru review - Review GitHub issues and PRs using Claude Code
 USAGE:
     ru review [options]
 
+EXECUTION MODES:
+    --plan              Generate plans/patches only (default, safe)
+    --apply             Apply approved plans (push, gh comments, close, labels)
+
 OPTIONS:
-    --mode=MODE         Orchestration mode: auto, ntm, basic (default: auto)
-    --parallel=N        Parallel sessions in ntm mode (default: 4)
+    --mode=MODE         Driver mode: auto, ntm, local (default: auto)
+    --parallel=N        Parallel sessions (default: 4, adjusted by governor)
     --repos=PATTERN     Only review repos matching pattern
     --skip-days=N       Skip repos reviewed within N days (default: 7)
     --priority=LEVEL    Min priority: all, normal, high, critical (default: all)
-    --dry-run           Preview without starting
+    --dry-run           Discovery only, don't start sessions
     --resume            Resume interrupted session
-    --no-push           Don't push changes (review only)
+    --push              Allow pushing changes (only valid with --apply)
+    --no-push           Don't push changes (default)
     --json              Output progress as JSON
 
+COST BUDGET OPTIONS:
+    --max-repos=N       Limit to N repositories
+    --max-runtime=MIN   Stop after N minutes
+    --max-questions=N   Limit human questions to N
+
 EXAMPLES:
-    ru review                              # Review all repos
+    ru review                              # Plan-only review (safe default)
     ru review --dry-run                    # Preview what would be reviewed
+    ru review --apply --push               # Apply approved changes + push
     ru review --repos="myorg/*"            # Only repos in myorg
     ru review --priority=high              # Only high/critical priority
     ru review --parallel=8                 # More parallel sessions
     ru review --resume                     # Resume interrupted review
+    ru review --max-repos=5 --max-questions=10  # Limited run
 ```
 
 ### A.2 `ru review-status`
@@ -2396,13 +3447,45 @@ REVIEW_NOTIFY="true"
 
 ---
 
-## Appendix C: State File Formats
+## Appendix C: State File Formats (Atomic + Item-Level)
+
+State files use atomic writes with flock to prevent corruption from concurrent access
+or interrupted writes. Item-level tracking enables accurate per-issue/PR analytics.
+
+### C.0 State Locking
+
+```bash
+# Global lock for all state file operations
+acquire_state_lock() {
+    local lock_file="$RU_STATE_DIR/review.lock"
+    exec 200>"$lock_file"
+    flock -n 200 || return 1
+}
+
+release_state_lock() {
+    flock -u 200 2>/dev/null || true
+}
+
+# Atomic JSON write helper
+write_json_atomic() {
+    local file="$1"
+    local content="$2"
+    local tmp_file="${file}.tmp.$$"
+
+    echo "$content" > "$tmp_file"
+    mv "$tmp_file" "$file"
+}
+```
 
 ### C.1 Review State (`~/.local/state/ru/review-state.json`)
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "lock": {
+    "path": "~/.local/state/ru/review.lock",
+    "strategy": "flock"
+  },
   "repos": {
     "owner/repo": {
       "last_review": "2025-01-04T10:30:00Z",
@@ -2412,7 +3495,26 @@ REVIEW_NOTIFY="true"
       "issues_resolved": 2,
       "prs_closed": 0,
       "outcome": "completed",
-      "duration_seconds": 847
+      "duration_seconds": 847,
+      "digest_hash": "sha256:..."
+    }
+  },
+  "items": {
+    "owner/repo#issue-42": {
+      "type": "issue",
+      "number": 42,
+      "last_review": "2025-01-04T10:30:00Z",
+      "outcome": "fixed",
+      "plan_hash": "sha256:abc123...",
+      "notes": "Path handling fixed for Windows"
+    },
+    "owner/repo#pr-15": {
+      "type": "pr",
+      "number": 15,
+      "last_review": "2025-01-04T10:35:00Z",
+      "outcome": "closed",
+      "plan_hash": "sha256:def456...",
+      "notes": "Idea implemented independently"
     }
   },
   "runs": {
@@ -2420,8 +3522,13 @@ REVIEW_NOTIFY="true"
       "started_at": "2025-01-04T10:00:00Z",
       "completed_at": "2025-01-04T11:30:00Z",
       "repos_processed": 8,
-      "questions_answered": 12,
-      "mode": "ntm"
+      "items_processed": 14,
+      "questions_asked": 12,
+      "questions_answered": 10,
+      "questions_skipped": 2,
+      "mode": "ntm",
+      "driver": "ntm",
+      "worktrees_path": "~/.local/state/ru/worktrees/abc123"
     }
   }
 }
@@ -2606,13 +3713,305 @@ outputs:
 | **Stream-JSON** | Claude Code output mode for programmatic parsing |
 | **Activity Detection** | ntm's velocity-based agent state classification |
 | **Hysteresis** | Stability filter preventing rapid state flapping |
-| **Priority Score** | Calculated importance of reviewing a repo |
+| **Priority Score** | Calculated importance of reviewing a work item |
+| **Work Item** | Individual issue or PR being reviewed |
 | **Drill-down** | Viewing full session details from summary |
 | **Checkpoint** | Saved state for session recovery |
+| **Worktree** | Isolated git working tree for safe edits |
+| **Session Driver** | Unified interface for ntm and local execution |
+| **Review Plan Artifact** | Structured JSON output from agent session |
+| **Quality Gate** | Test/lint checks before apply phase |
+| **Rate-Limit Governor** | Adaptive concurrency controller |
+| **Repo Digest** | Cached codebase understanding for incremental reviews |
 
 ---
 
-*Document Version: 2.0*
+## Appendix F: Repo Digest Cache
+
+The repo digest cache eliminates repetitive "understand the codebase" work by
+maintaining a persistent summary of each repository.
+
+### F.1 Digest Storage
+
+```
+~/.local/state/ru/repo-digests/
+├── owner_repo.md          # Cached digest
+├── owner_repo.meta.json   # Metadata (last update, commit range)
+└── owner_other.md
+```
+
+### F.2 Digest Format
+
+```markdown
+# Repo Digest: owner/repo
+
+**Last Updated:** 2025-01-04T10:30:00Z
+**Commit Range:** abc123..def456
+**Review Run:** 20250104-103000-12345
+
+## Purpose
+Brief description of what this project does.
+
+## Architecture
+- Main entry point: src/main.py
+- Key modules: auth/, api/, models/
+- Database: SQLite with SQLAlchemy
+
+## Patterns & Conventions
+- Uses type hints throughout
+- Tests in tests/ directory (pytest)
+- CI: GitHub Actions (.github/workflows/)
+
+## Recent Changes (since last review)
+- Added new auth module (commit def456)
+- Refactored API endpoints (commit cde789)
+
+## Notes for Future Reviews
+- Consider updating deprecated dependency X
+- User #42 reported Windows issue (investigate)
+```
+
+### F.3 Digest Update Logic
+
+```bash
+prepare_repo_digests() {
+    local repos=("$@")
+
+    for repo_info in "${repos[@]}"; do
+        local repo_id wt_path
+        get_worktree_mapping "$repo_info" repo_id wt_path
+
+        local digest_cache="$RU_STATE_DIR/repo-digests/${repo_id//\//_}.md"
+        local meta_cache="$RU_STATE_DIR/repo-digests/${repo_id//\//_}.meta.json"
+
+        if [[ -f "$digest_cache" ]] && [[ -f "$meta_cache" ]]; then
+            # Copy cached digest to worktree
+            cp "$digest_cache" "$wt_path/.ru/repo-digest.md"
+
+            # Record commit range for delta update
+            local last_commit
+            last_commit=$(jq -r '.last_commit' "$meta_cache")
+            local current_commit
+            current_commit=$(git -C "$wt_path" rev-parse HEAD)
+
+            # Provide delta info to agent
+            if [[ "$last_commit" != "$current_commit" ]]; then
+                local changes
+                changes=$(git -C "$wt_path" log --oneline "$last_commit".."$current_commit" 2>/dev/null || echo "")
+                echo -e "\n## Changes Since Last Review\n$changes" >> "$wt_path/.ru/repo-digest.md"
+            fi
+        fi
+    done
+}
+
+# After successful review, update cache
+update_digest_cache() {
+    local wt_path="$1"
+    local repo_id="$2"
+
+    local digest_file="$wt_path/.ru/repo-digest.md"
+    if [[ -f "$digest_file" ]]; then
+        local cache_dir="$RU_STATE_DIR/repo-digests"
+        mkdir -p "$cache_dir"
+
+        cp "$digest_file" "$cache_dir/${repo_id//\//_}.md"
+
+        local current_commit
+        current_commit=$(git -C "$wt_path" rev-parse HEAD)
+
+        cat > "$cache_dir/${repo_id//\//_}.meta.json" << EOF
+{
+  "last_commit": "$current_commit",
+  "last_update": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "run_id": "$REVIEW_RUN_ID"
+}
+EOF
+    fi
+}
+```
+
+---
+
+## Appendix G: Testing & Verification
+
+### G.1 Bash Unit Tests (bats)
+
+Key areas requiring comprehensive tests:
+
+```bash
+# test/test_graphql_batching.bats
+
+@test "gh_api_graphql_repo_batch generates valid query" {
+    local chunk=$'owner1/repo1\nowner2/repo2'
+    local query
+    query=$(gh_api_graphql_repo_batch "$chunk" --dry-run)
+
+    [[ "$query" == *"repo0: repository(owner:\"owner1\", name:\"repo1\")"* ]]
+    [[ "$query" == *"repo1: repository(owner:\"owner2\", name:\"repo2\")"* ]]
+}
+
+@test "calculate_item_priority_score returns expected scores" {
+    # Security label should score highest
+    local score
+    score=$(calculate_item_priority_score "issue" "security,bug" "2024-12-01" "2025-01-01" "false")
+    [[ $score -ge 80 ]]
+
+    # Draft PR should score lower
+    score=$(calculate_item_priority_score "pr" "enhancement" "2024-12-01" "2025-01-01" "true")
+    [[ $score -lt 30 ]]
+}
+
+@test "write_json_atomic is atomic" {
+    local file="$BATS_TMPDIR/test.json"
+    echo '{"version":1}' > "$file"
+
+    # Simulate concurrent write
+    (
+        sleep 0.1
+        write_json_atomic "$file" '{"version":2}'
+    ) &
+
+    write_json_atomic "$file" '{"version":3}'
+    wait
+
+    # File should be valid JSON (not corrupted)
+    jq empty "$file"
+}
+```
+
+### G.2 Test Fixtures
+
+Store NDJSON fixture streams for parsing tests:
+
+```
+test/fixtures/
+├── claude_stream/
+│   ├── basic_session.ndjson
+│   ├── ask_user_question.ndjson
+│   ├── external_prompt.ndjson
+│   └── error_session.ndjson
+├── gh/
+│   ├── graphql_batch_response.json
+│   ├── rate_limit_response.json
+│   └── issue_list.json
+└── plans/
+    ├── simple_fix.json
+    ├── multiple_items.json
+    └── with_questions.json
+```
+
+### G.3 Integration Smoke Tests
+
+```bash
+# test/integration/test_review_flow.sh
+
+setup() {
+    # Create sandbox repos
+    SANDBOX="$BATS_TMPDIR/sandbox"
+    mkdir -p "$SANDBOX"
+
+    # Create test repo with fake issue
+    create_test_repo "$SANDBOX/test-repo" "owner/test-repo"
+}
+
+@test "dry-run discovery finds test repo" {
+    run ru review --dry-run --repos="owner/test-repo"
+    [[ $status -eq 0 ]]
+    [[ "$output" == *"test-repo"* ]]
+}
+
+@test "plan mode creates artifacts without pushing" {
+    run ru review --mode=local --repos="owner/test-repo" --plan
+    [[ $status -eq 0 ]]
+
+    # Verify worktree was created
+    [[ -d "$RU_STATE_DIR/worktrees"/*/"owner_test-repo" ]]
+
+    # Verify plan artifact exists
+    [[ -f "$RU_STATE_DIR/worktrees"/*/"owner_test-repo/.ru/review-plan.json" ]]
+
+    # Verify nothing was pushed
+    local remote_head
+    remote_head=$(git -C "$SANDBOX/test-repo" rev-parse origin/main)
+    local local_head
+    local_head=$(git -C "$SANDBOX/test-repo" rev-parse main)
+    [[ "$remote_head" == "$local_head" ]]
+}
+
+@test "apply mode requires explicit flag" {
+    # Run plan first
+    ru review --mode=local --repos="owner/test-repo" --plan
+
+    # Apply without --push should not push
+    run ru review --apply --no-push
+    [[ $status -eq 0 ]]
+
+    # Verify gh_actions were NOT executed
+    # (would require mocking gh)
+}
+```
+
+### G.4 Mocking External Dependencies
+
+```bash
+# test/mocks/gh_mock.sh
+
+# Set up mock gh command
+setup_gh_mock() {
+    export GH_MOCK_DIR="$BATS_TMPDIR/gh_mock"
+    mkdir -p "$GH_MOCK_DIR"
+
+    # Create mock gh script
+    cat > "$GH_MOCK_DIR/gh" << 'EOF'
+#!/bin/bash
+case "$*" in
+    "api rate_limit")
+        cat "$GH_MOCK_DIR/responses/rate_limit.json"
+        ;;
+    "api graphql"*)
+        cat "$GH_MOCK_DIR/responses/graphql.json"
+        ;;
+    "issue list"*)
+        cat "$GH_MOCK_DIR/responses/issues.json"
+        ;;
+    *)
+        echo "Mock: unknown command: $*" >&2
+        exit 1
+        ;;
+esac
+EOF
+    chmod +x "$GH_MOCK_DIR/gh"
+
+    export PATH="$GH_MOCK_DIR:$PATH"
+}
+```
+
+### G.5 Golden Plan Artifacts
+
+Store expected plan outputs for regression testing:
+
+```bash
+@test "review produces expected plan for fixture repo" {
+    # Run review on fixture
+    ru review --mode=local --repos="fixture/simple-bug" --plan
+
+    # Compare plan to golden file
+    local plan_file
+    plan_file=$(find "$RU_STATE_DIR/worktrees" -name "review-plan.json" | head -1)
+
+    # Use jq to compare (ignore timestamps)
+    local actual expected
+    actual=$(jq 'del(.run_id, .git.commits[].sha)' "$plan_file")
+    expected=$(jq 'del(.run_id, .git.commits[].sha)' "test/golden/simple-bug-plan.json")
+
+    [[ "$actual" == "$expected" ]]
+}
+```
+
+---
+
+*Document Version: 3.0*
 *Last Updated: January 2025*
 *Author: Claude (Opus 4.5)*
-*Word Count: ~10,000*
+*Word Count: ~15,000*
+*Revision: Integrated 14 architectural improvements for production-grade reliability*
