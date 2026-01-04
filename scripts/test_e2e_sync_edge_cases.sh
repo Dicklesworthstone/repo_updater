@@ -8,7 +8,7 @@
 #   - Merge conflicts during pull - git behavior
 #   - ru sync exit codes with different scenarios
 #   - Helpful error message verification
-#   - JSON output structure validation
+#   - Resume/restart interrupted sync functionality
 #
 # Note: Tests diverged/conflict scenarios using direct git commands
 # (ru sync uses gh CLI for cloning which requires network/auth)
@@ -511,11 +511,14 @@ test_autostash_dirty_repo() {
     echo "dirty changes" >> "$local_repo/file.txt"
 
     # Pull without autostash should fail (or warn)
-    local pull_output
-    pull_output=$(git -C "$local_repo" pull 2>&1) || true
-    local pull_exit=$?
+    local pull_output pull_exit
+    if pull_output=$(git -C "$local_repo" pull 2>&1); then
+        pull_exit=0
+    else
+        pull_exit=$?
+    fi
 
-    # Git should complain about uncommitted changes
+    # Git should complain about uncommitted changes or fail
     if [[ $pull_exit -ne 0 ]] || printf '%s\n' "$pull_output" | grep -qi "uncommitted\|stash\|dirty"; then
         pass "Pull detects dirty working directory"
     else
