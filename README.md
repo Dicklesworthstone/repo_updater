@@ -443,15 +443,45 @@ https://github.com/owner/repo
 # Shorthand (assumes github.com)
 owner/repo
 
-# Pin to specific branch
+# Pin to specific branch or tag
 owner/repo@develop
+owner/repo@v2.0.1
 
 # Custom local directory name
 owner/repo as custom-name
 
+# Combined: branch + custom name
+owner/repo@develop as dev-version
+
 # SSH URL format
 git@github.com:owner/repo.git
+
+# SSH with custom name
+git@github.com:owner/repo.git as myrepo
 ```
+
+### Advanced Repo Spec Syntax
+
+The repo spec parser supports flexible combinations:
+
+```
+<url_or_shorthand>[@<branch>] [as <local_name>]
+```
+
+| Spec | URL | Branch | Local Name |
+|------|-----|--------|------------|
+| `owner/repo` | `owner/repo` | (default) | `repo` |
+| `owner/repo@develop` | `owner/repo` | `develop` | `repo` |
+| `owner/repo as myrepo` | `owner/repo` | (default) | `myrepo` |
+| `owner/repo@v2 as stable` | `owner/repo` | `v2` | `stable` |
+| `git@github.com:o/r.git` | `git@github.com:o/r.git` | (default) | `r` |
+| `git@github.com:o/r.git as x` | `git@github.com:o/r.git` | (default) | `x` |
+
+**Notes:**
+- The `@branch` specifier must come before `as name`
+- Branch names cannot contain `/` (use `v2` not `feature/v2`)
+- The SSH `@` in `git@github.com` is not confused with branch syntax
+- Custom names are case-sensitive and become the directory name
 
 ### Supported URL Formats
 
