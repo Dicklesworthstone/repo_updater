@@ -2502,12 +2502,20 @@ cmd_self_update() {
         exit 3
     fi
 
+    # Check for "Not Found" response (no releases exist)
+    if echo "$response" | grep -q '"message"[[:space:]]*:[[:space:]]*"Not Found"'; then
+        log_info "No releases found on GitHub"
+        log_info "You may be running a development version"
+        exit 0
+    fi
+
     # Extract version from response (simple grep for portability)
     local latest_version
     latest_version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
 
     if [[ -z "$latest_version" ]]; then
         log_error "Could not parse version from GitHub API response"
+        log_verbose "Response: $response"
         exit 3
     fi
 
