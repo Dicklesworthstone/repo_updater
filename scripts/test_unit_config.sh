@@ -472,3 +472,4 @@ run_test test_ensure_config_exists_idempotent
 run_test test_ensure_config_exists_creates_state_dirs
 
 print_results
+exit $?
