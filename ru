@@ -1454,10 +1454,327 @@ parse_args() {
 }
 
 #==============================================================================
+# SECTION 12.5: REPORTING AND SUMMARY FUNCTIONS
+#==============================================================================
+
+# Aggregate results from the NDJSON results file
+# Returns: space-separated key=value pairs for counts
+# Works without jq by using grep/sed fallback
+aggregate_results() {
+    local cloned=0 updated=0 current=0 failed=0 conflicts=0 skipped=0
+
+    if [[ ! -f "$RESULTS_FILE" ]] || [[ ! -s "$RESULTS_FILE" ]]; then
+        echo "CLONED=0 UPDATED=0 CURRENT=0 FAILED=0 CONFLICTS=0 SKIPPED=0"
+        return
+    fi
+
+    # Use pure bash parsing - no jq dependency
+    while IFS= read -r line; do
+        # Extract status field using bash parameter expansion
+        local status
+        # Pattern: "status":"value" - extract value between quotes after status
+        if [[ "$line" =~ \"status\":\"([^\"]+)\" ]]; then
+            status="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+
+        case "$status" in
+            ok|cloned)   ((cloned++)) ;;
+            updated)     ((updated++)) ;;
+            current)     ((current++)) ;;
+            failed|timeout)  ((failed++)) ;;
+            diverged|dirty|conflict|mismatch|not_git) ((conflicts++)) ;;
+            skipped)     ((skipped++)) ;;
+            *)           ((skipped++)) ;;
+        esac
+    done < "$RESULTS_FILE"
+
+    echo "CLONED=$cloned UPDATED=$updated CURRENT=$current FAILED=$failed CONFLICTS=$conflicts SKIPPED=$skipped"
+}
+
+# Print a beautiful summary box with gum or ANSI fallback
+# Args: $1=cloned $2=updated $3=current $4=conflicts $5=failed $6=duration_seconds
+print_summary() {
+    local cloned="${1:-0}"
+    local updated="${2:-0}"
+    local current="${3:-0}"
+    local conflicts="${4:-0}"
+    local failed="${5:-0}"
+    local duration="${6:-0}"
+    local total=$((cloned + updated + current + conflicts + failed))
+
+    # Format duration
+    local duration_str
+    if [[ "$duration" -ge 60 ]]; then
+        local mins=$((duration / 60))
+        local secs=$((duration % 60))
+        duration_str="${mins}m ${secs}s"
+    else
+        duration_str="${duration}s"
+    fi
+
+    local log_path="$RU_LOG_DIR/latest"
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        # Use gum for beautiful box
+        local summary_text=""
+        summary_text+="               📊 Sync Summary\n"
+        summary_text+="─────────────────────────────────────────\n"
+        [[ $cloned -gt 0 ]] && summary_text+="  ✅ Cloned:     $cloned repos\n"
+        [[ $updated -gt 0 ]] && summary_text+="  ✅ Updated:    $updated repos\n"
+        [[ $current -gt 0 ]] && summary_text+="  ⏭️  Current:    $current repos (already up to date)\n"
+        [[ $conflicts -gt 0 ]] && summary_text+="  ⚠️  Conflicts:  $conflicts repos (need attention)\n"
+        [[ $failed -gt 0 ]] && summary_text+="  ❌ Failed:     $failed repos\n"
+        summary_text+="─────────────────────────────────────────\n"
+        summary_text+="  Total: $total repos processed in $duration_str\n"
+        summary_text+="  Logs:  $log_path"
+
+        echo -e "$summary_text" | gum style --border rounded --padding "0 1" --border-foreground 212 >&2
+    else
+        # ANSI fallback
+        echo "" >&2
+        echo -e "${BOLD}╭─────────────────────────────────────────────────────────────╮${RESET}" >&2
+        echo -e "${BOLD}│                    📊 Sync Summary                          │${RESET}" >&2
+        echo -e "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
+        [[ $cloned -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${GREEN}✅${RESET} Cloned:     $cloned repos                                   ${BOLD}│${RESET}" >&2
+        [[ $updated -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${GREEN}✅${RESET} Updated:    $updated repos                                   ${BOLD}│${RESET}" >&2
+        [[ $current -gt 0 ]] && echo -e "${BOLD}│${RESET}  ⏭️  Current:    $current repos (already up to date)           ${BOLD}│${RESET}" >&2
+        [[ $conflicts -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${YELLOW}⚠️${RESET}  Conflicts:  $conflicts repos (need attention)              ${BOLD}│${RESET}" >&2
+        [[ $failed -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${RED}❌${RESET} Failed:     $failed repos                                   ${BOLD}│${RESET}" >&2
+        echo -e "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
+        echo -e "${BOLD}│${RESET}  Total: $total repos processed in $duration_str                      ${BOLD}│${RESET}" >&2
+        echo -e "${BOLD}│${RESET}  Logs:  $log_path                           ${BOLD}│${RESET}" >&2
+        echo -e "${BOLD}╰─────────────────────────────────────────────────────────────╯${RESET}" >&2
+    fi
+}
+
+# Print actionable conflict resolution help
+# Reads from RESULTS_FILE to find repos with issues
+print_conflict_help() {
+    if [[ ! -f "$RESULTS_FILE" ]] || [[ ! -s "$RESULTS_FILE" ]]; then
+        return
+    fi
+
+    # Collect problematic repos
+    local has_conflicts="false"
+    local conflict_count=0
+
+    # First pass: check if there are any conflicts
+    while IFS= read -r line; do
+        local status
+        if [[ "$line" =~ \"status\":\"([^\"]+)\" ]]; then
+            status="${BASH_REMATCH[1]}"
+            case "$status" in
+                diverged|dirty|conflict|mismatch|not_git|failed|timeout)
+                    has_conflicts="true"
+                    ((conflict_count++))
+                    ;;
+            esac
+        fi
+    done < "$RESULTS_FILE"
+
+    [[ "$has_conflicts" != "true" ]] && return
+
+    echo "" >&2
+    echo -e "${BOLD}${YELLOW}Repositories Needing Attention${RESET}" >&2
+    echo -e "─────────────────────────────────────────────────────────────" >&2
+    echo "" >&2
+
+    local num=0
+    while IFS= read -r line; do
+        local repo status
+        if [[ "$line" =~ \"repo\":\"([^\"]+)\" ]]; then
+            repo="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+        if [[ "$line" =~ \"status\":\"([^\"]+)\" ]]; then
+            status="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+
+        local path="$PROJECTS_DIR/$repo"
+
+        case "$status" in
+            dirty)
+                ((num++))
+                echo -e "${BOLD}$num. $repo${RESET}" >&2
+                echo -e "   Path:   $path" >&2
+                echo -e "   Issue:  ${YELLOW}Dirty working tree${RESET} (uncommitted changes)" >&2
+                echo "" >&2
+                echo -e "   ${DIM}Resolution options:${RESET}" >&2
+                echo -e "     ${GREEN}a)${RESET} Stash and pull:" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git stash && git pull && git stash pop${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}b)${RESET} Commit your changes:" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git add . && git commit -m \"WIP\"${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${RED}c)${RESET} Discard local changes (${RED}DESTRUCTIVE${RESET}):" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git checkout . && git clean -fd${RESET}" >&2
+                echo "" >&2
+                ;;
+            diverged)
+                ((num++))
+                echo -e "${BOLD}$num. $repo${RESET}" >&2
+                echo -e "   Path:   $path" >&2
+                echo -e "   Issue:  ${YELLOW}Diverged${RESET} (local and remote both have new commits)" >&2
+                echo "" >&2
+                echo -e "   ${DIM}Resolution options:${RESET}" >&2
+                echo -e "     ${GREEN}a)${RESET} Rebase your changes:" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git pull --rebase${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}b)${RESET} Merge (creates merge commit):" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git pull --no-ff${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}c)${RESET} Push your changes first (if intentional):" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git push${RESET}" >&2
+                echo "" >&2
+                ;;
+            mismatch)
+                ((num++))
+                echo -e "${BOLD}$num. $repo${RESET}" >&2
+                echo -e "   Path:   $path" >&2
+                echo -e "   Issue:  ${RED}Remote mismatch${RESET} (different repo at this path)" >&2
+                echo "" >&2
+                echo -e "   ${DIM}Resolution options:${RESET}" >&2
+                echo -e "     ${GREEN}a)${RESET} Check current remote:" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git remote -v${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}b)${RESET} Update remote URL:" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git remote set-url origin <correct-url>${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${RED}c)${RESET} Remove and re-clone (${RED}DESTRUCTIVE${RESET}):" >&2
+                echo -e "        ${CYAN}rm -rf \"$path\" && ru sync${RESET}" >&2
+                echo "" >&2
+                ;;
+            not_git)
+                ((num++))
+                echo -e "${BOLD}$num. $repo${RESET}" >&2
+                echo -e "   Path:   $path" >&2
+                echo -e "   Issue:  ${RED}Not a git repository${RESET}" >&2
+                echo "" >&2
+                echo -e "   ${DIM}Resolution options:${RESET}" >&2
+                echo -e "     ${GREEN}a)${RESET} Remove and re-clone:" >&2
+                echo -e "        ${CYAN}rm -rf \"$path\" && ru sync${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}b)${RESET} Initialize as git repo:" >&2
+                echo -e "        ${CYAN}cd \"$path\" && git init && git remote add origin <url>${RESET}" >&2
+                echo "" >&2
+                ;;
+            failed|timeout)
+                ((num++))
+                echo -e "${BOLD}$num. $repo${RESET}" >&2
+                echo -e "   Path:   $path" >&2
+                echo -e "   Issue:  ${RED}Operation failed${RESET} (network/auth issue)" >&2
+                echo "" >&2
+                echo -e "   ${DIM}Resolution options:${RESET}" >&2
+                echo -e "     ${GREEN}a)${RESET} Check network connectivity and retry:" >&2
+                echo -e "        ${CYAN}ru sync $repo${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}b)${RESET} Check GitHub authentication:" >&2
+                echo -e "        ${CYAN}gh auth status${RESET}" >&2
+                echo "" >&2
+                echo -e "     ${GREEN}c)${RESET} View detailed log:" >&2
+                echo -e "        ${CYAN}cat \"$RU_LOG_DIR/latest/repos/${repo}.log\"${RESET}" >&2
+                echo "" >&2
+                ;;
+        esac
+    done < "$RESULTS_FILE"
+}
+
+# Generate JSON report for --json mode
+# Outputs complete structured JSON to stdout
+generate_json_report() {
+    local cloned="${1:-0}"
+    local updated="${2:-0}"
+    local current="${3:-0}"
+    local conflicts="${4:-0}"
+    local failed="${5:-0}"
+    local duration="${6:-0}"
+    local total=$((cloned + updated + current + conflicts + failed))
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Build repos array from results file
+    local repos_json="[]"
+    if [[ -f "$RESULTS_FILE" ]] && [[ -s "$RESULTS_FILE" ]]; then
+        repos_json="["
+        local first="true"
+        while IFS= read -r line; do
+            [[ "$first" == "true" ]] || repos_json+=","
+            first="false"
+            # Parse each field and rebuild with proper structure
+            local repo action status repo_duration message
+            [[ "$line" =~ \"repo\":\"([^\"]+)\" ]] && repo="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \"action\":\"([^\"]+)\" ]] && action="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \"status\":\"([^\"]+)\" ]] && status="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \"duration\":([0-9]+) ]] && repo_duration="${BASH_REMATCH[1]}"
+
+            local path="$PROJECTS_DIR/$repo"
+            local safe_path
+            safe_path=$(json_escape "$path")
+
+            repos_json+="{\"name\":\"$repo\",\"path\":\"$safe_path\",\"action\":\"$action\",\"status\":\"$status\",\"duration\":${repo_duration:-0}}"
+        done < "$RESULTS_FILE"
+        repos_json+="]"
+    fi
+
+    # Escape paths for JSON
+    local safe_projects_dir
+    safe_projects_dir=$(json_escape "$PROJECTS_DIR")
+
+    # Output structured JSON
+    cat << EOF
+{
+  "version": "$VERSION",
+  "timestamp": "$timestamp",
+  "duration_seconds": $duration,
+  "config": {
+    "projects_dir": "$safe_projects_dir",
+    "layout": "$LAYOUT",
+    "update_strategy": "$UPDATE_STRATEGY"
+  },
+  "summary": {
+    "total": $total,
+    "cloned": $cloned,
+    "updated": $updated,
+    "current": $current,
+    "conflicts": $conflicts,
+    "failed": $failed
+  },
+  "repos": $repos_json
+}
+EOF
+}
+
+# Compute appropriate exit code based on results
+# Args: $1=failed $2=conflicts
+# Returns: exit code (0, 1, or 2)
+compute_exit_code() {
+    local failed="${1:-0}"
+    local conflicts="${2:-0}"
+
+    if [[ "$failed" -gt 0 ]]; then
+        return 1  # Partial failure (network, auth, etc.)
+    elif [[ "$conflicts" -gt 0 ]]; then
+        return 2  # Conflicts exist (need manual resolution)
+    else
+        return 0  # Success
+    fi
+}
+
+#==============================================================================
 # SECTION 13: COMMAND STUBS (to be implemented)
 #==============================================================================
 
 cmd_sync() {
+    # Track start time for duration reporting
+    local start_time
+    start_time=$(date +%s)
+
     # Auto-init on first run
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_info "First run detected. Initializing configuration..."
@@ -1730,19 +2047,28 @@ cmd_sync() {
     # Reset trap to normal cleanup
     trap cleanup EXIT
 
-    log_info "Sync complete:"
-    [[ $cloned -gt 0 ]] && log_success "  Cloned:    $cloned"
-    [[ $updated -gt 0 ]] && log_success "  Updated:   $updated"
-    [[ $skipped -gt 0 ]] && log_info "  Current:   $skipped"
-    [[ $resumed -gt 0 ]] && log_info "  Resumed:   $resumed (skipped from prior run)"
-    [[ $conflicts -gt 0 ]] && log_warn "  Conflicts: $conflicts"
-    [[ $failed -gt 0 ]] && log_error "  Failed:    $failed"
+    # Calculate duration
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
 
-    if [[ $failed -gt 0 ]]; then
-        exit 1
-    elif [[ $conflicts -gt 0 ]]; then
-        exit 2
+    # Use current (skipped) count for display
+    local current_count=$skipped
+
+    # Print summary using the new reporting functions
+    print_summary "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
+
+    # Print conflict resolution help if there are issues
+    print_conflict_help
+
+    # Output JSON report if --json flag is set
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        generate_json_report "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
     fi
+
+    # Compute and use appropriate exit code
+    compute_exit_code "$failed" "$conflicts"
+    exit $?
 }
 
 cmd_status() {
