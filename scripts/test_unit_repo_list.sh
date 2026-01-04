@@ -18,6 +18,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/test_framework.sh"
 
 # Source the functions we need to test
+source_ru_function "_is_safe_path_segment"
 source_ru_function "load_repo_list"
 source_ru_function "parse_repo_spec"
 source_ru_function "parse_repo_url"
