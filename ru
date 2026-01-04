@@ -662,6 +662,22 @@ detect_os() {
 # SECTION 9: URL & PATH PARSING
 #==============================================================================
 
+# Validate a path segment is safe (no path traversal, no command injection)
+# Returns: 0 if safe, 1 if unsafe
+_is_safe_path_segment() {
+    local segment="$1"
+    # Reject empty
+    [[ -z "$segment" ]] && return 1
+    # Reject dot-only names (path traversal: . or ..)
+    [[ "$segment" =~ ^\.+$ ]] && return 1
+    # Reject leading dash (could be confused with git options)
+    [[ "$segment" == -* ]] && return 1
+    # Reject slashes (path traversal via subdirectories)
+    [[ "$segment" == */* ]] && return 1
+    [[ "$segment" == *\\* ]] && return 1
+    return 0
+}
+
 # Parse all GitHub URL formats and extract components
 # Supports: https://github.com/owner/repo, git@github.com:owner/repo.git,
 #           github.com/owner/repo, owner/repo (assumes github.com)
@@ -676,35 +692,39 @@ parse_repo_url() {
     url="${url%.git}"
     url="${url%/}"
 
+    local matched="false"
+
     # SSH format: git@host:owner/repo
     if [[ "$url" =~ ^git@([^:]+):([^/]+)/(.+)$ ]]; then
         _host="${BASH_REMATCH[1]}"
         _owner="${BASH_REMATCH[2]}"
         _repo="${BASH_REMATCH[3]}"
-        return 0
-    fi
-
+        matched="true"
     # HTTPS format: https://host/owner/repo
-    if [[ "$url" =~ ^https?://([^/]+)/([^/]+)/([^/]+)$ ]]; then
+    elif [[ "$url" =~ ^https?://([^/]+)/([^/]+)/([^/]+)$ ]]; then
         _host="${BASH_REMATCH[1]}"
         _owner="${BASH_REMATCH[2]}"
         _repo="${BASH_REMATCH[3]}"
-        return 0
-    fi
-
+        matched="true"
     # Host/owner/repo format (no protocol): github.com/owner/repo
-    if [[ "$url" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
+    elif [[ "$url" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
         _host="${BASH_REMATCH[1]}"
         _owner="${BASH_REMATCH[2]}"
         _repo="${BASH_REMATCH[3]}"
-        return 0
-    fi
-
+        matched="true"
     # Shorthand: owner/repo (assumes github.com)
-    if [[ "$url" =~ ^([^/]+)/([^/]+)$ ]]; then
+    elif [[ "$url" =~ ^([^/]+)/([^/]+)$ ]]; then
         _host="github.com"
         _owner="${BASH_REMATCH[1]}"
         _repo="${BASH_REMATCH[2]}"
+        matched="true"
+    fi
+
+    # Validate parsed components for path safety
+    if [[ "$matched" == "true" ]]; then
+        if ! _is_safe_path_segment "$_owner" || ! _is_safe_path_segment "$_repo"; then
+            return 1
+        fi
         return 0
     fi
 
@@ -1328,7 +1348,7 @@ save_sync_state() {
     if [[ ${#completed_ref[@]} -gt 0 ]]; then
         for item in "${completed_ref[@]}"; do
             [[ -n "$completed_json" ]] && completed_json+=","
-            completed_json+="\"$item\""
+            completed_json+="\"$(json_escape "$item")\""
         done
     fi
 
@@ -1337,7 +1357,7 @@ save_sync_state() {
     if [[ ${#pending_ref[@]} -gt 0 ]]; then
         for item in "${pending_ref[@]}"; do
             [[ -n "$pending_json" ]] && pending_json+=","
-            pending_json+="\"$item\""
+            pending_json+="\"$(json_escape "$item")\""
         done
     fi
 
