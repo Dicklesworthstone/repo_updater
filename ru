@@ -3096,7 +3096,7 @@ cmd_prune() {
     # Handle delete mode
     if [[ "$delete_mode" == "true" ]]; then
         if [[ "$NON_INTERACTIVE" != "true" ]]; then
-            log_warning "This will permanently delete ${#orphans[@]} repository(s)!"
+            log_warn "This will permanently delete ${#orphans[@]} repository(s)!"
             echo "" >&2
             for path in "${orphans[@]}"; do
                 echo "  $path" >&2
@@ -3104,7 +3104,7 @@ cmd_prune() {
             echo "" >&2
 
             local confirm=""
-            if is_gum_available; then
+            if [[ "$GUM_AVAILABLE" == "true" ]]; then
                 if ! gum confirm "Delete these repositories?"; then
                     log_info "Aborted"
                     return 0
