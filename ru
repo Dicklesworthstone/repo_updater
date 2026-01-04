@@ -1445,6 +1445,7 @@ process_single_repo_worker() {
     # Check if repo exists locally
     if [[ ! -d "$local_path" ]]; then
         if [[ "$pull_only" == "true" ]]; then
+            write_result "$repo_name" "skip" "skipped" "0" "pull-only mode" "$local_path"
             echo "SKIP:skipped:$repo_name"
             return 0
         fi
@@ -1456,16 +1457,19 @@ process_single_repo_worker() {
         fi
     else
         if [[ "$clone_only" == "true" ]]; then
+            write_result "$repo_name" "skip" "skipped" "0" "clone-only mode" "$local_path"
             echo "SKIP:skipped:$repo_name"
             return 0
         fi
 
         if ! is_git_repo "$local_path"; then
+            write_result "$repo_name" "skip" "not_git" "0" "" "$local_path"
             echo "CONFLICT:not_git:$repo_name"
             return 0
         fi
 
         if check_remote_mismatch "$local_path" "$url"; then
+            write_result "$repo_name" "pull" "mismatch" "0" "" "$local_path"
             echo "CONFLICT:mismatch:$repo_name"
             return 0
         fi
@@ -1476,6 +1480,7 @@ process_single_repo_worker() {
         dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
         if [[ "$dirty" == "true" && "$autostash" != "true" ]]; then
+            write_result "$repo_name" "pull" "dirty" "0" "" "$local_path"
             echo "CONFLICT:dirty:$repo_name"
             return 0
         fi

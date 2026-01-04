@@ -300,6 +300,42 @@ test_set_config_value_handles_paths() {
     log_test_pass "$test_name"
 }
 
+test_set_config_value_escapes_sed_special_chars() {
+    local test_name="set_config_value: Escapes sed special characters"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Start with a key that we'll update
+    echo "TESTKEY=original" > "$RU_CONFIG_DIR/config"
+
+    # Test ampersand (& means "matched text" in sed replacement)
+    set_config_value "TESTKEY" "foo&bar"
+    local result
+    result=$(grep "^TESTKEY=" "$RU_CONFIG_DIR/config" | cut -d= -f2-)
+    assert_equals "foo&bar" "$result" "Ampersand should be escaped properly"
+
+    # Test backslash
+    set_config_value "TESTKEY" 'path\with\backslashes'
+    result=$(grep "^TESTKEY=" "$RU_CONFIG_DIR/config" | cut -d= -f2-)
+    assert_equals 'path\with\backslashes' "$result" "Backslash should be escaped properly"
+
+    # Test pipe (our sed delimiter)
+    set_config_value "TESTKEY" "value|with|pipes"
+    result=$(grep "^TESTKEY=" "$RU_CONFIG_DIR/config" | cut -d= -f2-)
+    assert_equals "value|with|pipes" "$result" "Pipe should be escaped properly"
+
+    # Test combined special characters
+    set_config_value "TESTKEY" 'mixed&special\chars|here'
+    result=$(grep "^TESTKEY=" "$RU_CONFIG_DIR/config" | cut -d= -f2-)
+    assert_equals 'mixed&special\chars|here' "$result" "Combined special chars should be escaped"
+
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Tests: ensure_config_exists
 #==============================================================================
@@ -463,6 +499,7 @@ run_test test_set_config_value_creates_new_key
 run_test test_set_config_value_updates_existing_key
 run_test test_set_config_value_creates_config_file
 run_test test_set_config_value_handles_paths
+run_test test_set_config_value_escapes_sed_special_chars
 
 # ensure_config_exists tests
 run_test test_ensure_config_exists_creates_directories
