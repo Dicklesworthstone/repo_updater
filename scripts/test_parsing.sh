@@ -26,7 +26,6 @@ source "$SCRIPT_DIR/test_framework.sh"
 # Minimal log functions
 log_error() { :; }
 log_verbose() { :; }
-log_warn() { :; }
 
 # Default values for path functions
 PROJECTS_DIR="/tmp/projects"
@@ -53,7 +52,6 @@ extract_function() {
     ' "$file"
 }
 
-source <(extract_function "_is_safe_path_segment" "$PROJECT_DIR/ru")
 source <(extract_function "parse_repo_url" "$PROJECT_DIR/ru")
 source <(extract_function "normalize_url" "$PROJECT_DIR/ru")
 source <(extract_function "url_to_local_path" "$PROJECT_DIR/ru")

@@ -1408,7 +1408,6 @@ process_single_repo_worker() {
     # Check if repo exists locally
     if [[ ! -d "$local_path" ]]; then
         if [[ "$pull_only" == "true" ]]; then
-            write_result "$repo_name" "skip" "skipped" "0" "pull-only mode" "$local_path"
             echo "SKIP:skipped:$repo_name"
             return 0
         fi
@@ -1420,19 +1419,16 @@ process_single_repo_worker() {
         fi
     else
         if [[ "$clone_only" == "true" ]]; then
-            write_result "$repo_name" "skip" "skipped" "0" "clone-only mode" "$local_path"
             echo "SKIP:skipped:$repo_name"
             return 0
         fi
 
         if ! is_git_repo "$local_path"; then
-            write_result "$repo_name" "skip" "not_git" "0" "" "$local_path"
             echo "CONFLICT:not_git:$repo_name"
             return 0
         fi
 
         if check_remote_mismatch "$local_path" "$url"; then
-            write_result "$repo_name" "pull" "mismatch" "0" "" "$local_path"
             echo "CONFLICT:mismatch:$repo_name"
             return 0
         fi
@@ -1443,19 +1439,16 @@ process_single_repo_worker() {
         dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
         if [[ "$dirty" == "true" && "$autostash" != "true" ]]; then
-            write_result "$repo_name" "pull" "dirty" "0" "" "$local_path"
             echo "CONFLICT:dirty:$repo_name"
             return 0
         fi
 
         if [[ "$status" == "current" ]]; then
-            write_result "$repo_name" "pull" "current" "0" "" "$local_path"
             echo "OK:current:$repo_name"
             return 0
         fi
 
         if [[ "$status" == "diverged" ]]; then
-            write_result "$repo_name" "pull" "diverged" "0" "" "$local_path"
             echo "CONFLICT:diverged:$repo_name"
             return 0
         fi
@@ -1544,37 +1537,6 @@ run_parallel_sync() {
                     echo -ne "\r→ Progress: $((current + 1))/$total" >&2
                 } 201>"${lock_file}.progress"
             done
-
-        # Calculate duration and aggregate results for ad-hoc sync
-        local end_time duration
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
-
-        # Aggregate results from RESULTS_FILE
-        local results cloned updated current_count failed conflicts
-        results=$(aggregate_results)
-        cloned=$(echo "$results" | grep -o 'CLONED=[0-9]*' | cut -d= -f2)
-        updated=$(echo "$results" | grep -o 'UPDATED=[0-9]*' | cut -d= -f2)
-        current_count=$(echo "$results" | grep -o 'CURRENT=[0-9]*' | cut -d= -f2)
-        failed=$(echo "$results" | grep -o 'FAILED=[0-9]*' | cut -d= -f2)
-        conflicts=$(echo "$results" | grep -o 'CONFLICTS=[0-9]*' | cut -d= -f2)
-
-        echo "" >&2
-
-        # Print summary
-        print_summary "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
-
-        # Print conflict resolution help if needed
-        print_conflict_help
-
-        # Output JSON report if --json flag is set
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            generate_json_report "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
-        fi
-
-        # Compute and use appropriate exit code
-        compute_exit_code "$failed" "$conflicts"
-        exit $?
         ) &
         worker_pids+=($!)
     done
@@ -2132,37 +2094,7 @@ cmd_sync() {
                 do_clone "$url" "$path" "$repo_name" "$branch"
             fi
         done
-
-        # Calculate duration and aggregate results for ad-hoc sync
-        local end_time duration
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
-
-        # Aggregate results from RESULTS_FILE
-        local results cloned updated current_count failed conflicts
-        results=$(aggregate_results)
-        cloned=$(echo "$results" | grep -o 'CLONED=[0-9]*' | cut -d= -f2)
-        updated=$(echo "$results" | grep -o 'UPDATED=[0-9]*' | cut -d= -f2)
-        current_count=$(echo "$results" | grep -o 'CURRENT=[0-9]*' | cut -d= -f2)
-        failed=$(echo "$results" | grep -o 'FAILED=[0-9]*' | cut -d= -f2)
-        conflicts=$(echo "$results" | grep -o 'CONFLICTS=[0-9]*' | cut -d= -f2)
-
-        echo "" >&2
-
-        # Print summary
-        print_summary "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
-
-        # Print conflict resolution help if needed
-        print_conflict_help
-
-        # Output JSON report if --json flag is set
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            generate_json_report "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
-        fi
-
-        # Compute and use appropriate exit code
-        compute_exit_code "$failed" "$conflicts"
-        exit $?
+        exit 0
     fi
 
     # No arguments - check for configured repos
@@ -2414,37 +2346,6 @@ cmd_sync() {
             for p in "${pending_names[@]}"; do
                 [[ "$p" != "$repo_name" ]] && new_pending+=("$p")
             done
-
-        # Calculate duration and aggregate results for ad-hoc sync
-        local end_time duration
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
-
-        # Aggregate results from RESULTS_FILE
-        local results cloned updated current_count failed conflicts
-        results=$(aggregate_results)
-        cloned=$(echo "$results" | grep -o 'CLONED=[0-9]*' | cut -d= -f2)
-        updated=$(echo "$results" | grep -o 'UPDATED=[0-9]*' | cut -d= -f2)
-        current_count=$(echo "$results" | grep -o 'CURRENT=[0-9]*' | cut -d= -f2)
-        failed=$(echo "$results" | grep -o 'FAILED=[0-9]*' | cut -d= -f2)
-        conflicts=$(echo "$results" | grep -o 'CONFLICTS=[0-9]*' | cut -d= -f2)
-
-        echo "" >&2
-
-        # Print summary
-        print_summary "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
-
-        # Print conflict resolution help if needed
-        print_conflict_help
-
-        # Output JSON report if --json flag is set
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            generate_json_report "$cloned" "$updated" "$current_count" "$conflicts" "$failed" "$duration"
-        fi
-
-        # Compute and use appropriate exit code
-        compute_exit_code "$failed" "$conflicts"
-        exit $?
         fi
         pending_names=()
         if [[ ${#new_pending[@]} -gt 0 ]]; then
