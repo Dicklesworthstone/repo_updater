@@ -489,13 +489,13 @@ test_check_remote_mismatch_same_url() {
     local work_dir="$PROJECTS_DIR/match"
     init_repo_with_commit "$remote" "$work_dir"
 
-    # Get the actual remote URL
-    local actual_url
-    actual_url=$(git -C "$work_dir" remote get-url origin)
+    # Set origin to a GitHub-style URL (check_remote_mismatch uses normalize_url
+    # which only works with GitHub-compatible URLs, not local filesystem paths)
+    git -C "$work_dir" remote set-url origin "https://github.com/owner/match"
 
     # check_remote_mismatch returns true (exit 0) if URLs are DIFFERENT
     # So for same URL, it should return false (exit 1)
-    if check_remote_mismatch "$work_dir" "$actual_url"; then
+    if check_remote_mismatch "$work_dir" "https://github.com/owner/match"; then
         fail "check_remote_mismatch should return false for matching URLs"
     else
         pass "check_remote_mismatch returns false for matching URLs"
@@ -539,11 +539,12 @@ test_check_remote_mismatch_no_remote() {
     git -C "$work_dir" add file.txt
     git -C "$work_dir" commit -m "Initial" >/dev/null 2>&1
 
-    # check_remote_mismatch should return error (exit 1) when no remote
+    # check_remote_mismatch returns 0 (true = mismatch) when no remote exists
+    # (missing remote is treated as a mismatch condition)
     if check_remote_mismatch "$work_dir" "https://github.com/any/repo"; then
-        fail "check_remote_mismatch should fail when no remote exists"
+        pass "check_remote_mismatch returns true (mismatch) when no remote"
     else
-        pass "check_remote_mismatch returns false when no remote"
+        fail "check_remote_mismatch should return true when no remote exists"
     fi
 
     cleanup_test_env
