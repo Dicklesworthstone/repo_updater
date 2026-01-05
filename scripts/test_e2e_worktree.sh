@@ -1,408 +1,368 @@
 #!/usr/bin/env bash
 #
-# E2E Test: ru worktree management (bd-33aj)
+# E2E Test: Review worktree management
 #
-# Tests git worktree operations used by the review workflow:
-#   1. Worktree creation from main branch
-#   2. Worktree creation with custom branch
-#   3. Worktree mapping and lookup
-#   4. Worktree cleanup
-#   5. List and validate worktrees
-#   6. Orphaned worktree detection
-#
-# Uses local git repos for deterministic testing without network access.
+# Covers bd-33aj scenarios using real git worktree operations:
+#   1. Create worktree from main/HEAD
+#   2. Create worktree from specific commit (pinned ref)
+#   3. Worktree directory respects custom RU_STATE_DIR
+#   4. List and validate worktree mapping
+#   5. Cleanup removes worktrees and mapping
+#   6. Corrupted/non-git repo is skipped safely
+#   7. Concurrent worktree mapping updates remain valid JSON
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
-# shellcheck disable=SC1091  # Sourced files checked separately
-# shellcheck disable=SC2317  # Functions called via run_test
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RU_SCRIPT="$PROJECT_DIR/ru"
 
-# Source E2E framework
+# Source the E2E framework (test isolation + assertions)
 source "$SCRIPT_DIR/test_e2e_framework.sh"
 
-#==============================================================================
-# Test Helpers
-#==============================================================================
-
-# Source specific ru functions for worktree operations
-source_ru_worktree_functions() {
-    # Extract helper functions first
-    eval "$(sed -n '/^_is_valid_var_name()/,/^}/p' "$RU_SCRIPT")"
-    eval "$(sed -n '/^_set_out_var()/,/^}/p' "$RU_SCRIPT")"
-    eval "$(sed -n '/^ensure_dir()/,/^}/p' "$RU_SCRIPT")"
-
-    # Extract worktree-related functions from ru
-    eval "$(sed -n '/^get_worktrees_dir()/,/^}/p' "$RU_SCRIPT")"
-    eval "$(sed -n '/^record_worktree_mapping()/,/^}/p' "$RU_SCRIPT")"
-    eval "$(sed -n '/^get_worktree_path()/,/^}/p' "$RU_SCRIPT")"
-    eval "$(sed -n '/^list_review_worktrees()/,/^}/p' "$RU_SCRIPT")"
-}
-
-# Create a test git repo for worktree operations
-create_worktree_test_repo() {
-    local repo_name="$1"
-    local num_commits="${2:-3}"
-    local repo_path="$E2E_TEMP_DIR/repos/$repo_name"
-
-    mkdir -p "$repo_path"
-
-    (
-        cd "$repo_path" || exit 1
-        git init -q
-        git config user.email "test@test.com"
-        git config user.name "Test User"
-
-        for ((i=1; i<=num_commits; i++)); do
-            echo "Commit $i content" > "file$i.txt"
-            git add .
-            git commit -q -m "Commit $i"
-        done
-    )
-
-    echo "$repo_path"
-}
-
-# Setup test environment for worktree tests
-worktree_test_setup() {
-    e2e_setup
-    source_ru_worktree_functions
-
-    # Set up state directory
-    export RU_STATE_DIR="$XDG_STATE_HOME/ru"
-    mkdir -p "$RU_STATE_DIR"
-
-    # Set a test run ID
-    export REVIEW_RUN_ID="test-run-$$"
-
-    e2e_log_operation "worktree_setup" "Worktree test environment ready"
-}
-
-#==============================================================================
-# Test: Basic worktree creation from main branch
-#==============================================================================
-
-test_worktree_create_from_main() {
-    local test_name="Worktree creation from main branch"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "test-repo" 3)
-
-    # Create a worktree
-    local wt_path="$E2E_TEMP_DIR/worktrees/test-wt"
-    mkdir -p "$(dirname "$wt_path")"
-
-    local wt_result=0
-    git -C "$repo_path" worktree add -q "$wt_path" HEAD 2>/dev/null || wt_result=$?
-
-    assert_equals "0" "$wt_result" "Worktree creation succeeds"
-    assert_true "test -d '$wt_path'" "Worktree directory exists"
-    assert_true "test -f '$wt_path/.git'" "Worktree has .git file"
-
-    # Verify worktree is linked to main repo
-    local wt_list
-    wt_list=$(git -C "$repo_path" worktree list --porcelain)
-    assert_contains "$wt_list" "$wt_path" "Main repo lists worktree"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
-}
-
-#==============================================================================
-# Test: Worktree creation with custom branch
-#==============================================================================
-
-test_worktree_create_with_branch() {
-    local test_name="Worktree creation with custom branch"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo with a feature branch
-    local repo_path
-    repo_path=$(create_worktree_test_repo "branch-repo" 2)
-
-    (
-        cd "$repo_path" || exit 1
-        git checkout -q -b feature-branch
-        echo "Feature content" > feature.txt
-        git add .
-        git commit -q -m "Feature commit"
-        git checkout -q main 2>/dev/null || git checkout -q master 2>/dev/null
-    )
-
-    # Create worktree on feature branch
-    local wt_path="$E2E_TEMP_DIR/worktrees/feature-wt"
-    mkdir -p "$(dirname "$wt_path")"
-
-    local wt_result=0
-    git -C "$repo_path" worktree add -q "$wt_path" feature-branch 2>/dev/null || wt_result=$?
-
-    assert_equals "0" "$wt_result" "Feature branch worktree creation succeeds"
-    assert_true "test -f '$wt_path/feature.txt'" "Feature file exists in worktree"
-
-    # Verify we're on the right branch
-    local current_branch
-    current_branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
-    assert_equals "feature-branch" "$current_branch" "Worktree is on feature branch"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
-}
-
-#==============================================================================
-# Test: Worktree mapping and lookup
-#==============================================================================
-
-test_worktree_mapping() {
-    local test_name="Worktree mapping and lookup"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "mapping-repo" 1)
-
-    # Create worktree
-    local wt_path="$E2E_TEMP_DIR/worktrees/mapped-wt"
-    mkdir -p "$(dirname "$wt_path")"
-    git -C "$repo_path" worktree add -q "$wt_path" HEAD 2>/dev/null
-
-    # Record mapping using ru function
-    local repo_id="testowner/mapping-repo"
-    record_worktree_mapping "$repo_id" "$wt_path" "main"
-
-    # Verify mapping file exists
-    local mapping_file
-    mapping_file="$(get_worktrees_dir)/mapping.json"
-    assert_true "test -f '$mapping_file'" "Mapping file created"
-
-    # Lookup worktree path
-    local found_path=""
-    get_worktree_path "$repo_id" found_path
-    assert_equals "$wt_path" "$found_path" "Worktree path lookup works"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
-}
-
-#==============================================================================
-# Test: List worktrees
-#==============================================================================
-
-test_worktree_list() {
-    local test_name="List and validate worktrees"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "list-repo" 2)
-
-    # Create multiple worktrees
-    local wt1="$E2E_TEMP_DIR/worktrees/wt1"
-    local wt2="$E2E_TEMP_DIR/worktrees/wt2"
-    mkdir -p "$(dirname "$wt1")"
-
-    git -C "$repo_path" worktree add -q "$wt1" HEAD 2>/dev/null
-    git -C "$repo_path" worktree add -q "$wt2" HEAD 2>/dev/null
-
-    # Record mappings
-    record_worktree_mapping "owner/repo1" "$wt1" "main"
-    record_worktree_mapping "owner/repo2" "$wt2" "main"
-
-    # List worktrees using ru function
-    local listed
-    listed=$(list_review_worktrees)
-
-    assert_contains "$listed" "repo1" "List contains repo1"
-    assert_contains "$listed" "repo2" "List contains repo2"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
-}
-
-#==============================================================================
-# Test: Worktree cleanup
-#==============================================================================
-
-test_worktree_cleanup() {
-    local test_name="Worktree cleanup removes all files"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "cleanup-repo" 1)
-
-    # Create worktree
-    local wt_path="$E2E_TEMP_DIR/worktrees/cleanup-wt"
-    mkdir -p "$(dirname "$wt_path")"
-    git -C "$repo_path" worktree add -q "$wt_path" HEAD 2>/dev/null
-
-    assert_true "test -d '$wt_path'" "Worktree exists before cleanup"
-
-    # Remove worktree properly
-    git -C "$repo_path" worktree remove -f "$wt_path" 2>/dev/null
-
-    assert_true "test ! -d '$wt_path'" "Worktree directory removed"
-
-    # Verify worktree list is updated
-    local wt_list
-    wt_list=$(git -C "$repo_path" worktree list --porcelain)
-    assert_not_contains "$wt_list" "cleanup-wt" "Worktree removed from list"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
-}
-
-#==============================================================================
-# Test: Orphaned worktree detection
-#==============================================================================
-
-test_worktree_orphaned_detection() {
-    local test_name="Orphaned worktree detection"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "orphan-repo" 1)
-
-    # Create worktree
-    local wt_path="$E2E_TEMP_DIR/worktrees/orphan-wt"
-    mkdir -p "$(dirname "$wt_path")"
-    git -C "$repo_path" worktree add -q "$wt_path" HEAD 2>/dev/null
-
-    # Simulate orphaned worktree by removing directory but not git reference
-    rm -rf "$wt_path"
-
-    # git worktree list should still show it (as prunable)
-    local wt_list
-    wt_list=$(git -C "$repo_path" worktree list 2>/dev/null)
-    # The worktree should still be listed but marked as prunable
-
-    # Prune to clean up
-    git -C "$repo_path" worktree prune 2>/dev/null
-
-    # After prune, should be gone
-    wt_list=$(git -C "$repo_path" worktree list --porcelain 2>/dev/null)
-    assert_not_contains "$wt_list" "orphan-wt" "Orphaned worktree pruned"
-
-    pass "Orphan detection and prune works"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
-}
-
-#==============================================================================
-# Test: Concurrent worktree operations
-#==============================================================================
-
-test_worktree_concurrent() {
-    local test_name="Concurrent worktree operations"
-    log_test_start "$test_name"
-
-    worktree_test_setup
-
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "concurrent-repo" 5)
-
-    # Create multiple worktrees concurrently
-    local wt_base="$E2E_TEMP_DIR/worktrees/concurrent"
-    mkdir -p "$wt_base"
-
-    local pids=()
-    for i in 1 2 3; do
-        (
-            git -C "$repo_path" worktree add -q "$wt_base/wt$i" HEAD 2>/dev/null
-        ) &
-        pids+=($!)
-    done
-
-    # Wait for all to complete
-    local all_ok=true
-    for pid in "${pids[@]}"; do
-        if ! wait "$pid"; then
-            all_ok=false
-        fi
-    done
-
-    if $all_ok; then
-        pass "Concurrent worktree creation succeeded"
-    else
-        fail "Some concurrent worktree creations failed"
+#------------------------------------------------------------------------------
+# Minimal stubs + helpers for isolated worktree tests
+#------------------------------------------------------------------------------
+
+log_verbose() { :; }
+log_info() { :; }
+log_warn() { printf 'WARN: %s\n' "$*" >&2; }
+log_error() { printf 'ERROR: %s\n' "$*" >&2; }
+
+# Source required ru functions (avoid sourcing whole script)
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_var"
+source_ru_function "ensure_dir"
+source_ru_function "dir_lock_try_acquire"
+source_ru_function "dir_lock_release"
+source_ru_function "dir_lock_acquire"
+source_ru_function "get_worktrees_dir"
+source_ru_function "record_worktree_mapping"
+source_ru_function "get_worktree_path"
+source_ru_function "worktree_exists"
+source_ru_function "list_review_worktrees"
+source_ru_function "cleanup_review_worktrees"
+source_ru_function "is_git_repo"
+source_ru_function "ensure_clean_or_fail"
+source_ru_function "prepare_review_worktrees"
+
+# prepare_review_worktrees calls digest helpers; keep tests focused on worktrees.
+prepare_repo_digest_for_worktree() { :; }
+
+# resolve_repo_spec is large; stub just enough for worktree tests.
+# Supports branch/ref pinning via "owner/repo@ref".
+resolve_repo_spec() {
+    local spec="$1"
+    local projects_dir="$2"
+    local layout="$3"  # unused (tests assume flat)
+    local url_var="$4"
+    local branch_var="$5"
+    local custom_var="$6"
+    local path_var="$7"
+    local repo_id_var="$8"
+
+    local repo_spec="$spec"
+    local ref=""
+    if [[ "$repo_spec" == *"@"* ]]; then
+        ref="${repo_spec##*@}"
+        repo_spec="${repo_spec%@*}"
     fi
 
-    # Verify all worktrees exist
-    assert_true "test -d '$wt_base/wt1'" "Worktree 1 exists"
-    assert_true "test -d '$wt_base/wt2'" "Worktree 2 exists"
-    assert_true "test -d '$wt_base/wt3'" "Worktree 3 exists"
+    local owner="${repo_spec%%/*}"
+    local repo="${repo_spec##*/}"
 
-    e2e_cleanup
-    log_test_pass "$test_name"
+    _set_out_var "$url_var" "https://github.com/$owner/$repo" || return 1
+    _set_out_var "$branch_var" "$ref" || return 1
+    _set_out_var "$custom_var" "" || return 1
+    _set_out_var "$path_var" "$projects_dir/$repo" || return 1
+    _set_out_var "$repo_id_var" "$owner/$repo" || return 1
+    return 0
 }
 
-#==============================================================================
-# Test: Worktree with custom path
-#==============================================================================
+create_git_repo_with_commits() {
+    local repo_path="$1"
+    local commits="${2:-1}"
 
-test_worktree_custom_path() {
-    local test_name="Worktree with custom path"
-    log_test_start "$test_name"
+    ensure_dir "$repo_path"
+    git -C "$repo_path" init >/dev/null 2>&1
+    git -C "$repo_path" config user.email "test@test.com"
+    git -C "$repo_path" config user.name "Test User"
 
-    worktree_test_setup
+    local i
+    for ((i=1; i<=commits; i++)); do
+        printf 'commit %s\n' "$i" > "$repo_path/file.txt"
+        git -C "$repo_path" add file.txt >/dev/null 2>&1
+        git -C "$repo_path" commit -m "commit $i" >/dev/null 2>&1
+    done
 
-    # Create test repo
-    local repo_path
-    repo_path=$(create_worktree_test_repo "custom-path-repo" 2)
-
-    # Create worktree with deeply nested custom path
-    local custom_path="$E2E_TEMP_DIR/custom/deeply/nested/worktree"
-    mkdir -p "$(dirname "$custom_path")"
-
-    local wt_result=0
-    git -C "$repo_path" worktree add -q "$custom_path" HEAD 2>/dev/null || wt_result=$?
-
-    assert_equals "0" "$wt_result" "Custom path worktree creation succeeds"
-    assert_true "test -d '$custom_path'" "Custom path worktree exists"
-
-    # Verify git operations work in custom path worktree
-    local status_result=0
-    git -C "$custom_path" status >/dev/null 2>&1 || status_result=$?
-    assert_equals "0" "$status_result" "Git status works in custom path worktree"
-
-    e2e_cleanup
-    log_test_pass "$test_name"
+    git -C "$repo_path" branch -M main >/dev/null 2>&1 || true
 }
 
-#==============================================================================
-# Run Tests
-#==============================================================================
+worktree_path_for_repo() {
+    local repo_id="$1"
+    local worktrees_dir
+    worktrees_dir=$(get_worktrees_dir)
+    printf '%s/%s\n' "$worktrees_dir" "${repo_id//\//_}"
+}
 
-log_suite_start "E2E Tests: Worktree Management (bd-33aj)"
+#------------------------------------------------------------------------------
+# Tests
+#------------------------------------------------------------------------------
 
-run_test test_worktree_create_from_main
-run_test test_worktree_create_with_branch
-run_test test_worktree_mapping
-run_test test_worktree_list
-run_test test_worktree_cleanup
-run_test test_worktree_orphaned_detection
-run_test test_worktree_concurrent
-run_test test_worktree_custom_path
+test_worktree_create_from_head() {
+    log_test_start "worktrees: create from HEAD"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-head-$$"
+
+    local repo_id="acme/alpha"
+    local repo_path="$PROJECTS_DIR/alpha"
+    create_git_repo_with_commits "$repo_path" 1
+
+    local item="${repo_id}|issue|1"
+    local rc=0
+    prepare_review_worktrees "$item" >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "prepare_review_worktrees succeeds"
+
+    local wt_path
+    wt_path=$(worktree_path_for_repo "$repo_id")
+    assert_dir_exists "$wt_path" "Worktree directory created"
+    assert_file_exists "$(get_worktrees_dir)/mapping.json" "mapping.json written"
+
+    local mapped_path=""
+    get_worktree_path "$repo_id" mapped_path >/dev/null 2>&1 || true
+    assert_equals "$wt_path" "$mapped_path" "get_worktree_path returns worktree path"
+
+    local head_main head_wt
+    head_main=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || echo "")
+    head_wt=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
+    assert_equals "$head_main" "$head_wt" "Worktree HEAD matches main repo HEAD"
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+    e2e_cleanup
+    log_test_pass "worktrees: create from HEAD"
+}
+
+test_worktree_create_from_specific_commit() {
+    log_test_start "worktrees: create from specific commit"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-commit-$$"
+
+    local repo_id="acme/beta"
+    local repo_path="$PROJECTS_DIR/beta"
+    create_git_repo_with_commits "$repo_path" 2
+
+    local first_commit
+    first_commit=$(git -C "$repo_path" rev-list --max-count=1 --reverse HEAD 2>/dev/null || echo "")
+    assert_not_equals "" "$first_commit" "First commit SHA discovered"
+
+    # Pinned ref in spec; resolved repo id should still be repo_id without @ref.
+    local item="${repo_id}@${first_commit}|issue|1"
+    local rc=0
+    prepare_review_worktrees "$item" >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "prepare_review_worktrees succeeds with pinned ref"
+
+    local wt_path
+    wt_path=$(worktree_path_for_repo "$repo_id")
+    assert_dir_exists "$wt_path" "Worktree directory created"
+
+    local head_wt
+    head_wt=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
+    assert_equals "$first_commit" "$head_wt" "Worktree HEAD matches pinned commit"
+
+    local mapped_path=""
+    get_worktree_path "$repo_id" mapped_path >/dev/null 2>&1 || true
+    assert_equals "$wt_path" "$mapped_path" "Mapping key uses resolved repo id (no @ref)"
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+    e2e_cleanup
+    log_test_pass "worktrees: create from specific commit"
+}
+
+test_worktree_respects_custom_state_dir() {
+    log_test_start "worktrees: respects RU_STATE_DIR"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-state-$$"
+
+    export RU_STATE_DIR="$E2E_TEMP_DIR/custom_state/ru"
+    ensure_dir "$RU_STATE_DIR"
+
+    local repo_id="acme/gamma"
+    local repo_path="$PROJECTS_DIR/gamma"
+    create_git_repo_with_commits "$repo_path" 1
+
+    local item="${repo_id}|issue|1"
+    prepare_review_worktrees "$item" >/dev/null 2>&1 || true
+
+    local wt_dir
+    wt_dir=$(get_worktrees_dir)
+    assert_contains "$wt_dir" "$RU_STATE_DIR/worktrees/$REVIEW_RUN_ID" "Worktrees dir uses RU_STATE_DIR"
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+    unset RU_STATE_DIR
+    e2e_cleanup
+    log_test_pass "worktrees: respects RU_STATE_DIR"
+}
+
+test_worktree_list_and_validate() {
+    log_test_start "worktrees: list and validate mapping"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-list-$$"
+
+    local repo_a="acme/delta"
+    local repo_b="acme/epsilon"
+    create_git_repo_with_commits "$PROJECTS_DIR/delta" 1
+    create_git_repo_with_commits "$PROJECTS_DIR/epsilon" 1
+
+    prepare_review_worktrees "${repo_a}|issue|1" "${repo_b}|pr|2" >/dev/null 2>&1 || true
+
+    local json
+    json=$(list_review_worktrees "$REVIEW_RUN_ID" 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+        assert_equals "object" "$(printf '%s' "$json" | jq -r 'type')" "list_review_worktrees returns JSON object"
+        assert_not_equals "" "$(printf '%s' "$json" | jq -r --arg r "$repo_a" '.[$r].path // ""')" "Repo A mapping present"
+        assert_not_equals "" "$(printf '%s' "$json" | jq -r --arg r "$repo_b" '.[$r].path // ""')" "Repo B mapping present"
+    else
+        skip_test "jq not installed - skipping mapping validation"
+    fi
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+    e2e_cleanup
+    log_test_pass "worktrees: list and validate mapping"
+}
+
+test_worktree_cleanup_removes_all() {
+    log_test_start "worktrees: cleanup removes all associated files"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-clean-$$"
+
+    local repo_id="acme/zeta"
+    local repo_path="$PROJECTS_DIR/zeta"
+    create_git_repo_with_commits "$repo_path" 1
+
+    prepare_review_worktrees "${repo_id}|issue|1" >/dev/null 2>&1 || true
+
+    local wt_path
+    wt_path=$(worktree_path_for_repo "$repo_id")
+    assert_dir_exists "$wt_path" "Worktree created"
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+
+    local base_dir="${XDG_STATE_HOME}/ru/worktrees/${REVIEW_RUN_ID}"
+    assert_dir_not_exists "$base_dir" "Run worktrees directory removed"
+
+    # Worktree should be gone from git's perspective
+    if git -C "$repo_path" worktree list 2>/dev/null | grep -qF "$wt_path"; then
+        fail "git worktree list should not include removed worktree"
+    else
+        pass "git worktree list does not include removed worktree"
+    fi
+
+    e2e_cleanup
+    log_test_pass "worktrees: cleanup removes all associated files"
+}
+
+test_worktree_skips_corrupted_repo() {
+    log_test_start "worktrees: corrupted/non-git repo is skipped safely"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-corrupt-$$"
+
+    local repo_id="acme/broken"
+    local repo_path="$PROJECTS_DIR/broken"
+    ensure_dir "$repo_path"
+    printf '%s\n' "not a repo" > "$repo_path/README.txt"
+
+    local rc=0
+    prepare_review_worktrees "${repo_id}|issue|1" >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "prepare_review_worktrees does not hard-fail on non-git repo"
+
+    if worktree_exists "$repo_id"; then
+        fail "worktree_exists should be false for skipped repo"
+    else
+        pass "worktree_exists is false for skipped repo"
+    fi
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+    e2e_cleanup
+    log_test_pass "worktrees: corrupted/non-git repo is skipped safely"
+}
+
+test_worktree_mapping_concurrent_updates() {
+    log_test_start "worktrees: concurrent mapping updates stay valid"
+    e2e_setup
+
+    export PROJECTS_DIR="$RU_PROJECTS_DIR"
+    export LAYOUT="flat"
+    export REVIEW_RUN_ID="wt-concurrent-$$"
+
+    local repo_a="acme/cona"
+    local repo_b="acme/conb"
+    create_git_repo_with_commits "$PROJECTS_DIR/cona" 1
+    create_git_repo_with_commits "$PROJECTS_DIR/conb" 1
+
+    (
+        prepare_review_worktrees "${repo_a}|issue|1" >/dev/null 2>&1 || true
+    ) &
+    local pid_a=$!
+    (
+        prepare_review_worktrees "${repo_b}|issue|1" >/dev/null 2>&1 || true
+    ) &
+    local pid_b=$!
+
+    wait "$pid_a" 2>/dev/null || true
+    wait "$pid_b" 2>/dev/null || true
+
+    if command -v jq >/dev/null 2>&1; then
+        local mapping_file
+        mapping_file="$(get_worktrees_dir)/mapping.json"
+        assert_file_exists "$mapping_file" "mapping.json exists after concurrent runs"
+        if jq empty "$mapping_file" >/dev/null 2>&1; then
+            pass "mapping.json is valid JSON after concurrent updates"
+        else
+            fail "mapping.json is invalid JSON after concurrent updates"
+        fi
+        assert_not_equals "" "$(jq -r --arg r "$repo_a" '.[$r].path // ""' "$mapping_file")" "Repo A mapping present"
+        assert_not_equals "" "$(jq -r --arg r "$repo_b" '.[$r].path // ""' "$mapping_file")" "Repo B mapping present"
+    else
+        skip_test "jq not installed - skipping concurrent mapping validation"
+    fi
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true
+    e2e_cleanup
+    log_test_pass "worktrees: concurrent mapping updates stay valid"
+}
+
+#------------------------------------------------------------------------------
+# Run tests
+#------------------------------------------------------------------------------
+
+log_suite_start "E2E Tests: worktree management"
+
+run_test test_worktree_create_from_head
+run_test test_worktree_create_from_specific_commit
+run_test test_worktree_respects_custom_state_dir
+run_test test_worktree_list_and_validate
+run_test test_worktree_cleanup_removes_all
+run_test test_worktree_skips_corrupted_repo
+run_test test_worktree_mapping_concurrent_updates
 
 print_results
 exit $?
+

@@ -9390,12 +9390,18 @@ record_worktree_mapping() {
     ensure_dir "$worktrees_dir"
 
     local mapping_file="$worktrees_dir/mapping.json"
-
-    # Initialize if doesn't exist
-    [[ ! -f "$mapping_file" ]] && echo '{}' > "$mapping_file"
+    local lock_dir="${mapping_file}.lock.d"
 
     # Add mapping atomically (requires jq)
     if command -v jq &>/dev/null; then
+        if ! dir_lock_acquire "$lock_dir" 30; then
+            log_error "Failed to acquire worktree mapping lock"
+            return 1
+        fi
+
+        # Initialize if doesn't exist
+        [[ ! -f "$mapping_file" ]] && echo '{}' > "$mapping_file"
+
         local tmp_file="${mapping_file}.tmp.$$"
         if jq --arg repo "$repo_id" \
               --arg path "$wt_path" \
@@ -9403,10 +9409,18 @@ record_worktree_mapping() {
               --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '.[$repo] = {"path": $path, "branch": $branch, "created_at": $created}' \
               "$mapping_file" > "$tmp_file"; then
-            mv "$tmp_file" "$mapping_file"
+            if mv "$tmp_file" "$mapping_file"; then
+                dir_lock_release "$lock_dir"
+            else
+                log_error "Failed to write worktree mapping file: $mapping_file"
+                rm -f "$tmp_file"
+                dir_lock_release "$lock_dir"
+                return 1
+            fi
         else
             log_error "Failed to update worktree mapping for $repo_id"
             rm -f "$tmp_file"
+            dir_lock_release "$lock_dir"
             return 1
         fi
     else
@@ -9478,22 +9492,25 @@ prepare_review_worktrees() {
     local failed=0
 
     for item in "${items[@]}"; do
-        local repo_id
-        repo_id="${item%%|*}"
-
-        # Skip if already processed
-        [[ -n "${seen_repos[$repo_id]:-}" ]] && continue
-        seen_repos["$repo_id"]=1
+        local repo_spec
+        repo_spec="${item%%|*}"
 
         # Resolve repo spec to get local path
         # shellcheck disable=SC2034  # resolved_repo_id used by resolve_repo_spec
         local url branch custom_name local_path resolved_repo_id
-        if ! resolve_repo_spec "$repo_id" "$PROJECTS_DIR" "$LAYOUT" \
+        if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
                 url branch custom_name local_path resolved_repo_id 2>/dev/null; then
-            log_warn "Could not resolve repo: $repo_id"
+            log_warn "Could not resolve repo: $repo_spec"
             ((failed++))
             continue
         fi
+
+        local repo_id="$resolved_repo_id"
+        [[ -z "$repo_id" ]] && repo_id="$repo_spec"
+
+        # Skip if already processed (dedupe by resolved repo id)
+        [[ -n "${seen_repos[$repo_id]:-}" ]] && continue
+        seen_repos["$repo_id"]=1
 
         # Check if repo exists locally
         if [[ ! -d "$local_path" ]]; then
