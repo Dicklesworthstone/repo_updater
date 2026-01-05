@@ -3668,6 +3668,13 @@ cmd_doctor() {
         printf '%b\n' "${DIM}[  ]${RESET} gum: not installed (optional, for prettier UI)" >&2
     fi
 
+    # Check flock (optional, enables parallel sync)
+    if command -v flock &>/dev/null; then
+        printf '%b\n' "${GREEN}[OK]${RESET} flock: available (enables parallel sync)" >&2
+    else
+        printf '%b\n' "${DIM}[  ]${RESET} flock: not installed (optional; enables parallel sync)" >&2
+    fi
+
     local run_review_checks="false"
     if [[ "$review_flag" == "true" ]]; then
         run_review_checks="true"
@@ -3731,6 +3738,17 @@ cmd_doctor() {
             ((review_issues++))
         fi
 
+        if command -v flock &>/dev/null; then
+            printf '%b\n' "${GREEN}[OK]${RESET} flock: available" >&2
+        else
+            printf '%b\n' "${RED}[!!]${RESET} flock: not installed (required for review locking)" >&2
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                printf '%b\n' "${DIM}      Install: brew install flock${RESET}" >&2
+            else
+                printf '%b\n' "${DIM}      Install: sudo apt install util-linux OR sudo dnf install util-linux${RESET}" >&2
+            fi
+            ((review_issues++))
+        fi
         if command -v tmux &>/dev/null; then
             local tmux_version
             tmux_version=$(tmux -V 2>/dev/null | head -1 || echo "unknown")
@@ -3841,7 +3859,30 @@ cmd_self_update() {
     latest_version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
 
     if [[ -z "$latest_version" ]]; then
-        log_error "Could not parse version from GitHub API response"
+        # Fallback: follow the github.com redirect for /releases/latest.
+        # This avoids API rate limits and works even when the API response changes.
+        local latest_url="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/latest"
+        local effective=""
+
+        if command -v curl &>/dev/null; then
+            effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null || true)
+        elif command -v wget &>/dev/null; then
+            effective=$(wget -qS --spider "$latest_url" 2>&1 | awk '/^  Location: / {print $2}' | tail -1 | tr -d '\r' || true)
+        fi
+
+        if [[ -n "$effective" && "$effective" == *"/tag/"* ]]; then
+            latest_version="${effective##*/tag/}"
+        fi
+    fi
+
+    if [[ -z "$latest_version" ]]; then
+        local api_msg
+        api_msg=$(echo "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [[ -n "$api_msg" ]]; then
+            log_error "Could not determine latest release version (GitHub API: $api_msg)"
+        else
+            log_error "Could not determine latest release version"
+        fi
         log_verbose "Response: $response"
         exit 3
     fi
