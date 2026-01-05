@@ -235,6 +235,24 @@ setup_review_env_with_repo() {
     "$RU_SCRIPT" add owner/repo >/dev/null 2>&1
 }
 
+_make_minimal_path_bin_without_drivers() {
+    local out_dir="$1"
+
+    mkdir -p "$out_dir"
+
+    local -a cmds=(
+        awk cat cut date flock grep head jq mkdir mktemp sed sort tr uniq wc
+    )
+
+    local cmd
+    for cmd in "${cmds[@]}"; do
+        local bin
+        bin=$(command -v "$cmd" 2>/dev/null || echo "")
+        [[ -n "$bin" ]] || continue
+        ln -s "$bin" "$out_dir/$cmd" 2>/dev/null || true
+    done
+}
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -294,6 +312,45 @@ test_review_prereq_gh_auth_failure_exit_code_3() {
 
     assert_exit_code 3 "$exit_code" "review fails with exit code 3 on gh auth failure"
     assert_file_contains "$err_txt" "not authenticated" "stderr explains gh auth required"
+
+    cleanup_test_env
+}
+
+test_review_dry_run_succeeds_without_tmux_or_ntm() {
+    echo "Test: ru review --dry-run succeeds without tmux/ntm drivers"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_with_items)"
+
+    # Create minimal repo list without using `ru init/add` (keeps PATH needs small).
+    mkdir -p "$XDG_CONFIG_HOME/ru/repos.d"
+    printf '%s\n' "owner/repo" > "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+
+    local minimal_bin="$TEMP_DIR/minimal_bin"
+    _make_minimal_path_bin_without_drivers "$minimal_bin"
+
+    local saved_path="$PATH"
+    local bash_bin
+    bash_bin=$(command -v bash 2>/dev/null || echo "")
+    if [[ -z "$bash_bin" ]]; then
+        fail "bash not found in PATH"
+        cleanup_test_env
+        return
+    fi
+
+    # Ensure review driver commands are not visible.
+    export PATH="$TEMP_DIR/mock_bin:$minimal_bin"
+
+    local out_json="$TEMP_DIR/out.json"
+    local err_txt="$TEMP_DIR/err.txt"
+    "$bash_bin" "$RU_SCRIPT" --json review --dry-run --non-interactive >"$out_json" 2>"$err_txt"
+    local exit_code=$?
+
+    PATH="$saved_path"
+
+    assert_exit_code 0 "$exit_code" "review --dry-run exits 0 without drivers"
+    assert_jq_filter "$out_json" '.mode' "discovery" "JSON mode is discovery"
+    assert_file_contains "$err_txt" "Dry run complete" "stderr reports dry run completion"
 
     cleanup_test_env
 }
@@ -383,6 +440,7 @@ EOF
 test_review_dry_run_json_outputs_items
 test_review_dry_run_json_outputs_empty
 test_review_prereq_gh_auth_failure_exit_code_3
+test_review_dry_run_succeeds_without_tmux_or_ntm
 test_review_status_reports_free_when_no_lock
 test_review_status_json_includes_lock_and_checkpoint
 

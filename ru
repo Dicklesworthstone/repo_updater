@@ -10546,15 +10546,20 @@ cmd_review() {
         finalize_review_exit "$apply_code"
     fi
 
-    # Auto-detect driver if needed
-    if [[ "$REVIEW_DRIVER" == "auto" ]]; then
-        REVIEW_DRIVER=$(detect_review_driver)
-        log_verbose "Auto-detected driver: $REVIEW_DRIVER"
-    fi
+    # Dry-run discovery should not require a session driver (tmux/ntm).
+    if [[ "$REVIEW_DRY_RUN" != "true" ]]; then
+        # Auto-detect driver if needed
+        if [[ "$REVIEW_DRIVER" == "auto" ]]; then
+            REVIEW_DRIVER=$(detect_review_driver)
+            log_verbose "Auto-detected driver: $REVIEW_DRIVER"
+        fi
 
-    if [[ "$REVIEW_DRIVER" == "none" ]]; then
-        log_error "No review driver available. Install tmux or ntm."
-        exit 3
+        if [[ "$REVIEW_DRIVER" == "none" ]]; then
+            log_error "No review driver available. Install tmux or ntm."
+            exit 3
+        fi
+    else
+        [[ "$REVIEW_DRIVER" == "auto" ]] && REVIEW_DRIVER="none"
     fi
 
     # Discovery phase
