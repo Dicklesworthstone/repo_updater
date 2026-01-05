@@ -27,7 +27,6 @@ logs/
 # Test artifacts
 test-repos/
 /tmp/
-a.out
 
 # Debug artifacts
 *.debug
