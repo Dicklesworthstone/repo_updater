@@ -56,8 +56,6 @@ extract_function() {
 source <(extract_function "_is_valid_var_name" "$PROJECT_DIR/ru")
 source <(extract_function "_set_out_var" "$PROJECT_DIR/ru")
 source <(extract_function "_is_safe_path_segment" "$PROJECT_DIR/ru")
-source <(extract_function "_is_valid_var_name" "$PROJECT_DIR/ru")
-source <(extract_function "_set_out_var" "$PROJECT_DIR/ru")
 source <(extract_function "parse_repo_url" "$PROJECT_DIR/ru")
 source <(extract_function "normalize_url" "$PROJECT_DIR/ru")
 source <(extract_function "url_to_local_path" "$PROJECT_DIR/ru")
