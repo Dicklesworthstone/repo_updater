@@ -449,6 +449,84 @@ verify_checksum() {
 # INSTALLATION FUNCTIONS
 #==============================================================================
 
+# Install latest release without using the GitHub API.
+# Uses the stable /releases/latest/download/<asset> endpoints to avoid API rate limits
+# and to work better in restricted network environments.
+# Returns:
+#   0 - success
+#   2 - no releases exist (caller may fall back to main)
+#   1 - other failure
+install_from_latest_release() {
+    local install_dir="$1"
+    local temp_dir
+
+    if ! temp_dir=$(mktemp_dir); then
+        log_error "Failed to create temp directory (mktemp)"
+        return 1
+    fi
+    RU_INSTALLER_TEMP_DIR="$temp_dir"
+    trap cleanup_temp_dir EXIT
+
+    local latest_base="https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest/download"
+    local script_url="$latest_base/$SCRIPT_NAME"
+    local checksum_url="$latest_base/checksums.txt"
+
+    log_step "Downloading ru (latest release)..."
+    if ! download_file "$script_url" "$temp_dir/$SCRIPT_NAME"; then
+        # Best-effort: determine whether there are simply no releases.
+        if get_latest_release_from_redirect >/dev/null; then
+            log_error "Failed to download latest release artifact ($SCRIPT_NAME)"
+            return 1
+        fi
+        if [[ "$?" -eq 1 ]]; then
+            cleanup_temp_dir
+            RU_INSTALLER_TEMP_DIR=""
+            return 2
+        fi
+        log_error "Failed to download latest release artifact ($SCRIPT_NAME)"
+        return 1
+    fi
+
+    # Sanity check: ensure we downloaded a Bash script, not an HTML error page.
+    local first_line=""
+    IFS= read -r first_line < "$temp_dir/$SCRIPT_NAME" 2>/dev/null || true
+    if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
+        if get_latest_release_from_redirect >/dev/null; then
+            log_error "Downloaded unexpected content instead of ru (latest release)"
+            log_info "First line: $first_line"
+            return 1
+        fi
+        if [[ "$?" -eq 1 ]]; then
+            cleanup_temp_dir
+            RU_INSTALLER_TEMP_DIR=""
+            return 2
+        fi
+        log_error "Downloaded unexpected content instead of ru (latest release)"
+        log_info "First line: $first_line"
+        return 1
+    fi
+
+    log_step "Downloading checksums..."
+    if download_file "$checksum_url" "$temp_dir/checksums.txt"; then
+        local expected_checksum
+        expected_checksum=$(grep -E "^[a-f0-9]{64}[[:space:]]+\\*?$SCRIPT_NAME$" "$temp_dir/checksums.txt" | cut -d' ' -f1)
+
+        if [[ -n "$expected_checksum" ]]; then
+            log_step "Verifying checksum..."
+            if ! verify_checksum "$temp_dir/$SCRIPT_NAME" "$expected_checksum"; then
+                return 1
+            fi
+            log_success "Checksum verified"
+        else
+            log_warn "No checksum found for $SCRIPT_NAME in checksums.txt"
+        fi
+    else
+        log_warn "Could not download checksums.txt. Proceeding without verification."
+    fi
+
+    install_script "$temp_dir/$SCRIPT_NAME" "$install_dir"
+}
+
 # Install from GitHub Release (with checksum verification)
 install_from_release() {
     local version="$1"
@@ -635,40 +713,24 @@ main() {
         install_from_main "$install_dir" || exit 1
     else
         # Install from release
-        local version
-        local get_release_exit=0
         if [[ -n "${RU_VERSION:-}" ]]; then
-            version="$RU_VERSION"
-            log_info "Installing version: $version"
-            install_from_release "$version" "$install_dir" || exit 1
+            log_info "Installing version: $RU_VERSION"
+            install_from_release "$RU_VERSION" "$install_dir" || exit 1
         else
-            log_step "Fetching latest release version..."
-            version=$(get_latest_release) || get_release_exit=$?
-
-            case $get_release_exit in
-                0)
-                    log_info "Latest version: $version"
-                    ;;
-                1)
-                    # No releases exist - fall back to main branch with warning
+            log_step "Installing latest release..."
+            if ! install_from_latest_release "$install_dir"; then
+                local rc=$?
+                if [[ "$rc" -eq 2 ]]; then
                     log_warn "No releases found for this repository."
                     log_warn "Falling back to installation from main branch."
                     log_warn "This is equivalent to RU_UNSAFE_MAIN=1."
                     log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
                     printf '\n' >&2
                     install_from_main "$install_dir" || exit 1
-                    version=""  # Skip release installation below
-                    ;;
-                *)
-                    # API error - already logged by get_latest_release
+                else
                     exit 1
-                    ;;
-            esac
-        fi
-
-        # Install from release (if we have a version)
-        if [[ -n "$version" ]]; then
-            install_from_release "$version" "$install_dir" || exit 1
+                fi
+            fi
         fi
     fi
 
@@ -679,7 +741,8 @@ main() {
         # Check if we can prompt
         if [[ -t 0 ]]; then
             printf '\n' >&2
-            read -rp "Add $install_dir to PATH? [y/N] " response
+            printf 'Add %s to PATH? [y/N] ' "$install_dir" >&2
+            IFS= read -r response
             case "$response" in
                 [yY]|[yY][eE][sS])
                     add_to_path "$install_dir"

@@ -226,7 +226,7 @@ test_gum_confirm_function_exists() {
     func_def=$(type gum_confirm 2>/dev/null)
 
     assert_contains "$func_def" "GUM_AVAILABLE" "Should check GUM_AVAILABLE"
-    assert_contains "$func_def" "read -rp" "Should have fallback with read"
+    assert_contains "$func_def" "IFS= read -r yn" "Should have fallback with read"
 
     log_test_pass "$test_name"
 }

@@ -1111,16 +1111,23 @@ gum_confirm() {
             return 1
         fi
     else
+        if ! can_prompt; then
+            [[ "$default" == "true" ]]
+            return $?
+        fi
+
         # ANSI fallback
         local yn
         if [[ "$default" == "true" ]]; then
-            read -rp "$prompt [Y/n] " yn
+            printf '%s ' "$prompt [Y/n]" >&2
+            IFS= read -r yn
             case "${yn,,}" in
                 n|no) return 1 ;;
                 *) return 0 ;;
             esac
         else
-            read -rp "$prompt [y/N] " yn
+            printf '%s ' "$prompt [y/N]" >&2
+            IFS= read -r yn
             case "${yn,,}" in
                 y|yes) return 0 ;;
                 *) return 1 ;;
@@ -6765,8 +6772,14 @@ dashboard_prompt_line() {
     local prompt="$1"
     local input=""
 
+    if ! can_prompt; then
+        echo ""
+        return 1
+    fi
+
     exit_alt_screen
-    read -r -p "$prompt" input
+    printf '%s' "$prompt" >&2
+    IFS= read -r input
     enter_alt_screen
     DASHBOARD_STATE[refresh_needed]="true"
     echo "$input"
@@ -6802,7 +6815,8 @@ dashboard_prompt_choice() {
         ((i++))
     done
     local choice=""
-    read -r -p "Choose [1-${#options[@]}]: " choice
+    printf 'Choose [1-%d]: ' "${#options[@]}" >&2
+    IFS= read -r choice
     enter_alt_screen
     DASHBOARD_STATE[refresh_needed]="true"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
@@ -7933,9 +7947,15 @@ basic_mode_choose_answer() {
     local -a options=()
     mapfile -t options < <(question_get_options_lines "$question_json")
 
+    if ! can_prompt; then
+        echo ""
+        return 1
+    fi
+
     if [[ ${#options[@]} -eq 0 ]]; then
         local answer
-        read -r -p "Answer: " answer
+        printf 'Answer: ' >&2
+        IFS= read -r answer
         echo "$answer"
         return 0
     fi
@@ -7954,7 +7974,8 @@ basic_mode_choose_answer() {
         ((i++))
     done
     local choice=""
-    read -r -p "Choose [1-${#options[@]}]: " choice
+    printf 'Choose [1-%d]: ' "${#options[@]}" >&2
+    IFS= read -r choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
         echo "${options[$((choice - 1))]}"
         return 0
