@@ -26,6 +26,7 @@ source_ru_function "resolve_repo_spec"
 source_ru_function "url_to_local_path"
 source_ru_function "dedupe_repos"
 source_ru_function "detect_collisions"
+source_ru_function "get_all_repos"
 
 # Stub logging functions for testing
 log_verbose() { :; }
@@ -514,6 +515,163 @@ EOF
 }
 
 #==============================================================================
+# Tests: get_all_repos
+#==============================================================================
+
+test_get_all_repos_empty_when_no_dir() {
+    local test_name="get_all_repos returns empty when repos.d doesn't exist"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    # Set RU_CONFIG_DIR to a directory without repos.d
+    RU_CONFIG_DIR="$test_env/config"
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="flat"
+
+    local result
+    result=$(get_all_repos)
+
+    assert_equals "" "$result" "Should return empty when repos.d doesn't exist"
+
+    unset RU_CONFIG_DIR
+    log_test_pass "$test_name"
+}
+
+test_get_all_repos_empty_when_no_txt_files() {
+    local test_name="get_all_repos returns empty when repos.d has no .txt files"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    RU_CONFIG_DIR="$test_env/config"
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="flat"
+
+    # Create repos.d but with no .txt files
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+    echo "owner/repo" > "$RU_CONFIG_DIR/repos.d/ignored.md"
+
+    local result
+    result=$(get_all_repos)
+
+    assert_equals "" "$result" "Should return empty when no .txt files"
+
+    unset RU_CONFIG_DIR
+    log_test_pass "$test_name"
+}
+
+test_get_all_repos_loads_single_file() {
+    local test_name="get_all_repos loads from single .txt file"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    RU_CONFIG_DIR="$test_env/config"
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="flat"
+
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+    cat > "$RU_CONFIG_DIR/repos.d/repos.txt" << 'EOF'
+owner/repo1
+owner/repo2
+EOF
+
+    local result
+    result=$(get_all_repos)
+
+    assert_contains "$result" "owner/repo1" "Should contain repo1"
+    assert_contains "$result" "owner/repo2" "Should contain repo2"
+
+    unset RU_CONFIG_DIR
+    log_test_pass "$test_name"
+}
+
+test_get_all_repos_loads_multiple_files() {
+    local test_name="get_all_repos loads from multiple .txt files"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    RU_CONFIG_DIR="$test_env/config"
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="flat"
+
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+
+    # Create multiple list files
+    echo "owner/repo1" > "$RU_CONFIG_DIR/repos.d/public.txt"
+    echo "owner/repo2" > "$RU_CONFIG_DIR/repos.d/private.txt"
+    echo "owner/repo3" > "$RU_CONFIG_DIR/repos.d/work.txt"
+
+    local result
+    result=$(get_all_repos)
+
+    assert_contains "$result" "owner/repo1" "Should contain repo1 from public.txt"
+    assert_contains "$result" "owner/repo2" "Should contain repo2 from private.txt"
+    assert_contains "$result" "owner/repo3" "Should contain repo3 from work.txt"
+
+    unset RU_CONFIG_DIR
+    log_test_pass "$test_name"
+}
+
+test_get_all_repos_deduplicates() {
+    local test_name="get_all_repos deduplicates across files"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    RU_CONFIG_DIR="$test_env/config"
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="flat"
+
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+
+    # Same repo in multiple files
+    echo "owner/repo" > "$RU_CONFIG_DIR/repos.d/file1.txt"
+    echo "owner/repo" > "$RU_CONFIG_DIR/repos.d/file2.txt"
+
+    local result
+    result=$(get_all_repos)
+    local line_count
+    line_count=$(echo "$result" | wc -l | tr -d ' ')
+
+    assert_equals "1" "$line_count" "Should deduplicate to 1 repo"
+    assert_contains "$result" "owner/repo" "Should contain owner/repo"
+
+    unset RU_CONFIG_DIR
+    log_test_pass "$test_name"
+}
+
+test_get_all_repos_ignores_non_txt() {
+    local test_name="get_all_repos ignores non-.txt files"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    RU_CONFIG_DIR="$test_env/config"
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="flat"
+
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+
+    # Mix of .txt and other files
+    echo "owner/wanted" > "$RU_CONFIG_DIR/repos.d/repos.txt"
+    echo "owner/ignored1" > "$RU_CONFIG_DIR/repos.d/repos.md"
+    echo "owner/ignored2" > "$RU_CONFIG_DIR/repos.d/repos.txt.bak"
+
+    local result
+    result=$(get_all_repos)
+
+    assert_contains "$result" "owner/wanted" "Should contain repo from .txt"
+    assert_not_contains "$result" "ignored1" "Should not contain repo from .md"
+    assert_not_contains "$result" "ignored2" "Should not contain repo from .txt.bak"
+
+    unset RU_CONFIG_DIR
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -551,6 +709,14 @@ run_test test_detect_collisions_same_repo_no_collision
 run_test test_detect_collisions_flat_layout_collision
 run_test test_detect_collisions_owner_repo_layout_no_collision
 run_test test_detect_collisions_custom_name_collision
+
+# get_all_repos tests
+run_test test_get_all_repos_empty_when_no_dir
+run_test test_get_all_repos_empty_when_no_txt_files
+run_test test_get_all_repos_loads_single_file
+run_test test_get_all_repos_loads_multiple_files
+run_test test_get_all_repos_deduplicates
+run_test test_get_all_repos_ignores_non_txt
 
 echo ""
 print_results

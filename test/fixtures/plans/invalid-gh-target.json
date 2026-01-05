@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "repo": "octo/repo1",
+  "items": [
+    {"type": "issue", "number": 42, "decision": "fix"}
+  ],
+  "gh_actions": [
+    {"op": "comment", "target": "issue#abc"}
+  ]
+}

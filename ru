@@ -120,7 +120,7 @@ fi
 #==============================================================================
 
 # Version: read from VERSION file, fallback to embedded
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
     VERSION="$(cat "$SCRIPT_DIR/VERSION")"
@@ -163,6 +163,15 @@ XDG_CACHE_HOME="$(resolve_abs_or_tilde_path_or_default "${XDG_CACHE_HOME:-}" "$H
 RU_CONFIG_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_CONFIG_DIR:-}" "$XDG_CONFIG_HOME/ru")"
 RU_STATE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_STATE_DIR:-}" "$XDG_STATE_HOME/ru")"
 RU_CACHE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_CACHE_DIR:-}" "$XDG_CACHE_HOME/ru")"
+RU_LOG_DIR="$RU_STATE_DIR/logs"
+
+# Harden state directory paths against relative values
+if [[ "$XDG_STATE_HOME" != /* ]]; then
+    XDG_STATE_HOME="$HOME/$XDG_STATE_HOME"
+fi
+if [[ "$RU_STATE_DIR" != /* ]]; then
+    RU_STATE_DIR="$HOME/$RU_STATE_DIR"
+fi
 RU_LOG_DIR="$RU_STATE_DIR/logs"
 
 # Default configuration values
@@ -558,6 +567,7 @@ REVIEW OPTIONS:
     --priority=LEVEL     Min priority: all, critical, high, normal, low
     --skip-days=N        Skip repos reviewed within N days (default: 7)
     --dry-run            Discovery only, don't start sessions
+    --status             Show review lock/checkpoint status and exit
     --resume             Resume interrupted review from checkpoint
     --push               Allow pushing changes (with --apply)
     --auto-answer=POLICY Auto-answer policy in non-interactive mode (auto|skip|fail)
@@ -578,6 +588,7 @@ EXAMPLES:
     ru prune --archive   Archive orphan repos
     ru import repos.txt  Import repos from file (auto-detects visibility)
     ru review --dry-run  Discover issues/PRs without starting reviews
+    ru review --status   Show review lock/checkpoint status
     ru review            Start AI-assisted review of issues/PRs
     ru review --apply    Execute approved changes from plan
     ru review --basic    Answer queued review questions
@@ -598,6 +609,139 @@ EXIT CODES:
 
 More info: https://github.com/Dicklesworthstone/repo_updater
 EOF
+}
+
+# Show stylish quick menu when ru is run with no arguments
+# Uses gum for beautiful output with ANSI fallback
+show_quick_menu() {
+    # Note: check_gum may not have been called yet, so check directly
+    local has_gum="false"
+    command -v gum &>/dev/null && has_gum="true"
+
+    if [[ "$has_gum" == "true" ]]; then
+        # ══════════════════════════════════════════════════════════════════════
+        # GUM-STYLED OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        printf '\n' >&2
+
+        # Header banner with double border
+        gum style \
+            --border double \
+            --border-foreground 212 \
+            --padding "0 2" \
+            --margin "0 0" \
+            --bold \
+            "🔄 ru v${VERSION}" \
+            "Repo Updater" >&2
+
+        printf '\n' >&2
+
+        # Commands section header
+        gum style --foreground 214 --bold "COMMANDS" >&2
+        printf '\n' >&2
+
+        # Core workflow commands
+        gum style --foreground 39 --bold "  Core Workflow" >&2
+        gum style "    $(gum style --foreground 82 'sync')           Clone missing repos and pull updates" >&2
+        gum style "    $(gum style --foreground 82 'status')         Show repository status (read-only)" >&2
+        gum style "    $(gum style --foreground 82 'review')         AI-assisted review of issues and PRs" >&2
+        printf '\n' >&2
+
+        # Repository management
+        gum style --foreground 39 --bold "  Repository Management" >&2
+        gum style "    $(gum style --foreground 82 'add') <repo>      Add a repository to your list" >&2
+        gum style "    $(gum style --foreground 82 'remove') <repo>   Remove a repository from your list" >&2
+        gum style "    $(gum style --foreground 82 'list')           Show configured repositories" >&2
+        gum style "    $(gum style --foreground 212 --bold 'import') <file>   $(gum style --foreground 212 'Import repos from file (auto-detects visibility)')" >&2
+        printf '\n' >&2
+
+        # Setup & maintenance
+        gum style --foreground 39 --bold "  Setup & Maintenance" >&2
+        gum style "    $(gum style --foreground 82 'init')           Initialize configuration directory" >&2
+        gum style "    $(gum style --foreground 82 'config')         Show or set configuration values" >&2
+        gum style "    $(gum style --foreground 82 'doctor')         Run system diagnostics" >&2
+        gum style "    $(gum style --foreground 82 'prune')          Find and manage orphan repositories" >&2
+        gum style "    $(gum style --foreground 82 'self-update')    Update ru to the latest version" >&2
+        printf '\n' >&2
+
+        # Quick examples
+        gum style --foreground 214 --bold "QUICK START" >&2
+        printf '\n' >&2
+        gum style --faint "  # First time setup" >&2
+        gum style --foreground 82 "  ru init" >&2
+        printf '\n' >&2
+        gum style --faint "  # Add and sync repos" >&2
+        gum style --foreground 82 "  ru add owner/repo" >&2
+        gum style --foreground 82 "  ru sync" >&2
+        printf '\n' >&2
+        gum style --faint "  # Import repos from a file" >&2
+        gum style --foreground 212 "  ru import my_repos.txt" >&2
+        printf '\n' >&2
+
+        # Footer
+        gum style --faint "  Run 'ru --help' for full documentation" >&2
+        gum style --faint "  https://github.com/Dicklesworthstone/repo_updater" >&2
+        printf '\n' >&2
+    else
+        # ══════════════════════════════════════════════════════════════════════
+        # ANSI FALLBACK OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        printf '\n' >&2
+
+        # Header banner with box drawing
+        printf '%b\n' "${BOLD}${MAGENTA}╔════════════════════════════════════════════╗${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}║${RESET}  ${BOLD}🔄 ru${RESET} v${VERSION}                              ${BOLD}${MAGENTA}║${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}║${RESET}  ${DIM}Repo Updater${RESET}                              ${BOLD}${MAGENTA}║${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}╚════════════════════════════════════════════╝${RESET}" >&2
+        printf '\n' >&2
+
+        # Commands section header
+        printf '%b\n' "${BOLD}${YELLOW}COMMANDS${RESET}" >&2
+        printf '\n' >&2
+
+        # Core workflow commands
+        printf '%b\n' "  ${BOLD}${CYAN}Core Workflow${RESET}" >&2
+        printf '%b\n' "    ${GREEN}sync${RESET}           Clone missing repos and pull updates" >&2
+        printf '%b\n' "    ${GREEN}status${RESET}         Show repository status (read-only)" >&2
+        printf '%b\n' "    ${GREEN}review${RESET}         AI-assisted review of issues and PRs" >&2
+        printf '\n' >&2
+
+        # Repository management
+        printf '%b\n' "  ${BOLD}${CYAN}Repository Management${RESET}" >&2
+        printf '%b\n' "    ${GREEN}add${RESET} <repo>      Add a repository to your list" >&2
+        printf '%b\n' "    ${GREEN}remove${RESET} <repo>   Remove a repository from your list" >&2
+        printf '%b\n' "    ${GREEN}list${RESET}           Show configured repositories" >&2
+        printf '%b\n' "    ${BOLD}${MAGENTA}import${RESET} <file>   ${MAGENTA}Import repos from file (auto-detects visibility)${RESET}" >&2
+        printf '\n' >&2
+
+        # Setup & maintenance
+        printf '%b\n' "  ${BOLD}${CYAN}Setup & Maintenance${RESET}" >&2
+        printf '%b\n' "    ${GREEN}init${RESET}           Initialize configuration directory" >&2
+        printf '%b\n' "    ${GREEN}config${RESET}         Show or set configuration values" >&2
+        printf '%b\n' "    ${GREEN}doctor${RESET}         Run system diagnostics" >&2
+        printf '%b\n' "    ${GREEN}prune${RESET}          Find and manage orphan repositories" >&2
+        printf '%b\n' "    ${GREEN}self-update${RESET}    Update ru to the latest version" >&2
+        printf '\n' >&2
+
+        # Quick examples
+        printf '%b\n' "${BOLD}${YELLOW}QUICK START${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# First time setup${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru init${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# Add and sync repos${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru add owner/repo${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru sync${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# Import repos from a file${RESET}" >&2
+        printf '%b\n' "  ${MAGENTA}ru import my_repos.txt${RESET}" >&2
+        printf '\n' >&2
+
+        # Footer
+        printf '%b\n' "  ${DIM}Run 'ru --help' for full documentation${RESET}" >&2
+        printf '%b\n' "  ${DIM}https://github.com/Dicklesworthstone/repo_updater${RESET}" >&2
+        printf '\n' >&2
+    fi
 }
 
 #==============================================================================
@@ -2169,12 +2313,12 @@ parse_args() {
                 COMMAND="$1"
                 shift
                 ;;
-            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd)
+            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd|--review)
                 # Subcommand-specific options - pass through to ARGS
                 ARGS+=("$1")
                 shift
                 ;;
-            --plan|--apply|--push|--analytics|--basic|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
+            --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
                     shift
@@ -2289,6 +2433,25 @@ aggregate_results() {
     done < "$RESULTS_FILE"
 
     echo "CLONED=$cloned UPDATED=$updated CURRENT=$current SKIPPED=$skipped FAILED=$failed CONFLICTS=$conflicts SYSTEM_ERRORS=$system_errors"
+}
+
+# Load aggregate_results into global counters without eval.
+# Sets: CLONED UPDATED CURRENT SKIPPED FAILED CONFLICTS SYSTEM_ERRORS
+load_aggregate_results_globals() {
+    CLONED=0 UPDATED=0 CURRENT=0 SKIPPED=0 FAILED=0 CONFLICTS=0 SYSTEM_ERRORS=0
+
+    local kv key val
+    for kv in $(aggregate_results); do
+        key="${kv%%=*}"
+        val="${kv#*=}"
+        [[ "$val" =~ ^[0-9]+$ ]] || val=0
+
+        case "$key" in
+            CLONED|UPDATED|CURRENT|SKIPPED|FAILED|CONFLICTS|SYSTEM_ERRORS)
+                printf -v "$key" '%s' "$val"
+                ;;
+        esac
+    done
 }
 
 # Print a beautiful summary box with gum or ANSI fallback
@@ -2631,7 +2794,7 @@ cmd_sync() {
         done
 
         # Aggregate results and compute proper exit code
-        eval "$(aggregate_results)"
+        load_aggregate_results_globals
         compute_exit_code "$FAILED" "$CONFLICTS" "$SYSTEM_ERRORS"
         exit $?
     fi
@@ -2902,7 +3065,7 @@ cmd_sync() {
     duration=$((end_time - start_time))
 
     # Get aggregated counts from results file
-    eval "$(aggregate_results)"
+    load_aggregate_results_globals
 
     # Print summary using the new reporting functions
     print_summary "$CLONED" "$UPDATED" "$CURRENT" "$SKIPPED" "$CONFLICTS" "$FAILED" "$duration"
@@ -3264,6 +3427,28 @@ cmd_import() {
     [[ ! -f "$public_file" ]] && touch "$public_file"
     [[ ! -f "$private_file" ]] && touch "$private_file"
 
+    # Load existing repos into associative array for fast deduplication
+    local -A existing_repos
+    for f in "$public_file" "$private_file"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            # Trim whitespace
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+
+            # shellcheck disable=SC2034 # Variables set by nameref
+            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
+            parse_repo_spec "$line" ex_url ex_branch ex_name
+            if parse_repo_url "$ex_url" ex_host ex_owner ex_repo; then
+                # Store canonical ID: host/owner/repo
+                existing_repos["${ex_host}/${ex_owner}/${ex_repo}"]=1
+            fi
+        done < "$f"
+    done
+
     # Counters
     local imported_public=0
     local imported_private=0
@@ -3309,9 +3494,9 @@ cmd_import() {
             local normalized
             normalized=$(normalize_url "$line")
 
-            # Check for duplicates in both files
-            if grep -qxF "$normalized" "$public_file" 2>/dev/null || \
-               grep -qxF "$normalized" "$private_file" 2>/dev/null; then
+            # Check for duplicates using canonical ID
+            local canonical_id="${host}/${owner}/${repo}"
+            if [[ -n "${existing_repos[$canonical_id]:-}" ]]; then
                 ((skipped_duplicate++))
                 continue
             fi
@@ -3731,22 +3916,32 @@ cmd_doctor() {
             ((review_issues++))
         fi
 
+        local tmux_available="false"
+        local ntm_available="false"
+
         if command -v tmux &>/dev/null; then
             local tmux_version
             tmux_version=$(tmux -V 2>/dev/null | head -1 || echo "unknown")
             printf '%b\n' "${GREEN}[OK]${RESET} tmux: $tmux_version" >&2
+            tmux_available="true"
         else
             printf '%b\n' "${YELLOW}[??]${RESET} tmux: not installed (required for local driver)" >&2
         fi
 
         if command -v ntm &>/dev/null; then
-            if ntm --robot-status &>/dev/null; then
+            if ntm --help 2>&1 | grep -q "robot"; then
                 printf '%b\n' "${GREEN}[OK]${RESET} ntm: robot mode available" >&2
+                ntm_available="true"
             else
                 printf '%b\n' "${YELLOW}[??]${RESET} ntm: installed but robot mode unavailable" >&2
             fi
         else
             printf '%b\n' "${DIM}[  ]${RESET} ntm: not installed (optional)" >&2
+        fi
+
+        if [[ "$tmux_available" != "true" && "$ntm_available" != "true" ]]; then
+            printf '%b\n' "${RED}[!!]${RESET} review driver: no tmux or ntm available" >&2
+            ((review_issues++))
         fi
 
         if command -v gh &>/dev/null && gh auth status &>/dev/null; then
@@ -5061,7 +5256,7 @@ extract_inline_options() {
     local output="$1"
 
     # Look for patterns like "a) ...", "1. ...", "- Option A"
-    echo "$output" | grep -E '^\s*[a-z]\)|^\s*[0-9]+\.|^\s*-\s+[A-Z]' | head -5
+    echo "$output" | grep -E '^[[:space:]]*[a-z]\)|^[[:space:]]*[0-9]+\.|^[[:space:]]*-[[:space:]]+[A-Z]' | head -5
 }
 
 # Detect wait reason and classify it
@@ -5282,6 +5477,19 @@ validate_agent_command() {
             --arg status "needs_approval" \
             --arg reason "Empty command" \
             '{command: $cmd, status: $status, reason: $reason}'
+        return 2
+    fi
+
+    # Security: Check for shell metacharacters that enable command chaining/injection
+    # These could bypass base_cmd checks by executing additional commands
+    # Characters: ; | & ` $( ) && || (newlines handled by caller typically)
+    if [[ "$cmd" =~ [\;\|\&\`] ]] || [[ "$cmd" =~ \$\( ]] || [[ "$cmd" =~ \&\& ]] || [[ "$cmd" =~ \|\| ]]; then
+        jq -n \
+            --arg cmd "$cmd" \
+            --arg base "$base_cmd" \
+            --arg status "needs_approval" \
+            --arg reason "Command contains shell metacharacters (;|&\`\$()) that could enable command chaining" \
+            '{command: $cmd, base_command: $base, status: $status, reason: $reason}'
         return 2
     fi
 
@@ -5858,7 +6066,7 @@ update_github_rate_limit() {
 # Scans recent logs for 429/rate limit patterns
 # Sets: GOVERNOR_STATE[model_in_backoff], GOVERNOR_STATE[model_backoff_until]
 check_model_rate_limit() {
-    local state_dir="$RU_STATE_DIR"
+    local state_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
     local log_dir
     log_dir="$state_dir/logs/$(date +%Y-%m-%d)"
 
@@ -6573,6 +6781,237 @@ dashboard_apply_template() {
     driver_send_to_session "$session_id" "$template_text" || true
 }
 
+# Print wrapped text with a fixed indent
+print_wrapped_block() {
+    local indent="$1"
+    local width="$2"
+    local text="$3"
+
+    [[ -z "$text" ]] && return 0
+
+    while IFS= read -r line; do
+        printf '%s%s\n' "$indent" "$line"
+    done < <(wrap_text "$text" "$width")
+}
+
+# Show a patch summary for the worktree
+show_patch_summary() {
+    local wt_path="$1"
+    local cols="$2"
+    local plan_file="${3:-}"
+
+    local width=$((cols - 6))
+    [[ $width -lt 20 ]] && width=20
+
+    printf '\n  %sPATCH SUMMARY%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+
+    if [[ -z "$wt_path" || ! -d "$wt_path/.git" ]]; then
+        printf '  %sNo worktree available%s\n' "${DASH_DIM}" "${DASH_RESET}"
+        return 0
+    fi
+
+    local diffstat shortstat
+    diffstat=$(git -C "$wt_path" diff --stat --no-color 2>/dev/null || echo "")
+    shortstat=$(git -C "$wt_path" diff --shortstat --no-color 2>/dev/null || echo "")
+
+    if [[ -z "$diffstat" ]]; then
+        printf '  %sNo uncommitted changes%s\n' "${DASH_DIM}" "${DASH_RESET}"
+    else
+        printf '  Changed files:\n'
+        while IFS= read -r line; do
+            printf '    %s\n' "$(truncate_string "$line" "$width")"
+        done <<< "$(echo "$diffstat" | head -n 6)"
+
+        if [[ -n "$shortstat" ]]; then
+            printf '  Diff: %s\n' "$shortstat"
+        fi
+    fi
+
+    if [[ -n "$plan_file" && -f "$plan_file" ]] && command -v jq &>/dev/null; then
+        local tests_ran tests_ok gates_ok gates_warn tests_status
+        tests_ran=$(jq -r '.git.tests.ran // null' "$plan_file" 2>/dev/null)
+        tests_ok=$(jq -r '.git.tests.ok // null' "$plan_file" 2>/dev/null)
+        gates_ok=$(jq -r '.git.quality_gates_ok // null' "$plan_file" 2>/dev/null)
+        gates_warn=$(jq -r '.git.quality_gates_warning // null' "$plan_file" 2>/dev/null)
+
+        if [[ "$tests_ran" == "true" ]]; then
+            tests_status=$([[ "$tests_ok" == "true" ]] && echo "PASS" || echo "FAIL")
+        elif [[ "$tests_ran" == "false" ]]; then
+            tests_status="NOT RUN"
+        else
+            tests_status="UNKNOWN"
+        fi
+
+        printf '  Tests: %s\n' "$tests_status"
+        if [[ "$gates_ok" == "true" ]]; then
+            printf '  Quality gates: OK\n'
+        elif [[ "$gates_warn" == "true" ]]; then
+            printf '  Quality gates: WARNING\n'
+        elif [[ "$gates_ok" == "false" ]]; then
+            printf '  Quality gates: FAIL\n'
+        fi
+    fi
+}
+
+# View raw session output (tail of session log)
+view_session_output() {
+    local log_file="$1"
+
+    local cols rows term_size max_lines
+    term_size=$(get_terminal_size)
+    read -r cols rows <<< "$term_size"
+    max_lines=$((rows - 6))
+    [[ $max_lines -lt 5 ]] && max_lines=5
+
+    clear_screen
+    printf '%sSession Output%s\n\n' "${DASH_BOLD}" "${DASH_RESET}"
+
+    if [[ -z "$log_file" || ! -f "$log_file" ]]; then
+        printf '%sNo session log available.%s\n' "${DASH_DIM}" "${DASH_RESET}"
+    else
+        tail -n "$max_lines" "$log_file"
+    fi
+
+    printf '\nPress any key to return...\n'
+    read_keypress
+}
+
+# Drill-down view for a single question
+open_drilldown() {
+    local question_json="$1"
+
+    local repo_id session_id question_id prompt recommended
+    repo_id=$(echo "$question_json" | jq -r '.repo // "unknown"' 2>/dev/null)
+    session_id=$(question_get_session_id "$question_json")
+    question_id=$(question_get_id "$question_json")
+    prompt=$(question_get_prompt "$question_json")
+    recommended=$(question_get_recommended "$question_json")
+
+    local wt_path=""
+    if [[ -n "$repo_id" ]]; then
+        get_worktree_path "$repo_id" wt_path 2>/dev/null || wt_path=""
+    fi
+
+    local log_file=""
+    local plan_file=""
+    if [[ -n "$wt_path" ]]; then
+        log_file="$wt_path/.ru/session.log"
+        [[ -f "$log_file" ]] || log_file=""
+        plan_file="$wt_path/.ru/review-plan.json"
+        [[ -f "$plan_file" ]] || plan_file=""
+    fi
+
+    while true; do
+        local cols rows term_size width
+        term_size=$(get_terminal_size)
+        read -r cols rows <<< "$term_size"
+        width=$((cols - 4))
+        [[ $width -lt 20 ]] && width=20
+
+        local number item_type priority title context repo_url
+        number=$(echo "$question_json" | jq -r '.number // empty' 2>/dev/null)
+        item_type=$(echo "$question_json" | jq -r '.type // "issue"' 2>/dev/null)
+        priority=$(echo "$question_json" | jq -r '.priority // "NORMAL"' 2>/dev/null)
+        title=$(echo "$question_json" | jq -r '.title // .item_title // .context.title // empty' 2>/dev/null)
+        repo_url=$(echo "$question_json" | jq -r '.repo_url // .url // empty' 2>/dev/null)
+        context=$(echo "$question_json" | jq -r '
+            if .context == null then ""
+            elif (.context | type) == "string" then .context
+            else (.context | tostring)
+            end
+        ' 2>/dev/null)
+
+        clear_screen
+        printf '%s%s%s\n' "${DASH_BOLD}" " ${repo_id} - Session Detail [ESC]" "${DASH_RESET}"
+        draw_hline "$cols"
+
+        printf '  Repository: %s\n' "${repo_url:-$repo_id}"
+        printf '  Session ID: %s\n' "${session_id:-unknown}"
+        [[ -n "$wt_path" ]] && printf '  Worktree: %s\n' "$wt_path"
+        printf '  Priority: %s\n' "$priority"
+
+        if [[ -n "$number" || -n "$title" ]]; then
+            printf '\n  %s%s%s\n' "${DASH_BOLD}" "$(truncate_string "${item_type^^} #${number:-?}: ${title:-No title}" "$width")" "${DASH_RESET}"
+        fi
+
+        if [[ -n "$prompt" ]]; then
+            printf '\n  %sQUESTION%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$prompt"
+        fi
+
+        if [[ -n "$context" ]]; then
+            printf '\n  %sCONTEXT%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$context"
+        fi
+
+        local -a options=()
+        mapfile -t options < <(question_get_options_lines "$question_json")
+        if [[ ${#options[@]} -gt 0 ]]; then
+            printf '\n  %sOPTIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            [[ -n "${options[0]:-}" ]] && printf '  A: %s\n' "$(truncate_string "${options[0]}" "$width")"
+            [[ -n "${options[1]:-}" ]] && printf '  B: %s\n' "$(truncate_string "${options[1]}" "$width")"
+            if [[ ${#options[@]} -gt 2 ]]; then
+                printf '  C: %s\n' "$(truncate_string "${options[2]}" "$width")"
+            else
+                printf '  C: Skip\n'
+            fi
+        elif [[ -n "$recommended" ]]; then
+            printf '\n  %sRECOMMENDED%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$recommended"
+            printf '  C: Skip\n'
+        else
+            printf '\n  %sACTIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            printf '  C: Skip\n'
+        fi
+
+        local c_label="Skip"
+        if [[ -n "${options[2]:-}" ]]; then
+            c_label="Option 3"
+        fi
+
+        show_patch_summary "$wt_path" "$cols" "$plan_file"
+
+        printf '\n  [a] Quick fix  [b] Alt fix  [c] %s  [v] View session  [ESC] Back\n' "$c_label"
+
+        local key
+        key=$(read_keypress)
+        case "$key" in
+            $'\x1b'|q) return 0 ;;
+            a|b)
+                local answer=""
+                if [[ "$key" == "a" ]]; then
+                    answer="${options[0]:-}"
+                    [[ -z "$answer" ]] && answer="$recommended"
+                else
+                    answer="${options[1]:-}"
+                fi
+
+                if [[ -z "$answer" ]]; then
+                    continue
+                fi
+
+                [[ -n "$session_id" ]] && driver_send_to_session "$session_id" "$answer" || true
+                [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+                return 0
+                ;;
+            c)
+                if [[ -n "${options[2]:-}" ]]; then
+                    local answer="${options[2]}"
+                    [[ -n "$session_id" ]] && driver_send_to_session "$session_id" "$answer" || true
+                    [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+                else
+                    [[ -n "$question_id" ]] && mark_question_skipped "$question_id" || true
+                fi
+                return 0
+                ;;
+            v)
+                view_session_output "$log_file"
+                ;;
+            *) ;;
+        esac
+    done
+}
+
 # Enter alternate screen buffer
 enter_alt_screen() {
     printf '\033[?1049h'  # Enter alternate screen
@@ -6632,6 +7071,21 @@ truncate_string() {
         echo "${str:0:$((max_width - 3))}..."
     else
         echo "$str"
+    fi
+}
+
+# Wrap text to a given width (preserves words when possible)
+wrap_text() {
+    local text="$1"
+    local width="$2"
+
+    [[ -z "$text" ]] && return 0
+    [[ -z "$width" || "$width" -le 0 ]] && { echo "$text"; return 0; }
+
+    if command -v fold &>/dev/null; then
+        echo "$text" | fold -s -w "$width"
+    else
+        echo "$text"
     fi
 }
 
@@ -7102,8 +7556,14 @@ run_dashboard() {
                     ;;
                 drill:*)
                     local idx="${action#drill:}"
-                    # TODO: Open drill-down view (bd-7of4)
-                    log_verbose "Drill into question $idx"
+                    if [[ -n "$filtered_questions" ]]; then
+                        local question_json
+                        question_json=$(get_question_at_index "$filtered_questions" "$idx")
+                        if [[ -n "$question_json" ]]; then
+                            open_drilldown "$question_json"
+                            DASHBOARD_STATE[refresh_needed]="true"
+                        fi
+                    fi
                     ;;
                 skip:*)
                     local idx="${action#skip:}"
@@ -7633,6 +8093,7 @@ parse_review_args() {
     REVIEW_DRIVER="auto"         # auto, ntm, or local
     REVIEW_PARALLEL=4            # concurrent sessions
     REVIEW_DRY_RUN="false"       # discovery only
+    REVIEW_STATUS="false"        # status only, no discovery/sessions
     REVIEW_ANALYTICS="false"     # show analytics dashboard
     REVIEW_BASIC_TUI="false"     # basic gum/ANSI TUI for questions
     # shellcheck disable=SC2034  # Used by later phases
@@ -7699,6 +8160,9 @@ parse_review_args() {
             --dry-run)
                 REVIEW_DRY_RUN="true"
                 ;;
+            --status)
+                REVIEW_STATUS="true"
+                ;;
             --resume)
                 # shellcheck disable=SC2034  # Used by later phases
                 REVIEW_RESUME="true"
@@ -7763,7 +8227,7 @@ parse_review_args() {
 #------------------------------------------------------------------------------
 
 get_skipped_questions_log_file() {
-    printf '%s\n' "${RU_STATE_DIR}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
 }
 
 check_interactive_capability() {
@@ -7870,11 +8334,11 @@ summarize_non_interactive_questions() {
 #------------------------------------------------------------------------------
 
 # File descriptor for state lock (separate from review session lock)
-STATE_LOCK_FD=""
+STATE_LOCK_FD=201
 
 # Get path to review state directory
 get_review_state_dir() {
-    printf '%s\n' "${RU_STATE_DIR}/review"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/review"
 }
 
 # Acquire exclusive lock on state files
@@ -7882,23 +8346,11 @@ get_review_state_dir() {
 acquire_state_lock() {
     local state_dir
     state_dir=$(get_review_state_dir)
-    if ! command -v flock &>/dev/null; then
-        log_error "flock is required for state locking"
-        return 1
-    fi
-
-    if ! ensure_dir "$state_dir"; then
-        log_error "Failed to create state directory: $state_dir"
-        return 1
-    fi
+    ensure_dir "$state_dir"
     local lock_file="$state_dir/state.lock"
 
-    # Open fd for locking (avoid eval; quoting is sufficient)
-    if ! exec {STATE_LOCK_FD}>"$lock_file"; then
-        log_error "Failed to open state lock file: $lock_file"
-        return 1
-    fi
- 
+    # Open fd for locking (no eval)
+    exec 201>"$lock_file"
 
     # Get exclusive lock (blocking)
     if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
@@ -7910,11 +8362,7 @@ acquire_state_lock() {
 
 # Release state lock
 release_state_lock() {
-    if [[ -n "${STATE_LOCK_FD:-}" ]]; then
-        flock -u "$STATE_LOCK_FD" 2>/dev/null || true
-        exec {STATE_LOCK_FD}>&- 2>/dev/null || true
-        STATE_LOCK_FD=""
-    fi
+    flock -u "$STATE_LOCK_FD" 2>/dev/null || true
 }
 
 # Execute a function while holding the state lock
@@ -8253,7 +8701,7 @@ cleanup_old_review_state() {
     state_dir=$(get_review_state_dir)
 
     # Clean old worktrees if they exist
-    local worktrees_dir="$RU_STATE_DIR/worktrees"
+    local worktrees_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
     if [[ -d "$worktrees_dir" ]]; then
         find "$worktrees_dir" -maxdepth 1 -type d -mtime "+$max_age_days" \
             -exec rm -rf {} \; 2>/dev/null || true
@@ -8288,7 +8736,7 @@ cleanup_old_review_state() {
 
 # Get digest cache directory
 get_digest_cache_dir() {
-    printf '%s\n' "$RU_STATE_DIR/repo-digests"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/repo-digests"
 }
 
 # Load cached digest into a worktree and append delta since last review
@@ -8712,7 +9160,7 @@ cmd_review_analytics() {
 
 # Get the worktrees directory for current review run
 get_worktrees_dir() {
-    printf '%s\n' "${RU_STATE_DIR}/worktrees/${REVIEW_RUN_ID:-unknown}"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/${REVIEW_RUN_ID:-unknown}"
 }
 
 # Check if a repository is clean (no uncommitted changes)
@@ -8928,7 +9376,7 @@ cleanup_review_worktrees() {
         return 1
     fi
 
-    local base="${RU_STATE_DIR}/worktrees/$run_id"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/$run_id"
 
     [[ ! -d "$base" ]] && return 0
 
@@ -8987,7 +9435,7 @@ cleanup_review_worktrees() {
 # Output: JSON array of worktree info
 list_review_worktrees() {
     local run_id="${1:-${REVIEW_RUN_ID:-}}"
-    local base="${RU_STATE_DIR}/worktrees/$run_id"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/$run_id"
     local mapping_file="$base/mapping.json"
 
     if [[ -f "$mapping_file" ]]; then
@@ -9379,9 +9827,9 @@ discover_work_items() {
             log_verbose "Querying batch of $count repos"
             local response
             if response=$(gh_api_graphql_repo_batch "$chunk"); then
-                local items
-                items=$(parse_graphql_work_items "$response")
-                [[ -n "$items" ]] && all_work_items+="${items}"$'\n'
+                local parsed_items
+                parsed_items=$(parse_graphql_work_items "$response")
+                [[ -n "$parsed_items" ]] && all_work_items+="${parsed_items}"$'\n'
             else
                 log_warn "GraphQL batch query failed"
             fi
@@ -9395,9 +9843,9 @@ discover_work_items() {
         log_verbose "Querying final batch of $count repos"
         local response
         if response=$(gh_api_graphql_repo_batch "$chunk"); then
-            local items
-            items=$(parse_graphql_work_items "$response")
-            [[ -n "$items" ]] && all_work_items+="${items}"$'\n'
+            local parsed_items
+            parsed_items=$(parse_graphql_work_items "$response")
+            [[ -n "$parsed_items" ]] && all_work_items+="${parsed_items}"$'\n'
         else
             log_warn "GraphQL batch query failed"
         fi
@@ -9932,6 +10380,168 @@ finalize_review_exit() {
 }
 
 #------------------------------------------------------------------------------
+# cmd_review_status: Report review lock + checkpoint status (read-only)
+#
+# Outputs:
+#   - Human summary to stderr (default)
+#   - JSON to stdout when --json is set
+#
+# Returns:
+#   0 always (best-effort)
+#------------------------------------------------------------------------------
+cmd_review_status() {
+    local lock_file info_file checkpoint_file state_file
+    lock_file=$(get_review_lock_file)
+    info_file=$(get_review_lock_info_file)
+    checkpoint_file=$(get_checkpoint_file)
+    state_file=$(get_review_state_file)
+
+    ensure_dir "$(dirname "$lock_file")"
+
+    local lock_supported="false"
+    local lock_held="unknown"
+
+    if command -v flock &>/dev/null; then
+        lock_supported="true"
+        exec 19>"$lock_file"
+        if flock -n 19 2>/dev/null; then
+            lock_held="false"
+        else
+            lock_held="true"
+        fi
+        exec 19>&- 2>/dev/null || true
+    fi
+
+    local lock_held_json="null"
+    if [[ "$lock_held" == "true" || "$lock_held" == "false" ]]; then
+        lock_held_json="$lock_held"
+    fi
+
+    local info_exists="false"
+    local info_run_id="" info_started_at="" info_pid="" info_mode=""
+    local pid_alive="unknown"
+
+    if [[ -f "$info_file" ]]; then
+        info_exists="true"
+        if command -v jq &>/dev/null; then
+            info_run_id=$(jq -r '.run_id // ""' "$info_file" 2>/dev/null || echo "")
+            info_started_at=$(jq -r '.started_at // ""' "$info_file" 2>/dev/null || echo "")
+            info_pid=$(jq -r '.pid // ""' "$info_file" 2>/dev/null || echo "")
+            info_mode=$(jq -r '.mode // ""' "$info_file" 2>/dev/null || echo "")
+        fi
+        if [[ "$info_pid" =~ ^[0-9]+$ ]]; then
+            if kill -0 "$info_pid" 2>/dev/null; then
+                pid_alive="true"
+            else
+                pid_alive="false"
+            fi
+        fi
+    fi
+
+    local pid_alive_json="null"
+    if [[ "$pid_alive" == "true" || "$pid_alive" == "false" ]]; then
+        pid_alive_json="$pid_alive"
+    fi
+
+    local checkpoint_exists="false"
+    local checkpoint_run_id="" checkpoint_mode="" checkpoint_hash=""
+    local checkpoint_total="" checkpoint_completed="" checkpoint_pending="" checkpoint_questions=""
+    if [[ -f "$checkpoint_file" ]]; then
+        checkpoint_exists="true"
+        if command -v jq &>/dev/null; then
+            checkpoint_run_id=$(jq -r '.run_id // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_mode=$(jq -r '.mode // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_hash=$(jq -r '.config_hash // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_total=$(jq -r '.repos_total // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_completed=$(jq -r '.repos_completed // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_pending=$(jq -r '.repos_pending // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_questions=$(jq -r '.questions_pending // ""' "$checkpoint_file" 2>/dev/null || echo "")
+        fi
+    fi
+
+    local checkpoint_total_json="null"
+    local checkpoint_completed_json="null"
+    local checkpoint_pending_json="null"
+    local checkpoint_questions_json="null"
+    [[ "$checkpoint_total" =~ ^[0-9]+$ ]] && checkpoint_total_json="$checkpoint_total"
+    [[ "$checkpoint_completed" =~ ^[0-9]+$ ]] && checkpoint_completed_json="$checkpoint_completed"
+    [[ "$checkpoint_pending" =~ ^[0-9]+$ ]] && checkpoint_pending_json="$checkpoint_pending"
+    [[ "$checkpoint_questions" =~ ^[0-9]+$ ]] && checkpoint_questions_json="$checkpoint_questions"
+
+    local state_exists="false"
+    [[ -f "$state_file" ]] && state_exists="true"
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local ts
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        printf '{'
+        printf '"command":"review","mode":"status","timestamp":"%s",' "$ts"
+        printf '"lock":{"supported":%s,"held":%s,"info_file_exists":%s,' \
+            "$lock_supported" "$lock_held_json" "$info_exists"
+        printf '"info":{"run_id":"%s","started_at":"%s","pid":"%s","pid_alive":%s,"mode":"%s"}},' \
+            "$(json_escape "$info_run_id")" "$(json_escape "$info_started_at")" "$(json_escape "$info_pid")" "$pid_alive_json" "$(json_escape "$info_mode")"
+        printf '"checkpoint":{"exists":%s,"run_id":"%s","mode":"%s","config_hash":"%s","repos_total":%s,"repos_completed":%s,"repos_pending":%s,"questions_pending":%s},' \
+            "$checkpoint_exists" "$(json_escape "$checkpoint_run_id")" "$(json_escape "$checkpoint_mode")" "$(json_escape "$checkpoint_hash")" \
+            "$checkpoint_total_json" "$checkpoint_completed_json" "$checkpoint_pending_json" "$checkpoint_questions_json"
+        printf '"state":{"exists":%s}}' "$state_exists"
+        printf '\n'
+        return 0
+    fi
+
+    log_step "Review status"
+
+    if [[ "$lock_supported" != "true" ]]; then
+        log_warn "flock not available; lock status unknown"
+    else
+        case "$lock_held" in
+            true) log_info "Review lock: held" ;;
+            false) log_info "Review lock: free" ;;
+            *) log_info "Review lock: unknown" ;;
+        esac
+    fi
+
+    if [[ "$info_exists" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            [[ -n "$info_run_id" ]] && log_info "  Run ID:  $info_run_id"
+            [[ -n "$info_started_at" ]] && log_info "  Started: $info_started_at"
+            [[ -n "$info_pid" ]] && log_info "  PID:     $info_pid (alive: $pid_alive)"
+            [[ -n "$info_mode" ]] && log_info "  Mode:    $info_mode"
+        else
+            log_info "Lock info (raw):"
+            sed 's/^/  /' "$info_file" >&2 || true
+        fi
+    else
+        log_info "Lock info: none"
+    fi
+
+    if [[ "$checkpoint_exists" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            log_info "Checkpoint: present"
+            [[ -n "$checkpoint_run_id" ]] && log_info "  Run ID:           $checkpoint_run_id"
+            [[ -n "$checkpoint_mode" ]] && log_info "  Mode:             $checkpoint_mode"
+            [[ -n "$checkpoint_hash" ]] && log_info "  Config hash:       $checkpoint_hash"
+            [[ "$checkpoint_total_json" != "null" ]] && log_info "  Repos total:       $checkpoint_total_json"
+            [[ "$checkpoint_completed_json" != "null" ]] && log_info "  Repos completed:   $checkpoint_completed_json"
+            [[ "$checkpoint_pending_json" != "null" ]] && log_info "  Repos pending:     $checkpoint_pending_json"
+            [[ "$checkpoint_questions_json" != "null" ]] && log_info "  Questions pending: $checkpoint_questions_json"
+        else
+            log_info "Checkpoint present (jq not installed)"
+        fi
+    else
+        log_info "Checkpoint: none"
+    fi
+
+    if [[ "$state_exists" == "true" ]]; then
+        log_info "Review state: present"
+    else
+        log_info "Review state: none"
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
 # cmd_review: Review GitHub issues and PRs using Claude Code
 #------------------------------------------------------------------------------
 cmd_review() {
@@ -9940,6 +10550,11 @@ cmd_review() {
 
     # Parse review-specific arguments
     parse_review_args
+
+    if [[ "$REVIEW_STATUS" == "true" ]]; then
+        cmd_review_status
+        return $?
+    fi
 
     if [[ "$REVIEW_ANALYTICS" == "true" ]]; then
         cmd_review_analytics
@@ -10077,15 +10692,20 @@ cmd_review() {
         finalize_review_exit "$apply_code"
     fi
 
-    # Auto-detect driver if needed
-    if [[ "$REVIEW_DRIVER" == "auto" ]]; then
-        REVIEW_DRIVER=$(detect_review_driver)
-        log_verbose "Auto-detected driver: $REVIEW_DRIVER"
-    fi
+    # Dry-run discovery should not require a session driver (tmux/ntm).
+    if [[ "$REVIEW_DRY_RUN" != "true" ]]; then
+        # Auto-detect driver if needed
+        if [[ "$REVIEW_DRIVER" == "auto" ]]; then
+            REVIEW_DRIVER=$(detect_review_driver)
+            log_verbose "Auto-detected driver: $REVIEW_DRIVER"
+        fi
 
-    if [[ "$REVIEW_DRIVER" == "none" ]]; then
-        log_error "No review driver available. Install tmux or ntm."
-        exit 3
+        if [[ "$REVIEW_DRIVER" == "none" ]]; then
+            log_error "No review driver available. Install tmux or ntm."
+            exit 3
+        fi
+    else
+        [[ "$REVIEW_DRIVER" == "auto" ]] && REVIEW_DRIVER="none"
     fi
 
     # Discovery phase
@@ -10205,7 +10825,7 @@ resolve_review_apply_run_id() {
         return 0
     fi
 
-    local base="${RU_STATE_DIR}/worktrees"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
     if [[ ! -d "$base" ]]; then
         log_error "No review worktrees directory found: $base"
         return 1
@@ -10549,8 +11169,9 @@ push_worktree_changes() {
         return 1
     fi
 
-    if ! git -C "$main_repo" push 2>/dev/null; then
-        log_error "Push failed for $repo_id"
+    local push_output
+    if ! push_output=$(git -C "$main_repo" push 2>&1); then
+        log_error "Push failed for $repo_id: $push_output"
         git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
         [[ -n "$original_branch" ]] && git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
         return 1
@@ -11604,10 +12225,10 @@ run_secret_scan() {
         # Regex fallback
         log_verbose "Scanning for secrets with regex patterns"
         local patterns=(
-            'password\s*[:=]'
-            'api.?key\s*[:=]'
-            'secret\s*[:=]'
-            'token\s*[:=]'
+            'password[[:space:]]*[:=]'
+            'api.?key[[:space:]]*[:=]'
+            'secret[[:space:]]*[:=]'
+            'token[[:space:]]*[:=]'
             'AWS_ACCESS_KEY'
             'AWS_SECRET_ACCESS_KEY'
             'PRIVATE_KEY'
@@ -11617,9 +12238,13 @@ run_secret_scan() {
 
         local diff_output
         if [[ "$scope" == "staged" ]]; then
-            diff_output=$(git -C "$project_dir" diff --cached 2>/dev/null || true)
+            diff_output=$(git -C "$project_dir" diff --no-color --cached 2>/dev/null || true)
         else
-            diff_output=$(git -C "$project_dir" diff HEAD~1..HEAD 2>/dev/null || true)
+            if git -C "$project_dir" rev-parse --verify HEAD >/dev/null 2>&1; then
+                diff_output=$(git -C "$project_dir" diff --no-color HEAD 2>/dev/null || true)
+            else
+                diff_output=$(git -C "$project_dir" diff --no-color 2>/dev/null || true)
+            fi
         fi
 
         for pattern in "${patterns[@]}"; do
@@ -12103,6 +12728,12 @@ execute_gh_actions() {
 #==============================================================================
 
 main() {
+    # Show quick menu if run with no arguments
+    if [[ $# -eq 0 ]]; then
+        show_quick_menu
+        exit 0
+    fi
+
     # Initialize
     ARGS=()
     parse_args "$@"

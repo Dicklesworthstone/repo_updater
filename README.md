@@ -255,6 +255,11 @@ Keep your projects directory clean:
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 ```
 
+**If you suspect CDN caching (stale installer):**
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
+```
+
 <details>
 <summary><strong>Manual installation</strong></summary>
 
@@ -1311,6 +1316,7 @@ scripts/
 ├── test_unit_config.sh       # Configuration handling
 ├── test_unit_gum_wrappers.sh # Gum fallback behavior
 ├── test_e2e_init.sh          # Init workflow
+├── test_e2e_review.sh         # Review discovery workflow
 ├── test_e2e_add.sh           # Add command
 ├── test_e2e_sync.sh          # Sync workflow
 ├── test_e2e_status.sh        # Status command

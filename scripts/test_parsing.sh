@@ -57,6 +57,7 @@ source <(extract_function "_is_safe_path_segment" "$PROJECT_DIR/ru")
 source <(extract_function "parse_repo_url" "$PROJECT_DIR/ru")
 source <(extract_function "normalize_url" "$PROJECT_DIR/ru")
 source <(extract_function "url_to_local_path" "$PROJECT_DIR/ru")
+source <(extract_function "url_to_clone_target" "$PROJECT_DIR/ru")
 source <(extract_function "parse_repo_spec" "$PROJECT_DIR/ru")
 
 #==============================================================================
@@ -429,6 +430,292 @@ test_parse_spec_branch_with_at_symbol() {
 }
 
 #==============================================================================
+# Test Helpers: normalize_url
+#==============================================================================
+
+assert_normalize_url() {
+    local input="$1"
+    local expected="$2"
+    local msg="$3"
+
+    local result
+    if result=$(normalize_url "$input" 2>/dev/null); then
+        assert_equals "$expected" "$result" "$msg"
+    else
+        if [[ -z "$expected" ]]; then
+            _tf_pass "$msg (expected failure)"
+        else
+            _tf_fail "$msg" "$expected" "normalize failed"
+        fi
+    fi
+}
+
+assert_normalize_url_fails() {
+    local input="$1"
+    local msg="$2"
+
+    local result
+    if result=$(normalize_url "$input" 2>/dev/null) && [[ -n "$result" ]]; then
+        _tf_fail "$msg" "empty/error" "$result"
+    else
+        _tf_pass "$msg"
+    fi
+}
+
+#==============================================================================
+# Test Helpers: url_to_local_path
+#==============================================================================
+
+assert_url_to_path() {
+    local url="$1"
+    local projects_dir="$2"
+    local layout="$3"
+    local expected="$4"
+    local msg="$5"
+
+    local result
+    if result=$(url_to_local_path "$url" "$projects_dir" "$layout" 2>/dev/null); then
+        assert_equals "$expected" "$result" "$msg"
+    else
+        _tf_fail "$msg" "$expected" "path conversion failed"
+    fi
+}
+
+#==============================================================================
+# Test Helpers: url_to_clone_target
+#==============================================================================
+
+assert_clone_target() {
+    local url="$1"
+    local expected="$2"
+    local msg="$3"
+
+    local result
+    if result=$(url_to_clone_target "$url" 2>/dev/null); then
+        assert_equals "$expected" "$result" "$msg"
+    else
+        if [[ -z "$expected" ]]; then
+            _tf_pass "$msg (expected failure)"
+        else
+            _tf_fail "$msg" "$expected" "clone target failed"
+        fi
+    fi
+}
+
+#==============================================================================
+# Tests: normalize_url - Standard Formats
+#==============================================================================
+
+test_normalize_url_https() {
+    assert_normalize_url "https://github.com/owner/repo" \
+        "https://github.com/owner/repo" \
+        "HTTPS URL normalizes to itself"
+}
+
+test_normalize_url_https_with_git_suffix() {
+    assert_normalize_url "https://github.com/owner/repo.git" \
+        "https://github.com/owner/repo" \
+        "HTTPS URL with .git suffix strips suffix"
+}
+
+test_normalize_url_ssh() {
+    assert_normalize_url "git@github.com:owner/repo.git" \
+        "https://github.com/owner/repo" \
+        "SSH URL normalizes to HTTPS"
+}
+
+test_normalize_url_ssh_without_suffix() {
+    assert_normalize_url "git@github.com:owner/repo" \
+        "https://github.com/owner/repo" \
+        "SSH URL without .git normalizes to HTTPS"
+}
+
+test_normalize_url_shorthand() {
+    assert_normalize_url "owner/repo" \
+        "https://github.com/owner/repo" \
+        "Shorthand normalizes to HTTPS GitHub URL"
+}
+
+test_normalize_url_host_prefix() {
+    assert_normalize_url "github.com/owner/repo" \
+        "https://github.com/owner/repo" \
+        "Host prefix normalizes to full HTTPS"
+}
+
+test_normalize_url_gitlab() {
+    assert_normalize_url "git@gitlab.com:owner/repo.git" \
+        "https://gitlab.com/owner/repo" \
+        "GitLab SSH normalizes to GitLab HTTPS"
+}
+
+test_normalize_url_bitbucket() {
+    assert_normalize_url "https://bitbucket.org/owner/repo" \
+        "https://bitbucket.org/owner/repo" \
+        "Bitbucket URL normalizes correctly"
+}
+
+test_normalize_url_trailing_slash() {
+    assert_normalize_url "https://github.com/owner/repo/" \
+        "https://github.com/owner/repo" \
+        "Trailing slash is removed"
+}
+
+#==============================================================================
+# Tests: normalize_url - Edge Cases
+#==============================================================================
+
+test_normalize_url_empty() {
+    assert_normalize_url_fails "" \
+        "Empty string returns empty"
+}
+
+test_normalize_url_invalid() {
+    assert_normalize_url_fails "not-a-url" \
+        "Invalid URL returns empty"
+}
+
+test_normalize_url_just_host() {
+    assert_normalize_url_fails "github.com" \
+        "Just host returns empty"
+}
+
+#==============================================================================
+# Tests: url_to_local_path - Flat Layout
+#==============================================================================
+
+test_url_to_path_flat_https() {
+    assert_url_to_path "https://github.com/owner/repo" \
+        "/data/projects" "flat" \
+        "/data/projects/repo" \
+        "Flat layout: HTTPS URL"
+}
+
+test_url_to_path_flat_shorthand() {
+    assert_url_to_path "owner/repo" \
+        "/data/projects" "flat" \
+        "/data/projects/repo" \
+        "Flat layout: shorthand"
+}
+
+test_url_to_path_flat_ssh() {
+    assert_url_to_path "git@github.com:owner/repo.git" \
+        "/data/projects" "flat" \
+        "/data/projects/repo" \
+        "Flat layout: SSH URL"
+}
+
+test_url_to_path_flat_different_dir() {
+    assert_url_to_path "owner/repo" \
+        "/home/user/code" "flat" \
+        "/home/user/code/repo" \
+        "Flat layout: custom projects dir"
+}
+
+#==============================================================================
+# Tests: url_to_local_path - Owner-Repo Layout
+#==============================================================================
+
+test_url_to_path_owner_repo_https() {
+    assert_url_to_path "https://github.com/Dicklesworthstone/repo_updater" \
+        "/data/projects" "owner-repo" \
+        "/data/projects/Dicklesworthstone/repo_updater" \
+        "Owner-repo layout: HTTPS URL"
+}
+
+test_url_to_path_owner_repo_shorthand() {
+    assert_url_to_path "owner/repo" \
+        "/data/projects" "owner-repo" \
+        "/data/projects/owner/repo" \
+        "Owner-repo layout: shorthand"
+}
+
+test_url_to_path_owner_repo_ssh() {
+    assert_url_to_path "git@github.com:cli/cli.git" \
+        "/data/projects" "owner-repo" \
+        "/data/projects/cli/cli" \
+        "Owner-repo layout: SSH URL same name"
+}
+
+#==============================================================================
+# Tests: url_to_local_path - Full Layout
+#==============================================================================
+
+test_url_to_path_full_github() {
+    assert_url_to_path "https://github.com/owner/repo" \
+        "/data/projects" "full" \
+        "/data/projects/github.com/owner/repo" \
+        "Full layout: GitHub URL"
+}
+
+test_url_to_path_full_gitlab() {
+    assert_url_to_path "https://gitlab.com/owner/repo" \
+        "/data/projects" "full" \
+        "/data/projects/gitlab.com/owner/repo" \
+        "Full layout: GitLab URL"
+}
+
+test_url_to_path_full_shorthand() {
+    assert_url_to_path "owner/repo" \
+        "/data/projects" "full" \
+        "/data/projects/github.com/owner/repo" \
+        "Full layout: shorthand defaults to github.com"
+}
+
+test_url_to_path_full_custom_host() {
+    assert_url_to_path "https://git.example.com/owner/repo" \
+        "/data/projects" "full" \
+        "/data/projects/git.example.com/owner/repo" \
+        "Full layout: custom git host"
+}
+
+#==============================================================================
+# Tests: url_to_clone_target
+#==============================================================================
+
+test_clone_target_https() {
+    assert_clone_target "https://github.com/owner/repo" \
+        "owner/repo" \
+        "Clone target from HTTPS URL"
+}
+
+test_clone_target_https_with_suffix() {
+    assert_clone_target "https://github.com/owner/repo.git" \
+        "owner/repo" \
+        "Clone target from HTTPS URL with .git"
+}
+
+test_clone_target_ssh() {
+    assert_clone_target "git@github.com:owner/repo.git" \
+        "owner/repo" \
+        "Clone target from SSH URL"
+}
+
+test_clone_target_shorthand() {
+    assert_clone_target "owner/repo" \
+        "owner/repo" \
+        "Clone target from shorthand"
+}
+
+test_clone_target_mixed_case() {
+    assert_clone_target "Dicklesworthstone/repo_updater" \
+        "Dicklesworthstone/repo_updater" \
+        "Clone target preserves case"
+}
+
+test_clone_target_gitlab() {
+    # Note: gh clone doesn't work with non-GitHub, but the function returns owner/repo
+    assert_clone_target "https://gitlab.com/owner/repo" \
+        "owner/repo" \
+        "Clone target from GitLab URL"
+}
+
+test_clone_target_same_name() {
+    assert_clone_target "cli/cli" \
+        "cli/cli" \
+        "Clone target with same owner and repo"
+}
+
+#==============================================================================
 # Run All Tests
 #==============================================================================
 
@@ -499,6 +786,48 @@ run_test test_parse_spec_extra_spaces
 run_test test_parse_spec_case_sensitive_as
 run_test test_parse_spec_as_in_repo_name
 run_test test_parse_spec_branch_with_at_symbol
+
+# normalize_url - Standard Formats
+run_test test_normalize_url_https
+run_test test_normalize_url_https_with_git_suffix
+run_test test_normalize_url_ssh
+run_test test_normalize_url_ssh_without_suffix
+run_test test_normalize_url_shorthand
+run_test test_normalize_url_host_prefix
+run_test test_normalize_url_gitlab
+run_test test_normalize_url_bitbucket
+run_test test_normalize_url_trailing_slash
+
+# normalize_url - Edge Cases
+run_test test_normalize_url_empty
+run_test test_normalize_url_invalid
+run_test test_normalize_url_just_host
+
+# url_to_local_path - Flat Layout
+run_test test_url_to_path_flat_https
+run_test test_url_to_path_flat_shorthand
+run_test test_url_to_path_flat_ssh
+run_test test_url_to_path_flat_different_dir
+
+# url_to_local_path - Owner-Repo Layout
+run_test test_url_to_path_owner_repo_https
+run_test test_url_to_path_owner_repo_shorthand
+run_test test_url_to_path_owner_repo_ssh
+
+# url_to_local_path - Full Layout
+run_test test_url_to_path_full_github
+run_test test_url_to_path_full_gitlab
+run_test test_url_to_path_full_shorthand
+run_test test_url_to_path_full_custom_host
+
+# url_to_clone_target
+run_test test_clone_target_https
+run_test test_clone_target_https_with_suffix
+run_test test_clone_target_ssh
+run_test test_clone_target_shorthand
+run_test test_clone_target_mixed_case
+run_test test_clone_target_gitlab
+run_test test_clone_target_same_name
 
 # Print results
 print_results

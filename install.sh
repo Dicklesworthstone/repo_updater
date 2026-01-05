@@ -274,6 +274,10 @@ extract_json_string_field() {
         | head -1 \
         | cut -d'"' -f4
 }
+<<<<<<< HEAD
+=======
+
+>>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
 # Get the default shell config file
 get_shell_config() {
     local shell_name
@@ -323,17 +327,52 @@ in_path() {
 }
 
 # Get latest release version from GitHub
+# Returns:
+#   0 with version on stdout - success
+#   1 - no releases exist (caller should fall back to main)
+#   2 - API error (rate limit, network, etc.)
 get_latest_release() {
     local url="$GITHUB_API/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
     local response api_rc
 
     response=$(github_api_get "$url")
+<<<<<<< HEAD
     api_rc=$?
+=======
+    local api_rc=$?
+>>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
     if [[ "$api_rc" -eq 2 ]]; then
         # No releases exist - caller should fall back to main.
         return 1
     fi
+    if [[ "$api_rc" -ne 0 ]]; then
+        # Try a non-API method before failing (avoids API rate limits / weird proxies).
+        local redirect_version=""
+        if redirect_version=$(get_latest_release_from_redirect); then
+            log_warn "GitHub API unavailable; detected latest release via redirect."
+            printf '%s\n' "$redirect_version"
+            return 0
+        else
+            local redirect_rc=$?
+            if [[ "$redirect_rc" -eq 1 ]]; then
+                return 1
+            fi
 
+            local msg
+            msg=$(extract_json_string_field "$response" "message")
+            if [[ -n "$msg" ]]; then
+                log_error "GitHub API error while fetching latest release: $msg"
+            elif printf '%s\n' "$response" | grep -qi "rate limit"; then
+                log_error "GitHub API rate limit exceeded while fetching latest release."
+            else
+                log_error "Failed to fetch latest release from GitHub."
+            fi
+            log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
+            return 2
+        fi
+    fi
+
+<<<<<<< HEAD
     if [[ "$api_rc" -ne 0 ]]; then
         # Try a non-API method before failing (avoids API rate limits / weird proxies).
         local redirect_version=""
@@ -363,6 +402,10 @@ get_latest_release() {
 
     # Extract tag_name from JSON (simple approach for portability)
     local version=""
+=======
+    # Extract tag_name from JSON (simple grep approach for portability)
+    local version
+>>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
     if command_exists jq; then
         version=$(printf '%s\n' "$response" | jq -r '.tag_name // empty' 2>/dev/null | head -1)
     else
@@ -399,6 +442,10 @@ get_latest_release() {
 }
 
 # Download a file with cache-busting
+<<<<<<< HEAD
+=======
+# Adds a timestamp query parameter to bypass CDN/proxy caches
+>>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
 download_file() {
     local url="$1"
     local dest="$2"
@@ -625,22 +672,46 @@ main() {
 
     # Determine version and installation source
     if [[ -n "${RU_UNSAFE_MAIN:-}" ]] && [[ "$RU_UNSAFE_MAIN" == "1" ]]; then
-        # Install from main branch
+        # Install from main branch (explicit request)
         log_info "Installing from main branch (RU_UNSAFE_MAIN=1)"
         install_from_main "$install_dir" || exit 1
     else
         # Install from release
         local version
+        local get_release_exit=0
         if [[ -n "${RU_VERSION:-}" ]]; then
             version="$RU_VERSION"
             log_info "Installing version: $version"
+            install_from_release "$version" "$install_dir" || exit 1
         else
             log_step "Fetching latest release version..."
-            version=$(get_latest_release) || exit 1
-            log_info "Latest version: $version"
+            version=$(get_latest_release) || get_release_exit=$?
+
+            case $get_release_exit in
+                0)
+                    log_info "Latest version: $version"
+                    ;;
+                1)
+                    # No releases exist - fall back to main branch with warning
+                    log_warn "No releases found for this repository."
+                    log_warn "Falling back to installation from main branch."
+                    log_warn "This is equivalent to RU_UNSAFE_MAIN=1."
+                    log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
+                    printf '\n' >&2
+                    install_from_main "$install_dir" || exit 1
+                    version=""  # Skip release installation below
+                    ;;
+                *)
+                    # API error - already logged by get_latest_release
+                    exit 1
+                    ;;
+            esac
         fi
 
-        install_from_release "$version" "$install_dir" || exit 1
+        # Install from release (if we have a version)
+        if [[ -n "$version" ]]; then
+            install_from_release "$version" "$install_dir" || exit 1
+        fi
     fi
 
     # Check PATH and offer to add if needed

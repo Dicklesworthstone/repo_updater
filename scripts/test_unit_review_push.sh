@@ -88,7 +88,7 @@ test_verify_push_safe_rejects_unanswered_questions() {
 }
 EOF
 
-    assert_fails 'verify_push_safe "owner/repo" "$plan_file"' "should refuse push with unanswered questions"
+    assert_fails "should refuse push with unanswered questions" verify_push_safe "owner/repo" "$plan_file"
     log_test_pass "$test_name"
 }
 
