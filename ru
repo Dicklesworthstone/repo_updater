@@ -567,6 +567,7 @@ REVIEW OPTIONS:
     --priority=LEVEL     Min priority: all, critical, high, normal, low
     --skip-days=N        Skip repos reviewed within N days (default: 7)
     --dry-run            Discovery only, don't start sessions
+    --status             Show review lock/checkpoint status and exit
     --resume             Resume interrupted review from checkpoint
     --push               Allow pushing changes (with --apply)
     --auto-answer=POLICY Auto-answer policy in non-interactive mode (auto|skip|fail)
@@ -587,6 +588,7 @@ EXAMPLES:
     ru prune --archive   Archive orphan repos
     ru import repos.txt  Import repos from file (auto-detects visibility)
     ru review --dry-run  Discover issues/PRs without starting reviews
+    ru review --status   Show review lock/checkpoint status
     ru review            Start AI-assisted review of issues/PRs
     ru review --apply    Execute approved changes from plan
     ru review --basic    Answer queued review questions
@@ -2183,7 +2185,7 @@ parse_args() {
                 ARGS+=("$1")
                 shift
                 ;;
-            --plan|--apply|--push|--analytics|--basic|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
+            --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
                     shift
@@ -7945,6 +7947,7 @@ parse_review_args() {
     REVIEW_DRIVER="auto"         # auto, ntm, or local
     REVIEW_PARALLEL=4            # concurrent sessions
     REVIEW_DRY_RUN="false"       # discovery only
+    REVIEW_STATUS="false"        # status only, no discovery/sessions
     REVIEW_ANALYTICS="false"     # show analytics dashboard
     REVIEW_BASIC_TUI="false"     # basic gum/ANSI TUI for questions
     # shellcheck disable=SC2034  # Used by later phases
@@ -8010,6 +8013,9 @@ parse_review_args() {
                 ;;
             --dry-run)
                 REVIEW_DRY_RUN="true"
+                ;;
+            --status)
+                REVIEW_STATUS="true"
                 ;;
             --resume)
                 # shellcheck disable=SC2034  # Used by later phases
@@ -10228,6 +10234,168 @@ finalize_review_exit() {
 }
 
 #------------------------------------------------------------------------------
+# cmd_review_status: Report review lock + checkpoint status (read-only)
+#
+# Outputs:
+#   - Human summary to stderr (default)
+#   - JSON to stdout when --json is set
+#
+# Returns:
+#   0 always (best-effort)
+#------------------------------------------------------------------------------
+cmd_review_status() {
+    local lock_file info_file checkpoint_file state_file
+    lock_file=$(get_review_lock_file)
+    info_file=$(get_review_lock_info_file)
+    checkpoint_file=$(get_checkpoint_file)
+    state_file=$(get_review_state_file)
+
+    ensure_dir "$(dirname "$lock_file")"
+
+    local lock_supported="false"
+    local lock_held="unknown"
+
+    if command -v flock &>/dev/null; then
+        lock_supported="true"
+        exec 19>"$lock_file"
+        if flock -n 19 2>/dev/null; then
+            lock_held="false"
+        else
+            lock_held="true"
+        fi
+        exec 19>&- 2>/dev/null || true
+    fi
+
+    local lock_held_json="null"
+    if [[ "$lock_held" == "true" || "$lock_held" == "false" ]]; then
+        lock_held_json="$lock_held"
+    fi
+
+    local info_exists="false"
+    local info_run_id="" info_started_at="" info_pid="" info_mode=""
+    local pid_alive="unknown"
+
+    if [[ -f "$info_file" ]]; then
+        info_exists="true"
+        if command -v jq &>/dev/null; then
+            info_run_id=$(jq -r '.run_id // ""' "$info_file" 2>/dev/null || echo "")
+            info_started_at=$(jq -r '.started_at // ""' "$info_file" 2>/dev/null || echo "")
+            info_pid=$(jq -r '.pid // ""' "$info_file" 2>/dev/null || echo "")
+            info_mode=$(jq -r '.mode // ""' "$info_file" 2>/dev/null || echo "")
+        fi
+        if [[ "$info_pid" =~ ^[0-9]+$ ]]; then
+            if kill -0 "$info_pid" 2>/dev/null; then
+                pid_alive="true"
+            else
+                pid_alive="false"
+            fi
+        fi
+    fi
+
+    local pid_alive_json="null"
+    if [[ "$pid_alive" == "true" || "$pid_alive" == "false" ]]; then
+        pid_alive_json="$pid_alive"
+    fi
+
+    local checkpoint_exists="false"
+    local checkpoint_run_id="" checkpoint_mode="" checkpoint_hash=""
+    local checkpoint_total="" checkpoint_completed="" checkpoint_pending="" checkpoint_questions=""
+    if [[ -f "$checkpoint_file" ]]; then
+        checkpoint_exists="true"
+        if command -v jq &>/dev/null; then
+            checkpoint_run_id=$(jq -r '.run_id // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_mode=$(jq -r '.mode // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_hash=$(jq -r '.config_hash // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_total=$(jq -r '.repos_total // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_completed=$(jq -r '.repos_completed // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_pending=$(jq -r '.repos_pending // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_questions=$(jq -r '.questions_pending // ""' "$checkpoint_file" 2>/dev/null || echo "")
+        fi
+    fi
+
+    local checkpoint_total_json="null"
+    local checkpoint_completed_json="null"
+    local checkpoint_pending_json="null"
+    local checkpoint_questions_json="null"
+    [[ "$checkpoint_total" =~ ^[0-9]+$ ]] && checkpoint_total_json="$checkpoint_total"
+    [[ "$checkpoint_completed" =~ ^[0-9]+$ ]] && checkpoint_completed_json="$checkpoint_completed"
+    [[ "$checkpoint_pending" =~ ^[0-9]+$ ]] && checkpoint_pending_json="$checkpoint_pending"
+    [[ "$checkpoint_questions" =~ ^[0-9]+$ ]] && checkpoint_questions_json="$checkpoint_questions"
+
+    local state_exists="false"
+    [[ -f "$state_file" ]] && state_exists="true"
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local ts
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        printf '{'
+        printf '"command":"review","mode":"status","timestamp":"%s",' "$ts"
+        printf '"lock":{"supported":%s,"held":%s,"info_file_exists":%s,' \
+            "$lock_supported" "$lock_held_json" "$info_exists"
+        printf '"info":{"run_id":"%s","started_at":"%s","pid":"%s","pid_alive":%s,"mode":"%s"}},' \
+            "$(json_escape "$info_run_id")" "$(json_escape "$info_started_at")" "$(json_escape "$info_pid")" "$pid_alive_json" "$(json_escape "$info_mode")"
+        printf '"checkpoint":{"exists":%s,"run_id":"%s","mode":"%s","config_hash":"%s","repos_total":%s,"repos_completed":%s,"repos_pending":%s,"questions_pending":%s},' \
+            "$checkpoint_exists" "$(json_escape "$checkpoint_run_id")" "$(json_escape "$checkpoint_mode")" "$(json_escape "$checkpoint_hash")" \
+            "$checkpoint_total_json" "$checkpoint_completed_json" "$checkpoint_pending_json" "$checkpoint_questions_json"
+        printf '"state":{"exists":%s}}' "$state_exists"
+        printf '\n'
+        return 0
+    fi
+
+    log_step "Review status"
+
+    if [[ "$lock_supported" != "true" ]]; then
+        log_warn "flock not available; lock status unknown"
+    else
+        case "$lock_held" in
+            true) log_info "Review lock: held" ;;
+            false) log_info "Review lock: free" ;;
+            *) log_info "Review lock: unknown" ;;
+        esac
+    fi
+
+    if [[ "$info_exists" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            [[ -n "$info_run_id" ]] && log_info "  Run ID:  $info_run_id"
+            [[ -n "$info_started_at" ]] && log_info "  Started: $info_started_at"
+            [[ -n "$info_pid" ]] && log_info "  PID:     $info_pid (alive: $pid_alive)"
+            [[ -n "$info_mode" ]] && log_info "  Mode:    $info_mode"
+        else
+            log_info "Lock info (raw):"
+            sed 's/^/  /' "$info_file" >&2 || true
+        fi
+    else
+        log_info "Lock info: none"
+    fi
+
+    if [[ "$checkpoint_exists" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            log_info "Checkpoint: present"
+            [[ -n "$checkpoint_run_id" ]] && log_info "  Run ID:           $checkpoint_run_id"
+            [[ -n "$checkpoint_mode" ]] && log_info "  Mode:             $checkpoint_mode"
+            [[ -n "$checkpoint_hash" ]] && log_info "  Config hash:       $checkpoint_hash"
+            [[ "$checkpoint_total_json" != "null" ]] && log_info "  Repos total:       $checkpoint_total_json"
+            [[ "$checkpoint_completed_json" != "null" ]] && log_info "  Repos completed:   $checkpoint_completed_json"
+            [[ "$checkpoint_pending_json" != "null" ]] && log_info "  Repos pending:     $checkpoint_pending_json"
+            [[ "$checkpoint_questions_json" != "null" ]] && log_info "  Questions pending: $checkpoint_questions_json"
+        else
+            log_info "Checkpoint present (jq not installed)"
+        fi
+    else
+        log_info "Checkpoint: none"
+    fi
+
+    if [[ "$state_exists" == "true" ]]; then
+        log_info "Review state: present"
+    else
+        log_info "Review state: none"
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
 # cmd_review: Review GitHub issues and PRs using Claude Code
 #------------------------------------------------------------------------------
 cmd_review() {
@@ -10236,6 +10404,11 @@ cmd_review() {
 
     # Parse review-specific arguments
     parse_review_args
+
+    if [[ "$REVIEW_STATUS" == "true" ]]; then
+        cmd_review_status
+        return $?
+    fi
 
     if [[ "$REVIEW_ANALYTICS" == "true" ]]; then
         cmd_review_analytics

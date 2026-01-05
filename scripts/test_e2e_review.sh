@@ -298,6 +298,84 @@ test_review_prereq_gh_auth_failure_exit_code_3() {
     cleanup_test_env
 }
 
+test_review_status_reports_free_when_no_lock() {
+    echo "Test: ru review --status reports lock free when no lock is held"
+    setup_test_env
+
+    # Avoid prerequisite failures from other parts of review.
+    create_mock_gh 0 "$(graphql_response_empty)"
+    setup_review_env_with_repo
+
+    local err_txt="$TEMP_DIR/err.txt"
+    "$RU_SCRIPT" review --status --mode=local --non-interactive >/dev/null 2>"$err_txt"
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --status exits 0"
+    assert_file_contains "$err_txt" "Review lock: free" "stderr reports lock free"
+
+    cleanup_test_env
+}
+
+test_review_status_json_includes_lock_and_checkpoint() {
+    echo "Test: ru --json review --status includes lock + checkpoint fields"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_empty)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+    mkdir -p "$state_dir/review"
+
+    local lock_file="$state_dir/review.lock"
+    local info_file="$state_dir/review.lock.info"
+    local checkpoint_file="$state_dir/review/review-checkpoint.json"
+
+    # Hold the lock in this test process.
+    exec 8>"$lock_file"
+    flock -n 8 2>/dev/null || { fail "failed to acquire test lock"; cleanup_test_env; return; }
+
+    cat > "$info_file" <<'EOF'
+{
+  "run_id": "test-run-123",
+  "started_at": "2026-01-01T00:00:00Z",
+  "pid": 99999,
+  "mode": "plan"
+}
+EOF
+
+    cat > "$checkpoint_file" <<'EOF'
+{
+  "version": 1,
+  "timestamp": "2026-01-01T00:00:00Z",
+  "run_id": "test-run-123",
+  "mode": "plan",
+  "config_hash": "abc123",
+  "repos_total": 2,
+  "repos_completed": 1,
+  "repos_pending": 1,
+  "questions_pending": 0,
+  "completed_repos": ["owner/repo"],
+  "pending_repos": ["owner/repo"]
+}
+EOF
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    exec 8>&-
+
+    assert_exit_code 0 "$exit_code" "--json review --status exits 0"
+    assert_jq_filter "$out_json" '.mode' "status" "JSON mode is status"
+    assert_jq_filter "$out_json" '.command' "review" "JSON command is review"
+    assert_jq_filter "$out_json" '.lock.held' "true" "lock.held == true"
+    assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
+    assert_jq_number "$out_json" '.checkpoint.repos_pending' "1" "checkpoint.repos_pending == 1"
+
+    cleanup_test_env
+}
+
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -305,6 +383,8 @@ test_review_prereq_gh_auth_failure_exit_code_3() {
 test_review_dry_run_json_outputs_items
 test_review_dry_run_json_outputs_empty
 test_review_prereq_gh_auth_failure_exit_code_3
+test_review_status_reports_free_when_no_lock
+test_review_status_json_includes_lock_and_checkpoint
 
 echo ""
 echo "=============================================="
@@ -317,4 +397,3 @@ if [[ "$TESTS_FAILED" -eq 0 ]]; then
     exit 0
 fi
 exit 1
-
