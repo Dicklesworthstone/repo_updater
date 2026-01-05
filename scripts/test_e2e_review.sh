@@ -343,7 +343,7 @@ test_review_dry_run_succeeds_without_tmux_or_ntm() {
 
     local out_json="$TEMP_DIR/out.json"
     local err_txt="$TEMP_DIR/err.txt"
-    "$bash_bin" "$RU_SCRIPT" --json review --dry-run --non-interactive >"$out_json" 2>"$err_txt"
+    "$bash_bin" "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
     local exit_code=$?
 
     PATH="$saved_path"
