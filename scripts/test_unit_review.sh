@@ -111,26 +111,32 @@ test_discover_work_items_builds_items_from_fixture() {
 
     require_jq_or_skip || return 0
 
-    # Make gh "exist" for discover_work_items without calling real GitHub.
-    gh() { :; }
-
-    # Avoid pulling repo lists / parsing repo specs: keep this test offline and focused.
-    get_all_repos() { printf '%s\n' "octo/repo1"; }
-    repo_spec_to_github_id() { printf '%s\n' "$1"; }
-
     local fixture="$PROJECT_DIR/test/fixtures/gh/graphql_batch.json"
     assert_file_exists "$fixture" "Fixture should exist"
-    gh_api_graphql_repo_batch() { cat "$fixture"; }
+
+    local output
+    output=$(
+        # Make gh "exist" for discover_work_items without calling real GitHub.
+        gh() { :; }
+
+        # Avoid pulling repo lists / parsing repo specs: keep this test offline and focused.
+        get_all_repos() { printf '%s\n' "octo/repo1"; }
+        repo_spec_to_github_id() { printf '%s\n' "$1"; }
+
+        gh_api_graphql_repo_batch() { cat "$fixture"; }
+
+        local -a items=()
+        discover_work_items items "all" "" ""
+        printf '%s\n' "${items[@]}"
+    )
 
     local -a items=()
-    discover_work_items items "all" "" ""
+    mapfile -t items <<<"$output"
 
     assert_equals "3" "${#items[@]}" "Should discover 3 items from fixture"
-    assert_contains "${items[*]}" "octo/repo1|issue|42|" "Includes issue 42"
-    assert_contains "${items[*]}" "octo/repo1|pr|7|" "Includes PR 7"
-    assert_contains "${items[*]}" "octo/repo1|pr|8|" "Includes draft PR 8"
-
-    unset -f gh gh_api_graphql_repo_batch get_all_repos repo_spec_to_github_id
+    assert_contains "$output" "octo/repo1|issue|42|" "Includes issue 42"
+    assert_contains "$output" "octo/repo1|pr|7|" "Includes PR 7"
+    assert_contains "$output" "octo/repo1|pr|8|" "Includes draft PR 8"
 
     log_test_pass "$test_name"
 }
@@ -141,16 +147,21 @@ test_discover_work_items_handles_empty_graphql_response() {
 
     require_jq_or_skip || return 0
 
-    gh() { :; }
-    get_all_repos() { printf '%s\n' "octo/repo1"; }
-    repo_spec_to_github_id() { printf '%s\n' "$1"; }
-    gh_api_graphql_repo_batch() { printf '%s\n' '{"data":{}}'; }
+    local output
+    output=$(
+        gh() { :; }
+        get_all_repos() { printf '%s\n' "octo/repo1"; }
+        repo_spec_to_github_id() { printf '%s\n' "$1"; }
+        gh_api_graphql_repo_batch() { printf '%s\n' '{"data":{}}'; }
+
+        local -a items=()
+        discover_work_items items "all" "" ""
+        printf '%s\n' "${items[@]}"
+    )
 
     local -a items=()
-    discover_work_items items "all" "" ""
+    mapfile -t items <<<"$output"
     assert_equals "0" "${#items[@]}" "Empty response should produce zero items"
-
-    unset -f gh gh_api_graphql_repo_batch get_all_repos repo_spec_to_github_id
 
     log_test_pass "$test_name"
 }
@@ -546,8 +557,9 @@ test_summarize_review_plan_prints_counts() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local output
-    output=$(summarize_review_plan "$plan_file")
+    local output rc=0
+    output=$(summarize_review_plan "$plan_file") || rc=$?
+    assert_equals "0" "$rc" "summarize_review_plan should succeed"
 
     assert_contains "$output" "Repository: octo/repo1" "Should include repo"
     assert_contains "$output" "Items reviewed: 2" "Should count items"
@@ -565,8 +577,9 @@ test_get_review_plan_json_summary_is_parseable() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local output
-    output=$(get_review_plan_json_summary "$plan_file")
+    local output rc=0
+    output=$(get_review_plan_json_summary "$plan_file") || rc=$?
+    assert_equals "0" "$rc" "get_review_plan_json_summary should succeed"
 
     assert_exit_code 0 "Summary JSON should parse" jq -e '.' <<<"$output"
     assert_equals "2" "$(jq -r '.summary.total_items' <<<"$output")" "Should include total_items"
@@ -584,8 +597,9 @@ test_get_review_plan_json_summary_reports_error_for_invalid_plan() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/missing-fields.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local output
-    output=$(get_review_plan_json_summary "$plan_file")
+    local output rc=0
+    output=$(get_review_plan_json_summary "$plan_file") || rc=$?
+    assert_equals "1" "$rc" "Invalid plan should return non-zero"
 
     assert_exit_code 0 "Error JSON should parse" jq -e '.' <<<"$output"
     assert_contains "$output" "\"error\"" "Should emit error field"
