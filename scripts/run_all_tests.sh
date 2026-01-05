@@ -331,9 +331,14 @@ main() {
             local result_file="$tmpdir/result_$test_num"
 
             # Wait if we've hit the job limit
+            # Note: wait -n requires Bash 4.3+; use polling fallback for 4.0-4.2
             while [[ $running_jobs -ge $max_jobs ]]; do
-                # Wait for any job to finish
-                wait -n 2>/dev/null || true
+                if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+                    wait -n 2>/dev/null || true
+                else
+                    # Fallback: brief sleep then recount (less efficient but compatible)
+                    sleep 0.1
+                fi
                 running_jobs=$(jobs -r | wc -l)
             done
 
@@ -354,7 +359,7 @@ main() {
 
         # Collect results in order
         test_num=0
-        for _ in "${tests[@]}"; do
+        for test_file in "${tests[@]}"; do
             ((test_num++))
             local result_file="$tmpdir/result_$test_num"
             if [[ -f "$result_file" ]]; then
@@ -367,6 +372,12 @@ main() {
                 else
                     ((total_failed++))
                 fi
+            else
+                # Result file missing - report as failure
+                local test_name
+                test_name=$(basename "$test_file" .sh)
+                print_test_result "$test_num" "1" "0" "$test_name" "No result file (test may have crashed)"
+                ((total_failed++))
             fi
         done
 

@@ -1246,9 +1246,7 @@ run_parallel_tests() {
 
     log_info "Running ${#tests[@]} tests in parallel (max $max_jobs jobs)..."
 
-    # Cleanup trap
-    local old_trap
-    old_trap=$(trap -p INT TERM)
+    # Cleanup trap for interrupt handling
     # shellcheck disable=SC2317  # Function is invoked via trap
     _tf_parallel_cleanup() {
         log_warn "Parallel execution interrupted - cleaning up..."
@@ -1266,8 +1264,14 @@ run_parallel_tests() {
         local test_tmpdir="$tmpdir/test_$test_num"
 
         # Wait if we've hit the job limit
+        # Note: wait -n requires Bash 4.3+; use polling fallback for 4.0-4.2
         while [[ $running_jobs -ge $max_jobs ]]; do
-            wait -n 2>/dev/null || true
+            if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+                wait -n 2>/dev/null || true
+            else
+                # Fallback: brief sleep then recount (less efficient but compatible)
+                sleep 0.1
+            fi
             running_jobs=$(jobs -r | wc -l)
         done
 
@@ -1317,8 +1321,8 @@ run_parallel_tests() {
         fi
     done
 
-    # Restore trap
-    eval "$old_trap"
+    # Reset trap to default
+    trap - INT TERM
 
     # Aggregate results
     local total_passed=0 total_failed=0 total_assertions_passed=0 total_assertions_failed=0
