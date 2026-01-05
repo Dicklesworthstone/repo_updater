@@ -44,7 +44,8 @@ setup_worktree_test() {
     export RU_STATE_DIR="$TEST_DIR/state"
     export PROJECTS_DIR="$TEST_DIR/projects"
     export LAYOUT="flat"
-    export REVIEW_RUN_ID="test-run-$(date +%s)"
+    REVIEW_RUN_ID="test-run-$(date +%s)"
+    export REVIEW_RUN_ID
     mkdir -p "$RU_STATE_DIR" "$PROJECTS_DIR"
 }
 

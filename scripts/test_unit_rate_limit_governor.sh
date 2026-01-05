@@ -93,7 +93,7 @@ test_get_target_parallelism_override() {
     local test_name="get_target_parallelism: respects REVIEW_PARALLEL"
     log_test_start "$test_name"
 
-    REVIEW_PARALLEL=8
+    export REVIEW_PARALLEL=8
     local result
     result=$(get_target_parallelism)
 
