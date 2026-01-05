@@ -54,6 +54,9 @@ GITHUB_RELEASE_HOST="https://github.com"
 # Cache-bust token used for GitHub downloads (reduces stale CDN caching)
 RU_CACHE_BUST_TOKEN="${RU_CACHE_BUST_TOKEN:-$(date +%s)}"
 
+# Temp dir path for cleanup trap (kept global to avoid set -u issues with local vars)
+RU_INSTALLER_TEMP_DIR=""
+
 #==============================================================================
 # COLORS (disabled if stderr is not a terminal or NO_COLOR is set)
 # We check -t 2 (stderr) because all log functions output to stderr
@@ -101,6 +104,38 @@ log_step() {
 # Check if a command exists
 command_exists() {
     command -v "$1" &>/dev/null
+}
+
+cleanup_temp_dir() {
+    local dir="$RU_INSTALLER_TEMP_DIR"
+    if [[ -z "$dir" ]] || [[ "$dir" == "/" ]]; then
+        return 0
+    fi
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir" 2>/dev/null || true
+    fi
+}
+
+mktemp_dir() {
+    local dir=""
+
+    # GNU coreutils mktemp
+    if dir=$(mktemp -d 2>/dev/null); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+
+    # BSD mktemp (macOS) typically requires -t (template)
+    if dir=$(mktemp -d -t ru 2>/dev/null); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    if dir=$(mktemp -d -t ru.XXXXXXXXXX 2>/dev/null); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+
+    return 1
 }
 
 append_query_param() {
@@ -329,11 +364,12 @@ install_from_release() {
     local install_dir="$2"
     local temp_dir
 
-    if ! temp_dir=$(mktemp -d 2>/dev/null); then
+    if ! temp_dir=$(mktemp_dir); then
         log_error "Failed to create temp directory (mktemp)"
         return 1
     fi
-    trap 'rm -rf "$temp_dir"' EXIT
+    RU_INSTALLER_TEMP_DIR="$temp_dir"
+    trap cleanup_temp_dir EXIT
 
     local release_base="https://github.com/$REPO_OWNER/$REPO_NAME/releases/download/v$version"
     local script_url="$release_base/$SCRIPT_NAME"
@@ -373,11 +409,12 @@ install_from_main() {
     local install_dir="$1"
     local temp_dir
 
-    if ! temp_dir=$(mktemp -d 2>/dev/null); then
+    if ! temp_dir=$(mktemp_dir); then
         log_error "Failed to create temp directory (mktemp)"
         return 1
     fi
-    trap 'rm -rf "$temp_dir"' EXIT
+    RU_INSTALLER_TEMP_DIR="$temp_dir"
+    trap cleanup_temp_dir EXIT
 
     log_warn "Installing from main branch. This is NOT RECOMMENDED for production use."
     log_warn "The main branch may contain untested or breaking changes."
