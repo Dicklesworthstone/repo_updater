@@ -117,9 +117,16 @@ ru sync
 - [Conflict Resolution](#-conflict-resolution)
 - [Managing Orphan Repositories](#-managing-orphan-repositories)
 - [Output Modes](#-output-modes)
+- [AI-Assisted Code Review](#-ai-assisted-code-review)
+  - [Priority Scoring Algorithm](#priority-scoring-algorithm)
+  - [Session Drivers](#session-drivers)
+  - [Git Worktree Isolation](#git-worktree-isolation)
+  - [Review Policies](#review-policies)
 - [Exit Codes](#-exit-codes)
 - [Architecture](#-architecture)
   - [NDJSON Results Logging](#ndjson-results-logging)
+  - [Portable Locking](#portable-locking)
+  - [Retry with Exponential Backoff](#retry-with-exponential-backoff)
 - [Design Principles](#-design-principles)
 - [Testing](#-testing)
 - [Troubleshooting](#-troubleshooting)
@@ -330,6 +337,8 @@ ru [command] [options]
 | `self-update` | Update ru to the latest version |
 | `config` | Show or set configuration values |
 | `prune` | Find and manage orphan repositories |
+| `review` | AI-assisted code review orchestration |
+| `import` | Import repos from GitHub stars or org |
 
 ### Global Options
 
@@ -412,6 +421,34 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | (none) | List orphan repos (dry run, default) |
 | `--archive` | Move orphan repos to archive directory |
 | `--delete` | Permanently delete orphan repos (requires confirmation) |
+
+**`ru review`**
+| Flag | Description |
+|------|-------------|
+| `--plan` | Discovery mode: find work items and plan review (default) |
+| `--apply` | Apply mode: process approved changes from a previous plan |
+| `--dry-run` | Show what would be discovered without starting sessions |
+| `--status` | Show current review state without running discovery |
+| `--analytics` | Display analytics dashboard for past reviews |
+| `--basic` | Use basic TUI instead of terminal multiplexer |
+| `--mode=MODE` | Session driver: `auto`, `ntm`, or `local` |
+| `--parallel N`, `-j N` | Run N review sessions concurrently (default: 4) |
+| `--repos=PATTERN` | Filter repos by pattern (glob or regex) |
+| `--priority=LEVEL` | Minimum priority threshold: `critical`, `high`, `normal`, `low`, `all` |
+| `--skip-days=N` | Skip items reviewed within N days (default: 7) |
+| `--max-repos=N` | Limit number of repos to review (cost budget) |
+| `--max-runtime=N` | Maximum runtime in minutes (time budget) |
+| `--resume` | Resume an interrupted review session |
+| `--push` | Allow pushing changes (with `--apply`) |
+
+**`ru import`**
+| Flag | Description |
+|------|-------------|
+| `--stars` | Import from your GitHub stars |
+| `--org=NAME` | Import from an organization |
+| `--user=NAME` | Import from a user's repos |
+| `--limit=N` | Maximum repos to import |
+| `--private` | Add to private repos list |
 
 ---
 
@@ -1042,6 +1079,214 @@ ru sync --quiet
 
 ---
 
+## 🤖 AI-Assisted Code Review
+
+ru includes a powerful review orchestration system for managing AI-assisted code review across your repositories. It discovers open issues and pull requests, prioritizes them intelligently, and coordinates review sessions using Claude Code or other AI assistants.
+
+### The Review Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       ru review --plan                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+       ┌──────────┐    ┌──────────┐    ┌──────────┐
+       │  GraphQL │    │  Parse   │    │  Cache   │
+       │  Batch   │    │  Work    │    │  Digest  │
+       │  Query   │    │  Items   │    │  Check   │
+       └──────────┘    └──────────┘    └──────────┘
+              │               │               │
+              └───────────────┼───────────────┘
+                              ▼
+                    ┌─────────────────┐
+                    │  Priority       │
+                    │  Scoring        │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+       ┌──────────┐   ┌──────────┐   ┌──────────┐
+       │ CRITICAL │   │   HIGH   │   │  NORMAL  │
+       │ security │   │   bugs   │   │ features │
+       │ bugs >60d│   │ bugs >30d│   │          │
+       └──────────┘   └──────────┘   └──────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │  Session Driver │
+                    │  (tmux/ntm)     │
+                    └────────┬────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         ▼                   ▼                   ▼
+  ┌────────────┐     ┌────────────┐     ┌────────────┐
+  │ Session 1  │     │ Session 2  │     │ Session 3  │
+  │ (worktree) │     │ (worktree) │     │ (worktree) │
+  └────────────┘     └────────────┘     └────────────┘
+```
+
+### Two-Phase Review: Plan then Apply
+
+**Phase 1: Discovery (`--plan`)**
+- Queries GitHub for open issues and PRs across all repos
+- Scores items by priority using label analysis and age
+- Creates isolated git worktrees for safe review
+- Spawns Claude Code sessions in terminal multiplexer
+- Checkpoints progress for interruption recovery
+
+**Phase 2: Application (`--apply`)**
+- Reviews proposed changes from discovery phase
+- Runs quality gates (ShellCheck, tests, lint)
+- Optionally pushes approved changes (`--push`)
+- Archives completed work items
+
+```bash
+# Discover and plan reviews
+ru review --plan
+
+# After reviewing AI suggestions, apply approved changes
+ru review --apply --push
+```
+
+### Priority Scoring Algorithm
+
+ru uses a multi-factor scoring system to prioritize work items intelligently:
+
+| Factor | Points | Logic |
+|--------|--------|-------|
+| **Type** | 0-20 | PRs: +20, Issues: +10, Draft PRs: -15 |
+| **Labels** | 0-50 | security/critical: +50, bug/urgent: +30, enhancement: +10 |
+| **Age (bugs)** | 0-50 | >60 days: +50, >30 days: +30, >14 days: +15 |
+| **Age (features)** | -10 to 0 | Very old (>180 days): -10 (likely stale) |
+| **Recency** | 0-15 | Updated <3 days: +15, <7 days: +10 |
+| **Staleness** | -20 | Recently reviewed: -20 |
+
+**Priority levels:**
+| Score | Level | Meaning |
+|-------|-------|---------|
+| ≥150 | CRITICAL | Security issues, long-standing bugs |
+| ≥100 | HIGH | Bugs, urgent items |
+| ≥50 | NORMAL | Regular features and issues |
+| <50 | LOW | Backlog items |
+
+### Session Drivers
+
+ru supports multiple backends for managing review sessions:
+
+| Driver | Description | Best For |
+|--------|-------------|----------|
+| `auto` | Automatically detect best available | Default choice |
+| `ntm` | Named Tmux Manager integration | Multi-agent workflows |
+| `local` | Direct tmux sessions | Simple setups |
+
+```bash
+# Use specific driver
+ru review --mode=ntm --plan
+
+# Parallel sessions
+ru review -j 4 --plan
+```
+
+### Git Worktree Isolation
+
+Each review session operates in an isolated git worktree, ensuring:
+- Main working directory stays untouched
+- Multiple reviews can run in parallel
+- Changes can be discarded without affecting HEAD
+- Clean state for each AI session
+
+```
+~/.local/state/ru/worktrees/
+└── 20250105-143022-1234/
+    ├── owner_repo1/          # Isolated worktree
+    ├── owner_repo2/          # Isolated worktree
+    └── mapping.json          # Worktree registry
+```
+
+### Digest Caching
+
+To avoid redundant API calls and repeated reviews, ru caches repository digests:
+
+```
+~/.local/state/ru/review/
+├── digests/                  # Cached repo digests
+│   ├── owner_repo.json       # Issues/PRs snapshot
+│   └── ...
+├── state.json                # Current review state
+├── checkpoint.json           # Resumable checkpoint
+└── results/                  # Review outcomes
+    └── 20250105-143022/
+        └── results.ndjson    # Per-item results
+```
+
+Cache invalidation:
+```bash
+# Invalidate specific repos
+ru review --invalidate-cache=owner/repo1,owner/repo2
+
+# Invalidate all caches
+ru review --invalidate-cache=all
+```
+
+### Cost Budgets
+
+Control resource usage with budget constraints:
+
+```bash
+# Limit to 10 repos
+ru review --max-repos=10 --plan
+
+# Maximum 30 minutes runtime
+ru review --max-runtime=30 --plan
+
+# Skip recently reviewed items
+ru review --skip-days=14 --plan
+```
+
+### Review Analytics
+
+View statistics on past reviews:
+
+```bash
+ru review --analytics
+```
+
+Shows:
+- Total reviews completed
+- Average resolution time
+- Most active repositories
+- Issue type distribution
+- Review velocity trends
+
+### Review Policies
+
+Configure review behavior with policy files:
+
+```bash
+# ~/.config/ru/review/policy.json
+{
+  "REVIEW_LINT_REQUIRED": true,
+  "REVIEW_SECRET_SCAN": true,
+  "REVIEW_ALLOW_PUSH": false,
+  "REVIEW_REQUIRE_APPROVAL": true,
+  "REVIEW_SKIP_PRS": false,
+  "REVIEW_DEEP_MODE": false
+}
+```
+
+| Policy | Default | Description |
+|--------|---------|-------------|
+| `REVIEW_LINT_REQUIRED` | `true` | Run linters before applying |
+| `REVIEW_SECRET_SCAN` | `true` | Scan for secrets in changes |
+| `REVIEW_ALLOW_PUSH` | `false` | Allow pushing without `--push` |
+| `REVIEW_REQUIRE_APPROVAL` | `true` | Require explicit approval |
+| `REVIEW_SKIP_PRS` | `false` | Skip PRs (issues only) |
+| `REVIEW_DEEP_MODE` | `false` | Enable deep analysis |
+
+---
+
 ## 🔢 Exit Codes
 
 ru uses meaningful exit codes for automation:
@@ -1213,6 +1458,65 @@ cat ~/.local/state/ru/logs/latest/results.ndjson | jq -s 'group_by(.status) | ma
 cat ~/.local/state/ru/logs/latest/results.ndjson | jq -r 'select(.status == "failed") | "\(.repo): \(.message)"'
 ```
 
+### Portable Locking
+
+ru uses directory-based locking for coordination across parallel workers and concurrent processes. This approach works on all POSIX systems without requiring `flock` (which isn't available on all platforms):
+
+```bash
+# Lock acquisition via atomic mkdir
+dir_lock_try_acquire() {
+    local lock_dir="$1"
+    if mkdir "$lock_dir" 2>/dev/null; then
+        # Write lock info for debugging
+        echo "$$" > "$lock_dir/pid"
+        return 0
+    fi
+    return 1
+}
+```
+
+**How it works:**
+- `mkdir` is atomic on POSIX filesystems—only one process can create a directory
+- Lock holder's PID is written to a file inside the lock directory
+- Timeout-based acquisition retries with configurable duration
+- Automatic cleanup on process exit via trap handlers
+
+**Use cases:**
+- Parallel sync workers accessing shared state
+- Worktree mapping updates during concurrent reviews
+- Sync state file coordination
+
+### Retry with Exponential Backoff
+
+Network operations and API calls use intelligent retry logic with exponential backoff and jitter:
+
+```bash
+retry_with_backoff MAX_ATTEMPTS BASE_DELAY_SECONDS -- command args...
+```
+
+**Algorithm:**
+1. Attempt the operation
+2. On failure, wait `BASE_DELAY * 2^(attempt-1)` seconds
+3. Add random jitter (±25%) to prevent thundering herd
+4. Retry until `MAX_ATTEMPTS` exhausted
+5. Return last exit code on final failure
+
+**Example:**
+```bash
+# Retry GitHub API call up to 5 times with 2-second base delay
+retry_with_backoff 5 2 -- gh api repos/owner/repo
+# Delays: 2s, 4s, 8s, 16s (with jitter)
+```
+
+**Capture modes:**
+- `--capture=all` — Capture both stdout and stderr (default)
+- `--capture=stdout` — Capture only stdout, let stderr pass through
+
+This is used throughout ru for:
+- GitHub GraphQL batch queries
+- Clone operations on rate-limited repos
+- Network-dependent status checks
+
 ---
 
 ## 🧭 Design Principles
@@ -1304,36 +1608,63 @@ exit 3
 
 ## 🧪 Testing
 
-ru includes a comprehensive test suite to ensure reliability across updates.
+ru includes an extensive test suite with 58 test files covering unit tests, integration tests, and end-to-end workflows.
 
 ### Test Structure
 
 ```
 scripts/
-├── test_framework.sh         # Shared test utilities
-├── test_parsing.sh           # URL and repo spec parsing
-├── test_unit_config.sh       # Configuration handling
-├── test_unit_gum_wrappers.sh # Gum fallback behavior
-├── test_e2e_init.sh          # Init workflow
-├── test_e2e_review.sh         # Review discovery workflow
-├── test_e2e_add.sh           # Add command
-├── test_e2e_sync.sh          # Sync workflow
-├── test_e2e_status.sh        # Status command
-├── test_e2e_prune.sh         # Prune command
-└── test_e2e_self_update.sh   # Self-update workflow
+├── test_framework.sh              # Core test utilities and assertions
+├── test_e2e_framework.sh          # E2E test isolation and helpers
+│
+├── Unit Tests (test_unit_*)
+│   ├── test_unit_config.sh        # Configuration loading
+│   ├── test_unit_core_utils.sh    # Core utility functions
+│   ├── test_unit_graphql.sh       # GraphQL query construction
+│   ├── test_unit_review.sh        # Review scoring (27 tests, 66 assertions)
+│   ├── test_unit_review_locking.sh # Review lock management
+│   ├── test_unit_state_locking.sh # State lock security
+│   ├── test_unit_worktree.sh      # Worktree operations
+│   ├── test_unit_driver_interface.sh # Session driver abstraction
+│   ├── test_unit_gum_wrappers.sh  # Terminal UI fallbacks
+│   └── ... (20+ more unit test files)
+│
+├── Integration Tests
+│   ├── test_parsing.sh            # URL parsing (76 tests, 156 assertions)
+│   ├── test_local_git.sh          # Local git operations
+│   └── test_sync_state.sh         # Sync state management
+│
+└── End-to-End Tests (test_e2e_*)
+    ├── test_e2e_init.sh           # Init workflow
+    ├── test_e2e_sync_clone.sh     # Clone operations
+    ├── test_e2e_sync_pull.sh      # Pull operations
+    ├── test_e2e_worktree.sh       # Worktree management (7 tests, 23 assertions)
+    ├── test_e2e_error_handling.sh # Error scenarios (12 tests, 30 assertions)
+    ├── test_e2e_config.sh         # Configuration handling
+    ├── test_e2e_review.sh         # Review workflow
+    └── ... (15+ more E2E test files)
 ```
 
 ### Running Tests
 
 ```bash
 # Run all tests
-./scripts/test_all.sh
+./scripts/run_all_tests.sh
 
 # Run specific test file
 ./scripts/test_parsing.sh
 
 # Run with verbose output
-./scripts/test_e2e_sync.sh
+VERBOSE=1 ./scripts/test_unit_review.sh
+
+# Run only unit tests
+for f in scripts/test_unit_*.sh; do "$f"; done
+
+# Run E2E tests
+for f in scripts/test_e2e_*.sh; do "$f"; done
+
+# Check test coverage summary
+./scripts/test_coverage.sh
 ```
 
 ### Test Categories
