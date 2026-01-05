@@ -611,6 +611,139 @@ More info: https://github.com/Dicklesworthstone/repo_updater
 EOF
 }
 
+# Show stylish quick menu when ru is run with no arguments
+# Uses gum for beautiful output with ANSI fallback
+show_quick_menu() {
+    # Note: check_gum may not have been called yet, so check directly
+    local has_gum="false"
+    command -v gum &>/dev/null && has_gum="true"
+
+    if [[ "$has_gum" == "true" ]]; then
+        # ══════════════════════════════════════════════════════════════════════
+        # GUM-STYLED OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        printf '\n' >&2
+
+        # Header banner with double border
+        gum style \
+            --border double \
+            --border-foreground 212 \
+            --padding "0 2" \
+            --margin "0 0" \
+            --bold \
+            "🔄 ru v${VERSION}" \
+            "Repo Updater" >&2
+
+        printf '\n' >&2
+
+        # Commands section header
+        gum style --foreground 214 --bold "COMMANDS" >&2
+        printf '\n' >&2
+
+        # Core workflow commands
+        gum style --foreground 39 --bold "  Core Workflow" >&2
+        gum style "    $(gum style --foreground 82 'sync')           Clone missing repos and pull updates" >&2
+        gum style "    $(gum style --foreground 82 'status')         Show repository status (read-only)" >&2
+        gum style "    $(gum style --foreground 82 'review')         AI-assisted review of issues and PRs" >&2
+        printf '\n' >&2
+
+        # Repository management
+        gum style --foreground 39 --bold "  Repository Management" >&2
+        gum style "    $(gum style --foreground 82 'add') <repo>      Add a repository to your list" >&2
+        gum style "    $(gum style --foreground 82 'remove') <repo>   Remove a repository from your list" >&2
+        gum style "    $(gum style --foreground 82 'list')           Show configured repositories" >&2
+        gum style "    $(gum style --foreground 212 --bold 'import') <file>   $(gum style --foreground 212 'Import repos from file (auto-detects visibility)')" >&2
+        printf '\n' >&2
+
+        # Setup & maintenance
+        gum style --foreground 39 --bold "  Setup & Maintenance" >&2
+        gum style "    $(gum style --foreground 82 'init')           Initialize configuration directory" >&2
+        gum style "    $(gum style --foreground 82 'config')         Show or set configuration values" >&2
+        gum style "    $(gum style --foreground 82 'doctor')         Run system diagnostics" >&2
+        gum style "    $(gum style --foreground 82 'prune')          Find and manage orphan repositories" >&2
+        gum style "    $(gum style --foreground 82 'self-update')    Update ru to the latest version" >&2
+        printf '\n' >&2
+
+        # Quick examples
+        gum style --foreground 214 --bold "QUICK START" >&2
+        printf '\n' >&2
+        gum style --faint "  # First time setup" >&2
+        gum style --foreground 82 "  ru init" >&2
+        printf '\n' >&2
+        gum style --faint "  # Add and sync repos" >&2
+        gum style --foreground 82 "  ru add owner/repo" >&2
+        gum style --foreground 82 "  ru sync" >&2
+        printf '\n' >&2
+        gum style --faint "  # Import repos from a file" >&2
+        gum style --foreground 212 "  ru import my_repos.txt" >&2
+        printf '\n' >&2
+
+        # Footer
+        gum style --faint "  Run 'ru --help' for full documentation" >&2
+        gum style --faint "  https://github.com/Dicklesworthstone/repo_updater" >&2
+        printf '\n' >&2
+    else
+        # ══════════════════════════════════════════════════════════════════════
+        # ANSI FALLBACK OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        printf '\n' >&2
+
+        # Header banner with box drawing
+        printf '%b\n' "${BOLD}${MAGENTA}╔════════════════════════════════════════════╗${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}║${RESET}  ${BOLD}🔄 ru${RESET} v${VERSION}                              ${BOLD}${MAGENTA}║${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}║${RESET}  ${DIM}Repo Updater${RESET}                              ${BOLD}${MAGENTA}║${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}╚════════════════════════════════════════════╝${RESET}" >&2
+        printf '\n' >&2
+
+        # Commands section header
+        printf '%b\n' "${BOLD}${YELLOW}COMMANDS${RESET}" >&2
+        printf '\n' >&2
+
+        # Core workflow commands
+        printf '%b\n' "  ${BOLD}${CYAN}Core Workflow${RESET}" >&2
+        printf '%b\n' "    ${GREEN}sync${RESET}           Clone missing repos and pull updates" >&2
+        printf '%b\n' "    ${GREEN}status${RESET}         Show repository status (read-only)" >&2
+        printf '%b\n' "    ${GREEN}review${RESET}         AI-assisted review of issues and PRs" >&2
+        printf '\n' >&2
+
+        # Repository management
+        printf '%b\n' "  ${BOLD}${CYAN}Repository Management${RESET}" >&2
+        printf '%b\n' "    ${GREEN}add${RESET} <repo>      Add a repository to your list" >&2
+        printf '%b\n' "    ${GREEN}remove${RESET} <repo>   Remove a repository from your list" >&2
+        printf '%b\n' "    ${GREEN}list${RESET}           Show configured repositories" >&2
+        printf '%b\n' "    ${BOLD}${MAGENTA}import${RESET} <file>   ${MAGENTA}Import repos from file (auto-detects visibility)${RESET}" >&2
+        printf '\n' >&2
+
+        # Setup & maintenance
+        printf '%b\n' "  ${BOLD}${CYAN}Setup & Maintenance${RESET}" >&2
+        printf '%b\n' "    ${GREEN}init${RESET}           Initialize configuration directory" >&2
+        printf '%b\n' "    ${GREEN}config${RESET}         Show or set configuration values" >&2
+        printf '%b\n' "    ${GREEN}doctor${RESET}         Run system diagnostics" >&2
+        printf '%b\n' "    ${GREEN}prune${RESET}          Find and manage orphan repositories" >&2
+        printf '%b\n' "    ${GREEN}self-update${RESET}    Update ru to the latest version" >&2
+        printf '\n' >&2
+
+        # Quick examples
+        printf '%b\n' "${BOLD}${YELLOW}QUICK START${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# First time setup${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru init${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# Add and sync repos${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru add owner/repo${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru sync${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# Import repos from a file${RESET}" >&2
+        printf '%b\n' "  ${MAGENTA}ru import my_repos.txt${RESET}" >&2
+        printf '\n' >&2
+
+        # Footer
+        printf '%b\n' "  ${DIM}Run 'ru --help' for full documentation${RESET}" >&2
+        printf '%b\n' "  ${DIM}https://github.com/Dicklesworthstone/repo_updater${RESET}" >&2
+        printf '\n' >&2
+    fi
+}
+
 #==============================================================================
 # SECTION 7: CONFIGURATION
 #==============================================================================
@@ -12582,6 +12715,12 @@ execute_gh_actions() {
 #==============================================================================
 
 main() {
+    # Show quick menu if run with no arguments
+    if [[ $# -eq 0 ]]; then
+        show_quick_menu
+        exit 0
+    fi
+
     # Initialize
     ARGS=()
     parse_args "$@"
