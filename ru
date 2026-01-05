@@ -4455,6 +4455,18 @@ cmd_prune() {
 check_review_prerequisites() {
     local has_errors=false
 
+    # Review requires flock for locking/state safety.
+    if ! command -v flock &>/dev/null; then
+        log_error "flock is required for review command"
+        log_info "Install flock:"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            log_info "  brew install flock"
+        else
+            log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        fi
+        has_errors=true
+    fi
+
     # Check for gh CLI
     if ! check_gh_installed; then
         log_error "GitHub CLI (gh) is required for review command"
@@ -4539,6 +4551,17 @@ acquire_review_lock() {
     lock_file=$(get_review_lock_file)
     info_file=$(get_review_lock_info_file)
     ensure_dir "$(dirname "$lock_file")"
+
+    if ! command -v flock &>/dev/null; then
+        log_error "flock is required to run ru review (for locking)"
+        log_info "Install flock and try again."
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            log_info "  brew install flock"
+        else
+            log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        fi
+        return 1
+    fi
 
     # Check for stale locks first and clean up if needed
     check_stale_lock
@@ -8403,6 +8426,17 @@ acquire_state_lock() {
     state_dir=$(get_review_state_dir)
     ensure_dir "$state_dir"
     local lock_file="$state_dir/state.lock"
+
+    if ! command -v flock &>/dev/null; then
+        log_error "flock is required to run ru review (for state locking)"
+        log_info "Install flock and try again."
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            log_info "  brew install flock"
+        else
+            log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        fi
+        return 1
+    fi
 
     # Open fd for locking (no eval)
     exec 201>"$lock_file"
