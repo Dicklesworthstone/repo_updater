@@ -4595,6 +4595,14 @@ cmd_prune() {
     # Handle delete mode
     if [[ "$delete_mode" == "true" ]]; then
         if [[ "$NON_INTERACTIVE" != "true" ]]; then
+            # Avoid hanging in non-TTY contexts (pipes/CI). For unattended deletion,
+            # require explicit --non-interactive.
+            if [[ ! -t 0 ]]; then
+                log_error "Cannot prompt for prune deletion confirmation (stdin is not a TTY)"
+                log_info "Re-run with --non-interactive to proceed without prompts."
+                exit 3
+            fi
+
             log_warn "This will permanently delete ${#orphans[@]} repository(s)!"
             echo "" >&2
             for path in "${orphans[@]}"; do
@@ -4603,14 +4611,14 @@ cmd_prune() {
             echo "" >&2
 
             local confirm=""
-            if [[ "$GUM_AVAILABLE" == "true" ]]; then
+            if [[ "$GUM_AVAILABLE" == "true" && -t 1 ]]; then
                 if ! gum confirm "Delete these repositories?"; then
                     log_info "Aborted"
                     return 0
                 fi
             else
-                echo -n "Type 'delete' to confirm: " >&2
-                read -r confirm
+                printf "%s" "Type 'delete' to confirm: " >&2
+                IFS= read -r confirm
                 if [[ "$confirm" != "delete" ]]; then
                     log_info "Aborted"
                     return 0
