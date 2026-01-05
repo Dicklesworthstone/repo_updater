@@ -274,10 +274,7 @@ extract_json_string_field() {
         | head -1 \
         | cut -d'"' -f4
 }
-<<<<<<< HEAD
-=======
 
->>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
 # Get the default shell config file
 get_shell_config() {
     local shell_name
@@ -336,11 +333,7 @@ get_latest_release() {
     local response api_rc
 
     response=$(github_api_get "$url")
-<<<<<<< HEAD
     api_rc=$?
-=======
-    local api_rc=$?
->>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
     if [[ "$api_rc" -eq 2 ]]; then
         # No releases exist - caller should fall back to main.
         return 1
@@ -402,10 +395,6 @@ get_latest_release() {
 
     # Extract tag_name from JSON (simple approach for portability)
     local version=""
-=======
-    # Extract tag_name from JSON (simple grep approach for portability)
-    local version
->>>>>>> 0c31b4e (fix(test): correct nameref binding in source_ru_function)
     if command_exists jq; then
         version=$(printf '%s\n' "$response" | jq -r '.tag_name // empty' 2>/dev/null | head -1)
     else
