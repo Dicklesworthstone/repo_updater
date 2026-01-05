@@ -2178,7 +2178,7 @@ parse_args() {
                 COMMAND="$1"
                 shift
                 ;;
-            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd)
+            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd|--review)
                 # Subcommand-specific options - pass through to ARGS
                 ARGS+=("$1")
                 shift
@@ -3292,6 +3292,28 @@ cmd_import() {
     [[ ! -f "$public_file" ]] && touch "$public_file"
     [[ ! -f "$private_file" ]] && touch "$private_file"
 
+    # Load existing repos into associative array for fast deduplication
+    local -A existing_repos
+    for f in "$public_file" "$private_file"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            # Trim whitespace
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+
+            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
+            # shellcheck disable=SC2034 # Variables set by nameref
+            parse_repo_spec "$line" ex_url ex_branch ex_name
+            if parse_repo_url "$ex_url" ex_host ex_owner ex_repo; then
+                # Store canonical ID: host/owner/repo
+                existing_repos["${ex_host}/${ex_owner}/${ex_repo}"]=1
+            fi
+        done < "$f"
+    done
+
     # Counters
     local imported_public=0
     local imported_private=0
@@ -3337,9 +3359,9 @@ cmd_import() {
             local normalized
             normalized=$(normalize_url "$line")
 
-            # Check for duplicates in both files
-            if grep -qxF "$normalized" "$public_file" 2>/dev/null || \
-               grep -qxF "$normalized" "$private_file" 2>/dev/null; then
+            # Check for duplicates using canonical ID
+            local canonical_id="${host}/${owner}/${repo}"
+            if [[ -n "${existing_repos[$canonical_id]:-}" ]]; then
                 ((skipped_duplicate++))
                 continue
             fi
@@ -3759,22 +3781,32 @@ cmd_doctor() {
             ((review_issues++))
         fi
 
+        local tmux_available="false"
+        local ntm_available="false"
+
         if command -v tmux &>/dev/null; then
             local tmux_version
             tmux_version=$(tmux -V 2>/dev/null | head -1 || echo "unknown")
             printf '%b\n' "${GREEN}[OK]${RESET} tmux: $tmux_version" >&2
+            tmux_available="true"
         else
             printf '%b\n' "${YELLOW}[??]${RESET} tmux: not installed (required for local driver)" >&2
         fi
 
         if command -v ntm &>/dev/null; then
-            if ntm --robot-status &>/dev/null; then
+            if ntm --help 2>&1 | grep -q "robot"; then
                 printf '%b\n' "${GREEN}[OK]${RESET} ntm: robot mode available" >&2
+                ntm_available="true"
             else
                 printf '%b\n' "${YELLOW}[??]${RESET} ntm: installed but robot mode unavailable" >&2
             fi
         else
             printf '%b\n' "${DIM}[  ]${RESET} ntm: not installed (optional)" >&2
+        fi
+
+        if [[ "$tmux_available" != "true" && "$ntm_available" != "true" ]]; then
+            printf '%b\n' "${RED}[!!]${RESET} review driver: no tmux or ntm available" >&2
+            ((review_issues++))
         fi
 
         if command -v gh &>/dev/null && gh auth status &>/dev/null; then
@@ -6601,6 +6633,237 @@ dashboard_apply_template() {
     driver_send_to_session "$session_id" "$template_text" || true
 }
 
+# Print wrapped text with a fixed indent
+print_wrapped_block() {
+    local indent="$1"
+    local width="$2"
+    local text="$3"
+
+    [[ -z "$text" ]] && return 0
+
+    while IFS= read -r line; do
+        printf '%s%s\n' "$indent" "$line"
+    done < <(wrap_text "$text" "$width")
+}
+
+# Show a patch summary for the worktree
+show_patch_summary() {
+    local wt_path="$1"
+    local cols="$2"
+    local plan_file="${3:-}"
+
+    local width=$((cols - 6))
+    [[ $width -lt 20 ]] && width=20
+
+    printf '\n  %sPATCH SUMMARY%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+
+    if [[ -z "$wt_path" || ! -d "$wt_path/.git" ]]; then
+        printf '  %sNo worktree available%s\n' "${DASH_DIM}" "${DASH_RESET}"
+        return 0
+    fi
+
+    local diffstat shortstat
+    diffstat=$(git -C "$wt_path" diff --stat --no-color 2>/dev/null || echo "")
+    shortstat=$(git -C "$wt_path" diff --shortstat --no-color 2>/dev/null || echo "")
+
+    if [[ -z "$diffstat" ]]; then
+        printf '  %sNo uncommitted changes%s\n' "${DASH_DIM}" "${DASH_RESET}"
+    else
+        printf '  Changed files:\n'
+        while IFS= read -r line; do
+            printf '    %s\n' "$(truncate_string "$line" "$width")"
+        done <<< "$(echo "$diffstat" | head -n 6)"
+
+        if [[ -n "$shortstat" ]]; then
+            printf '  Diff: %s\n' "$shortstat"
+        fi
+    fi
+
+    if [[ -n "$plan_file" && -f "$plan_file" ]] && command -v jq &>/dev/null; then
+        local tests_ran tests_ok gates_ok gates_warn tests_status
+        tests_ran=$(jq -r '.git.tests.ran // null' "$plan_file" 2>/dev/null)
+        tests_ok=$(jq -r '.git.tests.ok // null' "$plan_file" 2>/dev/null)
+        gates_ok=$(jq -r '.git.quality_gates_ok // null' "$plan_file" 2>/dev/null)
+        gates_warn=$(jq -r '.git.quality_gates_warning // null' "$plan_file" 2>/dev/null)
+
+        if [[ "$tests_ran" == "true" ]]; then
+            tests_status=$([[ "$tests_ok" == "true" ]] && echo "PASS" || echo "FAIL")
+        elif [[ "$tests_ran" == "false" ]]; then
+            tests_status="NOT RUN"
+        else
+            tests_status="UNKNOWN"
+        fi
+
+        printf '  Tests: %s\n' "$tests_status"
+        if [[ "$gates_ok" == "true" ]]; then
+            printf '  Quality gates: OK\n'
+        elif [[ "$gates_warn" == "true" ]]; then
+            printf '  Quality gates: WARNING\n'
+        elif [[ "$gates_ok" == "false" ]]; then
+            printf '  Quality gates: FAIL\n'
+        fi
+    fi
+}
+
+# View raw session output (tail of session log)
+view_session_output() {
+    local log_file="$1"
+
+    local cols rows term_size max_lines
+    term_size=$(get_terminal_size)
+    read -r cols rows <<< "$term_size"
+    max_lines=$((rows - 6))
+    [[ $max_lines -lt 5 ]] && max_lines=5
+
+    clear_screen
+    printf '%sSession Output%s\n\n' "${DASH_BOLD}" "${DASH_RESET}"
+
+    if [[ -z "$log_file" || ! -f "$log_file" ]]; then
+        printf '%sNo session log available.%s\n' "${DASH_DIM}" "${DASH_RESET}"
+    else
+        tail -n "$max_lines" "$log_file"
+    fi
+
+    printf '\nPress any key to return...\n'
+    read_keypress
+}
+
+# Drill-down view for a single question
+open_drilldown() {
+    local question_json="$1"
+
+    local repo_id session_id question_id prompt recommended
+    repo_id=$(echo "$question_json" | jq -r '.repo // "unknown"' 2>/dev/null)
+    session_id=$(question_get_session_id "$question_json")
+    question_id=$(question_get_id "$question_json")
+    prompt=$(question_get_prompt "$question_json")
+    recommended=$(question_get_recommended "$question_json")
+
+    local wt_path=""
+    if [[ -n "$repo_id" ]]; then
+        get_worktree_path "$repo_id" wt_path 2>/dev/null || wt_path=""
+    fi
+
+    local log_file=""
+    local plan_file=""
+    if [[ -n "$wt_path" ]]; then
+        log_file="$wt_path/.ru/session.log"
+        [[ -f "$log_file" ]] || log_file=""
+        plan_file="$wt_path/.ru/review-plan.json"
+        [[ -f "$plan_file" ]] || plan_file=""
+    fi
+
+    while true; do
+        local cols rows term_size width
+        term_size=$(get_terminal_size)
+        read -r cols rows <<< "$term_size"
+        width=$((cols - 4))
+        [[ $width -lt 20 ]] && width=20
+
+        local number item_type priority title context repo_url
+        number=$(echo "$question_json" | jq -r '.number // empty' 2>/dev/null)
+        item_type=$(echo "$question_json" | jq -r '.type // "issue"' 2>/dev/null)
+        priority=$(echo "$question_json" | jq -r '.priority // "NORMAL"' 2>/dev/null)
+        title=$(echo "$question_json" | jq -r '.title // .item_title // .context.title // empty' 2>/dev/null)
+        repo_url=$(echo "$question_json" | jq -r '.repo_url // .url // empty' 2>/dev/null)
+        context=$(echo "$question_json" | jq -r '
+            if .context == null then ""
+            elif (.context | type) == "string" then .context
+            else (.context | tostring)
+            end
+        ' 2>/dev/null)
+
+        clear_screen
+        printf '%s%s%s\n' "${DASH_BOLD}" " ${repo_id} - Session Detail [ESC]" "${DASH_RESET}"
+        draw_hline "$cols"
+
+        printf '  Repository: %s\n' "${repo_url:-$repo_id}"
+        printf '  Session ID: %s\n' "${session_id:-unknown}"
+        [[ -n "$wt_path" ]] && printf '  Worktree: %s\n' "$wt_path"
+        printf '  Priority: %s\n' "$priority"
+
+        if [[ -n "$number" || -n "$title" ]]; then
+            printf '\n  %s%s%s\n' "${DASH_BOLD}" "$(truncate_string "${item_type^^} #${number:-?}: ${title:-No title}" "$width")" "${DASH_RESET}"
+        fi
+
+        if [[ -n "$prompt" ]]; then
+            printf '\n  %sQUESTION%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$prompt"
+        fi
+
+        if [[ -n "$context" ]]; then
+            printf '\n  %sCONTEXT%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$context"
+        fi
+
+        local -a options=()
+        mapfile -t options < <(question_get_options_lines "$question_json")
+        if [[ ${#options[@]} -gt 0 ]]; then
+            printf '\n  %sOPTIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            [[ -n "${options[0]:-}" ]] && printf '  A: %s\n' "$(truncate_string "${options[0]}" "$width")"
+            [[ -n "${options[1]:-}" ]] && printf '  B: %s\n' "$(truncate_string "${options[1]}" "$width")"
+            if [[ ${#options[@]} -gt 2 ]]; then
+                printf '  C: %s\n' "$(truncate_string "${options[2]}" "$width")"
+            else
+                printf '  C: Skip\n'
+            fi
+        elif [[ -n "$recommended" ]]; then
+            printf '\n  %sRECOMMENDED%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$recommended"
+            printf '  C: Skip\n'
+        else
+            printf '\n  %sACTIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            printf '  C: Skip\n'
+        fi
+
+        local c_label="Skip"
+        if [[ -n "${options[2]:-}" ]]; then
+            c_label="Option 3"
+        fi
+
+        show_patch_summary "$wt_path" "$cols" "$plan_file"
+
+        printf '\n  [a] Quick fix  [b] Alt fix  [c] %s  [v] View session  [ESC] Back\n' "$c_label"
+
+        local key
+        key=$(read_keypress)
+        case "$key" in
+            $'\x1b'|q) return 0 ;;
+            a|b)
+                local answer=""
+                if [[ "$key" == "a" ]]; then
+                    answer="${options[0]:-}"
+                    [[ -z "$answer" ]] && answer="$recommended"
+                else
+                    answer="${options[1]:-}"
+                fi
+
+                if [[ -z "$answer" ]]; then
+                    continue
+                fi
+
+                [[ -n "$session_id" ]] && driver_send_to_session "$session_id" "$answer" || true
+                [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+                return 0
+                ;;
+            c)
+                if [[ -n "${options[2]:-}" ]]; then
+                    local answer="${options[2]}"
+                    [[ -n "$session_id" ]] && driver_send_to_session "$session_id" "$answer" || true
+                    [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+                else
+                    [[ -n "$question_id" ]] && mark_question_skipped "$question_id" || true
+                fi
+                return 0
+                ;;
+            v)
+                view_session_output "$log_file"
+                ;;
+            *) ;;
+        esac
+    done
+}
+
 # Enter alternate screen buffer
 enter_alt_screen() {
     printf '\033[?1049h'  # Enter alternate screen
@@ -6660,6 +6923,21 @@ truncate_string() {
         echo "${str:0:$((max_width - 3))}..."
     else
         echo "$str"
+    fi
+}
+
+# Wrap text to a given width (preserves words when possible)
+wrap_text() {
+    local text="$1"
+    local width="$2"
+
+    [[ -z "$text" ]] && return 0
+    [[ -z "$width" || "$width" -le 0 ]] && { echo "$text"; return 0; }
+
+    if command -v fold &>/dev/null; then
+        echo "$text" | fold -s -w "$width"
+    else
+        echo "$text"
     fi
 }
 
@@ -7130,8 +7408,14 @@ run_dashboard() {
                     ;;
                 drill:*)
                     local idx="${action#drill:}"
-                    # TODO: Open drill-down view (bd-7of4)
-                    log_verbose "Drill into question $idx"
+                    if [[ -n "$filtered_questions" ]]; then
+                        local question_json
+                        question_json=$(get_question_at_index "$filtered_questions" "$idx")
+                        if [[ -n "$question_json" ]]; then
+                            open_drilldown "$question_json"
+                            DASHBOARD_STATE[refresh_needed]="true"
+                        fi
+                    fi
                     ;;
                 skip:*)
                     local idx="${action#skip:}"
@@ -10561,8 +10845,9 @@ push_worktree_changes() {
         return 1
     fi
 
-    if ! git -C "$main_repo" push 2>/dev/null; then
-        log_error "Push failed for $repo_id"
+    local push_output
+    if ! push_output=$(git -C "$main_repo" push 2>&1); then
+        log_error "Push failed for $repo_id: $push_output"
         git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
         [[ -n "$original_branch" ]] && git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
         return 1
