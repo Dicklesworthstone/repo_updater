@@ -6,7 +6,7 @@
 # DEFAULT: Downloads from GitHub Release with checksum verification
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 #
 # Options (via environment variables):
 #   DEST=/path/to/dir      Install directory (default: ~/.local/bin)
@@ -16,7 +16,7 @@
 #
 # Examples:
 #   # Standard installation (recommended)
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 #
 #   # Install specific version
 #   RU_VERSION=1.0.0 curl -fsSL .../install.sh | bash
@@ -151,15 +151,9 @@ get_latest_release() {
     local response
 
     if command_exists curl; then
-        response=$(curl -sS "$url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            return 1
-        }
+        response=$(curl -fsSL -H "Accept: application/vnd.github+json" "$url" 2>/dev/null) || response=""
     elif command_exists wget; then
-        response=$(wget -qO- "$url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            return 1
-        }
+        response=$(wget -qO- "$url" 2>/dev/null) || response=""
     else
         log_error "Neither curl nor wget found. Please install one of them."
         return 1
@@ -167,15 +161,45 @@ get_latest_release() {
 
     # Extract tag_name from JSON (simple grep approach for portability)
     local version
-    version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    version=$(printf '%s' "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
 
-    if [[ -z "$version" ]]; then
-        log_error "Could not parse version from GitHub API response"
-        return 1
+    if [[ -n "$version" ]]; then
+        # Remove 'v' prefix if present
+        echo "${version#v}"
+        return 0
     fi
 
-    # Remove 'v' prefix if present
-    echo "${version#v}"
+    # Fallback: follow the github.com redirect for /releases/latest.
+    # This avoids API rate limits and works even when the API response changes.
+    local latest_url="https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest"
+    local effective=""
+
+    if command_exists curl; then
+        effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null) || effective=""
+    elif command_exists wget; then
+        # Use the last Location header as the effective URL
+        effective=$(wget -qS --spider "$latest_url" 2>&1 | awk '/^  Location: / {print $2}' | tail -1 | tr -d '\r') || effective=""
+    fi
+
+    if [[ -n "$effective" && "$effective" == *"/tag/"* ]]; then
+        version="${effective##*/tag/}"
+        if [[ -n "$version" ]]; then
+            echo "${version#v}"
+            return 0
+        fi
+    fi
+
+    # If we got here: either no releases exist, or network/auth/rate-limit prevented detection.
+    local api_msg=""
+    api_msg=$(printf '%s' "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [[ -n "$api_msg" ]]; then
+        log_error "Could not determine latest release version (GitHub API: $api_msg)"
+    else
+        log_error "Could not determine latest release version"
+    fi
+    log_info "If this repo has no releases yet, install from main with:"
+    log_info "  RU_UNSAFE_MAIN=1 curl -fsSL \"${GITHUB_RAW}/${REPO_OWNER}/${REPO_NAME}/main/install.sh?ru_cb=\\$(date +%s)\" | bash"
+    return 1
 }
 
 # Download a file

@@ -67,9 +67,9 @@ set -uo pipefail
 # Basic sanity: this script relies heavily on $HOME for defaults.
 : "${HOME:?ru: HOME must be set}"
 
-# Bash >= 4.3 is required (namerefs + associative arrays). macOS ships Bash 3.2 by default.
-if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    printf 'ru: Bash >= 4.3 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
+# Bash >= 4.0 is required (associative arrays). macOS ships Bash 3.2 by default.
+if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 )); then
+    printf 'ru: Bash >= 4.0 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
 
     # Check if we're on macOS and can offer to install via Homebrew
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -110,7 +110,7 @@ if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO
             printf 'Then run: $(brew --prefix)/bin/bash %s\n' "${BASH_SOURCE[0]}" >&2
         fi
     else
-        printf 'ru: Install Bash 4.3+ from your package manager\n' >&2
+        printf 'ru: Install Bash 4.0+ from your package manager\n' >&2
     fi
     exit 3
 fi
@@ -243,6 +243,38 @@ is_interactive() {
 # Check if we can prompt the user (interactive and not --non-interactive)
 can_prompt() {
     is_interactive && [[ "$NON_INTERACTIVE" != "true" ]]
+}
+
+_is_valid_var_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]
+}
+
+_set_out_var() {
+    local name="$1"
+    local value="${2-}"
+
+    _is_valid_var_name "$name" || return 1
+    printf -v "$name" '%s' "$value"
+}
+
+_set_out_array() {
+    local out_name="$1"
+    shift
+
+    _is_valid_var_name "$out_name" || return 1
+
+    local -a tmp=("$@")
+    eval "$out_name=(\"\${tmp[@]}\")"
+}
+
+_copy_array_by_name() {
+    local src_name="$1"
+    local dest_name="$2"
+
+    _is_valid_var_name "$src_name" || return 1
+    _is_valid_var_name "$dest_name" || return 1
+    eval "$dest_name=(\"\${${src_name}[@]}\")"
 }
 
 # Ensure a directory exists
@@ -936,6 +968,124 @@ detect_os() {
     esac
 }
 
+detect_package_manager() {
+    if command -v brew &>/dev/null; then
+        echo "brew"
+    elif command -v apt-get &>/dev/null; then
+        echo "apt-get"
+    elif command -v apt &>/dev/null; then
+        echo "apt"
+    elif command -v dnf &>/dev/null; then
+        echo "dnf"
+    elif command -v yum &>/dev/null; then
+        echo "yum"
+    elif command -v pacman &>/dev/null; then
+        echo "pacman"
+    elif command -v zypper &>/dev/null; then
+        echo "zypper"
+    elif command -v apk &>/dev/null; then
+        echo "apk"
+    else
+        echo ""
+    fi
+}
+
+can_use_sudo() {
+    if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+        return 0
+    fi
+    command -v sudo &>/dev/null
+}
+
+print_flock_install_hints() {
+    log_info "Install flock:"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        log_info "  brew install flock"
+    else
+        log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        log_info "  sudo dnf install util-linux   # Fedora/RHEL"
+    fi
+}
+
+maybe_install_flock() {
+    # Installs flock if missing.
+    # - Prompts by default (interactive only)
+    # - RU_AUTO_INSTALL_DEPS=1 opts into auto-install (may work in --non-interactive if root or passwordless sudo)
+    if command -v flock &>/dev/null; then
+        return 0
+    fi
+
+    local auto_install="${RU_AUTO_INSTALL_DEPS:-0}"
+    if [[ "$auto_install" != "1" ]]; then
+        if [[ "$NON_INTERACTIVE" == "true" ]] || ! can_prompt; then
+            return 1
+        fi
+    fi
+
+    local pm
+    pm=$(detect_package_manager)
+    if [[ -z "$pm" ]]; then
+        return 1
+    fi
+
+    if [[ "$auto_install" != "1" ]]; then
+        echo "" >&2
+        if ! gum_confirm "flock is missing. Install it now?" "true"; then
+            return 1
+        fi
+    fi
+
+    log_step "Installing flock..."
+
+    local -a install_cmd=()
+    case "$pm" in
+        brew) install_cmd=(brew install flock) ;;
+        apt-get) install_cmd=(apt-get install -y util-linux) ;;
+        apt) install_cmd=(apt install -y util-linux) ;;
+        dnf) install_cmd=(dnf install -y util-linux) ;;
+        yum) install_cmd=(yum install -y util-linux) ;;
+        pacman) install_cmd=(pacman -S --noconfirm util-linux) ;;
+        zypper) install_cmd=(zypper --non-interactive install util-linux) ;;
+        apk) install_cmd=(apk add util-linux) ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$pm" != "brew" ]]; then
+        if [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+            if ! can_use_sudo; then
+                log_error "Cannot auto-install flock without sudo/root privileges"
+                return 1
+            fi
+
+            # If we're in an automation context, avoid hanging on a sudo password prompt.
+            if [[ "$auto_install" == "1" ]] && { [[ "$NON_INTERACTIVE" == "true" ]] || ! is_interactive; }; then
+                if sudo -n true 2>/dev/null; then
+                    install_cmd=(sudo -n "${install_cmd[@]}")
+                else
+                    log_error "Cannot auto-install flock: sudo requires a password (non-interactive)"
+                    return 1
+                fi
+            else
+                install_cmd=(sudo "${install_cmd[@]}")
+            fi
+        fi
+    fi
+
+    local output exit_code
+    if output=$("${install_cmd[@]}" 2>&1); then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        log_error "Failed to install flock (exit $exit_code): $output"
+        return 1
+    fi
+
+    command -v flock &>/dev/null
+}
+
 #==============================================================================
 # SECTION 9: URL & PATH PARSING
 #==============================================================================
@@ -960,12 +1110,17 @@ _is_safe_path_segment() {
 # Parse all GitHub URL formats and extract components
 # Supports: https://github.com/owner/repo, git@github.com:owner/repo.git,
 #           github.com/owner/repo, owner/repo (assumes github.com)
-# Uses nameref (-n) to return multiple values (requires Bash 4.3+)
+# Args: url host_var owner_var repo_var (variable names)
 parse_repo_url() {
     local url="$1"
-    local -n _host=$2
-    local -n _owner=$3
-    local -n _repo=$4
+    local host_var="$2"
+    local owner_var="$3"
+    local repo_var="$4"
+
+    # Use _out_ prefix to avoid shadowing caller's output variable names.
+    # Without this, if caller passes "host" as host_var, `local host=""` shadows
+    # it and `printf -v host` sets the local instead of caller's variable.
+    local _out_host="" _out_owner="" _out_repo=""
 
     # Normalize: strip .git suffix and trailing slashes
     url="${url%.git}"
@@ -975,43 +1130,46 @@ parse_repo_url() {
 
     # SSH scp-like format: git@host:owner/repo (repo must not contain /)
     if [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[1]}"
-        _owner="${BASH_REMATCH[2]}"
-        _repo="${BASH_REMATCH[3]}"
+        _out_host="${BASH_REMATCH[1]}"
+        _out_owner="${BASH_REMATCH[2]}"
+        _out_repo="${BASH_REMATCH[3]}"
         matched="true"
     # SSH URL format: ssh://git@host/owner/repo (optional user part)
     elif [[ "$url" =~ ^ssh://([^@/]+@)?([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[2]}"
-        _owner="${BASH_REMATCH[3]}"
-        _repo="${BASH_REMATCH[4]}"
+        _out_host="${BASH_REMATCH[2]}"
+        _out_owner="${BASH_REMATCH[3]}"
+        _out_repo="${BASH_REMATCH[4]}"
         matched="true"
     # HTTPS format: https://host/owner/repo (optional user@ for auth)
     elif [[ "$url" =~ ^https?://([^@/]+@)?([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[2]}"
-        _owner="${BASH_REMATCH[3]}"
-        _repo="${BASH_REMATCH[4]}"
+        _out_host="${BASH_REMATCH[2]}"
+        _out_owner="${BASH_REMATCH[3]}"
+        _out_repo="${BASH_REMATCH[4]}"
         matched="true"
     # Host/owner/repo format (no protocol): github.com/owner/repo
     elif [[ "$url" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[1]}"
-        _owner="${BASH_REMATCH[2]}"
-        _repo="${BASH_REMATCH[3]}"
+        _out_host="${BASH_REMATCH[1]}"
+        _out_owner="${BASH_REMATCH[2]}"
+        _out_repo="${BASH_REMATCH[3]}"
         matched="true"
     # Shorthand: owner/repo (assumes github.com)
     elif [[ "$url" =~ ^([^/]+)/([^/]+)$ ]]; then
-        _host="github.com"
-        _owner="${BASH_REMATCH[1]}"
-        _repo="${BASH_REMATCH[2]}"
+        _out_host="github.com"
+        _out_owner="${BASH_REMATCH[1]}"
+        _out_repo="${BASH_REMATCH[2]}"
         matched="true"
     fi
 
     # Validate parsed components for path safety
     if [[ "$matched" == "true" ]]; then
         # Strip optional :port from host (avoid filesystem-unfriendly ':' in full layout)
-        _host="${_host%%:*}"
-        if ! _is_safe_path_segment "$_owner" || ! _is_safe_path_segment "$_repo"; then
+        _out_host="${_out_host%%:*}"
+        if ! _is_safe_path_segment "$_out_owner" || ! _is_safe_path_segment "$_out_repo"; then
             return 1
         fi
+        _set_out_var "$host_var" "$_out_host" || return 1
+        _set_out_var "$owner_var" "$_out_owner" || return 1
+        _set_out_var "$repo_var" "$_out_repo" || return 1
         return 0
     fi
 
@@ -1150,26 +1308,28 @@ load_repo_list() {
 #   owner/repo as myname          -> url, empty branch, myname local_name
 #   owner/repo@develop as myname  -> url, develop branch, myname local_name
 #   owner/repo@feature/foo        -> url, feature/foo branch (branches can contain /)
-# Args: spec, url_var, branch_var, local_name_var (namerefs)
+# Args: spec url_var branch_var local_name_var (variable names)
 parse_repo_spec() {
     local spec="$1"
-    local -n _prs_url=$2
-    local -n _prs_branch=$3
-    local -n _prs_local_name=$4
+    local url_var="$2"
+    local branch_var="$3"
+    local local_name_var="$4"
+
+    local _out_url="" _out_branch="" _out_local_name=""
 
     # Extract 'as <name>' if present (must be last)
     if [[ "$spec" =~ ^(.+)[[:space:]]+as[[:space:]]+([^[:space:]]+)$ ]]; then
         spec="${BASH_REMATCH[1]}"
         # Trim trailing whitespace from spec (greedy .+ may capture trailing spaces)
         spec="${spec%"${spec##*[![:space:]]}"}"
-        _prs_local_name="${BASH_REMATCH[2]}"
+        _out_local_name="${BASH_REMATCH[2]}"
     else
-        _prs_local_name=""
+        _out_local_name=""
     fi
 
     # Default: no branch
-    _prs_url="$spec"
-    _prs_branch=""
+    _out_url="$spec"
+    _out_branch=""
 
     # Extract '@branch' by splitting on the LAST '@' and only accepting it if the
     # left side is a valid repo URL. This avoids mis-parsing ssh://git@host/... forms
@@ -1181,27 +1341,31 @@ parse_repo_spec() {
         # Only accept as branch if: left side parses as URL, branch is non-empty and has no spaces
         if [[ -n "$maybe_url" && -n "$maybe_branch" && "$maybe_branch" != *[[:space:]]* ]]; then
             if parse_repo_url "$maybe_url" host owner repo; then
-                _prs_url="$maybe_url"
-                _prs_branch="$maybe_branch"
+                _out_url="$maybe_url"
+                _out_branch="$maybe_branch"
             fi
         fi
     fi
+
+    _set_out_var "$url_var" "$_out_url" || return 1
+    _set_out_var "$branch_var" "$_out_branch" || return 1
+    _set_out_var "$local_name_var" "$_out_local_name" || return 1
 }
 
 # Resolve a repo spec into validated parts and a local path
 # This is the central function for parsing and validating repo specifications.
-# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var (namerefs)
+# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var (variable names)
 # repo_id is canonical for reporting (host/owner/repo, or owner/repo for github.com)
 # Returns: 0 on success, 1 on invalid spec
 resolve_repo_spec() {
     local spec="$1"
     local projects_dir="$2"
     local layout="$3"
-    local -n _rrs_url=$4
-    local -n _rrs_branch=$5
-    local -n _rrs_custom=$6
-    local -n _rrs_path=$7
-    local -n _rrs_repo_id=$8
+    local url_var="$4"
+    local branch_var="$5"
+    local custom_var="$6"
+    local path_var="$7"
+    local repo_id_var="$8"
 
     # Use unique prefixes to avoid shadowing caller variables and
     # avoid conflicts with variables used in parse_repo_spec and parse_repo_url
@@ -1224,28 +1388,32 @@ resolve_repo_spec() {
     fi
 
     # Validate custom name if provided
+    local resolved_path=""
     if [[ -n "$spec_custom" ]]; then
         _is_safe_path_segment "$spec_custom" || return 1
-        _rrs_path="${projects_dir}/${spec_custom}"
+        resolved_path="${projects_dir}/${spec_custom}"
     else
         case "$layout" in
-            flat)       _rrs_path="${projects_dir}/${spec_repo}" ;;
-            owner-repo) _rrs_path="${projects_dir}/${spec_owner}/${spec_repo}" ;;
-            full)       _rrs_path="${projects_dir}/${spec_host}/${spec_owner}/${spec_repo}" ;;
+            flat)       resolved_path="${projects_dir}/${spec_repo}" ;;
+            owner-repo) resolved_path="${projects_dir}/${spec_owner}/${spec_repo}" ;;
+            full)       resolved_path="${projects_dir}/${spec_host}/${spec_owner}/${spec_repo}" ;;
             *)          return 1 ;;
         esac
     fi
 
-    _rrs_url="$spec_url"
-    _rrs_branch="$spec_branch"
-    _rrs_custom="$spec_custom"
-
     # Build canonical repo ID for display/reporting
+    local resolved_repo_id=""
     if [[ "$spec_host" == "github.com" ]]; then
-        _rrs_repo_id="${spec_owner}/${spec_repo}"
+        resolved_repo_id="${spec_owner}/${spec_repo}"
     else
-        _rrs_repo_id="${spec_host}/${spec_owner}/${spec_repo}"
+        resolved_repo_id="${spec_host}/${spec_owner}/${spec_repo}"
     fi
+
+    _set_out_var "$url_var" "$spec_url" || return 1
+    _set_out_var "$branch_var" "$spec_branch" || return 1
+    _set_out_var "$custom_var" "$spec_custom" || return 1
+    _set_out_var "$path_var" "$resolved_path" || return 1
+    _set_out_var "$repo_id_var" "$resolved_repo_id" || return 1
 
     return 0
 }
@@ -1696,10 +1864,17 @@ load_sync_state() {
 # Args: status completed_array pending_array
 save_sync_state() {
     local status="$1"
-    shift
-    local -n completed_ref=$1
-    shift
-    local -n pending_ref=$1
+    local completed_name="$2"
+    local pending_name="$3"
+
+    if [[ -z "${completed_name:-}" || -z "${pending_name:-}" ]]; then
+        log_error "save_sync_state: missing array names"
+        return 4
+    fi
+
+    local -a completed=() pending=()
+    _copy_array_by_name "$completed_name" completed || return 4
+    _copy_array_by_name "$pending_name" pending || return 4
 
     local state_file
     state_file=$(get_sync_state_file)
@@ -1715,8 +1890,8 @@ save_sync_state() {
 
     # Build completed array JSON (handle empty array with set -u)
     local completed_json=""
-    if [[ ${#completed_ref[@]} -gt 0 ]]; then
-        for item in "${completed_ref[@]}"; do
+    if [[ ${#completed[@]} -gt 0 ]]; then
+        for item in "${completed[@]}"; do
             [[ -n "$completed_json" ]] && completed_json+=","
             completed_json+="\"$(json_escape "$item")\""
         done
@@ -1724,8 +1899,8 @@ save_sync_state() {
 
     # Build pending array JSON (handle empty array with set -u)
     local pending_json=""
-    if [[ ${#pending_ref[@]} -gt 0 ]]; then
-        for item in "${pending_ref[@]}"; do
+    if [[ ${#pending[@]} -gt 0 ]]; then
+        for item in "${pending[@]}"; do
             [[ -n "$pending_json" ]] && pending_json+=","
             pending_json+="\"$(json_escape "$item")\""
         done
@@ -1859,10 +2034,18 @@ process_single_repo_worker() {
 }
 
 # Run parallel sync with worker pool
-# Args: pending_repos array ref, parallel count
+# Args: pending_repos array name, parallel count
 run_parallel_sync() {
-    local -n repos_ref=$1
-    local parallel_count=$2
+    local repos_name="$1"
+    local parallel_count="$2"
+
+    if [[ -z "${repos_name:-}" ]]; then
+        log_error "run_parallel_sync: missing repos array name"
+        return 4
+    fi
+
+    local -a repos_ref=()
+    _copy_array_by_name "$repos_name" repos_ref || return 4
 
     # Validate parallel count
     if [[ ! "$parallel_count" =~ ^[0-9]+$ ]] || [[ "$parallel_count" -lt 1 ]]; then
@@ -2751,11 +2934,13 @@ cmd_sync() {
     # Check for flock availability before entering parallel mode
     if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
         if ! command -v flock &>/dev/null; then
-            log_warn "Parallel sync requires 'flock' which is not installed"
-            log_warn "Falling back to sequential sync"
-            log_info "To enable parallel sync on macOS: brew install flock"
-            PARALLEL=""
-            parallel_count="1"
+            if ! maybe_install_flock; then
+                log_warn "Parallel sync requires 'flock' which is not installed"
+                log_warn "Falling back to sequential sync"
+                print_flock_install_hints
+                PARALLEL=""
+                parallel_count="1"
+            fi
         fi
     fi
 
@@ -3264,27 +3449,6 @@ cmd_import() {
     [[ ! -f "$public_file" ]] && touch "$public_file"
     [[ ! -f "$private_file" ]] && touch "$private_file"
 
-    # Load existing repos into associative array for fast deduplication
-    local -A existing_repos
-    for f in "$public_file" "$private_file"; do
-        [[ -f "$f" ]] || continue
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            # Skip empty lines and comments
-            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-
-            # Trim whitespace
-            line="${line#"${line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-
-            # shellcheck disable=SC2034 # Variables set by parse_repo_spec
-            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
-            parse_repo_spec "$line" ex_url ex_branch ex_name
-            if parse_repo_url "$ex_url" ex_host ex_owner ex_repo; then
-                # Store canonical ID: host/owner/repo
-                existing_repos["${ex_host}/${ex_owner}/${ex_repo}"]=1
-            fi
-        done < "$f"
-    done
     # Counters
     local imported_public=0
     local imported_private=0
@@ -4232,6 +4396,15 @@ cmd_prune() {
 check_review_prerequisites() {
     local has_errors=false
 
+    # Review requires flock for locking/state safety.
+    if ! command -v flock &>/dev/null; then
+        if ! maybe_install_flock; then
+            log_error "flock is required for review command"
+            print_flock_install_hints
+            has_errors=true
+        fi
+    fi
+
     # Check for gh CLI
     if ! check_gh_installed; then
         log_error "GitHub CLI (gh) is required for review command"
@@ -4316,6 +4489,14 @@ acquire_review_lock() {
     lock_file=$(get_review_lock_file)
     info_file=$(get_review_lock_info_file)
     ensure_dir "$(dirname "$lock_file")"
+
+    if ! command -v flock &>/dev/null; then
+        if ! maybe_install_flock; then
+            log_error "flock is required to run ru review (for locking)"
+            print_flock_install_hints
+            return 1
+        fi
+    fi
 
     # Check for stale locks first and clean up if needed
     check_stale_lock
@@ -4743,42 +4924,48 @@ local_driver_interrupt_session() {
 #   0 if valid JSON, 1 if invalid
 parse_stream_json_event() {
     local line="$1"
-    local -n _pse_event_type=$2
-    local -n _pse_event_data=$3
+    local event_type_var="$2"
+    local event_data_var="$3"
+
+    local _out_event_type="" _out_event_data=""
 
     # Validate JSON
     if ! echo "$line" | jq empty 2>/dev/null; then
-        _pse_event_type="invalid"
-        _pse_event_data="$line"
+        _out_event_type="invalid"
+        _out_event_data="$line"
+        _set_out_var "$event_type_var" "$_out_event_type" || return 1
+        _set_out_var "$event_data_var" "$_out_event_data" || return 1
         return 1
     fi
 
-    _pse_event_type=$(echo "$line" | jq -r '.type // "unknown"')
+    _out_event_type=$(echo "$line" | jq -r '.type // "unknown"')
 
-    case "$_pse_event_type" in
+    case "$_out_event_type" in
         system)
             local subtype
             subtype=$(echo "$line" | jq -r '.subtype // ""')
             if [[ "$subtype" == "init" ]]; then
-                _pse_event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
+                _out_event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
             else
-                _pse_event_data=$(echo "$line" | jq -c '.')
+                _out_event_data=$(echo "$line" | jq -c '.')
             fi
             ;;
         assistant)
-            _pse_event_data=$(echo "$line" | jq -c '.message.content // []')
+            _out_event_data=$(echo "$line" | jq -c '.message.content // []')
             ;;
         user)
-            _pse_event_data=$(echo "$line" | jq -c '.message.content // []')
+            _out_event_data=$(echo "$line" | jq -c '.message.content // []')
             ;;
         result)
-            _pse_event_data=$(echo "$line" | jq -c '{status, duration_ms, session_id, cost_usd}')
+            _out_event_data=$(echo "$line" | jq -c '{status, duration_ms, session_id, cost_usd}')
             ;;
         *)
-            _pse_event_data="$line"
+            _out_event_data="$line"
             ;;
     esac
 
+    _set_out_var "$event_type_var" "$_out_event_type" || return 1
+    _set_out_var "$event_data_var" "$_out_event_data" || return 1
     return 0
 }
 
@@ -7904,8 +8091,11 @@ acquire_state_lock() {
     local state_dir
     state_dir=$(get_review_state_dir)
     if ! command -v flock &>/dev/null; then
-        log_error "flock is required for state locking"
-        return 1
+        if ! maybe_install_flock; then
+            log_error "flock is required for state locking"
+            print_flock_install_hints
+            return 1
+        fi
     fi
 
     if ! ensure_dir "$state_dir"; then
@@ -8800,20 +8990,22 @@ record_worktree_mapping() {
 # Returns: 0 if found, 1 if not found
 get_worktree_path() {
     local repo_id="$1"
-    local -n _wt_path_ref=$2
+    local path_var="$2"
 
     local worktrees_dir
     worktrees_dir=$(get_worktrees_dir)
     local mapping_file="$worktrees_dir/mapping.json"
 
     if [[ ! -f "$mapping_file" ]]; then
-        _wt_path_ref=""
+        _set_out_var "$path_var" "" || return 1
         return 1
     fi
 
     if command -v jq &>/dev/null; then
-        _wt_path_ref=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
-        [[ -n "$_wt_path_ref" ]] && return 0
+        local _out_path
+        _out_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
+        _set_out_var "$path_var" "$_out_path" || return 1
+        [[ -n "$_out_path" ]] && return 0
     fi
 
     return 1
@@ -8823,13 +9015,15 @@ get_worktree_path() {
 # Args: work_item (pipe-separated), repo_id output variable name, worktree_path output variable name
 get_worktree_mapping() {
     local work_item="$1"
-    local -n _repo_id_ref=$2
-    local -n _wt_path_out=$3
+    local repo_id_var="$2"
+    local wt_path_var="$3"
 
     # Extract repo_id from work item (first field before |)
-    _repo_id_ref="${work_item%%|*}"
+    local _out_repo_id
+    _out_repo_id="${work_item%%|*}"
+    _set_out_var "$repo_id_var" "$_out_repo_id" || return 1
 
-    get_worktree_path "$_repo_id_ref" _wt_path_out
+    get_worktree_path "$_out_repo_id" "$wt_path_var"
 }
 
 # Prepare worktrees for review
@@ -9326,11 +9520,13 @@ repo_spec_to_github_id() {
 # Discover work items from GitHub using GraphQL batching
 # Args: result_array_name, priority_filter, max_repos, allowed_repo_ids(optional)
 discover_work_items() {
-    local -n _items_ref=$1
+    local items_var="$1"
     # shellcheck disable=SC2034  # Used in bd-5jph (priority scoring)
     local priority_filter="$2"
     local max_repos="$3"
     local allowed_repos="${4:-}"
+
+    _set_out_array "$items_var" || return 0
 
     local -A allowed_repo_map=()
     if [[ -n "$allowed_repos" ]]; then
@@ -9340,7 +9536,7 @@ discover_work_items() {
         done
     fi
 
-    _items_ref=()
+    local -a items=()
 
     # Check for jq (required for parsing)
     if ! command -v jq &>/dev/null; then
@@ -9432,15 +9628,16 @@ discover_work_items() {
         title="${title//|/ }"
         labels="${labels//|/ }"
         # Convert TSV to pipe-separated for easier parsing later
-        _items_ref+=("${repo_id}|${item_type}|${number}|${title}|${labels}|${created_at}|${updated_at}|${is_draft}")
+        items+=("${repo_id}|${item_type}|${number}|${title}|${labels}|${created_at}|${updated_at}|${is_draft}")
     done <<< "$all_work_items"
 
     # Apply max_repos limit if specified
-    if [[ -n "$max_repos" ]] && [[ ${#_items_ref[@]} -gt $max_repos ]]; then
-        _items_ref=("${_items_ref[@]:0:$max_repos}")
+    if [[ -n "$max_repos" ]] && [[ ${#items[@]} -gt $max_repos ]]; then
+        items=("${items[@]:0:$max_repos}")
     fi
 
-    log_verbose "Discovered ${#_items_ref[@]} work item(s)"
+    _set_out_array "$items_var" "${items[@]}" || return 0
+    log_verbose "Discovered ${#items[@]} work item(s)"
 }
 
 #------------------------------------------------------------------------------
@@ -9483,7 +9680,12 @@ show_discovery_summary_ansi() {
     local total="$1" issues="$2" prs="$3"
     local critical="$4" high="$5" normal="$6" low="$7"
     local max_display="$8"
-    local -n _items_ansi=$9
+    local items_name="${9:-}"
+
+    local -a items=()
+    if [[ -n "$items_name" ]]; then
+        _copy_array_by_name "$items_name" items || true
+    fi
 
     local BOLD="\033[1m"
     local RED="\033[31m"
@@ -9506,13 +9708,13 @@ show_discovery_summary_ansi() {
     [[ $low -gt 0 ]] && echo -e "  ${GRAY}LOW: $low${RESET}" >&2
     echo "" >&2
 
-    if [[ ${#_items_ansi[@]} -gt 0 ]]; then
+    if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#_items_ansi[@]} ]] && display_count=${#_items_ansi[@]}
+        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
         echo -e "${BOLD}Top $display_count items to review:${RESET}" >&2
         local i=0
-        for item in "${_items_ansi[@]:0:$display_count}"; do
+        for item in "${items[@]:0:$display_count}"; do
             ((i++))
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
@@ -9539,7 +9741,12 @@ show_discovery_summary_gum() {
     local total="$1" issues="$2" prs="$3"
     local critical="$4" high="$5" normal="$6" low="$7"
     local max_display="$8"
-    local -n _items_gum=$9
+    local items_name="${9:-}"
+
+    local -a items=()
+    if [[ -n "$items_name" ]]; then
+        _copy_array_by_name "$items_name" items || true
+    fi
 
     # Header
     gum style --border rounded --padding "0 2" --border-foreground "#fab387" \
@@ -9558,13 +9765,13 @@ show_discovery_summary_gum() {
     [[ $low -gt 0 ]] && gum style --foreground "#6c7086" "  LOW: $low" >&2
     echo "" >&2
 
-    if [[ ${#_items_gum[@]} -gt 0 ]]; then
+    if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#_items_gum[@]} ]] && display_count=${#_items_gum[@]}
+        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
         gum style --bold "Top $display_count items to review:" >&2
         local i=0
-        for item in "${_items_gum[@]:0:$display_count}"; do
+        for item in "${items[@]:0:$display_count}"; do
             ((i++))
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
@@ -9596,16 +9803,21 @@ show_discovery_summary_json() {
     local total="$1" issues="$2" prs="$3"
     local critical="$4" high="$5" normal="$6" low="$7"
     local max_display="$8"
-    local -n _items_json=$9
+    local items_name="${9:-}"
+
+    local -a items=()
+    if [[ -n "$items_name" ]]; then
+        _copy_array_by_name "$items_name" items || true
+    fi
 
     local items_json="[]"
 
-    if [[ ${#_items_json[@]} -gt 0 ]]; then
+    if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#_items_json[@]} ]] && display_count=${#_items_json[@]}
+        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
         local item_list=""
-        for item in "${_items_json[@]:0:$display_count}"; do
+        for item in "${items[@]:0:$display_count}"; do
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
             local score level
@@ -11874,12 +12086,12 @@ record_gh_action_log() {
 
 parse_gh_action_target() {
     local target="$1"
-    local -n _type_ref=$2
-    local -n _number_ref=$3
+    local type_var="$2"
+    local number_var="$3"
 
     if [[ "$target" =~ ^(issue|pr)#[0-9]+$ ]]; then
-        _type_ref="${target%%#*}"
-        _number_ref="${target##*#}"
+        _set_out_var "$type_var" "${target%%#*}" || return 1
+        _set_out_var "$number_var" "${target##*#}" || return 1
         return 0
     fi
 
