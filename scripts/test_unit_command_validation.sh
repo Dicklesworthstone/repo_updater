@@ -59,10 +59,15 @@ GH_WRITE_COMMANDS=(
 )
 
 validate_agent_command() {
-    local cmd="$1"
+    local raw_cmd="$1"
     local mode="${2:-execute}"
-    local base_cmd
-    base_cmd=$(echo "$cmd" | awk '{print $1}')
+
+    # Normalize whitespace to single spaces
+    local cmd
+    cmd=$(echo "$raw_cmd" | xargs)
+
+    # Extract the base command (first word)
+    local base_cmd="${cmd%% *}"
 
     local blocked
     for blocked in "${BLOCKED_COMMANDS[@]}"; do
@@ -105,6 +110,21 @@ validate_agent_command() {
             --arg reason "gh command (unknown subcommand)" \
             '{command: $cmd, status: $status, reason: $reason}'
         return 0
+    fi
+
+    # Special check for git push variants (security bypass prevention)
+    if [[ "$base_cmd" == "git" ]]; then
+        # Check for 'push' token anywhere in the command
+        # This covers: git push, git -C path push, git push --force, etc.
+        if [[ " $cmd " == *" push "* ]]; then
+            jq -n \
+                --arg cmd "$cmd" \
+                --arg base "$base_cmd" \
+                --arg status "needs_approval" \
+                --arg reason "git push operation requires confirmation" \
+                '{command: $cmd, base_command: $base, status: $status, reason: $reason}'
+            return 2
+        fi
     fi
 
     local approval_cmd
@@ -395,6 +415,29 @@ test_gh_pr_merge_plan_mode() {
     log_test_pass "$test_name"
 }
 
+test_git_push_bypass_variants() {
+    local test_name="validate_agent_command: git push variants need approval"
+    log_test_start "$test_name"
+
+    # Test git  push (two spaces)
+    local result
+    result=$(validate_agent_command "git  push")
+    local exit_code=$?
+    assert_equals "2" "$exit_code" "git  push should need approval"
+    
+    # Test git -C . push
+    result=$(validate_agent_command "git -C . push")
+    exit_code=$?
+    assert_equals "2" "$exit_code" "git -C . push should need approval"
+
+    # Test git push --force
+    result=$(validate_agent_command "git push --force")
+    exit_code=$?
+    assert_equals "2" "$exit_code" "git push --force should need approval"
+
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Tests: Unknown Commands
 #==============================================================================
@@ -500,6 +543,7 @@ run_all_tests() {
     run_test test_gh_write_approval_execute_mode
     run_test test_gh_write_blocked_plan_mode
     run_test test_gh_pr_merge_plan_mode
+    run_test test_git_push_bypass_variants
 
     # Unknown command tests
     run_test test_unknown_command

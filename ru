@@ -450,6 +450,8 @@ REVIEW OPTIONS:
     --dry-run            Discovery only, don't start sessions
     --resume             Resume interrupted review from checkpoint
     --push               Allow pushing changes (with --apply)
+    --auto-answer=POLICY Auto-answer policy in non-interactive mode (auto|skip|fail)
+    --invalidate-cache=R Invalidate digest cache for repo(s) (use "all" for all)
     --max-repos=N        Limit number of repos to review
     --max-runtime=MIN    Time budget in minutes
     --max-questions=N    Question budget before pausing
@@ -2059,7 +2061,7 @@ parse_args() {
                 ARGS+=("$1")
                 shift
                 ;;
-            --plan|--apply|--push|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*)
+            --plan|--apply|--push|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
                     shift
@@ -2072,7 +2074,7 @@ parse_args() {
                     exit 4
                 fi
                 ;;
-            --mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions)
+            --mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions|--invalidate-cache|--auto-answer)
                 if [[ "$COMMAND" == "review" ]]; then
                     if [[ $# -lt 2 ]]; then
                         log_error "$1 requires a value"
@@ -6425,6 +6427,10 @@ REVIEW_MAX_ITEMS=20
 REVIEW_SKIP_PRS=false
 # Deep mode (comprehensive review, slower)
 REVIEW_DEEP_MODE=false
+# Non-interactive review behavior
+REVIEW_NON_INTERACTIVE=false
+# auto|skip|fail
+REVIEW_NON_INTERACTIVE_POLICY="auto"
 POLICY_EOF
         log_info "Created example policy file: $example_policy"
         log_info "Rename to _default.conf to activate default policies"
@@ -6483,6 +6489,9 @@ parse_review_args() {
     REVIEW_MAX_REPOS=""          # cost budget
     REVIEW_MAX_RUNTIME=""        # time budget (minutes)
     REVIEW_MAX_QUESTIONS=""      # question budget
+    REVIEW_INVALIDATE_CACHE=""   # repo ids to invalidate digest cache
+    REVIEW_NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+    REVIEW_NON_INTERACTIVE_POLICY="auto"
 
     for arg in "${ARGS[@]}"; do
         case "$arg" in
@@ -6557,6 +6566,21 @@ parse_review_args() {
                     exit 4
                 fi
                 ;;
+            --auto-answer=*)
+                REVIEW_NON_INTERACTIVE_POLICY="${arg#--auto-answer=}"
+                if [[ ! "$REVIEW_NON_INTERACTIVE_POLICY" =~ ^(auto|skip|fail)$ ]]; then
+                    log_error "Invalid --auto-answer policy: $REVIEW_NON_INTERACTIVE_POLICY (use auto, skip, or fail)"
+                    exit 4
+                fi
+                ;;
+            --invalidate-cache=*)
+                REVIEW_INVALIDATE_CACHE="${arg#--invalidate-cache=}"
+                REVIEW_INVALIDATE_CACHE="${REVIEW_INVALIDATE_CACHE//,/ }"
+                if [[ -z "$REVIEW_INVALIDATE_CACHE" ]]; then
+                    log_error "Invalid --invalidate-cache value"
+                    exit 4
+                fi
+                ;;
             -*)
                 log_error "Unknown review option: $arg"
                 exit 4
@@ -6571,6 +6595,96 @@ parse_review_args() {
                 ;;
         esac
     done
+}
+
+#------------------------------------------------------------------------------
+# NON-INTERACTIVE MODE (bd-s3iy)
+#------------------------------------------------------------------------------
+
+get_skipped_questions_log_file() {
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
+}
+
+check_interactive_capability() {
+    if [[ ! -t 0 ]]; then
+        if [[ "$REVIEW_NON_INTERACTIVE" != "true" ]]; then
+            log_warn "No TTY detected, enabling non-interactive review mode"
+            REVIEW_NON_INTERACTIVE="true"
+        fi
+    fi
+}
+
+log_skipped_question() {
+    local question_info="$1"
+    local reason="${2:-skipped}"
+
+    local log_file
+    log_file=$(get_skipped_questions_log_file)
+    ensure_dir "$(dirname "$log_file")"
+
+    if command -v jq &>/dev/null; then
+        jq -n \
+            --arg run_id "${REVIEW_RUN_ID:-unknown}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg reason "$reason" \
+            --argjson question "$question_info" \
+            '{run_id:$run_id,timestamp:$timestamp,reason:$reason,question:$question}' >> "$log_file"
+    else
+        printf '{"run_id":"%s","timestamp":"%s","reason":"%s","question":%s}\n' \
+            "${REVIEW_RUN_ID:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" "$question_info" >> "$log_file"
+    fi
+}
+
+handle_question_non_interactive() {
+    local question_info="$1"
+    local session_id="$2"
+
+    local reason recommended
+    reason=$(echo "$question_info" | jq -r '.reason // ""' 2>/dev/null || echo "")
+    recommended=$(echo "$question_info" | jq -r '.recommended // ""' 2>/dev/null || echo "")
+
+    case "$REVIEW_NON_INTERACTIVE_POLICY" in
+        fail)
+            log_error "[non-interactive] Question requires human input; failing"
+            log_skipped_question "$question_info" "fail"
+            return 3
+            ;;
+        skip)
+            log_warn "[non-interactive] Skipping question"
+            log_skipped_question "$question_info" "skip"
+            driver_send_to_session "$session_id" "skip"
+            return 0
+            ;;
+        auto)
+            if [[ "$reason" == "ask_user_question" && -n "$recommended" ]]; then
+                log_info "[non-interactive] Auto-selecting: $recommended"
+                driver_send_to_session "$session_id" "$recommended"
+                return 0
+            fi
+            log_warn "[non-interactive] No recommended option, skipping"
+            log_skipped_question "$question_info" "skip"
+            driver_send_to_session "$session_id" "skip"
+            return 0
+            ;;
+    esac
+}
+
+summarize_non_interactive_questions() {
+    local log_file
+    log_file=$(get_skipped_questions_log_file)
+
+    if [[ -f "$log_file" ]]; then
+        local count=0
+        if command -v jq &>/dev/null; then
+            count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+        else
+            count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+        fi
+        if [[ "$count" -gt 0 ]]; then
+            log_warn "Review completed with $count skipped question(s)"
+            log_info "Skipped questions logged to: $log_file"
+        fi
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -6831,6 +6945,16 @@ checkpoint_review_state() {
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     local run_id="${REVIEW_RUN_ID:-unknown}"
     local mode="${REVIEW_MODE:-plan}"
+    local config_hash
+    config_hash=$(get_config_hash)
+
+    local questions_pending=0
+    local questions_file
+    questions_file=$(get_questions_file)
+    if [[ -f "$questions_file" ]] && command -v jq &>/dev/null; then
+        questions_pending=$(jq -r 'if type=="array" then length elif has("questions") then (.questions | length) else 0 end' \
+            "$questions_file" 2>/dev/null || echo 0)
+    fi
 
     # Convert space-separated to JSON arrays
     local completed_json pending_json
@@ -6856,9 +6980,11 @@ checkpoint_review_state() {
   "timestamp": "$now",
   "run_id": "$run_id",
   "mode": "$mode",
+  "config_hash": "$config_hash",
   "repos_total": $total,
   "repos_completed": $completed_count,
   "repos_pending": $pending_count,
+  "questions_pending": $questions_pending,
   "completed_repos": $completed_json,
   "pending_repos": $pending_json
 }
@@ -6962,6 +7088,184 @@ cleanup_old_review_state() {
     update_review_state "
         .runs |= with_entries(select(.value.started_at > \"$cutoff\"))
     "
+}
+
+#------------------------------------------------------------------------------
+# REPO DIGEST CACHE (bd-5v2n)
+#
+# Cache repo digests between review runs to avoid repeated "understand codebase".
+#------------------------------------------------------------------------------
+
+# Get digest cache directory
+get_digest_cache_dir() {
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/repo-digests"
+}
+
+# Load cached digest into a worktree and append delta since last review
+# Args: repo_id, worktree_path
+prepare_repo_digest_for_worktree() {
+    local repo_id="$1"
+    local wt_path="$2"
+
+    local cache_dir digest_cache meta_cache digest_file
+    cache_dir=$(get_digest_cache_dir)
+    digest_cache="$cache_dir/${repo_id//\//_}.md"
+    meta_cache="$cache_dir/${repo_id//\//_}.meta.json"
+    digest_file="$wt_path/.ru/repo-digest.md"
+
+    if [[ ! -f "$digest_cache" ]]; then
+        log_verbose "No cached digest for $repo_id"
+        return 0
+    fi
+
+    if ! cp "$digest_cache" "$digest_file" 2>/dev/null; then
+        log_warn "Failed to copy digest cache for $repo_id"
+        return 1
+    fi
+
+    if [[ -f "$meta_cache" ]] && command -v jq &>/dev/null; then
+        local last_commit current_commit
+        last_commit=$(jq -r '.last_commit // empty' "$meta_cache" 2>/dev/null)
+        current_commit=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
+
+        if [[ -n "$last_commit" && -n "$current_commit" && "$last_commit" != "$current_commit" ]]; then
+            local changes files
+            changes=$(git -C "$wt_path" log --oneline "${last_commit}..${current_commit}" 2>/dev/null || true)
+            if [[ -n "$changes" ]]; then
+                files=$(git -C "$wt_path" diff --name-only "${last_commit}..${current_commit}" 2>/dev/null | head -20 || true)
+                {
+                    echo ""
+                    echo "## Changes Since Last Review"
+                    echo "```"
+                    echo "$changes"
+                    echo "```"
+                    echo ""
+                    echo "**Files Changed:**"
+                    echo "$files"
+                } >> "$digest_file"
+            fi
+        fi
+    fi
+
+    log_verbose "Loaded cached digest for $repo_id"
+    return 0
+}
+
+# Update digest cache from a worktree after successful review
+# Args: worktree_path, repo_id
+update_digest_cache() {
+    local wt_path="$1"
+    local repo_id="$2"
+
+    local digest_file="$wt_path/.ru/repo-digest.md"
+    if [[ ! -f "$digest_file" ]]; then
+        log_warn "No digest found for $repo_id at $digest_file"
+        return 1
+    fi
+
+    local cache_dir
+    cache_dir=$(get_digest_cache_dir)
+    ensure_dir "$cache_dir"
+
+    local cache_file="$cache_dir/${repo_id//\//_}.md"
+    if ! cp "$digest_file" "$cache_file" 2>/dev/null; then
+        log_warn "Failed to update digest cache for $repo_id"
+        return 1
+    fi
+
+    local current_commit digest_size
+    current_commit=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
+    digest_size=$(wc -c < "$digest_file" 2>/dev/null || echo 0)
+
+    local meta_file="$cache_dir/${repo_id//\//_}.meta.json"
+    cat > "$meta_file" <<EOF
+{
+  "last_commit": "$current_commit",
+  "last_update": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "run_id": "${REVIEW_RUN_ID:-unknown}",
+  "digest_size": $digest_size
+}
+EOF
+
+    log_verbose "Updated digest cache for $repo_id"
+    return 0
+}
+
+# Archive a digest cache entry (non-destructive invalidation)
+# Args: repo_id, reason (optional)
+invalidate_digest_cache() {
+    local repo_id="$1"
+    local reason="${2:-manual}"
+
+    local cache_dir digest_cache meta_cache
+    cache_dir=$(get_digest_cache_dir)
+    digest_cache="$cache_dir/${repo_id//\//_}.md"
+    meta_cache="$cache_dir/${repo_id//\//_}.meta.json"
+
+    if [[ ! -f "$digest_cache" && ! -f "$meta_cache" ]]; then
+        log_verbose "No digest cache to invalidate for $repo_id"
+        return 0
+    fi
+
+    local archive_dir ts base
+    archive_dir="$cache_dir/archived"
+    ensure_dir "$archive_dir"
+    ts="$(date -u +%Y%m%d-%H%M%S).$$.$RANDOM"
+    base="${repo_id//\//_}"
+
+    [[ -f "$digest_cache" ]] && mv "$digest_cache" "$archive_dir/${base}.${ts}.md" 2>/dev/null || true
+    [[ -f "$meta_cache" ]] && mv "$meta_cache" "$archive_dir/${base}.${ts}.meta.json" 2>/dev/null || true
+
+    log_info "Invalidated digest cache for $repo_id ($reason)"
+}
+
+# Archive digests older than max_age_days (non-destructive cleanup)
+# Args: max_age_days (default: 90)
+archive_old_digests() {
+    local max_age_days="${1:-90}"
+    local cache_dir
+    cache_dir=$(get_digest_cache_dir)
+
+    [[ -d "$cache_dir" ]] || return 0
+
+    local archive_dir
+    archive_dir="$cache_dir/archived"
+    ensure_dir "$archive_dir"
+
+    find "$cache_dir" -maxdepth 1 -name "*.meta.json" -mtime "+$max_age_days" -print0 2>/dev/null | \
+        while IFS= read -r -d '' meta_file; do
+            local base base_name ts digest_file
+            base="${meta_file%.meta.json}"
+            base_name=$(basename "$base")
+            digest_file="${base}.md"
+            ts="$(date -u +%Y%m%d-%H%M%S).$$.$RANDOM"
+
+            [[ -f "$digest_file" ]] && mv "$digest_file" "$archive_dir/${base_name}.${ts}.md" 2>/dev/null || true
+            [[ -f "$meta_file" ]] && mv "$meta_file" "$archive_dir/${base_name}.${ts}.meta.json" 2>/dev/null || true
+        done
+}
+
+# Update digest caches for all worktrees in the current review run
+update_repo_digests_from_worktrees() {
+    local worktrees_dir mapping_file
+    worktrees_dir=$(get_worktrees_dir)
+    mapping_file="$worktrees_dir/mapping.json"
+
+    if [[ ! -f "$mapping_file" ]]; then
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not available, digest cache update skipped"
+        return 0
+    fi
+
+    local repo_id wt_path
+    while IFS= read -r repo_id; do
+        [[ -z "$repo_id" ]] && continue
+        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
+        [[ -n "$wt_path" ]] && update_digest_cache "$wt_path" "$repo_id"
+    done < <(jq -r 'keys[]' "$mapping_file" 2>/dev/null)
 }
 
 #------------------------------------------------------------------------------
@@ -7159,6 +7463,9 @@ prepare_review_worktrees() {
 
         # Create .ru directory for artifacts
         ensure_dir "$wt_path/.ru"
+
+        # Load cached digest (if available) and append delta info
+        prepare_repo_digest_for_worktree "$repo_id" "$wt_path" || true
 
         # Record mapping for later phases
         if ! record_worktree_mapping "$repo_id" "$wt_path" "$wt_branch"; then
@@ -8204,6 +8511,8 @@ cmd_review() {
         exit 3
     fi
 
+    check_interactive_capability
+
     local resume_pending_repos=""
     local resume_run_id=""
     local repos_scanned=0
@@ -8258,6 +8567,33 @@ cmd_review() {
     fi
     # shellcheck disable=SC2034  # Used by later phases and logging
     REVIEW_RUN_ID="$run_id"
+
+    archive_old_digests 90
+
+    if [[ -n "$REVIEW_INVALIDATE_CACHE" ]]; then
+        local -a invalidate_repos=()
+        if [[ "$REVIEW_INVALIDATE_CACHE" == "all" ]]; then
+            while IFS= read -r spec; do
+                [[ -z "$spec" ]] && continue
+                # shellcheck disable=SC2034  # resolved_repo_id used by resolve_repo_spec
+                local url branch custom_name local_path resolved_repo_id
+                if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" \
+                        url branch custom_name local_path resolved_repo_id 2>/dev/null; then
+                    invalidate_repos+=("$resolved_repo_id")
+                fi
+            done < <(get_all_repos)
+        else
+            local token
+            for token in $REVIEW_INVALIDATE_CACHE; do
+                invalidate_repos+=("$token")
+            done
+        fi
+
+        local repo_id
+        for repo_id in "${invalidate_repos[@]}"; do
+            invalidate_digest_cache "$repo_id" "user-request"
+        done
+    fi
 
     # Acquire global lock
     if ! acquire_review_lock; then
@@ -8372,6 +8708,11 @@ cmd_review() {
         fi
     fi
 
+    if [[ "$REVIEW_NON_INTERACTIVE" == "true" ]]; then
+        summarize_non_interactive_questions
+    fi
+
+    update_repo_digests_from_worktrees || true
     clear_review_checkpoint
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         build_review_completion_json "$run_id" "$REVIEW_MODE" "$review_start_epoch" "0" "${work_items[@]}"
