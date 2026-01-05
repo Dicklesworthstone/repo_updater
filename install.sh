@@ -6,17 +6,19 @@
 # DEFAULT: Downloads from GitHub Release with checksum verification
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 #
 # Options (via environment variables):
 #   DEST=/path/to/dir      Install directory (default: ~/.local/bin)
 #   RU_SYSTEM=1            Install to /usr/local/bin (requires sudo)
 #   RU_VERSION=x.y.z       Install specific version (default: latest release)
 #   RU_UNSAFE_MAIN=1       Install from main branch (NOT RECOMMENDED)
+#   RU_CACHE_BUST=1        Append cache-busting query params to GitHub downloads (default: 1)
+#   RU_CACHE_BUST_TOKEN=... Cache-bust token override (default: current epoch seconds)
 #
 # Examples:
 #   # Standard installation (recommended)
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 #
 #   # Install specific version
 #   RU_VERSION=1.0.0 curl -fsSL .../install.sh | bash
@@ -47,6 +49,13 @@ REPO_NAME="repo_updater"
 SCRIPT_NAME="ru"
 GITHUB_API="https://api.github.com"
 GITHUB_RAW="https://raw.githubusercontent.com"
+GITHUB_RELEASE_HOST="https://github.com"
+
+# Cache-bust token used for GitHub downloads (reduces stale CDN caching)
+RU_CACHE_BUST_TOKEN="${RU_CACHE_BUST_TOKEN:-$(date +%s)}"
+
+# Temp dir path for cleanup trap (kept global to avoid set -u issues with local vars)
+RU_INSTALLER_TEMP_DIR=""
 
 #==============================================================================
 # COLORS (disabled if stderr is not a terminal or NO_COLOR is set)
@@ -95,6 +104,175 @@ log_step() {
 # Check if a command exists
 command_exists() {
     command -v "$1" &>/dev/null
+}
+
+cleanup_temp_dir() {
+    local dir="$RU_INSTALLER_TEMP_DIR"
+    if [[ -z "$dir" ]] || [[ "$dir" == "/" ]]; then
+        return 0
+    fi
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir" 2>/dev/null || true
+    fi
+}
+
+mktemp_dir() {
+    local dir=""
+
+    # GNU coreutils mktemp
+    if dir=$(mktemp -d 2>/dev/null); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+
+    # BSD mktemp (macOS) typically requires -t (template)
+    if dir=$(mktemp -d -t ru 2>/dev/null); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    if dir=$(mktemp -d -t ru.XXXXXXXXXX 2>/dev/null); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+
+    return 1
+}
+
+append_query_param() {
+    local url="$1"
+    local key="$2"
+    local value="$3"
+
+    local sep='?'
+    [[ "$url" == *\?* ]] && sep='&'
+    printf '%s%s%s=%s' "$url" "$sep" "$key" "$value"
+}
+
+maybe_cache_bust_url() {
+    local url="$1"
+
+    if [[ "${RU_CACHE_BUST:-1}" != "1" ]]; then
+        printf '%s' "$url"
+        return 0
+    fi
+
+    case "$url" in
+        "$GITHUB_RAW"/*|"$GITHUB_RELEASE_HOST"/*)
+            append_query_param "$url" "ru_cb" "$RU_CACHE_BUST_TOKEN"
+            ;;
+        *)
+            printf '%s' "$url"
+            ;;
+    esac
+}
+
+github_api_get() {
+    local url="$1"
+    local body=""
+
+    if command_exists curl; then
+        local response status
+        if ! response=$(curl -sS \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Cache-Control: no-cache" \
+            -H "Pragma: no-cache" \
+            -H "User-Agent: ru-installer" \
+            -w $'\n%{http_code}' \
+            "$url" 2>/dev/null); then
+            log_error "Failed to fetch GitHub API: $url"
+            return 1
+        fi
+        status="${response##*$'\n'}"
+        body="${response%$'\n'*}"
+
+        case "$status" in
+            200|201|202|204)
+                printf '%s' "$body"
+                return 0
+                ;;
+            404)
+                printf '%s' "$body"
+                return 2
+                ;;
+            *)
+                printf '%s' "$body"
+                return 1
+                ;;
+        esac
+    fi
+
+    if command_exists wget; then
+        if ! body=$(wget -qO- "$url" 2>/dev/null); then
+            log_error "Failed to fetch GitHub API: $url"
+            return 1
+        fi
+
+        # Best-effort status detection from JSON body
+        if printf '%s\n' "$body" | grep -q '"status"[[:space:]]*:[[:space:]]*"404"'; then
+            printf '%s' "$body"
+            return 2
+        fi
+
+        printf '%s' "$body"
+        return 0
+    fi
+
+    log_error "Neither curl nor wget found. Please install one of them."
+    return 1
+}
+
+# Attempt to detect the latest release tag without GitHub's API (avoids rate limits/proxies).
+# Returns:
+#   0 with version on stdout - success
+#   1 - no releases exist (redirect resolves to /releases)
+#   2 - request failed
+get_latest_release_from_redirect() {
+    local latest_url="$GITHUB_RELEASE_HOST/$REPO_OWNER/$REPO_NAME/releases/latest"
+    local effective_url=""
+
+    if command_exists curl; then
+        if ! effective_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null); then
+            return 2
+        fi
+    elif command_exists wget; then
+        # wget doesn't expose a direct "effective URL" format, so read the Location header.
+        # We intentionally avoid following redirects here so we can capture the tag URL.
+        effective_url=$(
+            wget -qS --spider --max-redirect=0 "$latest_url" 2>&1 \
+                | awk '/^  Location: /{print $2}' \
+                | tail -1 \
+                | tr -d '\r'
+        )
+        if [[ -z "$effective_url" ]]; then
+            return 2
+        fi
+    else
+        return 2
+    fi
+
+    if [[ "$effective_url" != *"/tag/"* ]]; then
+        return 1
+    fi
+
+    local tag="${effective_url##*/tag/}"
+    tag="${tag%%\?*}"
+    printf '%s\n' "${tag#v}"
+}
+
+extract_json_string_field() {
+    local json="$1"
+    local key="$2"
+
+    if command_exists jq; then
+        printf '%s\n' "$json" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null | head -1
+        return 0
+    fi
+
+    printf '%s\n' "$json" \
+        | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -1 \
+        | cut -d'"' -f4
 }
 
 # Get the default shell config file
@@ -146,47 +324,96 @@ in_path() {
 }
 
 # Get latest release version from GitHub
+# Returns:
+#   0 with version on stdout - success
+#   1 - no releases exist (caller should fall back to main)
+#   2 - API error (rate limit, network, etc.)
 get_latest_release() {
     local url="$GITHUB_API/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
-    local response
+    local response api_rc
 
-    if command_exists curl; then
-        response=$(curl -sS "$url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            return 1
-        }
-    elif command_exists wget; then
-        response=$(wget -qO- "$url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            return 1
-        }
-    else
-        log_error "Neither curl nor wget found. Please install one of them."
+    response=$(github_api_get "$url")
+    api_rc=$?
+    if [[ "$api_rc" -eq 2 ]]; then
+        # No releases exist - caller should fall back to main.
         return 1
     fi
+    if [[ "$api_rc" -ne 0 ]]; then
+        # Try a non-API method before failing (avoids API rate limits / weird proxies).
+        local redirect_version=""
+        if redirect_version=$(get_latest_release_from_redirect); then
+            log_warn "GitHub API unavailable; detected latest release via redirect."
+            printf '%s\n' "$redirect_version"
+            return 0
+        else
+            local redirect_rc=$?
+            if [[ "$redirect_rc" -eq 1 ]]; then
+                return 1
+            fi
 
-    # Extract tag_name from JSON (simple grep approach for portability)
-    local version
-    version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+            local msg
+            msg=$(extract_json_string_field "$response" "message")
+            if [[ -n "$msg" ]]; then
+                log_error "GitHub API error while fetching latest release: $msg"
+            elif printf '%s\n' "$response" | grep -qi "rate limit"; then
+                log_error "GitHub API rate limit exceeded while fetching latest release."
+            else
+                log_error "Failed to fetch latest release from GitHub."
+            fi
+            log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
+            return 2
+        fi
+    fi
+
+    # Extract tag_name from JSON (simple approach for portability)
+    local version=""
+    if command_exists jq; then
+        version=$(printf '%s\n' "$response" | jq -r '.tag_name // empty' 2>/dev/null | head -1)
+    else
+        version=$(printf '%s\n' "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
 
     if [[ -z "$version" ]]; then
-        log_error "Could not parse version from GitHub API response"
-        return 1
+        # Unexpected response shape; try redirect method as a fallback.
+        local redirect_version=""
+        if redirect_version=$(get_latest_release_from_redirect); then
+            log_warn "GitHub API returned unexpected payload; detected latest release via redirect."
+            printf '%s\n' "$redirect_version"
+            return 0
+        fi
+
+        local redirect_rc=$?
+        if [[ "$redirect_rc" -eq 1 ]]; then
+            return 1
+        fi
+
+        local msg
+        msg=$(extract_json_string_field "$response" "message")
+        if [[ -n "$msg" ]]; then
+            log_error "Could not determine latest release version (GitHub API message: $msg)"
+        else
+            log_error "Could not parse version from GitHub API response"
+        fi
+        log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
+        return 2
     fi
 
     # Remove 'v' prefix if present
-    echo "${version#v}"
+    printf '%s\n' "${version#v}"
 }
 
-# Download a file
+# Download a file with cache-busting
+# Adds a timestamp query parameter to bypass CDN/proxy caches
 download_file() {
     local url="$1"
     local dest="$2"
+    local final_url
+    final_url=$(maybe_cache_bust_url "$url")
 
     if command_exists curl; then
-        curl -fsSL "$url" -o "$dest"
+        curl -fsSL "$final_url" -o "$dest"
     elif command_exists wget; then
-        wget -q "$url" -O "$dest"
+        wget -q "$final_url" -O "$dest"
     else
         log_error "Neither curl nor wget found"
         return 1
@@ -228,11 +455,12 @@ install_from_release() {
     local install_dir="$2"
     local temp_dir
 
-    if ! temp_dir=$(mktemp -d 2>/dev/null); then
+    if ! temp_dir=$(mktemp_dir); then
         log_error "Failed to create temp directory (mktemp)"
         return 1
     fi
-    trap 'rm -rf "$temp_dir"' EXIT
+    RU_INSTALLER_TEMP_DIR="$temp_dir"
+    trap cleanup_temp_dir EXIT
 
     local release_base="https://github.com/$REPO_OWNER/$REPO_NAME/releases/download/v$version"
     local script_url="$release_base/$SCRIPT_NAME"
@@ -272,11 +500,12 @@ install_from_main() {
     local install_dir="$1"
     local temp_dir
 
-    if ! temp_dir=$(mktemp -d 2>/dev/null); then
+    if ! temp_dir=$(mktemp_dir); then
         log_error "Failed to create temp directory (mktemp)"
         return 1
     fi
-    trap 'rm -rf "$temp_dir"' EXIT
+    RU_INSTALLER_TEMP_DIR="$temp_dir"
+    trap cleanup_temp_dir EXIT
 
     log_warn "Installing from main branch. This is NOT RECOMMENDED for production use."
     log_warn "The main branch may contain untested or breaking changes."
@@ -401,22 +630,46 @@ main() {
 
     # Determine version and installation source
     if [[ -n "${RU_UNSAFE_MAIN:-}" ]] && [[ "$RU_UNSAFE_MAIN" == "1" ]]; then
-        # Install from main branch
+        # Install from main branch (explicit request)
         log_info "Installing from main branch (RU_UNSAFE_MAIN=1)"
         install_from_main "$install_dir" || exit 1
     else
         # Install from release
         local version
+        local get_release_exit=0
         if [[ -n "${RU_VERSION:-}" ]]; then
             version="$RU_VERSION"
             log_info "Installing version: $version"
+            install_from_release "$version" "$install_dir" || exit 1
         else
             log_step "Fetching latest release version..."
-            version=$(get_latest_release) || exit 1
-            log_info "Latest version: $version"
+            version=$(get_latest_release) || get_release_exit=$?
+
+            case $get_release_exit in
+                0)
+                    log_info "Latest version: $version"
+                    ;;
+                1)
+                    # No releases exist - fall back to main branch with warning
+                    log_warn "No releases found for this repository."
+                    log_warn "Falling back to installation from main branch."
+                    log_warn "This is equivalent to RU_UNSAFE_MAIN=1."
+                    log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
+                    printf '\n' >&2
+                    install_from_main "$install_dir" || exit 1
+                    version=""  # Skip release installation below
+                    ;;
+                *)
+                    # API error - already logged by get_latest_release
+                    exit 1
+                    ;;
+            esac
         fi
 
-        install_from_release "$version" "$install_dir" || exit 1
+        # Install from release (if we have a version)
+        if [[ -n "$version" ]]; then
+            install_from_release "$version" "$install_dir" || exit 1
+        fi
     fi
 
     # Check PATH and offer to add if needed

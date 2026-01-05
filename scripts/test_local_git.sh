@@ -53,6 +53,8 @@ source <(sed -n '/^setup_git_timeout()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^is_timeout_error()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_pull()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_fetch()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^_is_valid_var_name()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^_set_out_var()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^_is_safe_path_segment()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^parse_repo_url()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^normalize_url()/,/^}/p' "$PROJECT_DIR/ru")
@@ -60,6 +62,7 @@ source <(sed -n '/^get_remote_url()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^check_remote_mismatch()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^url_to_clone_target()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_clone()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^ensure_clean_or_fail()/,/^}/p' "$PROJECT_DIR/ru")
 
 #==============================================================================
 # Test Framework
@@ -711,6 +714,286 @@ test_get_remote_url_no_remote() {
 }
 
 #==============================================================================
+# Tests: ensure_clean_or_fail
+#==============================================================================
+
+test_ensure_clean_or_fail_clean_repo() {
+    echo "Testing ensure_clean_or_fail with clean repo..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "clean")
+    local work_dir="$PROJECTS_DIR/clean"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    if ensure_clean_or_fail "$work_dir" 2>/dev/null; then
+        pass "ensure_clean_or_fail returns 0 for clean repo"
+    else
+        fail "ensure_clean_or_fail should return 0 for clean repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_ensure_clean_or_fail_dirty_repo() {
+    echo "Testing ensure_clean_or_fail with dirty repo..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "dirty-check")
+    local work_dir="$PROJECTS_DIR/dirty-check"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Make uncommitted changes
+    make_dirty "$work_dir"
+
+    if ensure_clean_or_fail "$work_dir" 2>/dev/null; then
+        fail "ensure_clean_or_fail should return 1 for dirty repo"
+    else
+        pass "ensure_clean_or_fail returns 1 for dirty repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_ensure_clean_or_fail_staged_changes() {
+    echo "Testing ensure_clean_or_fail with staged changes..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "staged")
+    local work_dir="$PROJECTS_DIR/staged"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Make staged changes
+    echo "staged content" >> "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+
+    if ensure_clean_or_fail "$work_dir" 2>/dev/null; then
+        fail "ensure_clean_or_fail should return 1 for staged changes"
+    else
+        pass "ensure_clean_or_fail returns 1 for staged changes"
+    fi
+
+    cleanup_test_env
+}
+
+test_ensure_clean_or_fail_untracked_files() {
+    echo "Testing ensure_clean_or_fail with untracked files..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "untracked")
+    local work_dir="$PROJECTS_DIR/untracked"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Add untracked file
+    echo "untracked" > "$work_dir/new_file.txt"
+
+    if ensure_clean_or_fail "$work_dir" 2>/dev/null; then
+        fail "ensure_clean_or_fail should return 1 for untracked files"
+    else
+        pass "ensure_clean_or_fail returns 1 for untracked files"
+    fi
+
+    cleanup_test_env
+}
+
+test_ensure_clean_or_fail_not_git_repo() {
+    echo "Testing ensure_clean_or_fail with non-git directory..."
+    setup_test_env
+
+    local work_dir="$PROJECTS_DIR/not-git"
+    mkdir -p "$work_dir"
+
+    if ensure_clean_or_fail "$work_dir" 2>/dev/null; then
+        fail "ensure_clean_or_fail should return 1 for non-git directory"
+    else
+        pass "ensure_clean_or_fail returns 1 for non-git directory"
+    fi
+
+    cleanup_test_env
+}
+
+#==============================================================================
+# Tests: do_pull with autostash
+#==============================================================================
+
+test_do_pull_with_autostash() {
+    echo "Testing do_pull with autostash on dirty repo..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "autostash")
+    local dev_dir="$TEMP_DIR/dev"
+    local work_dir="$PROJECTS_DIR/autostash"
+
+    # Create initial repo
+    init_repo_with_commit "$remote" "$dev_dir"
+
+    # Clone to projects dir
+    git clone "$remote" "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Make local changes (dirty working tree)
+    echo "local changes" >> "$work_dir/file.txt"
+
+    # Make new commit in dev and push
+    add_commit_and_push "$dev_dir" "New commit for autostash test"
+
+    # Fetch first to know we're behind
+    git -C "$work_dir" fetch >/dev/null 2>&1
+
+    local before_head
+    before_head=$(git -C "$work_dir" rev-parse HEAD)
+
+    # Pull with autostash - should succeed despite dirty working tree
+    if do_pull "$work_dir" "autostash" "ff-only" "true" 2>/dev/null; then
+        local after_head
+        after_head=$(git -C "$work_dir" rev-parse HEAD)
+
+        if [[ "$before_head" != "$after_head" ]]; then
+            # Check that local changes were preserved
+            if grep -q "local changes" "$work_dir/file.txt"; then
+                pass "do_pull with autostash updated repo and preserved local changes"
+            else
+                fail "do_pull with autostash lost local changes"
+            fi
+        else
+            fail "do_pull with autostash did not update the repo"
+        fi
+    else
+        fail "do_pull with autostash failed on dirty repo"
+    fi
+
+    cleanup_test_env
+}
+
+#==============================================================================
+# Tests: Merge conflict scenarios
+#==============================================================================
+
+test_do_pull_diverged_ff_fails() {
+    echo "Testing do_pull fails on diverged repo with ff-only..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "diverged-ff")
+    local dev_dir="$TEMP_DIR/dev"
+    local work_dir="$PROJECTS_DIR/diverged-ff"
+
+    # Create initial repo
+    init_repo_with_commit "$remote" "$dev_dir"
+
+    # Clone to projects dir
+    git clone "$remote" "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Make local commit (unpushed)
+    add_local_commit "$work_dir" "Local change"
+
+    # Make remote commit (this causes divergence)
+    add_commit_and_push "$dev_dir" "Remote change"
+
+    # Fetch to update refs
+    git -C "$work_dir" fetch >/dev/null 2>&1
+
+    # do_pull with ff-only should fail on diverged repo
+    if do_pull "$work_dir" "diverged-ff" "ff-only" "false" 2>/dev/null; then
+        fail "do_pull ff-only should fail on diverged repo"
+    else
+        pass "do_pull ff-only correctly fails on diverged repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_do_pull_diverged_rebase_succeeds() {
+    echo "Testing do_pull with rebase on diverged repo..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "diverged-rebase")
+    local dev_dir="$TEMP_DIR/dev"
+    local work_dir="$PROJECTS_DIR/diverged-rebase"
+
+    # Create initial repo
+    init_repo_with_commit "$remote" "$dev_dir"
+
+    # Clone to projects dir
+    git clone "$remote" "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Make local commit in different file (no conflict)
+    echo "local only" > "$work_dir/local.txt"
+    git -C "$work_dir" add local.txt
+    git -C "$work_dir" commit -m "Local change in local.txt" >/dev/null 2>&1
+
+    # Make remote commit in different file
+    echo "remote only" > "$dev_dir/remote.txt"
+    git -C "$dev_dir" add remote.txt
+    git -C "$dev_dir" commit -m "Remote change in remote.txt" >/dev/null 2>&1
+    git -C "$dev_dir" push >/dev/null 2>&1
+
+    # Fetch to update refs
+    git -C "$work_dir" fetch >/dev/null 2>&1
+
+    # Verify diverged state
+    local status_line
+    status_line=$(get_repo_status "$work_dir" "false")
+    assert_contains "$status_line" "STATUS=diverged" "Should be diverged before pull"
+
+    # do_pull with rebase should succeed (no conflicts)
+    if do_pull "$work_dir" "diverged-rebase" "rebase" "false" 2>/dev/null; then
+        # Check that both files exist
+        if [[ -f "$work_dir/local.txt" && -f "$work_dir/remote.txt" ]]; then
+            pass "do_pull with rebase succeeded on diverged repo"
+        else
+            fail "do_pull with rebase missing files after merge"
+        fi
+    else
+        fail "do_pull with rebase failed on non-conflicting diverged repo"
+    fi
+
+    cleanup_test_env
+}
+
+test_status_with_merge_conflicts() {
+    echo "Testing get_repo_status with merge conflicts..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "conflict")
+    local dev_dir="$TEMP_DIR/dev"
+    local work_dir="$PROJECTS_DIR/conflict"
+
+    # Create initial repo
+    init_repo_with_commit "$remote" "$dev_dir"
+
+    # Clone to projects dir
+    git clone "$remote" "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Make conflicting changes to same file in both repos
+    echo "local version" > "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+    git -C "$work_dir" commit -m "Local version" >/dev/null 2>&1
+
+    echo "remote version" > "$dev_dir/file.txt"
+    git -C "$dev_dir" add file.txt
+    git -C "$dev_dir" commit -m "Remote version" >/dev/null 2>&1
+    git -C "$dev_dir" push >/dev/null 2>&1
+
+    # Fetch
+    git -C "$work_dir" fetch >/dev/null 2>&1
+
+    # Status should show diverged
+    local status_line
+    status_line=$(get_repo_status "$work_dir" "false")
+    assert_contains "$status_line" "STATUS=diverged" "Should detect diverged state"
+    assert_contains "$status_line" "AHEAD=1" "Should have 1 ahead"
+    assert_contains "$status_line" "BEHIND=1" "Should have 1 behind"
+
+    cleanup_test_env
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -784,6 +1067,36 @@ test_get_remote_url_named_remote
 echo ""
 
 test_get_remote_url_no_remote
+echo ""
+
+# ensure_clean_or_fail tests
+test_ensure_clean_or_fail_clean_repo
+echo ""
+
+test_ensure_clean_or_fail_dirty_repo
+echo ""
+
+test_ensure_clean_or_fail_staged_changes
+echo ""
+
+test_ensure_clean_or_fail_untracked_files
+echo ""
+
+test_ensure_clean_or_fail_not_git_repo
+echo ""
+
+# Autostash tests
+test_do_pull_with_autostash
+echo ""
+
+# Merge conflict scenario tests
+test_do_pull_diverged_ff_fails
+echo ""
+
+test_do_pull_diverged_rebase_succeeds
+echo ""
+
+test_status_with_merge_conflicts
 echo ""
 
 echo "============================================"

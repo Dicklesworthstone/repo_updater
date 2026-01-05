@@ -27,7 +27,8 @@
 <p align="center">
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
+# You can omit the `?ru_cb=...` once installed; it's just a cache-buster for the installer fetch.
 ```
 
 </p>
@@ -251,7 +252,12 @@ Keep your projects directory clean:
 
 **One-liner (recommended):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
+```
+
+**If you suspect CDN caching (stale installer):**
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 ```
 
 <details>
@@ -698,8 +704,8 @@ export RU_PARALLEL=4
 ```
 
 **Requirements:**
-- Parallel sync requires `flock` (available by default on Linux; install via Homebrew on macOS)
-- ru automatically falls back to serial execution if flock is unavailable
+- Parallel sync uses `flock` for coordination (Linux: usually available via `util-linux`; macOS: `brew install flock`)
+- If `flock` is missing, ru offers to install it (interactive) or falls back to serial execution
 
 ### Network Timeout Tuning
 
@@ -1310,6 +1316,7 @@ scripts/
 ├── test_unit_config.sh       # Configuration handling
 ├── test_unit_gum_wrappers.sh # Gum fallback behavior
 ├── test_e2e_init.sh          # Init workflow
+├── test_e2e_review.sh         # Review discovery workflow
 ├── test_e2e_add.sh           # Add command
 ├── test_e2e_sync.sh          # Sync workflow
 ├── test_e2e_status.sh        # Status command
@@ -1531,6 +1538,7 @@ All checks passed!
 | `RU_PROJECTS_DIR` | Base directory for repos | `/data/projects` |
 | `RU_LAYOUT` | Path layout (flat/owner-repo/full) | `flat` |
 | `RU_PARALLEL` | Number of parallel workers | `1` |
+| `RU_AUTO_INSTALL_DEPS` | Auto-install optional deps (currently: `flock`) | unset |
 | `RU_TIMEOUT` | Network timeout in seconds | `30` |
 | `RU_AUTOSTASH` | Auto-stash before pull | `false` |
 | `RU_UPDATE_STRATEGY` | Pull strategy (ff-only/rebase/merge) | `ff-only` |
@@ -1575,7 +1583,7 @@ All checks passed!
 |------------|---------|
 | gum | Beautiful terminal UI |
 | jq | JSON processing (for scripts) |
-| flock | Parallel sync coordination (Linux default, `brew install util-linux` on macOS) |
+| flock | Required for `ru review` and parallel sync (Linux: `util-linux`; macOS: `brew install flock`) |
 
 ### System Requirements
 
@@ -1593,7 +1601,7 @@ All checks passed!
 - **Checksum verification:** Installer verifies SHA256 before installation
 - **Release downloads:** Default installation from GitHub Releases, not main
 - **No credential storage:** Uses gh CLI's secure credential storage
-- **Prompted installation:** Never auto-installs without user confirmation
+- **Prompted installation:** Never auto-installs without user confirmation (unless you explicitly set `RU_AUTO_INSTALL_DEPS=1`)
 
 ### Privacy
 

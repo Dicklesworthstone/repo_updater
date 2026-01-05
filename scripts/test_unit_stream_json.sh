@@ -32,40 +32,47 @@ log_verbose() { :; }
 
 parse_stream_json_event() {
     local line="$1"
-    local -n _pse_event_type=$2
-    local -n _pse_event_data=$3
+    local event_type_var="$2"
+    local event_data_var="$3"
+
+    local event_type="" event_data=""
 
     if ! echo "$line" | jq empty 2>/dev/null; then
-        _pse_event_type="invalid"
-        _pse_event_data="$line"
+        event_type="invalid"
+        event_data="$line"
+        printf -v "$event_type_var" '%s' "$event_type"
+        printf -v "$event_data_var" '%s' "$event_data"
         return 1
     fi
 
-    _pse_event_type=$(echo "$line" | jq -r '.type // "unknown"')
+    event_type=$(echo "$line" | jq -r '.type // "unknown"')
 
-    case "$_pse_event_type" in
+    case "$event_type" in
         system)
             local subtype
             subtype=$(echo "$line" | jq -r '.subtype // ""')
             if [[ "$subtype" == "init" ]]; then
-                _pse_event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
+                event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
             else
-                _pse_event_data=$(echo "$line" | jq -c '.')
+                event_data=$(echo "$line" | jq -c '.')
             fi
             ;;
         assistant)
-            _pse_event_data=$(echo "$line" | jq -c '.message.content // []')
+            event_data=$(echo "$line" | jq -c '.message.content // []')
             ;;
         user)
-            _pse_event_data=$(echo "$line" | jq -c '.message.content // []')
+            event_data=$(echo "$line" | jq -c '.message.content // []')
             ;;
         result)
-            _pse_event_data=$(echo "$line" | jq -c '{status, duration_ms, session_id, cost_usd}')
+            event_data=$(echo "$line" | jq -c '{status, duration_ms, session_id, cost_usd}')
             ;;
         *)
-            _pse_event_data="$line"
+            event_data="$line"
             ;;
     esac
+
+    printf -v "$event_type_var" '%s' "$event_type"
+    printf -v "$event_data_var" '%s' "$event_data"
 
     return 0
 }
