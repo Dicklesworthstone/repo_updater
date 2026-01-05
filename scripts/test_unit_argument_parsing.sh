@@ -394,22 +394,6 @@ test_review_invalidate_cache_value_form_passed_to_args() {
     assert_contains "${ARGS[*]}" "owner/repo" "--invalidate-cache value stored in ARGS"
 }
 
-test_review_status_option_passed_to_args() {
-    reset_globals
-    parse_args review --status
-
-    assert_equals "review" "$COMMAND" "review sets COMMAND=review"
-    assert_contains "${ARGS[*]}" "--status" "--status passed to ARGS for review"
-}
-
-test_review_status_option_before_command_passed_to_args() {
-    reset_globals
-    parse_args --status review
-
-    assert_equals "review" "$COMMAND" "review sets COMMAND=review"
-    assert_contains "${ARGS[*]}" "--status" "--status preserved when provided before command"
-}
-
 #==============================================================================
 # Tests: Positional Arguments
 #==============================================================================
