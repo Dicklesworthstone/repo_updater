@@ -12,6 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$SCRIPT_DIR/test_framework.sh"
 
+# Helper functions required by parse_gh_action_target
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_var"
 source_ru_function "ensure_dir"
 source_ru_function "get_review_state_dir"
 source_ru_function "get_gh_actions_log_file"
