@@ -30,49 +30,44 @@ log_verbose() { :; }
 # Stream-JSON Parsing Functions (from ru script)
 #==============================================================================
 
+# Use namerefs to avoid variable shadowing when caller passes "event_type"
+# as output variable name (same as current ru implementation)
 parse_stream_json_event() {
     local line="$1"
-    local event_type_var="$2"
-    local event_data_var="$3"
-
-    local event_type="" event_data=""
+    local -n _pse_event_type=$2
+    local -n _pse_event_data=$3
 
     if ! echo "$line" | jq empty 2>/dev/null; then
-        event_type="invalid"
-        event_data="$line"
-        printf -v "$event_type_var" '%s' "$event_type"
-        printf -v "$event_data_var" '%s' "$event_data"
+        _pse_event_type="invalid"
+        _pse_event_data="$line"
         return 1
     fi
 
-    event_type=$(echo "$line" | jq -r '.type // "unknown"')
+    _pse_event_type=$(echo "$line" | jq -r '.type // "unknown"')
 
-    case "$event_type" in
+    case "$_pse_event_type" in
         system)
             local subtype
             subtype=$(echo "$line" | jq -r '.subtype // ""')
             if [[ "$subtype" == "init" ]]; then
-                event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
+                _pse_event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
             else
-                event_data=$(echo "$line" | jq -c '.')
+                _pse_event_data=$(echo "$line" | jq -c '.')
             fi
             ;;
         assistant)
-            event_data=$(echo "$line" | jq -c '.message.content // []')
+            _pse_event_data=$(echo "$line" | jq -c '.message.content // []')
             ;;
         user)
-            event_data=$(echo "$line" | jq -c '.message.content // []')
+            _pse_event_data=$(echo "$line" | jq -c '.message.content // []')
             ;;
         result)
-            event_data=$(echo "$line" | jq -c '{status, duration_ms, session_id, cost_usd}')
+            _pse_event_data=$(echo "$line" | jq -c '{status, duration_ms, session_id, cost_usd}')
             ;;
         *)
-            event_data="$line"
+            _pse_event_data="$line"
             ;;
     esac
-
-    printf -v "$event_type_var" '%s' "$event_type"
-    printf -v "$event_data_var" '%s' "$event_data"
 
     return 0
 }
