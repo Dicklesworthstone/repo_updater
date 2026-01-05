@@ -1203,8 +1203,8 @@ resolve_repo_spec() {
     local -n _rrs_path=$7
     local -n _rrs_repo_id=$8
 
-    # Use unique prefixes to avoid shadowing caller's nameref targets and
-    # avoid conflicts with namerefs in parse_repo_spec and parse_repo_url
+    # Use unique prefixes to avoid shadowing caller variables and
+    # avoid conflicts with variables used in parse_repo_spec and parse_repo_url
     local spec_url spec_branch spec_custom spec_host spec_owner spec_repo
     parse_repo_spec "$spec" spec_url spec_branch spec_custom
 
@@ -3108,7 +3108,7 @@ cmd_add() {
 
     for repo in "${repo_args[@]}"; do
         # Parse the repo spec to extract URL (ignoring branch/custom name for dupe check)
-        # shellcheck disable=SC2034  # spec_branch/spec_name set by nameref, intentionally unused
+        # shellcheck disable=SC2034  # spec_branch/spec_name set by parse_repo_spec, intentionally unused
         local spec_url spec_branch spec_name
         parse_repo_spec "$repo" spec_url spec_branch spec_name
 
@@ -3132,7 +3132,7 @@ cmd_add() {
             [[ -z "$line" ]] && continue
 
             # Parse the existing spec to get its URL
-            # shellcheck disable=SC2034  # existing_branch/existing_name set by nameref, intentionally unused
+            # shellcheck disable=SC2034  # existing_branch/existing_name set by parse_repo_spec, intentionally unused
             local existing_url existing_branch existing_name
             parse_repo_spec "$line" existing_url existing_branch existing_name
 
@@ -3170,7 +3170,7 @@ cmd_add() {
         if [[ -f "$other_file" ]]; then
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
-                # shellcheck disable=SC2034  # existing_branch, existing_name set by nameref but only URL used
+                # shellcheck disable=SC2034  # existing_branch, existing_name set by parse_repo_spec but only URL used
                 local existing_url existing_branch existing_name
                 parse_repo_spec "$line" existing_url existing_branch existing_name
                 local existing_host existing_owner existing_repo
@@ -3264,6 +3264,27 @@ cmd_import() {
     [[ ! -f "$public_file" ]] && touch "$public_file"
     [[ ! -f "$private_file" ]] && touch "$private_file"
 
+    # Load existing repos into associative array for fast deduplication
+    local -A existing_repos
+    for f in "$public_file" "$private_file"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            # Trim whitespace
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+
+            # shellcheck disable=SC2034 # Variables set by parse_repo_spec
+            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
+            parse_repo_spec "$line" ex_url ex_branch ex_name
+            if parse_repo_url "$ex_url" ex_host ex_owner ex_repo; then
+                # Store canonical ID: host/owner/repo
+                existing_repos["${ex_host}/${ex_owner}/${ex_repo}"]=1
+            fi
+        done < "$f"
+    done
     # Counters
     local imported_public=0
     local imported_private=0
@@ -3473,11 +3494,11 @@ cmd_remove() {
                 fi
 
                 # Parse the line to extract URL and compare owner/repo
-                # shellcheck disable=SC2034  # line_branch and line_custom_name are set by nameref but unused here
+                # shellcheck disable=SC2034  # line_branch and line_custom_name are set by parse_repo_spec but unused here
                 local line_url line_branch line_custom_name
                 parse_repo_spec "$line" line_url line_branch line_custom_name
 
-                # shellcheck disable=SC2034  # line_host is set by nameref but unused here
+                # shellcheck disable=SC2034  # line_host is set by parse_repo_url but unused here
                 local line_host line_owner line_repo
                 local should_remove="false"
                 if parse_repo_url "$line_url" line_host line_owner line_repo; then
@@ -4716,8 +4737,8 @@ local_driver_interrupt_session() {
 # Parse a single stream-json event line
 # Args:
 #   $1 - JSON line to parse
-#   $2 - nameref for event_type output
-#   $3 - nameref for event_data output
+#   $2 - event_type output variable name
+#   $3 - event_data output variable name
 # Returns:
 #   0 if valid JSON, 1 if invalid
 parse_stream_json_event() {
@@ -6869,7 +6890,7 @@ render_sessions_panel() {
 # Args: $1=cols, $2=completed, $3=issues, $4=prs, $5=commits
 render_summary_panel() {
     local cols="$1"
-    local completed="$2"
+    local completed_count="$2"
     local issues="$3"
     local prs="$4"
     local commits="$5"
@@ -6880,7 +6901,7 @@ render_summary_panel() {
 
     printf '  %sSUMMARY%s\n' "${DASH_BOLD}" "${DASH_RESET}"
     printf '  Completed: %s%d%s | Issues: %d | PRs: %d | Commits: %d\n' \
-        "${DASH_GREEN}" "$completed" "${DASH_RESET}" "$issues" "$prs" "$commits"
+        "${DASH_GREEN}" "$completed_count" "${DASH_RESET}" "$issues" "$prs" "$commits"
 }
 
 # Render footer with keyboard shortcuts
@@ -6910,8 +6931,8 @@ render_dashboard() {
     read -r cols rows <<< "$term_size"
 
     # Parse stats with fallbacks
-    local completed issues prs commits progress_current progress_total
-    completed=$(echo "$stats_json" | jq -r '.completed // 0' 2>/dev/null) || completed=0
+    local completed_count issues prs commits progress_current progress_total
+    completed_count=$(echo "$stats_json" | jq -r '.completed // 0' 2>/dev/null) || completed_count=0
     issues=$(echo "$stats_json" | jq -r '.issues // 0' 2>/dev/null) || issues=0
     prs=$(echo "$stats_json" | jq -r '.prs // 0' 2>/dev/null) || prs=0
     commits=$(echo "$stats_json" | jq -r '.commits // 0' 2>/dev/null) || commits=0
@@ -6929,7 +6950,7 @@ render_dashboard() {
 
     render_questions_panel "$cols" "$questions_rows" "$questions_json"
     render_sessions_panel "$cols" "$sessions_json"
-    render_summary_panel "$cols" "$completed" "$issues" "$prs" "$commits"
+    render_summary_panel "$cols" "$completed_count" "$issues" "$prs" "$commits"
     render_footer "$cols"
 }
 
@@ -8775,7 +8796,7 @@ record_worktree_mapping() {
 }
 
 # Get worktree path for a repo
-# Args: repo_id, nameref for path output
+# Args: repo_id, path output variable name
 # Returns: 0 if found, 1 if not found
 get_worktree_path() {
     local repo_id="$1"
@@ -8799,7 +8820,7 @@ get_worktree_path() {
 }
 
 # Get worktree mapping from work item info
-# Args: work_item (pipe-separated), nameref for repo_id, nameref for worktree_path
+# Args: work_item (pipe-separated), repo_id output variable name, worktree_path output variable name
 get_worktree_mapping() {
     local work_item="$1"
     local -n _repo_id_ref=$2
