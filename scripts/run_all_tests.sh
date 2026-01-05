@@ -8,6 +8,7 @@
 #   ./scripts/run_all_tests.sh --parallel   # Run tests in parallel (faster)
 #   ./scripts/run_all_tests.sh -j 4         # Run with 4 parallel jobs
 #   ./scripts/run_all_tests.sh --list       # List test files without running
+#   ./scripts/run_all_tests.sh --coverage   # Show coverage report after tests
 #   ./scripts/run_all_tests.sh test_e2e_*   # Run only matching test files
 #
 # Features:
@@ -37,6 +38,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAP_MODE="false"
 PARALLEL_MODE="false"
 LIST_ONLY="false"
+COVERAGE_MODE="false"
 FILTER_PATTERN=""
 MAX_JOBS=""  # Empty means unlimited (all CPUs)
 
@@ -67,6 +69,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --list)
             LIST_ONLY="true"
+            shift
+            ;;
+        --coverage)
+            COVERAGE_MODE="true"
             shift
             ;;
         --help|-h)
@@ -403,6 +409,11 @@ main() {
     local total_time=$((total_end_time - total_start_time))
 
     print_summary "${#tests[@]}" "$total_passed" "$total_failed" "$total_time"
+
+    # Show coverage report if requested
+    if [[ "$COVERAGE_MODE" == "true" && -x "$SCRIPT_DIR/test_coverage.sh" ]]; then
+        "$SCRIPT_DIR/test_coverage.sh"
+    fi
 
     # Exit with failure if any tests failed
     if [[ "$total_failed" -gt 0 ]]; then
