@@ -29,6 +29,7 @@ source_ru_function "get_worktree_path"
 source_ru_function "get_worktree_mapping"
 source_ru_function "list_review_worktrees"
 source_ru_function "worktree_exists"
+source_ru_function "get_main_repo_path_from_worktree"
 
 # Mock log functions for testing
 log_warn() { :; }
@@ -232,6 +233,98 @@ test_worktree_exists_recorded_but_no_dir() {
 }
 
 #==============================================================================
+# Tests: get_main_repo_path_from_worktree
+#==============================================================================
+
+test_get_main_repo_path_from_worktree_actual_worktree() {
+    local test_name="get_main_repo_path_from_worktree: returns main repo from worktree"
+    log_test_start "$test_name"
+    setup_worktree_test
+
+    # Create main repo
+    local main_repo
+    main_repo=$(create_test_repo "main-repo")
+
+    # Create a worktree
+    local worktree_dir="$TEST_DIR/worktrees/feature-branch"
+    mkdir -p "$(dirname "$worktree_dir")"
+    git -C "$main_repo" worktree add "$worktree_dir" -b feature-branch 2>/dev/null
+
+    # Get main repo from worktree
+    local result
+    result=$(get_main_repo_path_from_worktree "$worktree_dir")
+
+    assert_equals "$main_repo" "$result" "Should return main repo path from worktree"
+
+    # Cleanup worktree
+    git -C "$main_repo" worktree remove "$worktree_dir" 2>/dev/null || true
+
+    log_test_pass "$test_name"
+}
+
+test_get_main_repo_path_from_worktree_main_repo() {
+    local test_name="get_main_repo_path_from_worktree: returns self from main repo"
+    log_test_start "$test_name"
+    setup_worktree_test
+
+    # Create main repo
+    local main_repo
+    main_repo=$(create_test_repo "standalone-repo")
+
+    # Get main repo from itself (not a worktree)
+    local result
+    result=$(get_main_repo_path_from_worktree "$main_repo")
+
+    assert_equals "$main_repo" "$result" "Should return repo path when called on main repo"
+
+    log_test_pass "$test_name"
+}
+
+test_get_main_repo_path_from_worktree_not_git() {
+    local test_name="get_main_repo_path_from_worktree: fails for non-git directory"
+    log_test_start "$test_name"
+    setup_worktree_test
+
+    local not_git="$TEST_DIR/not-a-git-repo"
+    mkdir -p "$not_git"
+
+    assert_fails "Should fail for non-git directory" get_main_repo_path_from_worktree "$not_git"
+
+    log_test_pass "$test_name"
+}
+
+test_get_main_repo_path_from_worktree_multiple_worktrees() {
+    local test_name="get_main_repo_path_from_worktree: works with multiple worktrees"
+    log_test_start "$test_name"
+    setup_worktree_test
+
+    # Create main repo
+    local main_repo
+    main_repo=$(create_test_repo "multi-wt-repo")
+
+    # Create multiple worktrees
+    local wt1="$TEST_DIR/worktrees/wt1"
+    local wt2="$TEST_DIR/worktrees/wt2"
+    mkdir -p "$(dirname "$wt1")"
+    git -C "$main_repo" worktree add "$wt1" -b branch1 2>/dev/null
+    git -C "$main_repo" worktree add "$wt2" -b branch2 2>/dev/null
+
+    # Both worktrees should point to same main repo
+    local result1 result2
+    result1=$(get_main_repo_path_from_worktree "$wt1")
+    result2=$(get_main_repo_path_from_worktree "$wt2")
+
+    assert_equals "$main_repo" "$result1" "First worktree should return main repo"
+    assert_equals "$main_repo" "$result2" "Second worktree should return main repo"
+
+    # Cleanup
+    git -C "$main_repo" worktree remove "$wt1" 2>/dev/null || true
+    git -C "$main_repo" worktree remove "$wt2" 2>/dev/null || true
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
 # Run All Tests
 #==============================================================================
 
@@ -261,6 +354,12 @@ run_test test_list_review_worktrees_with_entries
 # worktree_exists tests
 run_test test_worktree_exists_not_found
 run_test test_worktree_exists_recorded_but_no_dir
+
+# get_main_repo_path_from_worktree tests
+run_test test_get_main_repo_path_from_worktree_actual_worktree
+run_test test_get_main_repo_path_from_worktree_main_repo
+run_test test_get_main_repo_path_from_worktree_not_git
+run_test test_get_main_repo_path_from_worktree_multiple_worktrees
 
 # Print results
 print_results
