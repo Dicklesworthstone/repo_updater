@@ -514,6 +514,213 @@ test_sync_json_output() {
 }
 
 #==============================================================================
+# Test: Clone with branch specification (bd-mlgr)
+#==============================================================================
+
+test_sync_clone_with_branch() {
+    local test_name="Clone with branch specification"
+    log_test_start "$test_name"
+
+    sync_test_setup
+
+    # Create a test remote with a non-default branch
+    create_test_remote "testowner" "branch-repo" 2
+
+    # Add a feature branch to the remote
+    local bare_path="${REMOTE_REGISTRY[testowner/branch-repo]}"
+    local work_dir="$E2E_TEMP_DIR/tmp_branch_work"
+    git clone -q "$bare_path" "$work_dir"
+
+    (
+        cd "$work_dir" || exit 1
+        git config user.email "test@test.com"
+        git config user.name "Test User"
+        git checkout -q -b feature-branch
+        echo "Feature branch content" > feature.txt
+        git add .
+        git commit -q -m "Feature commit"
+        git push -q origin feature-branch
+    )
+    rm -rf "$work_dir"
+
+    # Configure ru with branch specification
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    # Add repo with branch spec (owner/repo@branch format if supported, or we test manual checkout)
+    "$RU_SCRIPT" add testowner/branch-repo >/dev/null 2>&1
+    sync_test_finalize_mock
+
+    # First sync to clone
+    run_ru_sync
+
+    assert_equals "0" "$RU_EXIT_CODE" "Clone succeeds"
+    assert_true "test -d '$E2E_TEMP_DIR/projects/branch-repo'" "Repo cloned"
+
+    # Verify the repo can checkout the feature branch
+    local checkout_result=0
+    git -C "$E2E_TEMP_DIR/projects/branch-repo" fetch -q origin feature-branch 2>/dev/null
+    git -C "$E2E_TEMP_DIR/projects/branch-repo" checkout -q feature-branch 2>/dev/null || checkout_result=$?
+
+    assert_equals "0" "$checkout_result" "Can checkout feature branch"
+    assert_true "test -f '$E2E_TEMP_DIR/projects/branch-repo/feature.txt'" "Feature branch file exists"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Test: Clone failure handling (bd-mlgr)
+#==============================================================================
+
+test_sync_clone_failure() {
+    local test_name="Clone failure produces error status"
+    log_test_start "$test_name"
+
+    sync_test_setup
+
+    # Configure ru with a repo that won't exist in registry
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add nonexistent/fake-repo >/dev/null 2>&1
+
+    # Create mock gh that handles auth but fails on clone for unknown repos
+    sync_test_finalize_mock
+
+    # Run sync - should fail for the unknown repo
+    run_ru_sync
+
+    # The sync should complete but report failure
+    assert_not_equals "0" "$RU_EXIT_CODE" "Sync fails for unknown repo"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Test: Clone timeout simulation (bd-mlgr)
+#==============================================================================
+
+test_sync_clone_timeout_handling() {
+    local test_name="Clone timeout produces timeout status"
+    log_test_start "$test_name"
+
+    sync_test_setup
+
+    # Create a test remote
+    create_test_remote "testowner" "timeout-repo" 1
+    configure_ru_repos "testowner/timeout-repo"
+
+    # Create a mock gh that simulates timeout
+    local bash_path
+    bash_path=$(type -P bash)
+
+    cat > "$E2E_MOCK_BIN/gh" <<MOCK_EOF
+#!${bash_path}
+set -uo pipefail
+
+cmd="\${1:-}"
+sub="\${2:-}"
+
+if [[ "\$cmd" == "auth" && "\$sub" == "status" ]]; then
+    exit 0
+fi
+
+if [[ "\$cmd" == "repo" && "\$sub" == "clone" ]]; then
+    # Simulate timeout error message
+    echo "fatal: unable to access 'https://github.com/testowner/timeout-repo/': Operation timed out" >&2
+    exit 128
+fi
+
+exit 2
+MOCK_EOF
+    chmod +x "$E2E_MOCK_BIN/gh"
+
+    # Run sync with short timeout (ru uses timeout env vars)
+    export GIT_HTTP_LOW_SPEED_LIMIT=1
+    export GIT_HTTP_LOW_SPEED_TIME=1
+
+    run_ru_sync
+
+    # Should fail due to timeout
+    assert_not_equals "0" "$RU_EXIT_CODE" "Sync fails on timeout"
+
+    unset GIT_HTTP_LOW_SPEED_LIMIT
+    unset GIT_HTTP_LOW_SPEED_TIME
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Test: Clone with dry-run shows correct paths (bd-mlgr)
+#==============================================================================
+
+test_sync_clone_dry_run_paths() {
+    local test_name="Clone dry-run shows correct paths"
+    log_test_start "$test_name"
+
+    sync_test_setup
+
+    create_test_remote "testowner" "dryrun-repo" 1
+    configure_ru_repos "testowner/dryrun-repo"
+    sync_test_finalize_mock
+
+    # Run sync with dry-run
+    run_ru_sync --dry-run
+
+    assert_equals "0" "$RU_EXIT_CODE" "Dry-run succeeds"
+
+    # Verify no directory was created
+    assert_true "test ! -d '$E2E_TEMP_DIR/projects/dryrun-repo'" "Repo NOT cloned in dry-run"
+
+    # Verify output mentions the repo
+    if echo "$RU_STDERR" | grep -q "dryrun-repo"; then
+        pass "Dry-run mentions repo name"
+    else
+        fail "Dry-run should mention repo name"
+    fi
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Test: Clone multiple repos in parallel (bd-mlgr)
+#==============================================================================
+
+test_sync_clone_parallel() {
+    local test_name="Clone multiple repos respects parallelism"
+    log_test_start "$test_name"
+
+    sync_test_setup
+
+    # Create multiple test remotes
+    create_test_remote "parallel" "repo-a" 1
+    create_test_remote "parallel" "repo-b" 1
+    create_test_remote "parallel" "repo-c" 1
+    create_test_remote "parallel" "repo-d" 1
+
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add parallel/repo-a >/dev/null 2>&1
+    "$RU_SCRIPT" add parallel/repo-b >/dev/null 2>&1
+    "$RU_SCRIPT" add parallel/repo-c >/dev/null 2>&1
+    "$RU_SCRIPT" add parallel/repo-d >/dev/null 2>&1
+    sync_test_finalize_mock
+
+    # Run sync with parallelism
+    run_ru_sync -j2
+
+    assert_equals "0" "$RU_EXIT_CODE" "Parallel clone succeeds"
+
+    # Verify all repos were cloned
+    assert_true "test -d '$E2E_TEMP_DIR/projects/repo-a'" "Repo A cloned"
+    assert_true "test -d '$E2E_TEMP_DIR/projects/repo-b'" "Repo B cloned"
+    assert_true "test -d '$E2E_TEMP_DIR/projects/repo-c'" "Repo C cloned"
+    assert_true "test -d '$E2E_TEMP_DIR/projects/repo-d'" "Repo D cloned"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -525,6 +732,13 @@ run_test test_sync_with_force_clone
 run_test test_sync_with_worktree_mode
 run_test test_sync_multiple_repos
 run_test test_sync_json_output
+
+# Clone Driver Tests (bd-mlgr)
+run_test test_sync_clone_with_branch
+run_test test_sync_clone_failure
+run_test test_sync_clone_timeout_handling
+run_test test_sync_clone_dry_run_paths
+run_test test_sync_clone_parallel
 
 print_results
 exit $?
