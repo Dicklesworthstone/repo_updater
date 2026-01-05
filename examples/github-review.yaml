@@ -1,0 +1,144 @@
+# ntm workflow template for ru review (plan mode)
+# Copy to ~/.config/ntm/workflows/github-review.yaml
+schema_version: "2.0"
+name: github-review
+description: |
+  Automated GitHub issue and PR review workflow (plan mode).
+  Agent produces local patches and review-plan.json artifact.
+  NO direct GitHub mutations.
+
+inputs:
+  worktree_path:
+    description: Path to isolated worktree
+    required: true
+  repo_name:
+    description: GitHub repo identifier (owner/repo)
+    required: true
+  repo_digest_path:
+    description: Optional cached digest path
+    required: false
+  work_items:
+    description: JSON array of items to review
+    required: true
+
+settings:
+  timeout: "45m"
+  on_error: "fail"
+  notify_on_error: true
+
+defaults:
+  working_dir: ${inputs.worktree_path}
+  agent: claude
+
+steps:
+  - id: verify_prerequisites
+    type: shell
+    command: |
+      if ! command -v gh >/dev/null 2>&1; then
+        echo "gh is required" >&2
+        exit 1
+      fi
+      if ! gh auth status >/dev/null 2>&1; then
+        echo "gh auth required" >&2
+        exit 1
+      fi
+      if [[ -z "${inputs.worktree_path}" || ! -d "${inputs.worktree_path}" ]]; then
+        echo "worktree_path missing or invalid" >&2
+        exit 1
+      fi
+      if ! git -C "${inputs.worktree_path}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "worktree_path is not a git repository" >&2
+        exit 1
+      fi
+      mkdir -p "${inputs.worktree_path}/.ru"
+      if command -v jq >/dev/null 2>&1; then
+        if ! echo "${inputs.work_items}" | jq -e 'type == "array"' >/dev/null 2>&1; then
+          echo "work_items must be a JSON array" >&2
+          exit 1
+        fi
+      fi
+    on_failure: abort
+
+  - id: understand_codebase
+    agent: claude
+    depends_on: [verify_prerequisites]
+    prompt: |
+      You are working in ${inputs.worktree_path} for ${inputs.repo_name}.
+
+      First read ALL of AGENTS.md and README.md for this repository.
+      If repo_digest_path is provided and readable, load it.
+      Otherwise, create or update ${inputs.worktree_path}/.ru/repo-digest.md
+      with a concise summary (purpose, architecture, key modules, recent changes).
+
+      Keep the digest updated for future runs.
+    wait: completion
+    timeout: 10m
+    health_check:
+      interval: 30s
+      max_stalls: 3
+    outputs:
+      digest_path: ${inputs.worktree_path}/.ru/repo-digest.md
+
+  - id: review_issues_prs
+    agent: claude
+    depends_on: [understand_codebase]
+    prompt: |
+      Review the following work items for ${inputs.repo_name}:
+      ${inputs.work_items}
+
+      Rules:
+      - Use gh for READ ONLY (view/list). Do NOT mutate GitHub.
+      - Implement local fixes in the worktree and commit them.
+      - Write ${inputs.worktree_path}/.ru/review-plan.json with your decisions,
+        including any proposed gh_actions (but do not execute them).
+      - If you need user input, ask via AskUserQuestion with clear options.
+    wait: user_interaction
+    timeout: 30m
+    on_question:
+      action: queue
+      priority: ${question.urgency:-normal}
+      metadata:
+        repo: ${inputs.repo_name}
+        worktree: ${inputs.worktree_path}
+
+  - id: finalize_artifacts
+    type: shell
+    depends_on: [review_issues_prs]
+    command: |
+      plan_path="${inputs.worktree_path}/.ru/review-plan.json"
+      digest_path="${inputs.worktree_path}/.ru/repo-digest.md"
+
+      if [[ ! -f "$plan_path" ]]; then
+        echo "Missing review-plan.json at $plan_path" >&2
+        exit 1
+      fi
+
+      if command -v jq >/dev/null 2>&1; then
+        if ! jq -e '.schema_version == 1 and (.repo | type=="string") and (.items | type=="array")' "$plan_path" >/dev/null 2>&1; then
+          echo "review-plan.json failed validation" >&2
+          exit 1
+        fi
+      fi
+
+      if [[ ! -f "$digest_path" ]]; then
+        echo "Missing repo digest at $digest_path" >&2
+        exit 1
+      fi
+
+      echo "Review artifacts ready for ${inputs.repo_name}" >&2
+    on_failure: warn
+    outputs:
+      plan_path: ${inputs.worktree_path}/.ru/review-plan.json
+      digest_path: ${inputs.worktree_path}/.ru/repo-digest.md
+      items_reviewed: ${steps.review_issues_prs.items_reviewed:-0}
+
+outputs:
+  plan_path:
+    description: Path to review-plan.json
+    value: ${steps.finalize_artifacts.plan_path}
+  digest_path:
+    description: Path to repo-digest.md
+    value: ${steps.finalize_artifacts.digest_path}
+  items_reviewed:
+    description: Count of items reviewed
+    value: ${steps.finalize_artifacts.items_reviewed}
