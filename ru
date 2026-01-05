@@ -2185,7 +2185,7 @@ parse_args() {
                 ARGS+=("$1")
                 shift
                 ;;
-            --plan|--apply|--push|--analytics|--basic|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
+            --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
                     shift
