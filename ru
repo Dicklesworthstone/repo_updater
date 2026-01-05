@@ -134,15 +134,44 @@ RU_REPO_NAME="repo_updater"
 # shellcheck disable=SC2034
 RU_GITHUB_API="https://api.github.com"
 
+# Resolve a user-provided path that should be absolute.
+# - Accepts absolute paths ("/...") and simple "~" / "~/" forms.
+# - Rejects relative paths to avoid writing into the current working directory.
+resolve_abs_or_tilde_path_or_default() {
+    local candidate="${1:-}"
+    local default_path="${2:-}"
+
+    if [[ -n "$candidate" ]] && [[ "$candidate" == /* ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    if [[ -n "$candidate" ]] && [[ "${candidate:0:1}" == "~" ]] && { [[ "${#candidate}" -eq 1 ]] || [[ "${candidate:1:1}" == "/" ]]; }; then
+        printf '%s\n' "$HOME/${candidate:2}"
+        return 0
+    fi
+
+    printf '%s\n' "$default_path"
+}
+
 # XDG Base Directory defaults
-XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_CONFIG_HOME="$(resolve_abs_or_tilde_path_or_default "${XDG_CONFIG_HOME:-}" "$HOME/.config")"
+XDG_STATE_HOME="$(resolve_abs_or_tilde_path_or_default "${XDG_STATE_HOME:-}" "$HOME/.local/state")"
+XDG_CACHE_HOME="$(resolve_abs_or_tilde_path_or_default "${XDG_CACHE_HOME:-}" "$HOME/.cache")"
 
 # ru-specific directories (can be overridden via env vars)
-RU_CONFIG_DIR="${RU_CONFIG_DIR:-$XDG_CONFIG_HOME/ru}"
-RU_STATE_DIR="${RU_STATE_DIR:-$XDG_STATE_HOME/ru}"
-RU_CACHE_DIR="${RU_CACHE_DIR:-$XDG_CACHE_HOME/ru}"
+RU_CONFIG_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_CONFIG_DIR:-}" "$XDG_CONFIG_HOME/ru")"
+RU_STATE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_STATE_DIR:-}" "$XDG_STATE_HOME/ru")"
+RU_CACHE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_CACHE_DIR:-}" "$XDG_CACHE_HOME/ru")"
+RU_LOG_DIR="$RU_STATE_DIR/logs"
+
+# Harden state directory paths against relative values
+if [[ "$XDG_STATE_HOME" != /* ]]; then
+    XDG_STATE_HOME="$HOME/$XDG_STATE_HOME"
+fi
+if [[ "$RU_STATE_DIR" != /* ]]; then
+    RU_STATE_DIR="$HOME/$RU_STATE_DIR"
+fi
 RU_LOG_DIR="$RU_STATE_DIR/logs"
 
 # Default configuration values
@@ -514,6 +543,9 @@ LIST OPTIONS:
     --public             Show only repos from repos.txt
     --private            Show only repos from private.txt
 
+DOCTOR OPTIONS:
+    --review             Include review command prerequisites
+
 PRUNE OPTIONS:
     (no options)         List orphan repositories (dry run)
     --archive            Move orphans to archive directory
@@ -527,6 +559,8 @@ IMPORT OPTIONS:
 REVIEW OPTIONS:
     --plan               Generate review plans only, no mutations (default)
     --apply              Execute approved plans from previous --plan run
+    --analytics          Show review metrics dashboard and exit
+    --basic              Use basic question TUI (gum/ANSI) and exit
     --mode=MODE          Driver: auto, ntm, or local (default: auto)
     --parallel=N, -jN    Concurrent review sessions (default: 4)
     --repos=PATTERN      Filter repos by pattern
@@ -549,11 +583,14 @@ EXAMPLES:
     ru remove owner/repo Remove a repository
     ru doctor            Check system configuration
     ru prune             Find orphan repos not in config
+    ru doctor --review   Check system and review prerequisites
     ru prune --archive   Archive orphan repos
     ru import repos.txt  Import repos from file (auto-detects visibility)
     ru review --dry-run  Discover issues/PRs without starting reviews
     ru review            Start AI-assisted review of issues/PRs
     ru review --apply    Execute approved changes from plan
+    ru review --basic    Answer queued review questions
+    ru review --analytics Show review analytics dashboard
 
 CONFIGURATION:
     Config:  ~/.config/ru/config
@@ -2146,7 +2183,7 @@ parse_args() {
                 ARGS+=("$1")
                 shift
                 ;;
-            --plan|--apply|--push|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
+            --plan|--apply|--push|--analytics|--basic|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
                     shift
@@ -5939,6 +5976,8 @@ declare -gA DASHBOARD_STATE=(
     [expanded_question]=""
     [scroll_offset]=0
     [panel_focus]="questions"
+    [filter_query]=""
+    [paused]="false"
     [refresh_needed]="true"
     [last_refresh]=0
     [running]="true"
@@ -5971,6 +6010,442 @@ get_terminal_size() {
         rows=24
     fi
     echo "$cols $rows"
+}
+
+#------------------------------------------------------------------------------
+# QUESTION QUEUE HELPERS (bd-fi65 / bd-80pt)
+#------------------------------------------------------------------------------
+
+normalize_questions_json() {
+    local input="$1"
+
+    if ! command -v jq &>/dev/null; then
+        echo "[]"
+        return 0
+    fi
+
+    if ! echo "$input" | jq empty >/dev/null 2>&1; then
+        echo "[]"
+        return 0
+    fi
+
+    local json_type
+    json_type=$(echo "$input" | jq -r 'type' 2>/dev/null || echo "")
+    if [[ "$json_type" == "array" ]]; then
+        echo "$input"
+    else
+        echo "$input" | jq -c '.questions // []' 2>/dev/null || echo "[]"
+    fi
+}
+
+load_questions_queue() {
+    local questions_file
+    questions_file=$(get_questions_file)
+
+    if [[ ! -f "$questions_file" ]]; then
+        echo "[]"
+        return 0
+    fi
+
+    local content
+    content=$(cat "$questions_file" 2>/dev/null || echo "")
+    normalize_questions_json "$content"
+}
+
+write_questions_queue() {
+    local questions_json="$1"
+    local questions_file
+    questions_file=$(get_questions_file)
+
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not available; cannot update questions queue"
+        return 1
+    fi
+
+    local payload
+    payload=$(jq -n --argjson questions "$questions_json" '{version:1, questions:$questions}')
+    with_state_lock write_json_atomic "$questions_file" "$payload"
+}
+
+update_question_in_queue() {
+    local question_id="$1"
+    local update_filter="$2"
+    shift 2
+    local questions_file
+    questions_file=$(get_questions_file)
+
+    if [[ -z "$question_id" ]]; then
+        log_warn "Cannot update question with empty id"
+        return 1
+    fi
+
+    if [[ ! -f "$questions_file" ]]; then
+        log_warn "Questions queue not found: $questions_file"
+        return 1
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not available; cannot update questions queue"
+        return 1
+    fi
+
+    local current updated
+    current=$(cat "$questions_file" 2>/dev/null || echo "{}")
+    if ! echo "$current" | jq empty >/dev/null 2>&1; then
+        log_warn "Questions queue is invalid JSON"
+        return 1
+    fi
+
+    updated=$(echo "$current" | jq --arg qid "$question_id" "$@" "$update_filter" 2>/dev/null) || return 1
+    with_state_lock write_json_atomic "$questions_file" "$updated"
+}
+
+mark_question_answered() {
+    local question_id="$1"
+    local answer="$2"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    update_question_in_queue "$question_id" '
+        if type=="array" then
+            map(if .id == $qid then . + {status:"answered", answered_at:$now, answer:$answer} else . end)
+        else
+            .questions |= map(if .id == $qid then . + {status:"answered", answered_at:$now, answer:$answer} else . end)
+        end
+    ' --arg now "$now" --arg answer "$answer"
+}
+
+mark_question_skipped() {
+    local question_id="$1"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    update_question_in_queue "$question_id" '
+        if type=="array" then
+            map(if .id == $qid then . + {status:"skipped", skipped_at:$now} else . end)
+        else
+            .questions |= map(if .id == $qid then . + {status:"skipped", skipped_at:$now} else . end)
+        end
+    ' --arg now "$now"
+}
+
+mark_question_snoozed() {
+    local question_id="$1"
+    local snooze_until="$2"
+
+    update_question_in_queue "$question_id" '
+        if type=="array" then
+            map(if .id == $qid then . + {status:"snoozed", snooze_until:$snooze_until} else . end)
+        else
+            .questions |= map(if .id == $qid then . + {status:"snoozed", snooze_until:$snooze_until} else . end)
+        end
+    ' --arg snooze_until "$snooze_until"
+}
+
+filter_questions_json() {
+    local questions_json="$1"
+    local query="${DASHBOARD_STATE[filter_query]:-}"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if ! command -v jq &>/dev/null; then
+        echo "$questions_json"
+        return 0
+    fi
+
+    echo "$questions_json" | jq -c --arg now "$now" --arg query "$query" '
+        (if type=="array" then . else .questions // [] end)
+        | map(select(
+            (.status // "pending") == "pending"
+            or ((.status // "") == "snoozed" and (.snooze_until // "") <= $now)
+        ))
+        | if $query != "" then
+            map(select(
+                ((.repo // "") | test($query; "i"))
+                or ((.context // "" | tostring) | test($query; "i"))
+                or ((.prompt // "") | test($query; "i"))
+            ))
+          else .
+          end
+    ' 2>/dev/null || echo "[]"
+}
+
+get_question_at_index() {
+    local questions_json="$1"
+    local index="$2"
+
+    if ! command -v jq &>/dev/null; then
+        echo ""
+        return 1
+    fi
+
+    echo "$questions_json" | jq -c ".[$index] // empty" 2>/dev/null
+}
+
+date_add_days() {
+    local days="$1"
+    if date --version 2>/dev/null | grep -q GNU; then
+        date -u -d "$days days" +%Y-%m-%dT%H:%M:%SZ
+    else
+        date -u -v+"${days}d" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ
+    fi
+}
+
+dashboard_prompt_line() {
+    local prompt="$1"
+    local input=""
+
+    exit_alt_screen
+    read -r -p "$prompt" input
+    enter_alt_screen
+    DASHBOARD_STATE[refresh_needed]="true"
+    echo "$input"
+}
+
+dashboard_prompt_choice() {
+    local prompt="$1"
+    shift
+    local -a options=("$@")
+
+    if [[ "${#options[@]}" -eq 0 ]]; then
+        echo ""
+        return 1
+    fi
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        exit_alt_screen
+        local chosen
+        chosen=$(gum choose --cursor="> " --header "$prompt" "${options[@]}" 2>/dev/null || true)
+        enter_alt_screen
+        DASHBOARD_STATE[refresh_needed]="true"
+        echo "$chosen"
+        [[ -n "$chosen" ]]
+        return $?
+    fi
+
+    exit_alt_screen
+    printf '%s\n' "$prompt" >&2
+    local i=1
+    local opt
+    for opt in "${options[@]}"; do
+        printf '  %d) %s\n' "$i" "$opt" >&2
+        ((i++))
+    done
+    local choice=""
+    read -r -p "Choose [1-${#options[@]}]: " choice
+    enter_alt_screen
+    DASHBOARD_STATE[refresh_needed]="true"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
+        echo "${options[$((choice - 1))]}"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
+get_review_templates_dir() {
+    echo "${RU_CONFIG_DIR:-$HOME/.config/ru}/review-templates.d"
+}
+
+pick_review_template() {
+    local templates_dir
+    templates_dir=$(get_review_templates_dir)
+
+    if [[ ! -d "$templates_dir" ]]; then
+        log_warn "No templates directory found: $templates_dir"
+        return 1
+    fi
+
+    local -a templates=()
+    local file
+    for file in "$templates_dir"/*; do
+        [[ -f "$file" ]] || continue
+        templates+=("$(basename "$file")")
+    done
+
+    if [[ ${#templates[@]} -eq 0 ]]; then
+        log_warn "No templates found in $templates_dir"
+        return 1
+    fi
+
+    local selected
+    selected=$(dashboard_prompt_choice "Select a template" "${templates[@]}")
+    [[ -z "$selected" ]] && return 1
+
+    cat "$templates_dir/$selected"
+}
+
+render_help_overlay() {
+    clear_screen
+    printf '%s%sHelp%s\n\n' "$DASH_BOLD" "$DASH_CYAN" "$DASH_RESET"
+    printf 'Navigation: j/k or arrows, Tab switch panel, / search\n'
+    printf 'Quick: [1-9] answer, Enter expand, d drill, s skip, S skip all\n'
+    printf 'Actions: z snooze, t template, a apply, b bulk apply safe\n'
+    printf 'Control: p pause, r resume, h help, q quit, Esc cancel\n'
+    printf '\nPress any key to return...\n'
+    read_keypress
+    DASHBOARD_STATE[refresh_needed]="true"
+}
+
+question_get_id() {
+    local question_json="$1"
+    echo "$question_json" | jq -r '.id // .questions[0].id // .context.questions[0].id // .tool_use_id // empty' 2>/dev/null
+}
+
+question_get_session_id() {
+    local question_json="$1"
+    echo "$question_json" | jq -r '.session_id // .context.session_id // empty' 2>/dev/null
+}
+
+question_get_prompt() {
+    local question_json="$1"
+    echo "$question_json" | jq -r '
+        if .prompt then .prompt
+        elif (.questions[0].prompt) then .questions[0].prompt
+        elif (.context.questions[0].prompt) then .context.questions[0].prompt
+        elif .context then (.context | tostring)
+        else ""
+        end
+    ' 2>/dev/null
+}
+
+question_get_recommended() {
+    local question_json="$1"
+    echo "$question_json" | jq -r '.recommended // .questions[0].recommended // .context.questions[0].recommended // empty' 2>/dev/null
+}
+
+question_get_options_lines() {
+    local question_json="$1"
+    echo "$question_json" | jq -r '
+        (.options // .questions[0].options // .context.questions[0].options // []) | .[] |
+        if type=="object" and has("label") then .label else . end
+    ' 2>/dev/null
+}
+
+dashboard_answer_question() {
+    local questions_json="$1"
+    local index="$2"
+
+    local question_json
+    question_json=$(get_question_at_index "$questions_json" "$index")
+    [[ -z "$question_json" ]] && return 1
+
+    local question_id session_id prompt recommended
+    question_id=$(question_get_id "$question_json")
+    session_id=$(question_get_session_id "$question_json")
+    prompt=$(question_get_prompt "$question_json")
+    recommended=$(question_get_recommended "$question_json")
+
+    local -a options=()
+    mapfile -t options < <(question_get_options_lines "$question_json")
+
+    local answer=""
+    if [[ ${#options[@]} -gt 0 ]]; then
+        local choice_prompt="Answer: ${prompt:-Choose an option}"
+        answer=$(dashboard_prompt_choice "$choice_prompt" "${options[@]}")
+        if [[ -z "$answer" && -n "$recommended" ]]; then
+            answer="$recommended"
+        fi
+    else
+        local choice_prompt="Answer: ${prompt:-Enter response}"
+        answer=$(dashboard_prompt_line "$choice_prompt ")
+    fi
+
+    if [[ -z "$answer" ]]; then
+        log_warn "No answer selected"
+        return 1
+    fi
+
+    if [[ -n "$session_id" ]]; then
+        driver_send_to_session "$session_id" "$answer" || true
+    else
+        log_warn "Question missing session_id; answer not delivered"
+    fi
+
+    if [[ -n "$question_id" ]]; then
+        mark_question_answered "$question_id" "$answer" || true
+    fi
+}
+
+dashboard_skip_question() {
+    local questions_json="$1"
+    local index="$2"
+
+    local question_json
+    question_json=$(get_question_at_index "$questions_json" "$index")
+    [[ -z "$question_json" ]] && return 1
+
+    local question_id
+    question_id=$(question_get_id "$question_json")
+    if [[ -n "$question_id" ]]; then
+        mark_question_skipped "$question_id" || true
+    fi
+}
+
+dashboard_skip_all_questions() {
+    local questions_file
+    questions_file=$(get_questions_file)
+
+    if [[ ! -f "$questions_file" ]] || ! command -v jq &>/dev/null; then
+        return 0
+    fi
+
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local current updated
+    current=$(cat "$questions_file" 2>/dev/null || echo "{}")
+    updated=$(echo "$current" | jq --arg now "$now" '
+        if type=="array" then
+            map(if (.status // "pending") == "pending" then . + {status:"skipped", skipped_at:$now} else . end)
+        else
+            .questions |= map(if (.status // "pending") == "pending" then . + {status:"skipped", skipped_at:$now} else . end)
+        end
+    ' 2>/dev/null || echo "")
+
+    if [[ -n "$updated" ]]; then
+        with_state_lock write_json_atomic "$questions_file" "$updated"
+    fi
+}
+
+dashboard_snooze_question() {
+    local questions_json="$1"
+    local index="$2"
+
+    local question_json
+    question_json=$(get_question_at_index "$questions_json" "$index")
+    [[ -z "$question_json" ]] && return 1
+
+    local question_id
+    question_id=$(question_get_id "$question_json")
+    [[ -z "$question_id" ]] && return 1
+
+    local choice
+    choice=$(dashboard_prompt_choice "Snooze duration" "1 day" "7 days" "30 days" "Cancel")
+    case "$choice" in
+        "1 day") mark_question_snoozed "$question_id" "$(date_add_days 1)" ;;
+        "7 days") mark_question_snoozed "$question_id" "$(date_add_days 7)" ;;
+        "30 days") mark_question_snoozed "$question_id" "$(date_add_days 30)" ;;
+        *) ;;
+    esac
+}
+
+dashboard_apply_template() {
+    local questions_json="$1"
+    local index="$2"
+
+    local question_json
+    question_json=$(get_question_at_index "$questions_json" "$index")
+    [[ -z "$question_json" ]] && return 1
+
+    local session_id
+    session_id=$(question_get_session_id "$question_json")
+    [[ -z "$session_id" ]] && return 1
+
+    local template_text
+    template_text=$(pick_review_template || true)
+    [[ -z "$template_text" ]] && return 1
+
+    driver_send_to_session "$session_id" "$template_text" || true
 }
 
 # Enter alternate screen buffer
@@ -6090,7 +6565,14 @@ render_question_entry() {
     number=$(echo "$question_json" | jq -r '.number // 0')
     item_type=$(echo "$question_json" | jq -r '.type // "issue"')
     priority=$(echo "$question_json" | jq -r '.priority // "NORMAL"')
-    context=$(echo "$question_json" | jq -r '.context // ""' | head -1)
+    context=$(echo "$question_json" | jq -r '
+        if .prompt then .prompt
+        elif (.questions[0].prompt) then .questions[0].prompt
+        elif (.context.questions[0].prompt) then .context.questions[0].prompt
+        elif .context then (.context | tostring)
+        else ""
+        end
+    ' 2>/dev/null | head -1)
 
     # Priority colors
     local priority_color="$DASH_RESET"
@@ -6137,7 +6619,10 @@ render_question_entry() {
 
         # Options (if available)
         local options
-        options=$(echo "$question_json" | jq -r '.options // [] | .[] | .label' 2>/dev/null)
+        options=$(echo "$question_json" | jq -r '
+            (.options // .questions[0].options // .context.questions[0].options // []) | .[] |
+            if type=="object" and has("label") then .label else . end
+        ' 2>/dev/null)
         if [[ -n "$options" ]]; then
             local opt_line="      > "
             local opt_index=0
@@ -6179,6 +6664,10 @@ render_questions_panel() {
     # Render visible questions
     local visible_rows=$((max_rows - 4))
     local scroll_offset="${DASHBOARD_STATE[scroll_offset]}"
+    if [[ "$scroll_offset" -ge "$count" ]]; then
+        scroll_offset=0
+        DASHBOARD_STATE[scroll_offset]=0
+    fi
     local end_idx=$((scroll_offset + visible_rows))
     [[ $end_idx -gt $count ]] && end_idx=$count
 
@@ -6278,7 +6767,7 @@ render_footer() {
     draw_hline "$cols"
     printf '\n'
 
-    local shortcuts="[1-9] Answer [Enter] Expand [d] Drill [s] Skip [a] Apply [q] Quit"
+    local shortcuts="[1-9] Answer [Enter] Expand [d] Drill [s] Skip [S] Skip all [z] Snooze [t] Template [/] Search [h] Help [q] Quit"
     printf ' %s%s\n' "$shortcuts" "${DASH_RESET}"
 }
 
@@ -6349,6 +6838,14 @@ handle_dashboard_keypress() {
             fi
             echo "refresh"
             ;;
+        $'\t'|$'\x1b[C'|$'\x1b[D')  # tab or left/right arrows
+            case "${DASHBOARD_STATE[panel_focus]}" in
+                questions) DASHBOARD_STATE[panel_focus]="sessions" ;;
+                sessions) DASHBOARD_STATE[panel_focus]="summary" ;;
+                *) DASHBOARD_STATE[panel_focus]="questions" ;;
+            esac
+            echo "refresh"
+            ;;
 
         # Expand/collapse
         $'\x0a'|$'\x0d')  # Enter
@@ -6363,9 +6860,17 @@ handle_dashboard_keypress() {
         # Actions
         d) echo "drill:$selected" ;;
         s) echo "skip:$selected" ;;
+        S) echo "skip_all" ;;
+        z) echo "snooze:$selected" ;;
+        t) echo "template:$selected" ;;
         a) echo "apply" ;;
+        b) echo "bulk_apply" ;;
+        p) echo "pause" ;;
+        r) echo "resume" ;;
         q) echo "quit" ;;
         h) echo "help" ;;
+        '/') echo "search" ;;
+        $'\x1b') echo "cancel" ;;
 
         # Ignore other keys
         *) echo "none" ;;
@@ -6437,7 +6942,9 @@ run_dashboard() {
             local sessions_json="${DASHBOARD_SESSIONS:-[]}"
             local stats_json="${DASHBOARD_STATS:-{\"completed\":0,\"issues\":0,\"prs\":0,\"commits\":0,\"current\":0,\"total\":0}}"
 
-            render_dashboard "$run_id" "$start_time" "$questions_json" "$sessions_json" "$stats_json"
+            local filtered_questions
+            filtered_questions=$(filter_questions_json "$questions_json")
+            render_dashboard "$run_id" "$start_time" "$filtered_questions" "$sessions_json" "$stats_json"
 
             DASHBOARD_STATE[refresh_needed]="false"
             DASHBOARD_STATE[last_refresh]="$now"
@@ -6447,8 +6954,15 @@ run_dashboard() {
         local key
         if key=$(read_keypress 1); then
             local questions_count=0
+            local filtered_questions=""
             if command -v jq &>/dev/null; then
-                questions_count=$(echo "${DASHBOARD_QUESTIONS:-[]}" | jq 'length' 2>/dev/null || echo 0)
+                filtered_questions=$(filter_questions_json "${DASHBOARD_QUESTIONS:-[]}")
+                questions_count=$(echo "$filtered_questions" | jq 'length' 2>/dev/null || echo 0)
+            fi
+            if [[ "$questions_count" -le 0 ]]; then
+                DASHBOARD_STATE[selected_index]=0
+            elif [[ "${DASHBOARD_STATE[selected_index]}" -ge "$questions_count" ]]; then
+                DASHBOARD_STATE[selected_index]=$((questions_count - 1))
             fi
 
             local action
@@ -6457,8 +6971,9 @@ run_dashboard() {
             case "$action" in
                 answer:*)
                     local idx="${action#answer:}"
-                    # TODO: Handle answer selection (implemented in later beads)
-                    log_verbose "Selected answer for question $idx"
+                    if [[ -n "$filtered_questions" ]]; then
+                        dashboard_answer_question "$filtered_questions" "$idx"
+                    fi
                     ;;
                 drill:*)
                     local idx="${action#drill:}"
@@ -6467,12 +6982,42 @@ run_dashboard() {
                     ;;
                 skip:*)
                     local idx="${action#skip:}"
-                    # TODO: Skip question
-                    log_verbose "Skip question $idx"
+                    if [[ -n "$filtered_questions" ]]; then
+                        dashboard_skip_question "$filtered_questions" "$idx"
+                    fi
+                    DASHBOARD_STATE[refresh_needed]="true"
+                    ;;
+                skip_all)
+                    dashboard_skip_all_questions
+                    DASHBOARD_STATE[refresh_needed]="true"
+                    ;;
+                snooze:*)
+                    local idx="${action#snooze:}"
+                    if [[ -n "$filtered_questions" ]]; then
+                        dashboard_snooze_question "$filtered_questions" "$idx"
+                    fi
+                    DASHBOARD_STATE[refresh_needed]="true"
+                    ;;
+                template:*)
+                    local idx="${action#template:}"
+                    if [[ -n "$filtered_questions" ]]; then
+                        dashboard_apply_template "$filtered_questions" "$idx"
+                    fi
                     ;;
                 apply)
                     # TODO: Apply approved changes
                     log_verbose "Apply changes requested"
+                    ;;
+                bulk_apply)
+                    log_verbose "Bulk apply safe requested"
+                    ;;
+                pause)
+                    DASHBOARD_STATE[paused]="true"
+                    log_verbose "Dashboard paused"
+                    ;;
+                resume)
+                    DASHBOARD_STATE[paused]="false"
+                    log_verbose "Dashboard resumed"
                     ;;
                 quit)
                     DASHBOARD_STATE[running]="false"
@@ -6481,8 +7026,17 @@ run_dashboard() {
                     DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 help)
-                    # TODO: Show help overlay (bd-80pt)
-                    log_verbose "Help requested"
+                    render_help_overlay
+                    ;;
+                search)
+                    local query
+                    query=$(dashboard_prompt_line "Search: ")
+                    DASHBOARD_STATE[filter_query]="$query"
+                    DASHBOARD_STATE[refresh_needed]="true"
+                    ;;
+                cancel)
+                    DASHBOARD_STATE[filter_query]=""
+                    DASHBOARD_STATE[refresh_needed]="true"
                     ;;
             esac
         fi
@@ -6525,6 +7079,117 @@ update_dashboard_sessions() {
 update_dashboard_stats() {
     DASHBOARD_STATS="$1"
     DASHBOARD_STATE[refresh_needed]="true"
+}
+
+#------------------------------------------------------------------------------
+# BASIC MODE TUI (bd-fi65)
+# Simple question loop with gum/ANSI fallbacks
+#------------------------------------------------------------------------------
+
+show_question_basic_mode() {
+    local question_json="$1"
+
+    local repo prompt priority
+    repo=$(echo "$question_json" | jq -r '.repo // "unknown"' 2>/dev/null)
+    prompt=$(question_get_prompt "$question_json")
+    priority=$(echo "$question_json" | jq -r '.priority // "NORMAL"' 2>/dev/null)
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --border rounded --padding "1 2" --border-foreground "#fab387" \
+            "Question from: $repo" >&2
+        gum style --bold "$prompt" >&2
+        gum style "Priority: $priority" >&2
+    else
+        printf '%b\n' "${BOLD}Question from: ${repo}${RESET}" >&2
+        printf '%b\n' "${CYAN}${prompt}${RESET}" >&2
+        printf '%b\n' "Priority: $priority" >&2
+    fi
+}
+
+basic_mode_choose_answer() {
+    local question_json="$1"
+    local -a options=()
+    mapfile -t options < <(question_get_options_lines "$question_json")
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+        local answer
+        read -r -p "Answer: " answer
+        echo "$answer"
+        return 0
+    fi
+
+    options+=("Skip")
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum choose --cursor="> " --header "Choose an option" "${options[@]}"
+        return $?
+    fi
+
+    local i=1
+    local opt
+    for opt in "${options[@]}"; do
+        printf '  %d) %s\n' "$i" "$opt" >&2
+        ((i++))
+    done
+    local choice=""
+    read -r -p "Choose [1-${#options[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
+        echo "${options[$((choice - 1))]}"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
+basic_mode_loop() {
+    if ! command -v jq &>/dev/null; then
+        log_error "Basic mode requires jq for question parsing"
+        return 3
+    fi
+
+    local questions_json
+    questions_json=$(load_questions_queue)
+    local filtered
+    filtered=$(filter_questions_json "$questions_json")
+    local count
+    count=$(echo "$filtered" | jq 'length' 2>/dev/null || echo 0)
+
+    if [[ -z "$count" || "$count" -eq 0 ]]; then
+        log_info "No pending questions"
+        return 0
+    fi
+
+    local i
+    for ((i = 0; i < count; i++)); do
+        local question_json
+        question_json=$(get_question_at_index "$filtered" "$i")
+        [[ -z "$question_json" ]] && continue
+
+        show_question_basic_mode "$question_json"
+        local answer
+        answer=$(basic_mode_choose_answer "$question_json")
+        if [[ -z "$answer" ]]; then
+            log_warn "No answer selected"
+            continue
+        fi
+
+        if [[ "$answer" == "Skip" ]]; then
+            local question_id
+            question_id=$(question_get_id "$question_json")
+            [[ -n "$question_id" ]] && mark_question_skipped "$question_id" || true
+            continue
+        fi
+
+        local session_id
+        session_id=$(question_get_session_id "$question_json")
+        if [[ -n "$session_id" ]]; then
+            gum_spin "Sending answer..." driver_send_to_session "$session_id" "$answer" || true
+        fi
+
+        local question_id
+        question_id=$(question_get_id "$question_json")
+        [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+    done
 }
 
 #------------------------------------------------------------------------------
@@ -6843,6 +7508,8 @@ parse_review_args() {
     REVIEW_DRIVER="auto"         # auto, ntm, or local
     REVIEW_PARALLEL=4            # concurrent sessions
     REVIEW_DRY_RUN="false"       # discovery only
+    REVIEW_ANALYTICS="false"     # show analytics dashboard
+    REVIEW_BASIC_TUI="false"     # basic gum/ANSI TUI for questions
     # shellcheck disable=SC2034  # Used by later phases
     REVIEW_RESUME="${RESUME:-false}"  # use global --resume flag
     REVIEW_PUSH="false"          # allow pushing (with apply)
@@ -6863,6 +7530,12 @@ parse_review_args() {
                 ;;
             --apply)
                 REVIEW_MODE="apply"
+                ;;
+            --analytics)
+                REVIEW_ANALYTICS="true"
+                ;;
+            --basic)
+                REVIEW_BASIC_TUI="true"
                 ;;
             --mode=*)
                 REVIEW_DRIVER="${arg#--mode=}"
@@ -6991,7 +7664,7 @@ log_skipped_question() {
             question_json=$(jq -n --arg raw "$question_info" '{raw:$raw}')
         fi
 
-        jq -n \
+        jq -nc \
             --arg run_id "${REVIEW_RUN_ID:-unknown}" \
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg reason "$reason" \
@@ -7087,11 +7760,8 @@ acquire_state_lock() {
     ensure_dir "$state_dir"
     local lock_file="$state_dir/state.lock"
 
-    # Open fd for locking
-    # Use printf %q to safely escape the path for eval
-    local safe_lock_file
-    printf -v safe_lock_file %q "$lock_file"
-    eval "exec $STATE_LOCK_FD>$safe_lock_file"
+    # Open fd for locking (no eval)
+    exec 201>"$lock_file"
 
     # Get exclusive lock (blocking)
     if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
@@ -7128,7 +7798,7 @@ write_json_atomic() {
     ensure_dir "$(dirname "$file")"
 
     # Write to temp file
-    if ! echo "$content" > "$tmp_file" 2>/dev/null; then
+    if ! printf '%s' "$content" > "$tmp_file" 2>/dev/null; then
         log_error "Failed to write temp file: $tmp_file"
         rm -f "$tmp_file" 2>/dev/null || true
         return 1
@@ -7645,6 +8315,251 @@ update_repo_digests_from_worktrees() {
         wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
         [[ -n "$wt_path" ]] && update_digest_cache "$wt_path" "$repo_id"
     done < <(jq -r 'keys[]' "$mapping_file" 2>/dev/null)
+}
+
+#------------------------------------------------------------------------------
+# REVIEW METRICS & ANALYTICS (bd-mzcq)
+# Collect monthly metrics and decision history for review runs.
+#------------------------------------------------------------------------------
+
+get_metrics_dir() {
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/metrics"
+}
+
+get_metrics_file_for_period() {
+    local period="$1"
+    echo "$(get_metrics_dir)/${period}.json"
+}
+
+get_metrics_file() {
+    local period
+    period=$(date -u +%Y-%m)
+    get_metrics_file_for_period "$period"
+}
+
+get_decisions_log_file() {
+    echo "$(get_metrics_dir)/decisions.jsonl"
+}
+
+record_decision() {
+    local repo_id="$1"
+    local item_type="$2"
+    local number="$3"
+    local decision="$4"
+    [[ "$number" =~ ^[0-9]+$ ]] || number=0
+
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not available; decision history skipped"
+        return 1
+    fi
+
+    local decisions_log
+    decisions_log=$(get_decisions_log_file)
+    ensure_dir "$(dirname "$decisions_log")"
+
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    jq -n --arg ts "$ts" --arg repo "$repo_id" --arg type "$item_type" \
+        --argjson number "$number" --arg decision "$decision" \
+        '{timestamp:$ts,repo:$repo,type:$type,number:$number,decision:$decision}' >> "$decisions_log"
+}
+
+init_metrics_file() {
+    local metrics_dir metrics_file period
+    metrics_dir=$(get_metrics_dir)
+    metrics_file=$(get_metrics_file)
+    period=$(date -u +%Y-%m)
+
+    ensure_dir "$metrics_dir"
+
+    if [[ -f "$metrics_file" ]]; then
+        return 0
+    fi
+
+    cat > "$metrics_file" <<EOF
+{
+  "period": "$period",
+  "reviews": {
+    "total": 0,
+    "repos_reviewed": 0,
+    "issues_processed": 0,
+    "issues_resolved": 0,
+    "questions_asked": 0,
+    "questions_answered": 0
+  },
+  "timing": {
+    "total_duration_minutes": 0,
+    "avg_per_repo_minutes": 0
+  },
+  "decisions": {
+    "by_type": {}
+  }
+}
+EOF
+}
+
+record_decisions_from_plan() {
+    local repo_id="$1"
+    local plan_file="$2"
+
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not available; decision history skipped"
+        return 1
+    fi
+
+    if [[ ! -f "$plan_file" ]]; then
+        return 1
+    fi
+
+    jq -c '.items[] | {type, number, decision}' "$plan_file" 2>/dev/null | \
+        while IFS= read -r item; do
+            local item_type number decision
+            item_type=$(echo "$item" | jq -r '.type // empty' 2>/dev/null)
+            number=$(echo "$item" | jq -r '.number // 0' 2>/dev/null)
+            decision=$(echo "$item" | jq -r '.decision // empty' 2>/dev/null)
+            [[ -n "$item_type" && -n "$decision" ]] || continue
+            record_decision "$repo_id" "$item_type" "$number" "$decision" || true
+        done
+}
+
+record_metrics_from_plan() {
+    local repo_id="$1"
+    local plan_file="$2"
+    local duration_seconds="${3:-0}"
+
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not available; metrics skipped"
+        return 1
+    fi
+
+    if [[ ! -f "$plan_file" ]]; then
+        return 1
+    fi
+
+    init_metrics_file
+
+    local issues_processed issues_resolved questions_total questions_answered
+    issues_processed=$(jq -r '[.items[] | select(.type == "issue")] | length' "$plan_file" 2>/dev/null || echo 0)
+    issues_resolved=$(jq -r '[.items[] | select(.type == "issue" and .decision == "fix")] | length' "$plan_file" 2>/dev/null || echo 0)
+    questions_total=$(jq -r '[.questions // [] | .[]] | length' "$plan_file" 2>/dev/null || echo 0)
+    questions_answered=$(jq -r '[.questions // [] | .[] | select(.answered == true)] | length' "$plan_file" 2>/dev/null || echo 0)
+
+    local decision_counts
+    decision_counts=$(jq -c '[.items[].decision] | reduce .[] as $d ({}; .[$d] = (.[$d] // 0) + 1)' "$plan_file" 2>/dev/null || echo "{}")
+
+    local duration_minutes
+    duration_minutes=$(awk -v s="$duration_seconds" 'BEGIN { if (s ~ /^[0-9]+$/) { printf "%.1f", s/60 } else { printf "%.1f", 0 } }')
+
+    local metrics_file updated
+    metrics_file=$(get_metrics_file)
+
+    updated=$(jq \
+        --argjson issues_processed "$issues_processed" \
+        --argjson issues_resolved "$issues_resolved" \
+        --argjson questions_total "$questions_total" \
+        --argjson questions_answered "$questions_answered" \
+        --argjson duration_minutes "$duration_minutes" \
+        --argjson decisions "$decision_counts" \
+        '
+        .reviews.total += 1
+        | .reviews.repos_reviewed += 1
+        | .reviews.issues_processed += $issues_processed
+        | .reviews.issues_resolved += $issues_resolved
+        | .reviews.questions_asked += $questions_total
+        | .reviews.questions_answered += $questions_answered
+        | .timing.total_duration_minutes += $duration_minutes
+        | .timing.avg_per_repo_minutes = (if .reviews.repos_reviewed > 0 then (.timing.total_duration_minutes / .reviews.repos_reviewed) else 0 end)
+        | .decisions.by_type = (reduce ($decisions | to_entries[]) as $e (.decisions.by_type;
+            .[$e.key] = (.[$e.key] // 0) + $e.value))
+        ' "$metrics_file" 2>/dev/null) || return 1
+
+    with_state_lock write_json_atomic "$metrics_file" "$updated"
+}
+
+suggest_decision() {
+    local repo_id="$1"
+    local item_type="$2"
+    local decisions_log
+    decisions_log=$(get_decisions_log_file)
+
+    if [[ ! -f "$decisions_log" ]] || ! command -v jq &>/dev/null; then
+        return 1
+    fi
+
+    jq -s --arg repo "$repo_id" --arg type "$item_type" '
+        map(select(.repo == $repo and .type == $type))
+        | group_by(.decision)
+        | map({decision: .[0].decision, count: length})
+        | sort_by(-.count)
+        | .[0].decision // empty
+    ' "$decisions_log" 2>/dev/null
+}
+
+cmd_review_analytics() {
+    local period
+    period=$(date -u +%Y-%m)
+    local metrics_file
+    metrics_file=$(get_metrics_file_for_period "$period")
+
+    if [[ ! -f "$metrics_file" ]]; then
+        log_warn "No metrics found for period $period"
+        return 0
+    fi
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        cat "$metrics_file"
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required for analytics"
+        return 3
+    fi
+
+    local total repos issues_processed issues_resolved q_asked q_answered total_minutes avg_minutes
+    total=$(jq -r '.reviews.total // 0' "$metrics_file")
+    repos=$(jq -r '.reviews.repos_reviewed // 0' "$metrics_file")
+    issues_processed=$(jq -r '.reviews.issues_processed // 0' "$metrics_file")
+    issues_resolved=$(jq -r '.reviews.issues_resolved // 0' "$metrics_file")
+    q_asked=$(jq -r '.reviews.questions_asked // 0' "$metrics_file")
+    q_answered=$(jq -r '.reviews.questions_answered // 0' "$metrics_file")
+    total_minutes=$(jq -r '.timing.total_duration_minutes // 0' "$metrics_file")
+    avg_minutes=$(jq -r '.timing.avg_per_repo_minutes // 0' "$metrics_file")
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --border rounded --padding "0 2" --border-foreground "#89b4fa" \
+            "$(gum style --bold "Review Analytics (${period})")" >&2
+        gum style "Total reviews: $total" >&2
+        gum style "Repos reviewed: $repos" >&2
+        gum style "Issues processed: $issues_processed (resolved: $issues_resolved)" >&2
+        gum style "Questions: $q_answered/$q_asked answered" >&2
+        gum style "Total minutes: $total_minutes (avg/repo: $avg_minutes)" >&2
+    else
+        printf '%b\n' "${BOLD}Review Analytics (${period})${RESET}" >&2
+        printf '%b\n' "Total reviews: $total" >&2
+        printf '%b\n' "Repos reviewed: $repos" >&2
+        printf '%b\n' "Issues processed: $issues_processed (resolved: $issues_resolved)" >&2
+        printf '%b\n' "Questions: $q_answered/$q_asked answered" >&2
+        printf '%b\n' "Total minutes: $total_minutes (avg/repo: $avg_minutes)" >&2
+    fi
+
+    local decisions_log
+    decisions_log=$(get_decisions_log_file)
+    if [[ -f "$decisions_log" ]]; then
+        local top_repos
+        top_repos=$(jq -s '
+            group_by(.repo)
+            | map({repo: .[0].repo, count: length})
+            | sort_by(-.count)
+            | .[0:5]
+        ' "$decisions_log" 2>/dev/null)
+
+        if [[ -n "$top_repos" && "$top_repos" != "null" ]]; then
+            printf '\n%b\n' "${BOLD}Top repos by activity:${RESET}" >&2
+            echo "$top_repos" | jq -r '.[] | "  \(.repo): \(.count)"' >&2
+        fi
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -8885,6 +9800,24 @@ cmd_review() {
     # Parse review-specific arguments
     parse_review_args
 
+    if [[ "$REVIEW_ANALYTICS" == "true" ]]; then
+        cmd_review_analytics
+        return $?
+    fi
+
+    if [[ "$REVIEW_BASIC_TUI" == "true" ]]; then
+        if [[ "$REVIEW_DRIVER" == "auto" ]]; then
+            REVIEW_DRIVER=$(detect_review_driver)
+        fi
+        if [[ "$REVIEW_DRIVER" == "none" ]]; then
+            log_error "No review driver available. Install tmux or ntm."
+            return 3
+        fi
+        load_review_driver "$REVIEW_DRIVER" || return 3
+        basic_mode_loop
+        return $?
+    fi
+
     # Check prerequisites
     if ! check_review_prerequisites; then
         exit 3
@@ -9566,6 +10499,11 @@ apply_review_plan_for_repo() {
         fi
     fi
 
+    local duration_seconds
+    duration_seconds=$(jq -r '.metadata.duration_seconds // 0' "$plan_file" 2>/dev/null || echo 0)
+    record_decisions_from_plan "$repo_id" "$plan_file" || true
+    record_metrics_from_plan "$repo_id" "$plan_file" "$duration_seconds" || true
+
     return 0
 }
 
@@ -9777,6 +10715,75 @@ get_review_plan_json_summary() {
         },
         metadata: (.metadata // null)
     }' "$plan_file"
+}
+
+#==============================================================================
+# SECTION 13.8: PROMPT GENERATION
+#==============================================================================
+
+# Generate the "digest" prompt (writes/updates .ru/repo-digest.md)
+generate_digest_prompt() {
+  cat <<'EOF'
+First read ALL of AGENTS.md and README.md carefully.
+
+If a prior digest exists at `.ru/repo-digest.md`, read it first, then update it based on changes since the last review:
+  - inspect `git log` since the last digest timestamp
+  - inspect changed files and any new architecture decisions
+
+If no digest exists, create a comprehensive digest covering:
+  - project purpose and architecture
+  - key files/modules and their roles
+  - conventions, quality gates, and how to run tests
+
+Write the updated digest to `.ru/repo-digest.md`.
+EOF
+}
+
+# Generate the "review work items" prompt (must write .ru/review-plan.json)
+# Args: repo_name worktree_path run_id work_items_json
+generate_review_prompt() {
+  local repo_name="$1"
+  local worktree_path="$2"
+  local run_id="$3"
+  local work_items_json="$4"
+
+  # NOTE: Avoid unquoted heredocs here so any backticks/$() inside $work_items_json
+  # cannot trigger command substitution during prompt generation.
+  printf '%s\n' \
+    "POLICY: We don't allow PRs or outside contributions. Feel free to submit issues and PRs to illustrate fixes, but they will not be merged directly. The agent reviews and independently decides whether and how to address submissions. Bug reports are welcome." \
+    "" \
+    'TASK: Review the following work items using `gh` READ operations only:'
+
+  printf '%s\n' "$work_items_json"
+
+  printf '%s\n' \
+    "" \
+    "For each item:" \
+    '1) Read the issue/PR independently via `gh issue view` or `gh pr view`.' \
+    "2) Verify claims independently; do not trust reports blindly." \
+    "3) Check dates against recent commits (issues/PRs may be stale)." \
+    "4) If actionable: create local commits with focused fixes." \
+    '5) If unclear: ask the maintainer using the `AskUserQuestion` tool.' \
+    "" \
+    "CRITICAL RESTRICTIONS (PLAN MODE):" \
+    '- DO NOT run any `gh` mutation commands (comment/close/label/merge/etc).' \
+    "- DO NOT push any changes." \
+    "- Prefer minimal, reviewable commits; avoid broad refactors unless justified." \
+    "" \
+    "REQUIRED OUTPUT (contract):" \
+    '- You MUST write `.ru/review-plan.json` as strictly valid JSON.' \
+    "- It MUST conform to schema v1." \
+    "- Set:" \
+    "  - schema_version: 1" \
+    "  - run_id: \"$run_id\"" \
+    "  - repo: \"$repo_name\"" \
+    "  - worktree_path: \"$worktree_path\"" \
+    "  - metadata.model: your model id" \
+    "  - metadata.driver: \"ntm\" or \"local\"" \
+    "" \
+    "If you ask any maintainer questions:" \
+    '- Use `AskUserQuestion` with 2–4 options (label+description), multiSelect=false.' \
+    '- Mirror those into `.ru/review-plan.json` under `questions[]` with answered=false until answered.'
 }
 
 #==============================================================================
