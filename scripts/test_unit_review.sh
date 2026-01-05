@@ -18,6 +18,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/test_framework.sh"
 
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_array"
 source_ru_function "parse_graphql_work_items"
 source_ru_function "calculate_item_priority_score"
 source_ru_function "get_priority_level"

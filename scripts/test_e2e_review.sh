@@ -150,8 +150,13 @@ create_mock_gh() {
     local auth_exit_code="$1"
     local graphql_json="$2"
 
+    # Use absolute path to bash for mock script - /usr/bin/env bash fails when
+    # PATH is restricted (as in test_review_dry_run_succeeds_without_tmux_or_ntm)
+    local bash_path
+    bash_path=$(type -P bash)
+
     cat > "$TEMP_DIR/mock_bin/gh" <<EOF
-#!/usr/bin/env bash
+#!${bash_path}
 set -uo pipefail
 
 cmd="\${1:-}"
@@ -240,14 +245,22 @@ _make_minimal_path_bin_without_drivers() {
 
     mkdir -p "$out_dir"
 
+    # Essential commands needed by ru script during initialization and operation
+    # dirname/basename/pwd: Script directory detection (line 124)
+    # rm: State file cleanup
+    # printf: Output formatting
+    # ln: Various symlink operations
     local -a cmds=(
-        awk cat cut date flock grep head jq mkdir mktemp sed sort tr uniq wc
+        awk basename cat cut date dirname flock grep head jq ln mkdir mktemp
+        printf pwd rm sed sort tr uniq wc
     )
 
     local cmd
     for cmd in "${cmds[@]}"; do
         local bin
-        bin=$(command -v "$cmd" 2>/dev/null || echo "")
+        # Use 'type -P' to get the actual binary path, ignoring aliases/functions
+        # 'command -v' can return alias strings like "alias cat=batcat"
+        bin=$(type -P "$cmd" 2>/dev/null || echo "")
         [[ -n "$bin" ]] || continue
         ln -s "$bin" "$out_dir/$cmd" 2>/dev/null || true
     done
