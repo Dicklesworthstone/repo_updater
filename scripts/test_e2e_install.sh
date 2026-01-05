@@ -216,7 +216,7 @@ test_installer_falls_back_to_main_when_no_releases() {
     exit_code=$?
 
     assert_exit_code 0 "$exit_code" "install.sh exits 0 with no releases"
-    assert_output_contains "$output" "No GitHub releases found" "installer reports missing releases"
+    assert_output_contains "$output" "No releases found" "installer reports missing releases"
     assert_file_executable "$install_dir/ru" "fallback installed ru is executable"
 
     cleanup_test_env
