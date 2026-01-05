@@ -1220,7 +1220,7 @@ source_ru_function() {
     source <(sed -n "/^${func_name}()/,/^}/p" "$project_dir/ru")
 }
 
-# Create a mock git repository
+# Create a mock git repository (basic - just init)
 # Usage: local repo_dir=$(create_mock_repo "name")
 create_mock_repo() {
     local name="${1:-test-repo}"
@@ -1249,6 +1249,269 @@ create_bare_repo() {
     git -C "$repo_dir" symbolic-ref HEAD refs/heads/main
 
     echo "$repo_dir"
+}
+
+#==============================================================================
+# Enhanced Test Isolation (Real Filesystem Operations)
+#==============================================================================
+# These functions create real git repos, worktrees, and fixtures for testing
+# without mocks. Supports test-namespaced directories and failed artifact
+# preservation for post-mortem debugging.
+
+# Directory for preserving failed test artifacts
+TF_FAILED_ARTIFACTS_DIR="${TF_FAILED_ARTIFACTS_DIR:-/tmp/ru-test-failures}"
+TF_PRESERVE_FAILED="true"  # Set to false to disable artifact preservation
+
+# Create a real git repository with actual commits
+# Usage: local repo_dir=$(create_real_git_repo "name" [num_commits] [branch])
+# Creates a repo with the specified number of commits (default 3)
+# Returns the repo directory path
+create_real_git_repo() {
+    local name="${1:-test-repo}"
+    local num_commits="${2:-3}"
+    local branch="${3:-main}"
+    local temp_dir repo_dir
+
+    # Use test-namespaced directory if available
+    if [[ -n "$TF_CURRENT_TEST" ]]; then
+        temp_dir=$(create_namespaced_temp_dir "$TF_CURRENT_TEST")
+    else
+        temp_dir=$(create_temp_dir)
+    fi
+    repo_dir="$temp_dir/$name"
+
+    mkdir -p "$repo_dir"
+    git -C "$repo_dir" init -b "$branch" >/dev/null 2>&1
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test User"
+
+    # Create real commits
+    local i
+    for ((i=1; i<=num_commits; i++)); do
+        echo "Content for commit $i" > "$repo_dir/file_$i.txt"
+        git -C "$repo_dir" add "file_$i.txt" >/dev/null 2>&1
+        git -C "$repo_dir" commit -m "Commit $i: Add file_$i.txt" >/dev/null 2>&1
+    done
+
+    echo "$repo_dir"
+}
+
+# Create a real git repository with a remote (upstream)
+# Usage: local repo_info=$(create_real_git_repo_with_remote "name" [num_commits])
+# Returns: "repo_dir|remote_dir" (pipe-separated)
+create_real_git_repo_with_remote() {
+    local name="${1:-test-repo}"
+    local num_commits="${2:-3}"
+    local temp_dir repo_dir remote_dir
+
+    if [[ -n "$TF_CURRENT_TEST" ]]; then
+        temp_dir=$(create_namespaced_temp_dir "$TF_CURRENT_TEST")
+    else
+        temp_dir=$(create_temp_dir)
+    fi
+
+    # Create bare remote first
+    remote_dir="$temp_dir/${name}-remote.git"
+    mkdir -p "$remote_dir"
+    git init --bare "$remote_dir" >/dev/null 2>&1
+    git -C "$remote_dir" symbolic-ref HEAD refs/heads/main
+
+    # Create local repo
+    repo_dir="$temp_dir/$name"
+    mkdir -p "$repo_dir"
+    git -C "$repo_dir" init -b main >/dev/null 2>&1
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test User"
+
+    # Create commits
+    local i
+    for ((i=1; i<=num_commits; i++)); do
+        echo "Content for commit $i" > "$repo_dir/file_$i.txt"
+        git -C "$repo_dir" add "file_$i.txt" >/dev/null 2>&1
+        git -C "$repo_dir" commit -m "Commit $i" >/dev/null 2>&1
+    done
+
+    # Set up remote and push
+    git -C "$repo_dir" remote add origin "$remote_dir" >/dev/null 2>&1
+    git -C "$repo_dir" push -u origin main >/dev/null 2>&1
+
+    echo "$repo_dir|$remote_dir"
+}
+
+# Create a real git worktree from an existing repo
+# Usage: local worktree_dir=$(create_real_worktree "$repo_dir" "branch_name" ["worktree_name"])
+# Creates a new branch and worktree for it
+create_real_worktree() {
+    local repo_dir="$1"
+    local branch_name="$2"
+    local worktree_name="${3:-$branch_name}"
+    local worktree_dir
+
+    # Get parent directory of repo
+    local parent_dir
+    parent_dir=$(dirname "$repo_dir")
+    worktree_dir="$parent_dir/worktree-$worktree_name"
+
+    # Create branch and worktree
+    git -C "$repo_dir" branch "$branch_name" >/dev/null 2>&1
+    git -C "$repo_dir" worktree add "$worktree_dir" "$branch_name" >/dev/null 2>&1
+
+    echo "$worktree_dir"
+}
+
+# Create GitHub API test fixtures for offline testing
+# Usage: create_github_test_fixture "$fixture_dir" "type" [options]
+# Types: repo_info, releases, graphql_repos
+# Writes JSON fixtures to the specified directory
+create_github_test_fixture() {
+    local fixture_dir="$1"
+    local fixture_type="$2"
+    shift 2
+
+    mkdir -p "$fixture_dir"
+
+    case "$fixture_type" in
+        repo_info)
+            local owner="${1:-testowner}"
+            local repo="${2:-testrepo}"
+            cat > "$fixture_dir/repo_${owner}_${repo}.json" << FIXTURE_EOF
+{
+  "id": 123456789,
+  "name": "$repo",
+  "full_name": "$owner/$repo",
+  "private": false,
+  "owner": {"login": "$owner", "id": 1234},
+  "html_url": "https://github.com/$owner/$repo",
+  "clone_url": "https://github.com/$owner/$repo.git",
+  "ssh_url": "git@github.com:$owner/$repo.git",
+  "default_branch": "main",
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-06-15T12:00:00Z"
+}
+FIXTURE_EOF
+            echo "$fixture_dir/repo_${owner}_${repo}.json"
+            ;;
+        releases)
+            local owner="${1:-testowner}"
+            local repo="${2:-testrepo}"
+            local version="${3:-1.0.0}"
+            cat > "$fixture_dir/releases_${owner}_${repo}.json" << FIXTURE_EOF
+[
+  {
+    "id": 987654321,
+    "tag_name": "v$version",
+    "name": "Release $version",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2024-06-01T00:00:00Z",
+    "published_at": "2024-06-01T00:00:00Z",
+    "assets": [
+      {
+        "name": "${repo}-${version}.tar.gz",
+        "browser_download_url": "https://github.com/$owner/$repo/releases/download/v$version/${repo}-${version}.tar.gz"
+      }
+    ]
+  }
+]
+FIXTURE_EOF
+            echo "$fixture_dir/releases_${owner}_${repo}.json"
+            ;;
+        graphql_repos)
+            # GraphQL batch response for multiple repos
+            local repos_json="${1:-[]}"
+            cat > "$fixture_dir/graphql_batch.json" << FIXTURE_EOF
+{
+  "data": {
+    "viewer": {
+      "repositories": {
+        "nodes": $repos_json,
+        "pageInfo": {"hasNextPage": false, "endCursor": null}
+      }
+    }
+  }
+}
+FIXTURE_EOF
+            echo "$fixture_dir/graphql_batch.json"
+            ;;
+        *)
+            log_error "Unknown fixture type: $fixture_type"
+            return 1
+            ;;
+    esac
+}
+
+# Create a namespaced temp directory using test name
+# Usage: local temp_dir=$(create_namespaced_temp_dir "test_name")
+# Creates: /tmp/ru-test-<test_name>-XXXXXX for easier debugging
+create_namespaced_temp_dir() {
+    local test_name="${1:-unknown}"
+    # Sanitize test name for filesystem (replace non-alphanum with -)
+    local safe_name
+    safe_name=$(echo "$test_name" | tr -c '[:alnum:]_-' '-')
+    local temp_dir
+    temp_dir=$(mktemp -d "/tmp/ru-test-${safe_name}-XXXXXX")
+    TF_TEMP_DIRS+=("$temp_dir")
+    echo "$temp_dir"
+}
+
+# Preserve test artifacts on failure for post-mortem debugging
+# Usage: preserve_failed_artifacts "$test_name" "$artifact_dir"
+# Copies artifacts to TF_FAILED_ARTIFACTS_DIR/<test_name>-<timestamp>/
+preserve_failed_artifacts() {
+    local test_name="$1"
+    local artifact_dir="$2"
+
+    if [[ "$TF_PRESERVE_FAILED" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ ! -d "$artifact_dir" ]]; then
+        log_warn "Artifact directory does not exist: $artifact_dir"
+        return 1
+    fi
+
+    local timestamp safe_name dest_dir
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    safe_name=$(echo "$test_name" | tr -c '[:alnum:]_-' '-')
+    dest_dir="$TF_FAILED_ARTIFACTS_DIR/${safe_name}_${timestamp}"
+
+    mkdir -p "$dest_dir"
+    cp -r "$artifact_dir"/* "$dest_dir/" 2>/dev/null || true
+
+    log_info "Preserved failed test artifacts to: $dest_dir"
+    echo "$dest_dir"
+}
+
+# Mark current test as failed and preserve its artifacts
+# Usage: mark_test_failed_with_artifacts "$artifact_dir"
+# Call this in test teardown when a test fails
+mark_test_failed_with_artifacts() {
+    local artifact_dir="${1:-$TF_TEST_ENV_ROOT}"
+
+    if [[ -n "$TF_CURRENT_TEST" && -n "$artifact_dir" ]]; then
+        preserve_failed_artifacts "$TF_CURRENT_TEST" "$artifact_dir"
+    fi
+}
+
+# List preserved failure artifacts
+# Usage: list_failed_artifacts
+list_failed_artifacts() {
+    if [[ -d "$TF_FAILED_ARTIFACTS_DIR" ]]; then
+        echo "Failed test artifacts in $TF_FAILED_ARTIFACTS_DIR:"
+        ls -la "$TF_FAILED_ARTIFACTS_DIR" 2>/dev/null || echo "  (none)"
+    else
+        echo "No failed artifacts directory found"
+    fi
+}
+
+# Clean old failure artifacts (older than N days)
+# Usage: cleanup_old_artifacts [days]
+cleanup_old_artifacts() {
+    local days="${1:-7}"
+    if [[ -d "$TF_FAILED_ARTIFACTS_DIR" ]]; then
+        find "$TF_FAILED_ARTIFACTS_DIR" -type d -mtime "+$days" -exec rm -rf {} + 2>/dev/null || true
+        log_info "Cleaned artifacts older than $days days"
+    fi
 }
 
 #==============================================================================
@@ -1282,3 +1545,8 @@ export -f _json_git_state _json_env_snapshot _json_stack_trace _json_log
 export -f log_suite_json log_suite_end_json
 export -f log_test_start_json log_test_result_json log_assertion_json
 export -f set_test_context clear_test_context log_event_json
+# Enhanced test isolation exports
+export -f create_real_git_repo create_real_git_repo_with_remote create_real_worktree
+export -f create_github_test_fixture create_namespaced_temp_dir
+export -f preserve_failed_artifacts mark_test_failed_with_artifacts
+export -f list_failed_artifacts cleanup_old_artifacts
