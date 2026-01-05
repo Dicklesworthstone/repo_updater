@@ -183,9 +183,19 @@ maybe_self_refresh_installer() {
         return 0
     fi
 
-    local src="${BASH_SOURCE[0]:-}"
+    local src="${BASH_SOURCE[0]-}"
+    if [[ -z "$src" ]]; then
+        # When bash executes a script from stdin (e.g. `curl ... | bash`), BASH_SOURCE[0]
+        # can be empty. In that case, only attempt self-refresh when stdin isn't a TTY
+        # (i.e. this looks piped/redirected).
+        if [[ -t 0 ]]; then
+            return 0
+        fi
+        src="/dev/stdin"
+    fi
+
     case "$src" in
-        /dev/fd/*|/proc/self/fd/*) ;;
+        /dev/fd/*|/proc/self/fd/*|/dev/stdin) ;;
         *) return 0 ;;
     esac
 

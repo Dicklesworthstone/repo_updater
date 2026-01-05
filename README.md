@@ -257,7 +257,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/mai
 
 **If you suspect CDN caching (stale installer):**
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s).$$" | bash
 ```
 
 <details>
