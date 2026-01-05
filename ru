@@ -5939,6 +5939,10 @@ adjust_parallelism() {
 
     # Reduce if GitHub rate limit is low
     local github_remaining="${GOVERNOR_STATE[github_remaining]}"
+    # Validate github_remaining is a non-negative integer; default to 5000 if not
+    if ! [[ "$github_remaining" =~ ^[0-9]+$ ]]; then
+        github_remaining=5000
+    fi
     if [[ "$github_remaining" -lt 500 ]]; then
         effective=1
         log_verbose "Parallelism reduced to 1 (GitHub remaining: $github_remaining)"
@@ -5957,6 +5961,9 @@ adjust_parallelism() {
     # Circuit breaker check
     local error_count="${GOVERNOR_STATE[error_count_window]}"
     local window_start="${GOVERNOR_STATE[window_start]}"
+    # Validate integers; default to safe values if corrupted
+    [[ "$error_count" =~ ^[0-9]+$ ]] || error_count=0
+    [[ "$window_start" =~ ^[0-9]+$ ]] || window_start=0
     if [[ "$error_count" -ge 5 ]] && [[ $((now - window_start)) -le 300 ]]; then
         GOVERNOR_STATE[circuit_breaker_open]="true"
         effective=0
@@ -5995,6 +6002,9 @@ can_start_new_session() {
 
     # Check effective parallelism
     local effective="${GOVERNOR_STATE[effective_parallelism]}"
+    # Validate integers; default to conservative values if corrupted
+    [[ "$active_sessions" =~ ^[0-9]+$ ]] || active_sessions=0
+    [[ "$effective" =~ ^[0-9]+$ ]] || effective=1
     if [[ "$active_sessions" -ge "$effective" ]]; then
         log_verbose "Cannot start session: at capacity ($active_sessions >= $effective)"
         return 1
