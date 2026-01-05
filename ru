@@ -627,7 +627,7 @@ log_verbose() {
 # Output JSON to stdout (only in --json mode)
 output_json() {
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo "$1"
+        printf '%s\n' "$1"
     fi
 }
 
@@ -1653,8 +1653,63 @@ get_all_repos() {
 
     # Deduplicate and output
     if [[ -n "$all_repos" ]]; then
-        echo -n "$all_repos" | dedupe_repos
+        printf '%s' "$all_repos" | dedupe_repos
     fi
+}
+
+# Attempt to detect latest release version without the GitHub API (avoids rate limits/proxies).
+# Returns:
+#   0 with version on stdout - success
+#   1 - no releases exist (redirect resolves to /releases)
+#   2 - request failed
+get_latest_release_from_redirect() {
+    local latest_url="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/latest"
+    local effective_url=""
+
+    if command -v curl &>/dev/null; then
+        if ! effective_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null); then
+            return 2
+        fi
+    elif command -v wget &>/dev/null; then
+        effective_url=$(
+            wget -qS --spider --max-redirect=0 "$latest_url" 2>&1 \
+                | awk '/^  Location: /{print $2}' \
+                | tail -1 \
+                | tr -d '\r'
+        )
+        if [[ -z "$effective_url" ]]; then
+            return 2
+        fi
+    else
+        return 2
+    fi
+
+    if [[ "$effective_url" != *"/tag/"* ]]; then
+        return 1
+    fi
+
+    local tag="${effective_url##*/tag/}"
+    tag="${tag%%\?*}"
+    printf '%s\n' "${tag#v}"
+}
+
+append_query_param() {
+    local url="$1"
+    local key="$2"
+    local value="$3"
+
+    local sep='?'
+    [[ "$url" == *\?* ]] && sep='&'
+    printf '%s%s%s=%s' "$url" "$sep" "$key" "$value"
+}
+
+cache_bust_url() {
+    local url="$1"
+    if [[ "${RU_CACHE_BUST:-1}" != "1" ]]; then
+        printf '%s' "$url"
+        return 0
+    fi
+    append_query_param "$url" "ru_cb" "${RU_CACHE_BUST_TOKEN:-$(date +%s)}"
 }
 
 #==============================================================================
@@ -2241,7 +2296,7 @@ run_parallel_sync() {
     printf '%s\n' "${repos[@]}" > "$work_queue"
 
     # Initialize progress counter
-    echo "0" > "$progress_file"
+    printf '0\n' > "$progress_file"
 
     # Launch workers
     local worker_pids=()
@@ -2269,7 +2324,10 @@ run_parallel_sync() {
                     "$UPDATE_STRATEGY" "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES")
 
                 # Append result atomically
-                echo "$result" >> "$results_file"
+                {
+                    flock -x 202
+                    printf '%s\n' "$result" >> "$results_file"
+                } 202>"$lock_file"
 
                 # Update progress atomically
                 {
@@ -2278,7 +2336,7 @@ run_parallel_sync() {
                     current=$(cat "$progress_file")
                     echo $((current + 1)) > "$progress_file"
                     # Print progress
-                    echo -ne "\r→ Progress: $((current + 1))/$total" >&2
+                    printf '\r→ Progress: %d/%d' "$((current + 1))" "$total" >&2
                 } 201>"${lock_file}.progress"
             done
         ) &
@@ -2290,7 +2348,7 @@ run_parallel_sync() {
         wait "$pid" 2>/dev/null || true
     done
 
-    echo "" >&2  # New line after progress
+    printf '\n' >&2  # New line after progress
 
     # Parse results
     local cloned=0 updated=0 skipped=0 failed=0 conflicts=0
@@ -4212,43 +4270,18 @@ cmd_self_update() {
     local current_version="$VERSION"
     log_verbose "Current version: $current_version"
 
-    # Fetch latest release version from GitHub API
-    local api_url="$RU_GITHUB_API/repos/$RU_REPO_OWNER/$RU_REPO_NAME/releases/latest"
-    local response
-    if command -v curl &>/dev/null; then
-        response=$(curl -sS "$api_url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            exit 3
-        }
-    elif command -v wget &>/dev/null; then
-        response=$(wget -qO- "$api_url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            exit 3
-        }
-    else
-        log_error "Neither curl nor wget found"
+    # Detect latest release without GitHub API (avoids rate limits / proxy interference)
+    local latest_version=""
+    if ! latest_version=$(get_latest_release_from_redirect); then
+        local rc=$?
+        if [[ "$rc" -eq 1 ]]; then
+            log_info "No releases found on GitHub"
+            log_info "You may be running a development version"
+            exit 0
+        fi
+        log_error "Failed to determine latest release version"
         exit 3
     fi
-
-    # Check for "Not Found" response (no releases exist)
-    if echo "$response" | grep -q '"message"[[:space:]]*:[[:space:]]*"Not Found"'; then
-        log_info "No releases found on GitHub"
-        log_info "You may be running a development version"
-        exit 0
-    fi
-
-    # Extract version from response (simple grep for portability)
-    local latest_version
-    latest_version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
-
-    if [[ -z "$latest_version" ]]; then
-        log_error "Could not parse version from GitHub API response"
-        log_verbose "Response: $response"
-        exit 3
-    fi
-
-    # Remove 'v' prefix if present
-    latest_version="${latest_version#v}"
     log_verbose "Latest version: $latest_version"
 
     # Compare versions
@@ -4283,8 +4316,9 @@ cmd_self_update() {
 
     # Download URLs
     local release_base="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/download/v$latest_version"
-    local script_url="$release_base/ru"
-    local checksum_url="$release_base/checksums.txt"
+    local script_url checksum_url
+    script_url=$(cache_bust_url "$release_base/ru")
+    checksum_url=$(cache_bust_url "$release_base/checksums.txt")
 
     # Download the new script
     log_step "Downloading v$latest_version..."
@@ -10160,7 +10194,7 @@ format_priority_badge() {
     local use_color="${2:-true}"
 
     if [[ "$use_color" != "true" ]]; then
-        echo "[$level]"
+        printf '%s\n' "[$level]"
         return
     fi
 
@@ -10173,11 +10207,11 @@ format_priority_badge() {
     local BOLD="\033[1m"
 
     case "$level" in
-        CRITICAL) echo -e "${BOLD}${RED}[CRITICAL]${RESET}" ;;
-        HIGH)     echo -e "${ORANGE}[HIGH]${RESET}" ;;
-        NORMAL)   echo -e "${YELLOW}[NORMAL]${RESET}" ;;
-        LOW)      echo -e "${GRAY}[LOW]${RESET}" ;;
-        *)        echo "[$level]" ;;
+        CRITICAL) printf '%b\n' "${BOLD}${RED}[CRITICAL]${RESET}" ;;
+        HIGH)     printf '%b\n' "${ORANGE}[HIGH]${RESET}" ;;
+        NORMAL)   printf '%b\n' "${YELLOW}[NORMAL]${RESET}" ;;
+        LOW)      printf '%b\n' "${GRAY}[LOW]${RESET}" ;;
+        *)        printf '%s\n' "[$level]" ;;
     esac
 }
 
@@ -10201,24 +10235,24 @@ show_discovery_summary_ansi() {
     local CYAN="\033[36m"
     local RESET="\033[0m"
 
-    echo "" >&2
-    echo -e "${BOLD}━━━ Discovery Summary ━━━${RESET}" >&2
-    echo "" >&2
-    echo -e "Total work items: ${BOLD}$total${RESET}" >&2
-    echo -e "  Issues: ${CYAN}$issues${RESET} | PRs: ${CYAN}$prs${RESET}" >&2
-    echo "" >&2
-    echo -e "${BOLD}By priority:${RESET}" >&2
-    [[ $critical -gt 0 ]] && echo -e "  ${RED}CRITICAL: $critical${RESET}" >&2
-    [[ $high -gt 0 ]] && echo -e "  ${ORANGE}HIGH: $high${RESET}" >&2
-    [[ $normal -gt 0 ]] && echo -e "  ${YELLOW}NORMAL: $normal${RESET}" >&2
-    [[ $low -gt 0 ]] && echo -e "  ${GRAY}LOW: $low${RESET}" >&2
-    echo "" >&2
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}━━━ Discovery Summary ━━━${RESET}" >&2
+    printf '\n' >&2
+    printf '%b\n' "Total work items: ${BOLD}$total${RESET}" >&2
+    printf '%b\n' "  Issues: ${CYAN}$issues${RESET} | PRs: ${CYAN}$prs${RESET}" >&2
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}By priority:${RESET}" >&2
+    [[ $critical -gt 0 ]] && printf '%b\n' "  ${RED}CRITICAL: $critical${RESET}" >&2
+    [[ $high -gt 0 ]] && printf '%b\n' "  ${ORANGE}HIGH: $high${RESET}" >&2
+    [[ $normal -gt 0 ]] && printf '%b\n' "  ${YELLOW}NORMAL: $normal${RESET}" >&2
+    [[ $low -gt 0 ]] && printf '%b\n' "  ${GRAY}LOW: $low${RESET}" >&2
+    printf '\n' >&2
 
     if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
         [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
-        echo -e "${BOLD}Top $display_count items to review:${RESET}" >&2
+        printf '%b\n' "${BOLD}Top $display_count items to review:${RESET}" >&2
         local i=0
         for item in "${items[@]:0:$display_count}"; do
             ((i++))
@@ -10235,9 +10269,9 @@ show_discovery_summary_ansi() {
             local short_title="${title:0:45}"
             [[ ${#title} -gt 45 ]] && short_title="${short_title}..."
 
-            echo -e "  $i. $badge ${CYAN}${repo_id}${RESET}#${number}: $short_title" >&2
+            printf '%b\n' "  $i. $badge ${CYAN}${repo_id}${RESET}#${number}: $short_title" >&2
         done
-        echo "" >&2
+        printf '\n' >&2
     fi
 }
 
