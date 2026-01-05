@@ -18,6 +18,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/test_framework.sh"
 
 # Source helper functions from ru
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_var"
 source_ru_function "is_git_repo"
 source_ru_function "ensure_dir"
 source_ru_function "get_worktrees_dir"
@@ -44,7 +46,8 @@ setup_worktree_test() {
     export RU_STATE_DIR="$TEST_DIR/state"
     export PROJECTS_DIR="$TEST_DIR/projects"
     export LAYOUT="flat"
-    export REVIEW_RUN_ID="test-run-$(date +%s)"
+    REVIEW_RUN_ID="test-run-$(date +%s)"
+    export REVIEW_RUN_ID
     mkdir -p "$RU_STATE_DIR" "$PROJECTS_DIR"
 }
 
@@ -160,7 +163,7 @@ test_get_worktree_path_not_found() {
     setup_worktree_test
 
     local wt_path=""
-    assert_fails 'get_worktree_path "nonexistent/repo" wt_path 2>/dev/null' "Nonexistent repo should return failure"
+    assert_fails "Nonexistent repo should return failure" get_worktree_path "nonexistent/repo" wt_path
 }
 
 #==============================================================================
@@ -216,7 +219,7 @@ test_list_review_worktrees_with_entries() {
 test_worktree_exists_not_found() {
     setup_worktree_test
 
-    assert_fails 'worktree_exists "nonexistent/repo" 2>/dev/null' "Nonexistent worktree should return false"
+    assert_fails "Nonexistent worktree should return false" worktree_exists "nonexistent/repo"
 }
 
 test_worktree_exists_recorded_but_no_dir() {
@@ -225,7 +228,7 @@ test_worktree_exists_recorded_but_no_dir() {
     # Record a mapping to a path that doesn't exist
     record_worktree_mapping "owner/repo" "/nonexistent/path" "branch" 2>/dev/null
 
-    assert_fails 'worktree_exists "owner/repo" 2>/dev/null' "Recorded but non-existent worktree should return false"
+    assert_fails "Recorded but non-existent worktree should return false" worktree_exists "owner/repo"
 }
 
 #==============================================================================

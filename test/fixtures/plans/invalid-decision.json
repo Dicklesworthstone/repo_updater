@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "repo": "octo/repo1",
+  "items": [
+    {"type": "issue", "number": 42, "decision": "maybe"}
+  ]
+}

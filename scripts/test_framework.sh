@@ -51,6 +51,7 @@ TF_TESTS_SKIPPED=0
 TF_ASSERTIONS_PASSED=0
 TF_ASSERTIONS_FAILED=0
 TF_CURRENT_TEST=""
+TF_TEST_WAS_SKIPPED="false"  # Flag for skip_test to communicate with run_test
 
 # Temp directory management
 TF_TEMP_DIRS=()
@@ -365,6 +366,313 @@ _tap_summary() {
 }
 
 #==============================================================================
+# JSON Logging (Machine-Readable Output)
+#==============================================================================
+# Structured JSON logging for automated test result aggregation.
+# Enable with TF_JSON_LOG_FILE or enable_json_output.
+# JSON lines format (one JSON object per line) for easy parsing with jq.
+
+# JSON log file path (set to enable JSON logging)
+TF_JSON_LOG_FILE="${TF_JSON_LOG_FILE:-}"
+
+# JSON mode toggle
+TF_JSON_MODE="${TF_JSON_MODE:-false}"
+
+# Current test context for JSON output
+TF_JSON_SUITE_NAME=""
+TF_JSON_TEST_CONTEXT="{}"
+
+# Enable JSON output mode
+# Usage: enable_json_output ["/path/to/log.jsonl"]
+enable_json_output() {
+    TF_JSON_MODE="true"
+    if [[ -n "${1:-}" ]]; then
+        TF_JSON_LOG_FILE="$1"
+        local log_dir
+        log_dir=$(dirname "$TF_JSON_LOG_FILE")
+        mkdir -p "$log_dir"
+    fi
+}
+
+# Disable JSON output mode
+disable_json_output() {
+    TF_JSON_MODE="false"
+}
+
+# Check if JSON mode is enabled
+is_json_mode() {
+    [[ "$TF_JSON_MODE" == "true" || -n "$TF_JSON_LOG_FILE" ]]
+}
+
+# Escape string for JSON (handles quotes, backslashes, newlines, tabs)
+# Usage: escaped=$(_json_escape "string with \"quotes\"")
+_json_escape() {
+    local s="$1"
+    # Escape backslashes first, then other special chars
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Get microsecond-precision timestamp (falls back to millisecond/second)
+_json_timestamp_us() {
+    local ts
+    ts=$(date +%s%N 2>/dev/null)
+    if [[ "$ts" =~ %N$ || -z "$ts" ]]; then
+        # Fall back to seconds with fake microseconds
+        ts=$(date +%s)000000
+    fi
+    echo "$ts"
+}
+
+# Calculate elapsed time in microseconds
+# Usage: elapsed=$(_json_elapsed_us "$start_time_us")
+_json_elapsed_us() {
+    local start="$1"
+    local now
+    now=$(_json_timestamp_us)
+    if [[ ${#start} -gt 12 && ${#now} -gt 12 ]]; then
+        # Nanoseconds - convert to microseconds
+        echo $(( (now - start) / 1000 ))
+    else
+        # Seconds - convert to microseconds
+        echo $(( (now - start) * 1000000 ))
+    fi
+}
+
+# Get current git state for environment snapshot
+_json_git_state() {
+    local git_info="{}"
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        local branch commit dirty
+        branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "detached")
+        branch=$(_json_escape "$branch")
+        commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        dirty="false"
+        if ! git diff --quiet 2>/dev/null; then
+            dirty="true"
+        fi
+        git_info="{\"branch\":\"$branch\",\"commit\":\"$commit\",\"dirty\":$dirty}"
+    fi
+    echo "$git_info"
+}
+
+# Get environment snapshot (selected env vars)
+_json_env_snapshot() {
+    local env_vars=""
+    local vars_to_capture=(
+        "RU_PROJECTS_DIR" "RU_CONFIG_DIR" "RU_LOG_DIR"
+        "XDG_CONFIG_HOME" "XDG_STATE_HOME" "XDG_CACHE_HOME"
+        "TF_LOG_LEVEL" "TF_TAP_MODE" "TF_JSON_MODE"
+    )
+    for var in "${vars_to_capture[@]}"; do
+        local val="${!var:-}"
+        if [[ -n "$val" ]]; then
+            val=$(_json_escape "$val")
+            if [[ -n "$env_vars" ]]; then
+                env_vars+=","
+            fi
+            env_vars+="\"$var\":\"$val\""
+        fi
+    done
+    echo "{$env_vars}"
+}
+
+# Get simple stack trace (function call chain)
+_json_stack_trace() {
+    local trace=""
+    local i
+    for ((i=2; i<${#FUNCNAME[@]}; i++)); do
+        local func="${FUNCNAME[$i]:-main}"
+        local line="${BASH_LINENO[$((i-1))]:-0}"
+        local src="${BASH_SOURCE[$i]:-unknown}"
+        src=$(basename "$src")
+        if [[ -n "$trace" ]]; then
+            trace+=","
+        fi
+        trace+="{\"function\":\"$func\",\"line\":$line,\"file\":\"$src\"}"
+    done
+    echo "[$trace]"
+}
+
+# Write a JSON log entry
+# Usage: _json_log "event_type" "key1" "val1" "key2" "val2" ...
+_json_log() {
+    if ! is_json_mode; then
+        return 0
+    fi
+
+    local event_type="$1"
+    shift
+
+    local timestamp
+    timestamp=$(_tf_timestamp)
+    local json="{\"timestamp\":\"$timestamp\",\"event\":\"$event_type\""
+
+    # Add test context if available
+    if [[ -n "$TF_CURRENT_TEST" ]]; then
+        json+=",\"test_name\":\"$TF_CURRENT_TEST\""
+    fi
+    if [[ -n "$TF_JSON_SUITE_NAME" ]]; then
+        json+=",\"suite_name\":\"$TF_JSON_SUITE_NAME\""
+    fi
+    # Add custom test context if set (not empty object)
+    if [[ -n "$TF_JSON_TEST_CONTEXT" && "$TF_JSON_TEST_CONTEXT" != "{}" ]]; then
+        json+=",\"context\":$TF_JSON_TEST_CONTEXT"
+    fi
+
+    # Add key-value pairs
+    while [[ $# -ge 2 ]]; do
+        local key="$1"
+        local val="$2"
+        shift 2
+
+        # Detect type: number, boolean, or string
+        if [[ "$val" =~ ^-?[0-9]+$ ]]; then
+            json+=",\"$key\":$val"
+        elif [[ "$val" == "true" || "$val" == "false" ]]; then
+            json+=",\"$key\":$val"
+        elif [[ "$val" == "null" ]]; then
+            json+=",\"$key\":null"
+        elif [[ "$val" =~ ^\{.*\}$ || "$val" =~ ^\[.*\]$ ]]; then
+            # Raw JSON object/array
+            json+=",\"$key\":$val"
+        else
+            val=$(_json_escape "$val")
+            json+=",\"$key\":\"$val\""
+        fi
+    done
+
+    json+="}"
+
+    # Write to JSON log file
+    if [[ -n "$TF_JSON_LOG_FILE" ]]; then
+        echo "$json" >> "$TF_JSON_LOG_FILE"
+    fi
+
+    # Also write to stdout if JSON mode is primary output
+    if [[ "$TF_JSON_MODE" == "true" ]]; then
+        echo "$json"
+    fi
+}
+
+# Log test suite start (JSON)
+# Usage: log_suite_json "Suite Name"
+log_suite_json() {
+    local suite_name="$1"
+    TF_JSON_SUITE_NAME="$suite_name"
+    local git_state env_snapshot
+    git_state=$(_json_git_state)
+    env_snapshot=$(_json_env_snapshot)
+    # Note: suite_name is also added by _json_log when TF_JSON_SUITE_NAME is set
+    _json_log "suite_start" \
+        "git" "$git_state" \
+        "environment" "$env_snapshot"
+}
+
+# Log test suite end (JSON)
+# Usage: log_suite_end_json
+log_suite_end_json() {
+    _json_log "suite_end" \
+        "tests_passed" "$TF_TESTS_PASSED" \
+        "tests_failed" "$TF_TESTS_FAILED" \
+        "tests_skipped" "$TF_TESTS_SKIPPED" \
+        "assertions_passed" "$TF_ASSERTIONS_PASSED" \
+        "assertions_failed" "$TF_ASSERTIONS_FAILED"
+    TF_JSON_SUITE_NAME=""
+}
+
+# Log test start (JSON)
+# Usage: log_test_start_json
+# Note: test_name is automatically included via TF_CURRENT_TEST in _json_log
+log_test_start_json() {
+    _json_log "test_start" \
+        "phase" "execute"
+}
+
+# Log test result (JSON)
+# Usage: log_test_result_json "pass|fail|skip" duration_ms ["reason"]
+log_test_result_json() {
+    local result="$1"
+    local duration_ms="$2"
+    local reason="${3:-}"
+
+    local extra_args=()
+    if [[ -n "$reason" ]]; then
+        extra_args+=("reason" "$reason")
+    fi
+    if [[ "$result" == "fail" ]]; then
+        extra_args+=("stack_trace" "$(_json_stack_trace)")
+    fi
+
+    _json_log "test_result" \
+        "result" "$result" \
+        "duration_ms" "$duration_ms" \
+        "${extra_args[@]}"
+}
+
+# Log assertion result (JSON)
+# Usage: log_assertion_json "pass|fail" "message" ["expected"] ["actual"]
+log_assertion_json() {
+    local result="$1"
+    local msg="$2"
+    local expected="${3:-}"
+    local actual="${4:-}"
+
+    local extra_args=("message" "$msg")
+    if [[ -n "$expected" ]]; then
+        extra_args+=("expected" "$expected")
+    fi
+    if [[ -n "$actual" ]]; then
+        extra_args+=("actual" "$actual")
+    fi
+    if [[ "$result" == "fail" ]]; then
+        extra_args+=("stack_trace" "$(_json_stack_trace)")
+    fi
+
+    _json_log "assertion" \
+        "result" "$result" \
+        "${extra_args[@]}"
+}
+
+# Set custom test context (arbitrary key-value pairs for current test)
+# Usage: set_test_context "key1" "val1" "key2" "val2"
+set_test_context() {
+    local ctx="{"
+    local first=true
+    while [[ $# -ge 2 ]]; do
+        local key="$1"
+        local val="$2"
+        shift 2
+        val=$(_json_escape "$val")
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            ctx+=","
+        fi
+        ctx+="\"$key\":\"$val\""
+    done
+    ctx+="}"
+    TF_JSON_TEST_CONTEXT="$ctx"
+}
+
+# Clear test context
+clear_test_context() {
+    TF_JSON_TEST_CONTEXT="{}"
+}
+
+# Log a custom event with context
+# Usage: log_event_json "event_name" "key1" "val1" ...
+log_event_json() {
+    local event_name="$1"
+    shift
+    _json_log "$event_name" "$@"
+}
+
+#==============================================================================
 # Core Assertion Functions
 #==============================================================================
 
@@ -374,6 +682,8 @@ _tf_pass() {
     local msg="$1"
     ((TF_ASSERTIONS_PASSED++))
     echo "${TF_GREEN}PASS${TF_RESET}: $msg"
+    # JSON logging
+    log_assertion_json "pass" "$msg"
 }
 
 # Convenience alias for _tf_pass (used in simple if/else test patterns)
@@ -402,6 +712,8 @@ _tf_fail() {
     if [[ -n "$actual" ]]; then
         echo "       Actual:   ${TF_YELLOW}$actual${TF_RESET}"
     fi
+    # JSON logging
+    log_assertion_json "fail" "$msg" "$expected" "$actual"
 }
 
 # Assert two values are equal
@@ -778,8 +1090,11 @@ reset_test_env() {
 run_test() {
     local test_name="$1"
     local failed_before=$TF_ASSERTIONS_FAILED
+    local test_start_us elapsed_us elapsed_ms
 
     TF_CURRENT_TEST="$test_name"
+    TF_TEST_WAS_SKIPPED="false"  # Reset skip flag
+    test_start_us=$(_json_timestamp_us)
 
     if ! is_tap_mode; then
         echo ""
@@ -787,33 +1102,54 @@ run_test() {
         echo "----------------------------------------"
     fi
 
+    # JSON: log test start (test_name comes from TF_CURRENT_TEST)
+    log_test_start_json
+
     # Run the test
     if "$test_name"; then
-        if [[ $TF_ASSERTIONS_FAILED -eq $failed_before ]]; then
+        # Check if test was skipped (skip_test was called)
+        if [[ "$TF_TEST_WAS_SKIPPED" == "true" ]]; then
+            # Skip already handled by skip_test - don't double-count
+            :
+        elif [[ $TF_ASSERTIONS_FAILED -eq $failed_before ]]; then
+            elapsed_us=$(_json_elapsed_us "$test_start_us")
+            elapsed_ms=$((elapsed_us / 1000))
             ((TF_TESTS_PASSED++))
             if is_tap_mode; then
                 _tap_ok "$test_name"
             else
                 echo "${TF_GREEN}TEST PASSED${TF_RESET}: $test_name"
             fi
+            # JSON: log test pass
+            log_test_result_json "pass" "$elapsed_ms"
         else
+            elapsed_us=$(_json_elapsed_us "$test_start_us")
+            elapsed_ms=$((elapsed_us / 1000))
             ((TF_TESTS_FAILED++))
             if is_tap_mode; then
                 _tap_not_ok "$test_name" "assertions failed"
             else
                 echo "${TF_RED}TEST FAILED${TF_RESET}: $test_name"
             fi
+            # JSON: log test fail
+            log_test_result_json "fail" "$elapsed_ms" "assertions failed"
         fi
     else
+        elapsed_us=$(_json_elapsed_us "$test_start_us")
+        elapsed_ms=$((elapsed_us / 1000))
         ((TF_TESTS_FAILED++))
         if is_tap_mode; then
             _tap_not_ok "$test_name" "non-zero exit"
         else
             echo "${TF_RED}TEST FAILED${TF_RESET}: $test_name (non-zero exit)"
         fi
+        # JSON: log test fail
+        log_test_result_json "fail" "$elapsed_ms" "non-zero exit"
     fi
 
     TF_CURRENT_TEST=""
+    TF_TEST_WAS_SKIPPED="false"
+    clear_test_context
 }
 
 # Skip a test
@@ -821,11 +1157,14 @@ run_test() {
 skip_test() {
     local reason="${1:-}"
     ((TF_TESTS_SKIPPED++))
+    TF_TEST_WAS_SKIPPED="true"  # Signal to run_test that test was skipped
     if is_tap_mode; then
         _tap_skip "$TF_CURRENT_TEST" "$reason"
     else
         echo "${TF_YELLOW}SKIP${TF_RESET}: $TF_CURRENT_TEST${reason:+ ($reason)}"
     fi
+    # JSON: log test skip
+    log_test_result_json "skip" "0" "$reason"
     return 0
 }
 
@@ -859,6 +1198,171 @@ get_exit_code() {
 }
 
 #==============================================================================
+# Parallel Test Execution
+#==============================================================================
+# Run multiple tests in parallel with proper isolation.
+# Uses namespaced temp directories and aggregates results.
+
+# Run tests in parallel
+# Usage: run_parallel_tests [--jobs N] test_func1 test_func2 ...
+# Returns aggregated results in TF_TESTS_PASSED/FAILED/SKIPPED
+run_parallel_tests() {
+    local max_jobs=""
+    local tests=()
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --jobs|-j)
+                max_jobs="$2"
+                shift 2
+                ;;
+            -j[0-9]*)
+                max_jobs="${1#-j}"
+                shift
+                ;;
+            *)
+                tests+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#tests[@]} -eq 0 ]]; then
+        log_warn "run_parallel_tests: No tests provided"
+        return 0
+    fi
+
+    # Default to 4 jobs or nproc
+    max_jobs="${max_jobs:-$(nproc 2>/dev/null || echo 4)}"
+
+    local tmpdir
+    tmpdir=$(mktemp -d "/tmp/tf-parallel-XXXXXX")
+    TF_TEMP_DIRS+=("$tmpdir")
+
+    local pids=()
+    local running_jobs=0
+    local test_num=0
+
+    log_info "Running ${#tests[@]} tests in parallel (max $max_jobs jobs)..."
+
+    # Cleanup trap for interrupt handling
+    # shellcheck disable=SC2317  # Function is invoked via trap
+    _tf_parallel_cleanup() {
+        log_warn "Parallel execution interrupted - cleaning up..."
+        for pid in "${pids[@]}"; do
+            kill "$pid" 2>/dev/null || true
+        done
+        rm -rf "$tmpdir"
+    }
+    trap _tf_parallel_cleanup INT TERM
+
+    # Launch tests with throttling
+    for test_name in "${tests[@]}"; do
+        ((test_num++))
+        local result_file="$tmpdir/result_$test_num"
+        local test_tmpdir="$tmpdir/test_$test_num"
+
+        # Wait if we've hit the job limit
+        # Note: wait -n requires Bash 4.3+; use polling fallback for 4.0-4.2
+        while [[ $running_jobs -ge $max_jobs ]]; do
+            if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+                wait -n 2>/dev/null || true
+            else
+                # Fallback: brief sleep then recount (less efficient but compatible)
+                sleep 0.1
+            fi
+            running_jobs=$(jobs -r | wc -l)
+        done
+
+        # Run test in subshell with isolated env
+        # shellcheck disable=SC2030  # Variable modifications intentionally local to subshell
+        (
+            # Set up isolated temp directory for this test
+            TF_TEMP_DIRS=()
+            TF_CURRENT_TEST="$test_name"
+            mkdir -p "$test_tmpdir"
+            cd "$test_tmpdir" || exit 1
+
+            # Reset counters for this test
+            local passed_before=$TF_ASSERTIONS_PASSED
+            local failed_before=$TF_ASSERTIONS_FAILED
+            local test_result="pass"
+            local exit_code=0
+
+            # Run the test function
+            if ! "$test_name"; then
+                test_result="fail"
+                exit_code=1
+            elif [[ $TF_ASSERTIONS_FAILED -gt $failed_before ]]; then
+                test_result="fail"
+                exit_code=1
+            fi
+
+            # Write result to file
+            printf '%s|%d|%d|%d|%d\n' \
+                "$test_result" \
+                "$exit_code" \
+                "$((TF_ASSERTIONS_PASSED - passed_before))" \
+                "$((TF_ASSERTIONS_FAILED - failed_before))" \
+                0 > "$result_file"
+
+            exit "$exit_code"
+        ) &
+        pids+=($!)
+        ((running_jobs++))
+    done
+
+    # Wait for all jobs
+    local any_failed=0
+    for pid in "${pids[@]}"; do
+        if ! wait "$pid" 2>/dev/null; then
+            any_failed=1
+        fi
+    done
+
+    # Reset trap to default
+    trap - INT TERM
+
+    # Aggregate results
+    local total_passed=0 total_failed=0 total_assertions_passed=0 total_assertions_failed=0
+    test_num=0
+    for test_name in "${tests[@]}"; do
+        ((test_num++))
+        local result_file="$tmpdir/result_$test_num"
+        if [[ -f "$result_file" ]]; then
+            local result exit_code assertions_passed assertions_failed skipped
+            IFS='|' read -r result exit_code assertions_passed assertions_failed skipped < "$result_file"
+            if [[ "$result" == "pass" ]]; then
+                ((total_passed++))
+                echo "${TF_GREEN}PASS${TF_RESET}: $test_name (parallel)"
+            else
+                ((total_failed++))
+                echo "${TF_RED}FAIL${TF_RESET}: $test_name (parallel)"
+            fi
+            ((total_assertions_passed += assertions_passed))
+            ((total_assertions_failed += assertions_failed))
+        else
+            ((total_failed++))
+            echo "${TF_RED}FAIL${TF_RESET}: $test_name (no result file)"
+        fi
+    done
+
+    # Update global counters
+    ((TF_TESTS_PASSED += total_passed))
+    ((TF_TESTS_FAILED += total_failed))
+    ((TF_ASSERTIONS_PASSED += total_assertions_passed))
+    ((TF_ASSERTIONS_FAILED += total_assertions_failed))
+
+    log_info "Parallel execution complete: $total_passed passed, $total_failed failed"
+
+    # Cleanup temp dir
+    rm -rf "$tmpdir"
+
+    return $any_failed
+}
+
+#==============================================================================
 # Utility Functions for ru Tests
 #==============================================================================
 
@@ -871,17 +1375,21 @@ get_project_dir() {
 
 # Source a function from ru script by name
 # Usage: source_ru_function "function_name"
+# Note: Uses eval instead of source <(...) because process substitution
+# breaks nameref bindings in Bash (namerefs don't work correctly when
+# functions are sourced from a subshell).
 source_ru_function() {
     local func_name="$1"
     local project_dir
     project_dir=$(get_project_dir)
 
-    # Extract and source the function
-    # shellcheck disable=SC1090
-    source <(sed -n "/^${func_name}()/,/^}/p" "$project_dir/ru")
+    # Extract and eval the function (eval preserves nameref bindings)
+    local func_body
+    func_body=$(sed -n "/^${func_name}()/,/^}/p" "$project_dir/ru")
+    eval "$func_body"
 }
 
-# Create a mock git repository
+# Create a mock git repository (basic - just init)
 # Usage: local repo_dir=$(create_mock_repo "name")
 create_mock_repo() {
     local name="${1:-test-repo}"
@@ -913,6 +1421,269 @@ create_bare_repo() {
 }
 
 #==============================================================================
+# Enhanced Test Isolation (Real Filesystem Operations)
+#==============================================================================
+# These functions create real git repos, worktrees, and fixtures for testing
+# without mocks. Supports test-namespaced directories and failed artifact
+# preservation for post-mortem debugging.
+
+# Directory for preserving failed test artifacts
+TF_FAILED_ARTIFACTS_DIR="${TF_FAILED_ARTIFACTS_DIR:-/tmp/ru-test-failures}"
+TF_PRESERVE_FAILED="true"  # Set to false to disable artifact preservation
+
+# Create a real git repository with actual commits
+# Usage: local repo_dir=$(create_real_git_repo "name" [num_commits] [branch])
+# Creates a repo with the specified number of commits (default 3)
+# Returns the repo directory path
+create_real_git_repo() {
+    local name="${1:-test-repo}"
+    local num_commits="${2:-3}"
+    local branch="${3:-main}"
+    local temp_dir repo_dir
+
+    # Use test-namespaced directory if available
+    if [[ -n "$TF_CURRENT_TEST" ]]; then
+        temp_dir=$(create_namespaced_temp_dir "$TF_CURRENT_TEST")
+    else
+        temp_dir=$(create_temp_dir)
+    fi
+    repo_dir="$temp_dir/$name"
+
+    mkdir -p "$repo_dir"
+    git -C "$repo_dir" init -b "$branch" >/dev/null 2>&1
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test User"
+
+    # Create real commits
+    local i
+    for ((i=1; i<=num_commits; i++)); do
+        echo "Content for commit $i" > "$repo_dir/file_$i.txt"
+        git -C "$repo_dir" add "file_$i.txt" >/dev/null 2>&1
+        git -C "$repo_dir" commit -m "Commit $i: Add file_$i.txt" >/dev/null 2>&1
+    done
+
+    echo "$repo_dir"
+}
+
+# Create a real git repository with a remote (upstream)
+# Usage: local repo_info=$(create_real_git_repo_with_remote "name" [num_commits])
+# Returns: "repo_dir|remote_dir" (pipe-separated)
+create_real_git_repo_with_remote() {
+    local name="${1:-test-repo}"
+    local num_commits="${2:-3}"
+    local temp_dir repo_dir remote_dir
+
+    if [[ -n "$TF_CURRENT_TEST" ]]; then
+        temp_dir=$(create_namespaced_temp_dir "$TF_CURRENT_TEST")
+    else
+        temp_dir=$(create_temp_dir)
+    fi
+
+    # Create bare remote first
+    remote_dir="$temp_dir/${name}-remote.git"
+    mkdir -p "$remote_dir"
+    git init --bare "$remote_dir" >/dev/null 2>&1
+    git -C "$remote_dir" symbolic-ref HEAD refs/heads/main
+
+    # Create local repo
+    repo_dir="$temp_dir/$name"
+    mkdir -p "$repo_dir"
+    git -C "$repo_dir" init -b main >/dev/null 2>&1
+    git -C "$repo_dir" config user.email "test@test.com"
+    git -C "$repo_dir" config user.name "Test User"
+
+    # Create commits
+    local i
+    for ((i=1; i<=num_commits; i++)); do
+        echo "Content for commit $i" > "$repo_dir/file_$i.txt"
+        git -C "$repo_dir" add "file_$i.txt" >/dev/null 2>&1
+        git -C "$repo_dir" commit -m "Commit $i" >/dev/null 2>&1
+    done
+
+    # Set up remote and push
+    git -C "$repo_dir" remote add origin "$remote_dir" >/dev/null 2>&1
+    git -C "$repo_dir" push -u origin main >/dev/null 2>&1
+
+    echo "$repo_dir|$remote_dir"
+}
+
+# Create a real git worktree from an existing repo
+# Usage: local worktree_dir=$(create_real_worktree "$repo_dir" "branch_name" ["worktree_name"])
+# Creates a new branch and worktree for it
+create_real_worktree() {
+    local repo_dir="$1"
+    local branch_name="$2"
+    local worktree_name="${3:-$branch_name}"
+    local worktree_dir
+
+    # Get parent directory of repo
+    local parent_dir
+    parent_dir=$(dirname "$repo_dir")
+    worktree_dir="$parent_dir/worktree-$worktree_name"
+
+    # Create branch and worktree
+    git -C "$repo_dir" branch "$branch_name" >/dev/null 2>&1
+    git -C "$repo_dir" worktree add "$worktree_dir" "$branch_name" >/dev/null 2>&1
+
+    echo "$worktree_dir"
+}
+
+# Create GitHub API test fixtures for offline testing
+# Usage: create_github_test_fixture "$fixture_dir" "type" [options]
+# Types: repo_info, releases, graphql_repos
+# Writes JSON fixtures to the specified directory
+create_github_test_fixture() {
+    local fixture_dir="$1"
+    local fixture_type="$2"
+    shift 2
+
+    mkdir -p "$fixture_dir"
+
+    case "$fixture_type" in
+        repo_info)
+            local owner="${1:-testowner}"
+            local repo="${2:-testrepo}"
+            cat > "$fixture_dir/repo_${owner}_${repo}.json" << FIXTURE_EOF
+{
+  "id": 123456789,
+  "name": "$repo",
+  "full_name": "$owner/$repo",
+  "private": false,
+  "owner": {"login": "$owner", "id": 1234},
+  "html_url": "https://github.com/$owner/$repo",
+  "clone_url": "https://github.com/$owner/$repo.git",
+  "ssh_url": "git@github.com:$owner/$repo.git",
+  "default_branch": "main",
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-06-15T12:00:00Z"
+}
+FIXTURE_EOF
+            echo "$fixture_dir/repo_${owner}_${repo}.json"
+            ;;
+        releases)
+            local owner="${1:-testowner}"
+            local repo="${2:-testrepo}"
+            local version="${3:-1.0.0}"
+            cat > "$fixture_dir/releases_${owner}_${repo}.json" << FIXTURE_EOF
+[
+  {
+    "id": 987654321,
+    "tag_name": "v$version",
+    "name": "Release $version",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2024-06-01T00:00:00Z",
+    "published_at": "2024-06-01T00:00:00Z",
+    "assets": [
+      {
+        "name": "${repo}-${version}.tar.gz",
+        "browser_download_url": "https://github.com/$owner/$repo/releases/download/v$version/${repo}-${version}.tar.gz"
+      }
+    ]
+  }
+]
+FIXTURE_EOF
+            echo "$fixture_dir/releases_${owner}_${repo}.json"
+            ;;
+        graphql_repos)
+            # GraphQL batch response for multiple repos
+            local repos_json="${1:-[]}"
+            cat > "$fixture_dir/graphql_batch.json" << FIXTURE_EOF
+{
+  "data": {
+    "viewer": {
+      "repositories": {
+        "nodes": $repos_json,
+        "pageInfo": {"hasNextPage": false, "endCursor": null}
+      }
+    }
+  }
+}
+FIXTURE_EOF
+            echo "$fixture_dir/graphql_batch.json"
+            ;;
+        *)
+            log_error "Unknown fixture type: $fixture_type"
+            return 1
+            ;;
+    esac
+}
+
+# Create a namespaced temp directory using test name
+# Usage: local temp_dir=$(create_namespaced_temp_dir "test_name")
+# Creates: /tmp/ru-test-<test_name>-XXXXXX for easier debugging
+create_namespaced_temp_dir() {
+    local test_name="${1:-unknown}"
+    # Sanitize test name for filesystem (replace non-alphanum with -)
+    local safe_name
+    safe_name=$(echo "$test_name" | tr -c '[:alnum:]_-' '-')
+    local temp_dir
+    temp_dir=$(mktemp -d "/tmp/ru-test-${safe_name}-XXXXXX")
+    TF_TEMP_DIRS+=("$temp_dir")
+    echo "$temp_dir"
+}
+
+# Preserve test artifacts on failure for post-mortem debugging
+# Usage: preserve_failed_artifacts "$test_name" "$artifact_dir"
+# Copies artifacts to TF_FAILED_ARTIFACTS_DIR/<test_name>-<timestamp>/
+preserve_failed_artifacts() {
+    local test_name="$1"
+    local artifact_dir="$2"
+
+    if [[ "$TF_PRESERVE_FAILED" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ ! -d "$artifact_dir" ]]; then
+        log_warn "Artifact directory does not exist: $artifact_dir"
+        return 1
+    fi
+
+    local timestamp safe_name dest_dir
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    safe_name=$(echo "$test_name" | tr -c '[:alnum:]_-' '-')
+    dest_dir="$TF_FAILED_ARTIFACTS_DIR/${safe_name}_${timestamp}"
+
+    mkdir -p "$dest_dir"
+    cp -r "$artifact_dir"/* "$dest_dir/" 2>/dev/null || true
+
+    log_info "Preserved failed test artifacts to: $dest_dir"
+    echo "$dest_dir"
+}
+
+# Mark current test as failed and preserve its artifacts
+# Usage: mark_test_failed_with_artifacts "$artifact_dir"
+# Call this in test teardown when a test fails
+mark_test_failed_with_artifacts() {
+    local artifact_dir="${1:-$TF_TEST_ENV_ROOT}"
+
+    if [[ -n "$TF_CURRENT_TEST" && -n "$artifact_dir" ]]; then
+        preserve_failed_artifacts "$TF_CURRENT_TEST" "$artifact_dir"
+    fi
+}
+
+# List preserved failure artifacts
+# Usage: list_failed_artifacts
+list_failed_artifacts() {
+    if [[ -d "$TF_FAILED_ARTIFACTS_DIR" ]]; then
+        echo "Failed test artifacts in $TF_FAILED_ARTIFACTS_DIR:"
+        ls -la "$TF_FAILED_ARTIFACTS_DIR" 2>/dev/null || echo "  (none)"
+    else
+        echo "No failed artifacts directory found"
+    fi
+}
+
+# Clean old failure artifacts (older than N days)
+# Usage: cleanup_old_artifacts [days]
+cleanup_old_artifacts() {
+    local days="${1:-7}"
+    if [[ -d "$TF_FAILED_ARTIFACTS_DIR" ]]; then
+        find "$TF_FAILED_ARTIFACTS_DIR" -type d -mtime "+$days" -exec rm -rf {} + 2>/dev/null || true
+        log_info "Cleaned artifacts older than $days days"
+    fi
+}
+
+#==============================================================================
 # Initialization
 #==============================================================================
 
@@ -931,8 +1702,20 @@ export -f log_debug log_info log_warn log_error
 export -f log_test_start log_test_pass log_test_fail log_test_skip log_suite_start
 export -f init_log_file set_log_level
 export -f create_temp_dir cleanup_temp_dirs reset_test_env create_test_env get_test_env_root setup_cleanup_trap
-export -f run_test skip_test print_results get_exit_code
+export -f run_test skip_test print_results get_exit_code run_parallel_tests
 export -f enable_tap_output disable_tap_output is_tap_mode tap_plan tap_version tap_diag
 export -f _tap_ok _tap_not_ok _tap_skip _tap_todo _tap_summary
 export -f get_project_dir source_ru_function
 export -f create_mock_repo create_bare_repo
+# JSON logging exports
+export -f enable_json_output disable_json_output is_json_mode
+export -f _json_escape _json_timestamp_us _json_elapsed_us
+export -f _json_git_state _json_env_snapshot _json_stack_trace _json_log
+export -f log_suite_json log_suite_end_json
+export -f log_test_start_json log_test_result_json log_assertion_json
+export -f set_test_context clear_test_context log_event_json
+# Enhanced test isolation exports
+export -f create_real_git_repo create_real_git_repo_with_remote create_real_worktree
+export -f create_github_test_fixture create_namespaced_temp_dir
+export -f preserve_failed_artifacts mark_test_failed_with_artifacts
+export -f list_failed_artifacts cleanup_old_artifacts

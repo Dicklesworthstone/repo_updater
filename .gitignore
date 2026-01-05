@@ -27,10 +27,10 @@ logs/
 # Test artifacts
 test-repos/
 /tmp/
+a.out
 
 # Debug artifacts
 *.debug
-a.out
 
 # Node modules (if ever used for testing)
 node_modules/

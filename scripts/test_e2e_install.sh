@@ -132,6 +132,96 @@ test_install_to_custom_dir() {
     cleanup_test_env
 }
 
+create_mock_curl_installer_no_releases() {
+    local mock_bin="$TEMP_DIR/mock_bin"
+    mkdir -p "$mock_bin"
+
+    cat > "$mock_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+out_file=""
+write_out=""
+url=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            out_file="$2"
+            shift 2
+            ;;
+        -w)
+            write_out="$2"
+            shift 2
+            ;;
+        -H|-fsSL|-sS|-S|-L|-f|-s)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+
+url_no_query="${url%%\?*}"
+
+if [[ "$url_no_query" == "https://api.github.com/repos/Dicklesworthstone/repo_updater/releases/latest" ]]; then
+    body='{"message":"Not Found","status":"404"}'
+    if [[ -n "$write_out" ]]; then
+        printf '%s\n404' "$body"
+    else
+        printf '%s' "$body"
+    fi
+    exit 0
+fi
+
+if [[ "$url_no_query" == "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/ru" ]]; then
+    # Ensure cache buster is applied for GitHub downloads.
+    if [[ "$url" != *"ru_cb="* ]]; then
+        echo "mock curl: expected ru_cb cache buster in URL: $url" >&2
+        exit 2
+    fi
+    if [[ -n "$out_file" ]]; then
+        cat > "$out_file" <<'RU'
+#!/usr/bin/env bash
+echo "ru 0.0.0"
+RU
+    else
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'echo "ru 0.0.0"'
+    fi
+    exit 0
+fi
+
+echo "mock curl: unexpected URL: $url" >&2
+exit 22
+EOF
+
+    chmod +x "$mock_bin/curl"
+}
+
+test_installer_falls_back_to_main_when_no_releases() {
+    echo -e "${BLUE}Test:${RESET} install.sh falls back to main when no releases exist"
+    setup_test_env
+
+    create_mock_curl_installer_no_releases
+    export PATH="$TEMP_DIR/mock_bin:$PATH"
+
+    local install_dir="$TEMP_DIR/bin"
+    mkdir -p "$install_dir"
+
+    local output exit_code
+    output=$(DEST="$install_dir" RU_CACHE_BUST=1 bash "$INSTALL_SCRIPT" </dev/null 2>&1)
+    exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "install.sh exits 0 with no releases"
+    assert_output_contains "$output" "No releases found" "installer reports missing releases"
+    assert_file_executable "$install_dir/ru" "fallback installed ru is executable"
+
+    cleanup_test_env
+}
+
 test_version_output() {
     echo -e "${BLUE}Test:${RESET} --version returns valid version"
     setup_test_env
@@ -239,6 +329,8 @@ echo "============================================"
 echo ""
 
 test_install_to_custom_dir
+echo ""
+test_installer_falls_back_to_main_when_no_releases
 echo ""
 test_version_output
 echo ""

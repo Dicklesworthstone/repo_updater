@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "repo": "octo/repo1",
+  "items": [],
+  "questions": [
+    {"id": "q1", "prompt": "Apply fix?", "answered": false}
+  ]
+}

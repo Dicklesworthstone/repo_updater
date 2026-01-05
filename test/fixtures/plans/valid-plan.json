@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "repo": "octo/repo1",
+  "run_id": "run-123",
+  "items": [
+    {"type": "issue", "number": 42, "decision": "fix"},
+    {"type": "pr", "number": 7, "decision": "skip"}
+  ],
+  "git": {
+    "commits": ["abc123"],
+    "tests": {"ok": true}
+  },
+  "gh_actions": [
+    {"op": "comment", "target": "issue#42"}
+  ],
+  "questions": [
+    {"id": "q1", "prompt": "Apply?", "answered": false}
+  ]
+}

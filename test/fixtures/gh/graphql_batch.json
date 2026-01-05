@@ -1,0 +1,55 @@
+{
+  "data": {
+    "repo0": {
+      "nameWithOwner": "octo/archived",
+      "isArchived": true,
+      "isFork": false,
+      "issues": {"nodes": [{"number": 1, "title": "Archived issue", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2025-12-10T00:00:00Z", "labels": {"nodes": []}}]},
+      "pullRequests": {"nodes": []}
+    },
+    "repo1": {
+      "nameWithOwner": "octo/repo1",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2025-12-20T00:00:00Z",
+      "issues": {
+        "nodes": [
+          {
+            "number": 42,
+            "title": "Login fails",
+            "createdAt": "2025-12-01T00:00:00Z",
+            "updatedAt": "2025-12-20T00:00:00Z",
+            "labels": {"nodes": [{"name": "bug"}]}
+          }
+        ]
+      },
+      "pullRequests": {
+        "nodes": [
+          {
+            "number": 7,
+            "title": "Improve docs",
+            "createdAt": "2025-12-05T00:00:00Z",
+            "updatedAt": "2025-12-22T00:00:00Z",
+            "isDraft": false,
+            "labels": {"nodes": [{"name": "enhancement"}]}
+          },
+          {
+            "number": 8,
+            "title": "WIP: New feature",
+            "createdAt": "2025-12-10T00:00:00Z",
+            "updatedAt": "2025-12-21T00:00:00Z",
+            "isDraft": true,
+            "labels": {"nodes": [{"name": "feature"}]}
+          }
+        ]
+      }
+    },
+    "repo2": {
+      "nameWithOwner": "octo/forked",
+      "isArchived": false,
+      "isFork": true,
+      "issues": {"nodes": []},
+      "pullRequests": {"nodes": []}
+    }
+  }
+}
