@@ -50,6 +50,9 @@ setup_test_env() {
     export HOME="$TEMP_DIR/home"
     mkdir -p "$HOME"
 
+    # Force sequential mode for predictable output
+    export RU_PARALLEL=1
+
     # Create projects directory
     export TEST_PROJECTS_DIR="$TEMP_DIR/projects"
     mkdir -p "$TEST_PROJECTS_DIR"

@@ -32,6 +32,8 @@ log_error() { printf 'ERROR: %s\n' "$*" >&2; }
 # Source required ru functions (avoid sourcing whole script)
 source_ru_function "_is_valid_var_name"
 source_ru_function "_set_out_var"
+source_ru_function "_is_path_under_base"
+source_ru_function "_is_safe_path_segment"
 source_ru_function "ensure_dir"
 source_ru_function "dir_lock_try_acquire"
 source_ru_function "dir_lock_release"

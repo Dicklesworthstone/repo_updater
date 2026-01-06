@@ -165,6 +165,7 @@ e2e_setup() {
     export RU_PROJECTS_DIR="$E2E_TEMP_DIR/projects"
     export RU_CONFIG_DIR="$E2E_TEMP_DIR/config/ru"
     export RU_LOG_DIR="$E2E_TEMP_DIR/state/ru/logs"
+    export RU_PARALLEL=1  # Force sequential mode for predictable output
 
     # Set up mock bin in PATH
     E2E_MOCK_BIN="$E2E_TEMP_DIR/mock_bin"
