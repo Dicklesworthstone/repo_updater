@@ -1,9 +1,9 @@
 # Plan: Integrating NTM Robot Mode into ru for Automated Agent-Based Repository Maintenance
 
-> **Document Version:** 2.0.0
+> **Document Version:** 2.1.0
 > **Created:** 2026-01-06
 > **Updated:** 2026-01-06
-> **Status:** Proposal (Enhanced)
+> **Status:** Proposal (Production-Hardened)
 > **Target:** ru v1.2.0
 
 ---
@@ -34,22 +34,28 @@
 
 This proposal describes how to integrate **ntm (Named Tmux Manager)** robot mode into **ru (repo_updater)** to enable automated, AI-assisted repository maintenance across large collections of GitHub repositories.
 
-**The vision:** Run a single command (`ru agent-sweep`) that iterates through all configured repositories, launches Claude Code in each one, has the AI deeply understand the codebase, commit any uncommitted changes with detailed messages, and optionally handle GitHub releases—all without human intervention.
+**The vision:** Run a single command (`ru agent-sweep`) that iterates through all configured repositories, launches an AI agent for deep understanding, and then applies a machine-readable **commit/release plan** using ru's deterministic git execution—optionally handling GitHub releases—without requiring human intervention.
 
 **Key benefits:**
 - Automate the tedious task of cleaning up uncommitted work across dozens of repos
 - Generate high-quality, contextually-aware commit messages via AI analysis
 - Ensure consistent release practices across all managed repositories
 - Leverage ntm's battle-tested session management and monitoring capabilities
+- **Safer by default:** ru executes git actions with policy gates; the agent plans only
 
-**What's new in v2.0.0:**
-- Deep implementation details from actual ntm source code analysis
-- Portable directory-based locking (reuses ru's proven pattern)
-- Detailed JSON schemas for all robot mode responses
-- State detection mechanics (velocity tracking + 53 regex patterns)
-- Comprehensive error code mapping
-- jq-free JSON parsing fallbacks
-- Testing strategy with mock patterns
+**What's new in v2.1.0:**
+- **Planner → Validator → Executor model:** Agent produces commit plans, ru validates and executes
+- **Post-phase validation gates:** Don't trust "idle" as success; verify actual outcomes
+- **Portable JSON parsing:** Layered fallback (jq → python3 → perl → sed)
+- **Preflight safety checks:** Detect rebase/merge in progress, detached HEAD, etc.
+- **Run artifacts:** Capture pane output, plans, git state for debugging
+- **Secret scanning:** Block pushes if secrets detected (gitleaks/heuristics)
+- **Explicit release policy:** Replace heuristic keyword matching
+- **Global rate-limit backoff:** Coordinate pause across parallel workers
+- **Per-repo configuration:** Override timeouts, prompts, policies per repo
+- **Enhanced results schema:** Track HEAD before/after, commits created, artifacts path
+- **Deterministic prompts:** Structured output with contingencies
+- **Failure-mode testing:** Mock scenarios for timeout, rate limit, agent crash
 
 ---
 
@@ -274,43 +280,104 @@ ntm provides:
 Add a new subcommand to ru that:
 
 1. Iterates through all configured repositories (or a filtered subset)
-2. For each repo with uncommitted changes:
-   a. Launches a Claude Code session via ntm robot mode
-   b. Sends a sequence of AI prompts (codebase understanding → commit → release)
-   c. Monitors completion via ntm's wait mechanism (velocity + patterns)
-   d. Collects results and moves to next repo
-3. Produces a summary report of all actions taken
+2. **Preflight checks** repos for "safe to automate" conditions (merge/rebase state, branch tracking, etc.)
+3. For each repo with uncommitted changes and passing preflight:
+   a. Launches an agent session via ntm robot mode
+   b. Sends a sequence of prompts (understanding → produce commit plan → optionally produce release plan)
+   c. **Captures the agent's structured plan output**
+   d. **Validates the plan** with ru policy gates (secrets, file excludes, size limits)
+   e. **Applies the plan** using ru's deterministic git plumbing (commit/push/tag/release)
+   f. Collects results and moves to next repo
+4. Produces a summary report of all actions taken
 
-### 4.2 The Three-Phase Prompt Sequence
+### 4.2 The Three-Phase Prompt Sequence (Planner → Executor)
 
-Each repository goes through three phases:
+Each repository goes through three phases. **Critical change:** The agent produces structured plans; ru executes them.
 
 #### Phase 1: Deep Understanding
 ```
-First read ALL of the AGENTS.md file and README.md file super carefully
-and understand ALL of both! Then use your code investigation agent mode
-to fully understand the code, and technical architecture and purpose of
-the project. Use ultrathink.
+First read AGENTS.md (if present) and README.md (if present) carefully.
+If a file is missing, explicitly note that and continue.
+Then use your investigation mode to understand the codebase architecture,
+entrypoints, conventions, and what the current changes appear to be.
+At the end, output a short structured summary as JSON between:
+RU_UNDERSTANDING_JSON_BEGIN
+{ "summary": "...", "conventions": [...], "risks": [...], "notes": [...] }
+RU_UNDERSTANDING_JSON_END
 ```
 
-#### Phase 2: Intelligent Commits
+#### Phase 2: Intelligent Commits (Produces Commit Plan)
 ```
-Now, based on your knowledge of the project, commit all changed files now
-in a series of logically connected groupings with super detailed commit
-messages for each and then push. Take your time to do it right. Don't edit
-the code at all. Don't commit obviously ephemeral files. Use ultrathink.
+Now, based on your knowledge of the project, DO NOT run git commands.
+Instead, produce a COMMIT PLAN as JSON between these markers:
+RU_COMMIT_PLAN_JSON_BEGIN
+{ ... }
+RU_COMMIT_PLAN_JSON_END
+
+Rules:
+- Do not edit any code or files.
+- Do not include ephemeral/ignored files (.pyc, node_modules, __pycache__, etc.).
+- Group changes into logically connected commits.
+- For each commit, include:
+  - "files": explicit list of paths to stage
+  - "message": full commit message (subject + body)
+- Include "push": true/false
+- Include "excluded_files": list of files excluded and why
+Use ultrathink.
 ```
 
-#### Phase 3: GitHub Release (Conditional)
+**Commit plan schema:**
+```json
+{
+  "commits": [
+    {"files": ["path/a", "path/b"], "message": "feat(x): summary\n\nBody explaining why..."},
+    {"files": ["path/c"], "message": "fix(y): summary\n\nBody..."}
+  ],
+  "push": true,
+  "excluded_files": [
+    {"path": "__pycache__/foo.pyc", "reason": "bytecode cache"},
+    {"path": ".env", "reason": "environment secrets"}
+  ],
+  "assumptions": ["No breaking changes detected", "All tests assumed passing"],
+  "risks": ["Large diff in core module"]
+}
 ```
-Do all the GitHub stuff: commit, deploy, create tag, bump version, release,
-monitor gh actions, compute checksums, etc. Use ultrathink.
+
+#### Phase 3: GitHub Release (Produces Release Plan, Conditional)
+```
+If a release is warranted based on the changes, DO NOT execute release commands.
+Produce a RELEASE PLAN as JSON between:
+RU_RELEASE_PLAN_JSON_BEGIN
+{ ... }
+RU_RELEASE_PLAN_JSON_END
+
+Include:
+- "version": proposed version (or null if no release needed)
+- "tag": proposed tag (or null)
+- "changelog_entry": text to add to CHANGELOG
+- "version_files": files to update with new version
+- "checks": actions to verify before release (tests/CI)
+Use ultrathink.
+```
+
+**Release plan schema:**
+```json
+{
+  "version": "1.2.0",
+  "tag": "v1.2.0",
+  "changelog_entry": "## v1.2.0 (2026-01-06)\n\n### Added\n- ...",
+  "version_files": [
+    {"path": "VERSION", "old": "1.1.0", "new": "1.2.0"},
+    {"path": "package.json", "field": "version", "new": "1.2.0"}
+  ],
+  "checks": ["tests", "lint"]
+}
 ```
 
 Phase 3 only runs if:
-- The repo has GitHub Actions configured for releases
-- There are changes that warrant a release
-- The `--with-release` flag is passed
+- `--with-release` is passed **and** release policy allows it
+- Repo is explicitly opted-in (via config or workflow detection)
+- Agent produces a release plan that passes ru validation gates
 
 ### 4.3 High-Level Flow
 
@@ -444,10 +511,14 @@ compliance with OAuth 2.0 best practices for native apps.
 Co-Authored-By: Claude <noreply@anthropic.com>
 ```
 
-**Completion criteria:**
-- All changes committed (nothing in `git status --porcelain`)
-- Push successful
-- Claude Code returns to idle state
+**Completion criteria (validated by ru, not inferred from idle):**
+- Agent outputs `RU_COMMIT_PLAN_JSON_BEGIN...END` block (plan captured)
+- Plan passes validation (no secrets, files exist, within size limits)
+- **ru executes the plan:**
+  - Working tree clean after execution: `git status --porcelain` is empty
+  - Commits created as described in the commit plan (count + messages match)
+  - If `push=true`, push confirmed (ru executes push and verifies upstream state)
+- Agent returns to idle state (only used as "phase done talking", not as correctness)
 
 ### 5.3 Phase 3: GitHub Release (Conditional)
 
@@ -482,11 +553,14 @@ has_release_workflow() {
 6. Monitors Actions for completion
 7. If Actions generate artifacts, verifies checksums
 
-**Completion criteria:**
-- New tag visible on GitHub
-- Release created (if applicable)
-- Actions completed successfully
-- Claude Code returns to idle state
+**Completion criteria (validated by ru):**
+- Agent outputs `RU_RELEASE_PLAN_JSON_BEGIN...END` block (plan captured)
+- Plan passes validation (version format, files exist)
+- **ru executes the plan:**
+  - Tag exists locally and on remote (`git ls-remote --tags origin`)
+  - If GH release requested, release exists (via `gh release view` if available)
+  - If workflows run, CI status is green (via `gh run list/view` if available)
+- Agent returns to idle state (used as phase boundary only)
 
 ---
 
@@ -517,13 +591,60 @@ ntm_check_available() {
     return 0
 }
 
-# Parse JSON field without jq (fallback)
+# Parse JSON field with graceful degradation (portable)
+# Order: jq -> python3 -> perl(JSON::PP) -> minimal sed fallback
 # Args: $1=json, $2=field_name
 # Returns: field value (simple strings only)
 json_get_field() {
     local json="$1" field="$2"
-    # Simple pattern: "field":"value" or "field":value
-    echo "$json" | grep -oP "\"${field}\"\\s*:\\s*\"?\\K[^\",}]+" | head -1
+
+    # Best: jq
+    if command -v jq &>/dev/null; then
+        jq -r --arg f "$field" '.[$f] // empty' <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Fallback: python3
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json,sys
+field=sys.argv[1]
+data=json.loads(sys.stdin.read())
+v=data.get(field,'')
+print(v if isinstance(v,(str,int,float,bool)) else json.dumps(v))
+" "$field" <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Fallback: perl with JSON::PP
+    if command -v perl &>/dev/null && perl -MJSON::PP -e1 2>/dev/null; then
+        perl -MJSON::PP -0777 -ne '
+            my $f=shift @ARGV;
+            my $d=decode_json($_);
+            my $v=$d->{$f};
+            if(!defined $v){ print ""; }
+            elsif(ref($v)){ print encode_json($v); }
+            else{ print $v; }
+        ' "$field" <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Last resort: minimal sed extraction (flat strings only, best-effort)
+    # NOTE: This is fragile but works for simple ntm responses on macOS
+    sed -nE 's/.*"'"$field"'":[[:space:]]*"([^"]*)".*/\1/p' <<<"$json" | head -n1
+}
+
+# Escape string for safe JSON embedding (jq-free)
+# Args: $1=string to escape
+# Returns: escaped string (without surrounding quotes)
+json_escape() {
+    local s="$1"
+    # Escape backslash, double-quote, newlines, tabs
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    echo "$s"
 }
 
 # Check if JSON has success=true
@@ -788,16 +909,62 @@ has_uncommitted_changes() {
     [[ -n $(git -C "$repo_path" status --porcelain 2>/dev/null) ]]
 }
 
-# Check if repo has release GitHub Actions
+# Check if repo should have release automation
+# Uses explicit policy layer, not just keyword heuristics
 # Args: $1=repo_path
-# Returns: 0=has workflow, 1=no workflow
+# Returns: 0=release allowed, 1=no release
 has_release_workflow() {
     local repo_path="$1"
     local workflows_dir="$repo_path/.github/workflows"
 
+    # Check explicit per-repo config first
+    local repo_config="$repo_path/.ru/agent-sweep.conf"
+    if [[ -f "$repo_config" ]]; then
+        # shellcheck source=/dev/null
+        source "$repo_config"
+        case "${AGENT_SWEEP_RELEASE_STRATEGY:-}" in
+            never) return 1 ;;
+            tag-only|gh-release|auto) return 0 ;;
+        esac
+    fi
+
+    # Check user-level per-repo config
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local user_config="$RU_CONFIG_DIR/agent-sweep.d/${repo_name}.conf"
+    if [[ -f "$user_config" ]]; then
+        # shellcheck source=/dev/null
+        source "$user_config"
+        case "${AGENT_SWEEP_RELEASE_STRATEGY:-}" in
+            never) return 1 ;;
+            tag-only|gh-release|auto) return 0 ;;
+        esac
+    fi
+
+    # Prefer gh API detection if available
+    if command -v gh &>/dev/null; then
+        local remote_url
+        remote_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null)
+        if [[ -n "$remote_url" ]] && gh workflow list -R "$remote_url" &>/dev/null; then
+            # Has workflows; check for tag-triggered ones
+            if gh workflow list -R "$remote_url" 2>/dev/null | grep -qi 'release\|deploy\|publish'; then
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback: check for workflow files with tag triggers
     [[ -d "$workflows_dir" ]] || return 1
-    grep -riqE '(release|tag|deploy|publish|version)' "$workflows_dir"/*.yml 2>/dev/null
+    # Better heuristic: look for actual tag triggers, not just keyword mentions
+    grep -riqE '(on:|tags:|release:|workflow_dispatch:)' "$workflows_dir"/*.yml 2>/dev/null
 }
+
+# Release strategy options
+# --release-strategy=STRATEGY where STRATEGY is:
+#   never      - No releases, skip Phase 3
+#   auto       - Agent proposes; ru validates & executes (default)
+#   tag-only   - Create tag but no GH release
+#   gh-release - Tag + GH release + monitor actions
 
 # Main agent-sweep command
 cmd_agent_sweep() {
@@ -1233,17 +1400,189 @@ Sanitization: Replace non-alphanumeric chars with `_`
 | Rate limit detected | 3 | (pattern match) | Pause | Wait 60s, retry |
 | Network error | 1 | (pattern match) | Skip repo | Log, continue |
 | Interrupted (Ctrl+C) | N/A | N/A | 5 | Save state, cleanup |
+| Preflight failed (rebase/merge/etc.) | N/A | N/A | Skip repo | Record skip reason, continue |
+| Detached HEAD | N/A | N/A | Skip repo | Record skip reason, continue |
+| No upstream branch | N/A | N/A | Skip or no-push | Depends on `--push-strategy` |
+| Large untracked tree (>1000 files) | N/A | N/A | Skip repo | Likely misconfigured .gitignore |
+
+### 9.1.1 Preflight Safety Checks (NEW)
+
+Before invoking the agent, ru performs preflight validation to avoid "mystery failures" mid-run:
+
+```bash
+# Preflight check for "safe to automate" conditions
+# Args: $1=repo_path
+# Returns: 0=safe, 1=skip (sets PREFLIGHT_SKIP_REASON)
+repo_preflight_check() {
+    local repo_path="$1"
+    PREFLIGHT_SKIP_REASON=""
+
+    # Check: is it a git repo?
+    if ! git -C "$repo_path" rev-parse --is-inside-work-tree &>/dev/null; then
+        PREFLIGHT_SKIP_REASON="not_a_git_repo"
+        return 1
+    fi
+
+    # Check: rebase in progress?
+    if [[ -d "$repo_path/.git/rebase-apply" ]] || [[ -d "$repo_path/.git/rebase-merge" ]]; then
+        PREFLIGHT_SKIP_REASON="rebase_in_progress"
+        return 1
+    fi
+
+    # Check: merge in progress?
+    if [[ -f "$repo_path/.git/MERGE_HEAD" ]]; then
+        PREFLIGHT_SKIP_REASON="merge_in_progress"
+        return 1
+    fi
+
+    # Check: cherry-pick in progress?
+    if [[ -f "$repo_path/.git/CHERRY_PICK_HEAD" ]]; then
+        PREFLIGHT_SKIP_REASON="cherry_pick_in_progress"
+        return 1
+    fi
+
+    # Check: detached HEAD?
+    local branch
+    branch=$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null)
+    if [[ -z "$branch" ]]; then
+        PREFLIGHT_SKIP_REASON="detached_HEAD"
+        return 1
+    fi
+
+    # Check: has upstream? (skip if no-push strategy)
+    local upstream
+    upstream=$(git -C "$repo_path" rev-parse --abbrev-ref "@{u}" 2>/dev/null)
+    if [[ -z "$upstream" ]] && [[ "${AGENT_SWEEP_PUSH_STRATEGY:-push}" != "none" ]]; then
+        PREFLIGHT_SKIP_REASON="no_upstream_branch"
+        return 1
+    fi
+
+    # Check: diverged from upstream? (both ahead and behind)
+    if [[ -n "$upstream" ]]; then
+        local ahead behind
+        read -r ahead behind < <(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null)
+        if [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]]; then
+            PREFLIGHT_SKIP_REASON="diverged_from_upstream"
+            return 1
+        fi
+    fi
+
+    # Check: unmerged paths (conflicts)?
+    if git -C "$repo_path" ls-files --unmerged 2>/dev/null | grep -q .; then
+        PREFLIGHT_SKIP_REASON="unmerged_paths"
+        return 1
+    fi
+
+    # Check: git diff --check clean (whitespace issues, conflict markers)?
+    if ! git -C "$repo_path" diff --check &>/dev/null; then
+        PREFLIGHT_SKIP_REASON="diff_check_failed"
+        return 1
+    fi
+
+    # Check: untracked file count (protect against huge node_modules, etc.)
+    local untracked_count
+    untracked_count=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null | wc -l)
+    if [[ "$untracked_count" -gt "${AGENT_SWEEP_MAX_UNTRACKED:-1000}" ]]; then
+        PREFLIGHT_SKIP_REASON="too_many_untracked_files"
+        return 1
+    fi
+
+    return 0
+}
+```
+
+**Preflight skip reasons → human-readable:**
+| Reason | User Action |
+|--------|-------------|
+| `rebase_in_progress` | Complete or abort rebase: `git rebase --continue` or `--abort` |
+| `merge_in_progress` | Complete or abort merge: `git merge --continue` or `--abort` |
+| `cherry_pick_in_progress` | Complete or abort: `git cherry-pick --continue` or `--abort` |
+| `detached_HEAD` | Checkout a branch: `git checkout main` |
+| `no_upstream_branch` | Set upstream: `git branch --set-upstream-to=origin/main` |
+| `diverged_from_upstream` | Rebase or merge first: `git pull --rebase` |
+| `unmerged_paths` | Resolve conflicts: `git status` |
+| `too_many_untracked_files` | Check .gitignore, clean up: `git clean -n` |
 
 ### 9.2 Recovery Strategies
 
-**Rate Limit Recovery:**
+**Rate Limit Recovery (Global Backoff):**
+
+When rate limited, set a **global pause** that all parallel workers respect (not just local sleep):
+
 ```bash
-# In wait loop, check for rate limit pattern
+# Global backoff state file (shared across workers)
+BACKOFF_STATE_FILE="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+BACKOFF_LOCK="${AGENT_SWEEP_STATE_DIR}/locks/backoff.lock"
+
+# Trigger global backoff (any worker can call)
+# Args: $1=reason (e.g., "rate_limited")
+agent_sweep_backoff_trigger() {
+    local reason="$1"
+    local current_delay="${2:-30}"
+    local max_delay=600  # 10 minutes cap
+
+    if dir_lock_acquire "$BACKOFF_LOCK" 10; then
+        local now pause_until new_delay
+
+        # Read current state
+        if [[ -f "$BACKOFF_STATE_FILE" ]]; then
+            local current_pause
+            current_pause=$(json_get_field "$(cat "$BACKOFF_STATE_FILE")" "pause_until" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            if [[ "$current_pause" -gt "$now" ]]; then
+                # Already paused, extend with exponential backoff
+                new_delay=$((current_delay * 2))
+                [[ "$new_delay" -gt "$max_delay" ]] && new_delay=$max_delay
+            else
+                new_delay=$current_delay
+            fi
+        else
+            new_delay=$current_delay
+        fi
+
+        # Add jitter (±25%)
+        local jitter=$(( (RANDOM % (new_delay / 2)) - (new_delay / 4) ))
+        new_delay=$((new_delay + jitter))
+
+        pause_until=$(($(date +%s) + new_delay))
+
+        # Write state (prefer jq if available)
+        if command -v jq &>/dev/null; then
+            jq -n --arg reason "$reason" --argjson pause_until "$pause_until" \
+                '{reason:$reason,pause_until:$pause_until}' > "$BACKOFF_STATE_FILE"
+        else
+            echo "{\"reason\":\"$reason\",\"pause_until\":$pause_until}" > "$BACKOFF_STATE_FILE"
+        fi
+
+        log_warn "Rate limit detected ($reason), global pause for ${new_delay}s"
+        dir_lock_release "$BACKOFF_LOCK"
+    fi
+}
+
+# Check and wait if global backoff is active (all workers must call before work)
+agent_sweep_backoff_wait_if_needed() {
+    if [[ ! -f "$BACKOFF_STATE_FILE" ]]; then
+        return 0
+    fi
+
+    local pause_until now
+    pause_until=$(json_get_field "$(cat "$BACKOFF_STATE_FILE")" "pause_until" 2>/dev/null || echo 0)
+    now=$(date +%s)
+
+    if [[ "$pause_until" -gt "$now" ]]; then
+        local wait_secs=$((pause_until - now))
+        log_warn "Global backoff active, waiting ${wait_secs}s..."
+        sleep "$wait_secs"
+    fi
+}
+
+# In wait loop, check for rate limit and trigger global backoff
 if ntm_get_activity "$session" | grep -q '"rate_limited":true'; then
-    log_warn "Rate limit detected, waiting 60s..."
-    sleep 60
-    # Continue waiting
+    agent_sweep_backoff_trigger "rate_limited"
 fi
+
+# Before sending prompts or starting a new repo:
+agent_sweep_backoff_wait_if_needed
 ```
 
 **Crash Recovery:**
@@ -1268,7 +1607,9 @@ fi
 **Orphan Session Cleanup:**
 ```bash
 cleanup_agent_sweep_sessions() {
-    # Kill all sessions matching our pattern
+    # Kill all sessions matching our pattern (unless --keep-sessions)
+    [[ "${AGENT_SWEEP_KEEP_SESSIONS:-false}" == "true" ]] && return 0
+
     local sessions
     sessions=$(ntm --robot-status 2>/dev/null | grep -o '"name":"ru_sweep_[^"]*"' | cut -d'"' -f4)
     for session in $sessions; do
@@ -1278,6 +1619,67 @@ cleanup_agent_sweep_sessions() {
     done
 }
 ```
+
+### 9.2.1 Run Artifacts & Session Preservation (NEW)
+
+For each repo, ru writes structured artifacts to enable debugging and auditing:
+
+**Artifact directory:** `~/.local/state/ru/agent-sweep/runs/<run_id>/<repo>/`
+
+**Artifacts (recommended minimum):**
+| File | Contents |
+|------|----------|
+| `spawn.json` | ntm spawn response |
+| `activity.ndjson` | Periodic `--robot-activity` snapshots |
+| `pane_tail.txt` | Last N lines captured from tmux pane |
+| `commit_plan.json` | Agent's commit plan output |
+| `release_plan.json` | Agent's release plan output (if Phase 3) |
+| `git_before.txt` | `git status`, `git log -3`, `git branch -vv` before agent |
+| `git_after.txt` | Same, after agent (for comparison) |
+
+```bash
+# Capture git state for artifacts
+capture_git_state() {
+    local repo_path="$1"
+    local output_file="$2"
+
+    {
+        echo "=== git status ==="
+        git -C "$repo_path" status 2>&1
+        echo ""
+        echo "=== git log -3 --oneline ==="
+        git -C "$repo_path" log -3 --oneline 2>&1
+        echo ""
+        echo "=== git branch -vv ==="
+        git -C "$repo_path" branch -vv 2>&1
+        echo ""
+        echo "=== HEAD ==="
+        git -C "$repo_path" rev-parse HEAD 2>&1
+    } > "$output_file"
+}
+
+# Capture tmux pane output for debugging
+capture_pane_tail() {
+    local session="$1"
+    local output_file="$2"
+    local lines="${3:-400}"
+
+    tmux capture-pane -t "${session}:0.1" -p -S -"$lines" > "$output_file" 2>/dev/null || true
+}
+```
+
+**Session preservation options:**
+| Option | Behavior |
+|--------|----------|
+| `--keep-sessions` | Never kill tmux sessions (for manual follow-up) |
+| `--keep-sessions-on-fail` | Keep sessions only for failed repos (default: true) |
+| `--attach-on-fail` | Print `tmux attach -t <session>` hint for failures |
+| `--capture-lines=N` | Lines to capture from pane (default: 400) |
+
+**Always captured (even when killing sessions):**
+- `pane_tail.txt` is captured BEFORE killing the session
+- `commit_plan.json` / `release_plan.json` if extracted
+- `git_after.txt` to see what actually changed
 
 ### 9.3 State File for Resume
 
@@ -1298,20 +1700,42 @@ Location: `~/.local/state/ru/agent_sweep_state.json`
 }
 ```
 
-**Atomic updates (matching ru's existing pattern):**
+**Atomic updates (matching ru's existing pattern)**
+
+**NOTE:** Always JSON-escape strings before writing state. Prefer jq/python when available.
+
 ```bash
 save_agent_sweep_state() {
     local status="$1"
     local state_file="${AGENT_SWEEP_STATE_DIR}/state.json"
     local tmp_file="${state_file}.tmp.$$"
 
-    {
-        echo "{"
-        echo "  \"run_id\": \"$RUN_ID\","
-        echo "  \"status\": \"$status\","
-        echo "  \"repos_completed\": [$(printf '"%s",' "${COMPLETED_REPOS[@]}" | sed 's/,$//')]"
-        echo "}"
-    } > "$tmp_file"
+    # Prefer jq/python to write JSON; avoid manual JSON when possible.
+    if command -v jq &>/dev/null; then
+        jq -n --arg run_id "$RUN_ID" --arg status "$status" \
+            --argjson completed "$(printf '%s\n' "${COMPLETED_REPOS[@]}" | jq -R . | jq -s .)" \
+            '{run_id:$run_id,status:$status,repos_completed:$completed}' > "$tmp_file"
+    elif command -v python3 &>/dev/null; then
+        python3 -c "
+import json,sys
+data = {
+    'run_id': sys.argv[1],
+    'status': sys.argv[2],
+    'repos_completed': sys.argv[3].split('\\n') if sys.argv[3] else []
+}
+print(json.dumps(data, indent=2))
+" "$RUN_ID" "$status" "$(printf '%s\n' "${COMPLETED_REPOS[@]}")" > "$tmp_file"
+    else
+        # Fallback: minimal JSON with escaping helper
+        {
+            echo "{"
+            echo "  \"run_id\": \"$(json_escape "$RUN_ID")\","
+            echo "  \"status\": \"$(json_escape "$status")\","
+            # Note: This is fragile for repo names with special chars
+            echo "  \"repos_completed\": [$(printf '"%s",' "${COMPLETED_REPOS[@]}" | sed 's/,$//')]"
+            echo "}"
+        } > "$tmp_file"
+    fi
     mv "$tmp_file" "$state_file"
 }
 ```
@@ -1482,6 +1906,18 @@ ru agent-sweep [options]
 | `--json` | Output JSON results | false |
 | `--verbose` | Detailed logging | false |
 | `--quiet` | Minimal output | false |
+| **Execution Mode (NEW)** | | |
+| `--execution-mode=MODE` | `plan` (print plans only), `apply` (ru executes), `agent` (agent executes - legacy) | apply |
+| **Session Options (NEW)** | | |
+| `--keep-sessions` | Never kill tmux sessions | false |
+| `--keep-sessions-on-fail` | Keep sessions only for failed repos | true |
+| `--attach-on-fail` | Print attach instructions for failures | false |
+| `--capture-lines=N` | Lines to capture from agent pane | 400 |
+| **Release Options (NEW)** | | |
+| `--release-strategy=STR` | `never`, `auto`, `tag-only`, `gh-release` | auto |
+| **Security Options (NEW)** | | |
+| `--secret-scan=MODE` | `auto`, `on`, `off` | auto |
+| `--max-file-mb=N` | Maximum file size in MB | 10 |
 
 ### 12.3 Examples
 
@@ -1547,31 +1983,71 @@ ru agent-sweep --json 2>/dev/null | jq '.summary'
 ╰─────────────────────────────────────────────────────────────╯
 ```
 
-**JSON mode (stdout):**
+**JSON mode (stdout) - Enhanced Schema:**
 ```json
 {
   "timestamp": "2026-01-06T15:30:00Z",
+  "run_id": "20260106-153000-12345",
   "duration_seconds": 503,
   "summary": {
     "total": 5,
     "succeeded": 5,
-    "failed": 0
+    "failed": 0,
+    "skipped": 0
   },
   "repos": [
     {
       "name": "mcp_agent_mail",
       "path": "/data/projects/mcp_agent_mail",
+      "branch": "main",
+      "head_before": "abc1234def5678901234567890123456789012ab",
+      "head_after": "def5678abc1234901234567890123456789012cd",
       "success": true,
       "phases_completed": 2,
-      "duration_seconds": 123
+      "duration_seconds": 123,
+      "commits": [
+        {"sha": "def5678", "subject": "feat(mail): add batch send support"},
+        {"sha": "abc1234", "subject": "fix(config): handle missing defaults"}
+      ],
+      "push_attempted": true,
+      "push_ok": true,
+      "session": "ru_sweep_mcp_agent_mail_12345",
+      "kept_session": false,
+      "artifacts_dir": "~/.local/state/ru/agent-sweep/runs/20260106-153000-12345/mcp_agent_mail"
     },
     {
       "name": "repo_updater",
       "path": "/data/projects/repo_updater",
+      "branch": "main",
+      "head_before": "111222333444555666777888999000aaabbbcccd",
+      "head_after": "aaabbbcccddd111222333444555666777888999e",
       "success": true,
       "phases_completed": 3,
-      "release": "v1.2.0",
-      "duration_seconds": 274
+      "duration_seconds": 274,
+      "commits": [
+        {"sha": "aaabbb", "subject": "feat(agent-sweep): add ntm integration"}
+      ],
+      "push_attempted": true,
+      "push_ok": true,
+      "release": {
+        "version": "1.2.0",
+        "tag": "v1.2.0",
+        "gh_release_url": "https://github.com/owner/repo/releases/tag/v1.2.0"
+      },
+      "session": "ru_sweep_repo_updater_12345",
+      "kept_session": false,
+      "artifacts_dir": "~/.local/state/ru/agent-sweep/runs/20260106-153000-12345/repo_updater"
+    },
+    {
+      "name": "problematic_repo",
+      "path": "/data/projects/problematic_repo",
+      "branch": "feature/wip",
+      "success": false,
+      "error": "preflight_failed",
+      "error_detail": "rebase_in_progress",
+      "skipped": true,
+      "session": null,
+      "artifacts_dir": null
     }
   ]
 }
@@ -1742,23 +2218,56 @@ test_has_uncommitted_changes() {
 
 ```bash
 # Mock ntm for testing without real sessions
+# Supports multiple scenarios via NTM_MOCK_SCENARIO env var:
+#   ok            - Happy path (default)
+#   timeout       - Wait timeout
+#   resource_busy - Session already exists
+#   agent_error   - Agent crashes
+#   rate_limited  - Rate limit detected
+#   spawn_fail    - Spawn fails
+
 setup_ntm_mock() {
     mkdir -p "$TEST_BIN"
     cat > "$TEST_BIN/ntm" << 'EOF'
 #!/bin/bash
+scenario="${NTM_MOCK_SCENARIO:-ok}"
+
 case "$1" in
     --robot-status)
         echo '{"success":true,"sessions":[]}'
         ;;
     --robot-spawn=*)
+        if [[ "$scenario" == "resource_busy" ]]; then
+            echo '{"success":false,"error_code":"RESOURCE_BUSY","error":"session already exists"}'
+            exit 1
+        fi
+        if [[ "$scenario" == "spawn_fail" ]]; then
+            echo '{"success":false,"error_code":"INTERNAL_ERROR","error":"spawn failed"}'
+            exit 1
+        fi
         echo '{"success":true,"session":"test","agents":[{"pane":"0.1","ready":true}]}'
         ;;
     --robot-send=*)
         echo '{"success":true,"delivered":1}'
         ;;
     --robot-wait=*)
-        sleep 1  # Simulate work
+        if [[ "$scenario" == "timeout" ]]; then
+            echo '{"success":false,"error_code":"TIMEOUT","error":"Timeout waiting for condition"}'
+            exit 1
+        fi
+        if [[ "$scenario" == "agent_error" ]]; then
+            echo '{"success":false,"error_code":"INTERNAL_ERROR","error":"Agent crashed"}'
+            exit 3
+        fi
+        sleep 0.5  # Simulate work (faster for tests)
         echo '{"success":true,"condition":"idle","waited_seconds":1}'
+        ;;
+    --robot-activity=*)
+        if [[ "$scenario" == "rate_limited" ]]; then
+            echo '{"success":true,"agents":[{"state":"WAITING","rate_limited":true}]}'
+        else
+            echo '{"success":true,"agents":[{"state":"WAITING","rate_limited":false}]}'
+        fi
         ;;
     kill)
         echo "killed"
@@ -1794,6 +2303,205 @@ test_agent_sweep_single_repo() {
     assert_equals 0 $exit_code "Should succeed with mock ntm"
 
     cleanup_test_env
+}
+
+# === FAILURE MODE TESTS (NEW) ===
+
+test_agent_sweep_timeout() {
+    setup_test_env
+    export NTM_MOCK_SCENARIO=timeout
+    setup_ntm_mock
+    setup_dirty_repo "testrepo"
+
+    "$RU_SCRIPT" agent-sweep 2>/dev/null
+    local exit_code=$?
+
+    assert_equals 1 $exit_code "Should return 1 on timeout"
+    # Verify artifacts were captured
+    assert_file_exists "$HOME/.local/state/ru/agent-sweep/runs/*/testrepo/pane_tail.txt"
+
+    cleanup_test_env
+}
+
+test_agent_sweep_resource_busy() {
+    setup_test_env
+    export NTM_MOCK_SCENARIO=resource_busy
+    setup_ntm_mock
+    setup_dirty_repo "testrepo"
+
+    "$RU_SCRIPT" agent-sweep 2>/dev/null
+    local exit_code=$?
+
+    # Should skip repo and continue (or retry after killing)
+    assert_not_equals 3 $exit_code "Should not return dependency error"
+
+    cleanup_test_env
+}
+
+test_agent_sweep_agent_error() {
+    setup_test_env
+    export NTM_MOCK_SCENARIO=agent_error
+    setup_ntm_mock
+    setup_dirty_repo "testrepo"
+
+    "$RU_SCRIPT" agent-sweep 2>/dev/null
+    local exit_code=$?
+
+    assert_equals 1 $exit_code "Should return 1 on agent error"
+
+    cleanup_test_env
+}
+
+test_agent_sweep_rate_limited() {
+    setup_test_env
+    export NTM_MOCK_SCENARIO=rate_limited
+    setup_ntm_mock
+    setup_dirty_repo "testrepo"
+
+    # Verify global backoff is triggered
+    "$RU_SCRIPT" agent-sweep --phase1-timeout=2 2>&1 | grep -q "global pause"
+    local found=$?
+
+    # Note: This test is tricky because rate_limited only affects --robot-activity
+    # Real test would need more sophisticated mock
+
+    cleanup_test_env
+}
+
+# === PREFLIGHT TESTS (NEW) ===
+
+test_preflight_rebase_in_progress() {
+    setup_test_env
+    setup_ntm_mock
+    setup_dirty_repo "testrepo"
+
+    # Simulate rebase in progress
+    mkdir -p "$HOME/projects/testrepo/.git/rebase-apply"
+
+    "$RU_SCRIPT" agent-sweep --json 2>/dev/null | grep -q "rebase_in_progress"
+    local found=$?
+
+    assert_equals 0 $found "Should detect rebase in progress"
+
+    cleanup_test_env
+}
+
+test_preflight_detached_head() {
+    setup_test_env
+    setup_ntm_mock
+    setup_dirty_repo "testrepo"
+
+    # Detach HEAD
+    git -C "$HOME/projects/testrepo" checkout --detach HEAD 2>/dev/null
+
+    "$RU_SCRIPT" agent-sweep --json 2>/dev/null | grep -q "detached_HEAD"
+    local found=$?
+
+    assert_equals 0 $found "Should detect detached HEAD"
+
+    cleanup_test_env
+}
+
+# === SECURITY GUARDRAIL TESTS (NEW) ===
+
+test_security_denylist() {
+    setup_test_env
+
+    # Test is_file_denied function
+    source "$RU_SCRIPT"
+
+    is_file_denied ".env"
+    assert_equals 0 $? ".env should be denied"
+
+    is_file_denied "src/main.py"
+    assert_equals 1 $? "src/main.py should be allowed"
+
+    is_file_denied "id_rsa"
+    assert_equals 0 $? "id_rsa should be denied"
+
+    cleanup_test_env
+}
+
+# === JSON PARSING PORTABILITY TESTS (NEW) ===
+
+test_json_get_field_with_jq() {
+    # Skip if jq not available
+    command -v jq &>/dev/null || { skip_test "jq not available"; return; }
+
+    local json='{"success":true,"error":"test error","count":42}'
+    local result
+
+    result=$(json_get_field "$json" "error")
+    assert_equals "test error" "$result" "Should extract string field with jq"
+
+    result=$(json_get_field "$json" "count")
+    assert_equals "42" "$result" "Should extract number field with jq"
+}
+
+test_json_get_field_without_jq() {
+    # Force sed fallback
+    local PATH_BACKUP="$PATH"
+    PATH="/bin:/usr/bin"  # Exclude typical jq/python locations
+
+    local json='{"success":true,"error":"simple value"}'
+    local result
+
+    # This tests the sed fallback
+    result=$(json_get_field "$json" "error" 2>/dev/null || echo "fallback")
+
+    PATH="$PATH_BACKUP"
+    # Just verify it doesn't crash
+    assert_not_equals "" "$result" "Should handle missing jq gracefully"
+}
+```
+
+### 14.2.1 Contract Fixtures (NEW)
+
+Store expected ntm response fixtures for schema validation:
+
+**File:** `scripts/fixtures/ntm_responses.json`
+```json
+{
+  "spawn_success": {
+    "success": true,
+    "session": "ru_sweep_test_12345",
+    "agents": [{"pane": "0.1", "type": "claude", "ready": true}]
+  },
+  "spawn_resource_busy": {
+    "success": false,
+    "error_code": "RESOURCE_BUSY",
+    "error": "session already exists"
+  },
+  "wait_success": {
+    "success": true,
+    "condition": "idle",
+    "waited_seconds": 45.2
+  },
+  "wait_timeout": {
+    "success": false,
+    "error_code": "TIMEOUT",
+    "error": "Timeout waiting for condition"
+  }
+}
+```
+
+**Table-driven tests for error mapping:**
+```bash
+test_error_code_mapping() {
+    local -A expected_exit_codes=(
+        ["SESSION_NOT_FOUND"]=3
+        ["TIMEOUT"]=1
+        ["INTERNAL_ERROR"]=3
+        ["RESOURCE_BUSY"]=1
+        ["DEPENDENCY_MISSING"]=3
+    )
+
+    for error_code in "${!expected_exit_codes[@]}"; do
+        local expected=${expected_exit_codes[$error_code]}
+        local actual
+        actual=$(map_ntm_error_to_exit_code "$error_code")
+        assert_equals "$expected" "$actual" "Error code $error_code should map to exit $expected"
+    done
 }
 ```
 
@@ -1842,9 +2550,210 @@ fi
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| Secrets in commits | Low | High | Prompt says "Don't commit ephemeral" |
+| Secrets in commits | Medium | High | **ru enforces secret scanning + blocks push on findings** |
 | Unauthorized pushes | Low | High | Respect git credential config |
 | Prompt injection | Very Low | Medium | Sanitize repo names in sessions |
+| Large binaries | Medium | Medium | File size limits, binary detection |
+| Sensitive files | Medium | High | Denylist enforcement (.env, *.pem, etc.) |
+
+### 15.3.1 Security Guardrails (NEW)
+
+**Critical:** The prompt "Don't commit ephemeral files" is NOT sufficient. The agent can ignore it. ru **must** enforce guardrails before executing any commit/push.
+
+#### File Denylist
+
+Before executing a commit plan, ru validates each file against a denylist:
+
+```bash
+# Default denylist patterns (configurable)
+AGENT_SWEEP_DENYLIST_PATTERNS="${AGENT_SWEEP_DENYLIST_PATTERNS:-
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_rsa.*
+*.p12
+*.pfx
+credentials.json
+secrets.json
+node_modules
+__pycache__
+.pyc
+dist/
+build/
+*.log
+.DS_Store
+}"
+
+# Check if file matches denylist
+is_file_denied() {
+    local file="$1"
+    local pattern
+
+    for pattern in $AGENT_SWEEP_DENYLIST_PATTERNS; do
+        case "$file" in
+            $pattern) return 0 ;;  # Denied
+        esac
+    done
+    return 1  # Allowed
+}
+```
+
+#### File Size Limits
+
+Reject files above configurable size (default 10MB):
+
+```bash
+AGENT_SWEEP_MAX_FILE_MB="${AGENT_SWEEP_MAX_FILE_MB:-10}"
+
+# Check file size
+is_file_too_large() {
+    local file="$1"
+    local max_bytes=$((AGENT_SWEEP_MAX_FILE_MB * 1024 * 1024))
+    local size
+
+    size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+    [[ "$size" -gt "$max_bytes" ]]
+}
+```
+
+#### Binary Detection
+
+Detect binary files and require explicit allow:
+
+```bash
+is_binary_file() {
+    local file="$1"
+    # file command returns "... text" for text files
+    ! file -b "$file" 2>/dev/null | grep -qiE '(text|script|json|xml|empty)'
+}
+```
+
+#### Secret Scanning
+
+**Layered approach:**
+
+1. **If `gitleaks` installed:** Run full scan
+2. **Elif `detect-secrets` installed:** Run scan
+3. **Else:** Heuristic fallback (pattern matching)
+
+```bash
+AGENT_SWEEP_SECRET_SCAN="${AGENT_SWEEP_SECRET_SCAN:-auto}"  # auto|on|off
+
+# Secret scan before push
+# Args: $1=repo_path
+# Returns: 0=clean, 1=secrets found (writes to SCAN_FINDINGS)
+run_secret_scan() {
+    local repo_path="$1"
+    SCAN_FINDINGS=""
+
+    [[ "$AGENT_SWEEP_SECRET_SCAN" == "off" ]] && return 0
+
+    # Prefer gitleaks
+    if command -v gitleaks &>/dev/null; then
+        if ! SCAN_FINDINGS=$(gitleaks detect --source="$repo_path" --no-git 2>&1); then
+            return 1
+        fi
+        return 0
+    fi
+
+    # Fallback: detect-secrets
+    if command -v detect-secrets &>/dev/null; then
+        if SCAN_FINDINGS=$(detect-secrets scan "$repo_path" 2>&1 | grep -v '^\s*$'); then
+            # detect-secrets returns JSON; check if any secrets found
+            if echo "$SCAN_FINDINGS" | grep -q '"results":\s*{[^}]'; then
+                return 1
+            fi
+        fi
+        return 0
+    fi
+
+    # Last resort: heuristic patterns
+    run_secret_scan_heuristic "$repo_path"
+}
+
+# Heuristic secret detection (best-effort)
+run_secret_scan_heuristic() {
+    local repo_path="$1"
+    local patterns=(
+        '-----BEGIN.*PRIVATE KEY-----'
+        'AKIA[0-9A-Z]{16}'                    # AWS Access Key
+        'ghp_[a-zA-Z0-9]{36}'                 # GitHub PAT
+        'sk-[a-zA-Z0-9]{48}'                  # OpenAI API Key
+        'xox[baprs]-[0-9a-zA-Z]{10,}'         # Slack Token
+        'password\s*=\s*["\x27][^\s]{8,}'     # Password assignments
+    )
+
+    local findings=""
+    for pattern in "${patterns[@]}"; do
+        local matches
+        matches=$(git -C "$repo_path" diff --staged 2>/dev/null | grep -E "$pattern" || true)
+        if [[ -n "$matches" ]]; then
+            findings+="Pattern: $pattern"$'\n'"$matches"$'\n\n'
+        fi
+    done
+
+    if [[ -n "$findings" ]]; then
+        SCAN_FINDINGS="$findings"
+        return 1
+    fi
+    return 0
+}
+```
+
+#### Commit Plan Validation
+
+Before executing a commit plan from the agent:
+
+```bash
+# Validate commit plan before execution
+# Args: $1=commit_plan_json, $2=repo_path
+# Returns: 0=valid, 1=blocked (sets VALIDATION_ERROR)
+validate_commit_plan() {
+    local plan="$1"
+    local repo_path="$2"
+    VALIDATION_ERROR=""
+
+    # Extract files from plan
+    local files
+    files=$(json_get_field "$plan" "commits" | grep -oE '"files":\s*\[[^\]]*\]' | grep -oE '"[^"]+\.?[^"]*"' || true)
+
+    for file in $files; do
+        file="${file//\"/}"  # Remove quotes
+
+        # Check denylist
+        if is_file_denied "$file"; then
+            VALIDATION_ERROR="Denied file in plan: $file"
+            return 1
+        fi
+
+        # Check size (if file exists)
+        if [[ -f "$repo_path/$file" ]] && is_file_too_large "$repo_path/$file"; then
+            VALIDATION_ERROR="File too large: $file"
+            return 1
+        fi
+
+        # Check binary
+        if [[ -f "$repo_path/$file" ]] && is_binary_file "$repo_path/$file"; then
+            VALIDATION_ERROR="Binary file without explicit allow: $file"
+            return 1
+        fi
+    done
+
+    # Run secret scan on staged changes
+    if ! run_secret_scan "$repo_path"; then
+        VALIDATION_ERROR="Secrets detected: $SCAN_FINDINGS"
+        return 1
+    fi
+
+    return 0
+}
+```
+
+**Block push policy (default):**
+- If validation fails: block commit, write artifact report, mark repo failed
+- Agent's plan is preserved in artifacts for manual review
 
 ---
 
@@ -1940,7 +2849,59 @@ AGENT_SWEEP_PHASE1_TIMEOUT=180
 AGENT_SWEEP_PHASE2_TIMEOUT=300
 AGENT_SWEEP_PHASE3_TIMEOUT=600
 AGENT_SWEEP_WITH_RELEASE=false
+
+# Security settings (NEW)
+AGENT_SWEEP_SECRET_SCAN=auto          # auto|on|off
+AGENT_SWEEP_MAX_FILE_MB=10
+AGENT_SWEEP_DENYLIST_PATTERNS=".env *.pem id_rsa node_modules dist build"
+
+# Session settings (NEW)
+AGENT_SWEEP_KEEP_SESSIONS_ON_FAIL=true
+AGENT_SWEEP_CAPTURE_LINES=400
+
+# Release settings (NEW)
+AGENT_SWEEP_RELEASE_STRATEGY=auto     # never|auto|tag-only|gh-release
+
+# Execution mode (NEW)
+AGENT_SWEEP_EXECUTION_MODE=apply      # plan|apply|agent
 ```
+
+#### Per-Repo Overrides (NEW)
+
+ru loads optional per-repo settings from (in priority order):
+
+1. `<repo>/.ru/agent-sweep.conf` (repo-local, checked into repo)
+2. `~/.config/ru/agent-sweep.d/<repo-name>.conf` (user-local)
+3. Global defaults in `~/.config/ru/config`
+
+**Example `<repo>/.ru/agent-sweep.conf`:**
+```bash
+# Override for monorepo - needs longer timeouts
+AGENT_SWEEP_PHASE1_TIMEOUT=300
+AGENT_SWEEP_PHASE2_TIMEOUT=600
+
+# Disable releases for this repo
+AGENT_SWEEP_RELEASE_STRATEGY=never
+
+# Custom denylist (extend default)
+AGENT_SWEEP_DENYLIST_PATTERNS=".env *.pem id_rsa node_modules dist build vendor"
+
+# Custom prompt file (optional)
+AGENT_SWEEP_PHASE2_PROMPT_FILE="$REPO_PATH/.ru/commit-prompt.txt"
+```
+
+**Example `~/.config/ru/agent-sweep.d/myrepo.conf`:**
+```bash
+# User-level override for specific repo
+AGENT_SWEEP_PHASE1_TIMEOUT=120
+AGENT_SWEEP_RELEASE_STRATEGY=gh-release
+```
+
+**Why per-repo config matters:**
+- Monorepos need longer timeouts
+- Some repos have different commit conventions
+- Some repos should never auto-release
+- Different .gitignore patterns require custom denylists
 
 #### Environment Variables
 ```bash
@@ -1996,6 +2957,7 @@ AGENT_SWEEP_PHASE3_TIMEOUT=600   # Override Phase 3 timeout
 |---------|------|---------|
 | 1.0.0 | 2026-01-06 | Initial proposal |
 | 2.0.0 | 2026-01-06 | Deep dive insights: error codes, state detection, locking, testing |
+| 2.1.0 | 2026-01-06 | Production hardening: Planner→Executor model, validation gates, portable JSON, preflight checks, artifacts, secret scanning, global backoff, per-repo config, enhanced results, deterministic prompts, failure-mode testing |
 
 ---
 
