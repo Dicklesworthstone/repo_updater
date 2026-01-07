@@ -24,9 +24,11 @@ source "$SCRIPT_DIR/test_framework.sh"
 # Source required functions from ru
 #==============================================================================
 
-# Source the denylist array
+# Source the denylist arrays
 # shellcheck disable=SC1090
 eval "$(sed -n '/^declare -a AGENT_SWEEP_DENYLIST_PATTERNS=/,/^)/p' "$PROJECT_DIR/ru")"
+# Initialize the extra denylist array (normally set by load_repo_agent_config)
+declare -ga AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
 
 # Source validation and execution functions
 source_ru_function "validate_commit_plan"
