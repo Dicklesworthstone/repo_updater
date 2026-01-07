@@ -296,7 +296,46 @@ GitHub's raw content is served through a CDN that caches aggressively. The `?ru_
 | `$(date +%s).$$` | Timestamp + PID (unique per invocation) |
 | `RU_CACHE_BUST_TOKEN=xyz` | Custom token override |
 
-The installer also self-refreshes: when piped from curl, it detects if a newer version is available and re-executes with the latest code.
+**Installer self-refresh mechanism:**
+
+When the installer runs via `curl | bash`, it performs automatic self-refresh to ensure you always get the latest version:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Installer Self-Refresh                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │  Detect piped   │◀─────── stdin is not a TTY?
+                    │  execution      │
+                    └────────┬────────┘
+                             │ yes
+                             ▼
+                    ┌─────────────────┐
+                    │  Download fresh │◀─────── Fetch latest install.sh
+                    │  installer      │         to temp file
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │  Validate       │◀─────── Check #!/usr/bin/env bash
+                    │  shebang        │         header is present
+                    └────────┬────────┘
+                             │ valid
+                             ▼
+                    ┌─────────────────┐
+                    │  Re-exec with   │◀─────── RU_INSTALLER_REFRESHED=1
+                    │  fresh copy     │         prevents infinite loop
+                    └─────────────────┘
+```
+
+This ensures that even if CDN caching serves a stale version initially, the installer will fetch and execute the latest code. The `RU_INSTALLER_REFRESHED=1` environment variable prevents recursion.
+
+To disable self-refresh (for airgapped environments):
+```bash
+RU_INSTALLER_NO_SELF_REFRESH=1 bash install.sh
+```
 
 <details>
 <summary><strong>Manual installation</strong></summary>
@@ -1843,6 +1882,63 @@ ru agent-sweep --verbose
 ru agent-sweep --debug
 ```
 
+### Three-Phase Agent Workflow
+
+Each repository goes through a structured three-phase workflow that separates planning from execution:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Three-Phase Workflow                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+       ┌──────────┐    ┌──────────┐    ┌──────────┐
+       │  PHASE 1 │    │  PHASE 2 │    │  PHASE 3 │
+       │ Planning │───▶│  Commit  │───▶│ Release  │
+       └──────────┘    └──────────┘    └──────────┘
+              │               │               │
+              ▼               ▼               ▼
+       ┌──────────┐    ┌──────────┐    ┌──────────┐
+       │  Analyze │    │  Execute │    │  Create  │
+       │  changes │    │   plan   │    │   tag/   │
+       │  + plan  │    │ + commit │    │  release │
+       └──────────┘    └──────────┘    └──────────┘
+```
+
+**Phase 1: Planning** (`--phase1-timeout`, default 300s)
+- Claude Code analyzes the uncommitted changes in the repository
+- Determines which files should be staged (respecting denylist)
+- Generates a structured commit message following conventional commit format
+- Outputs a JSON plan with files, message, and rationale
+
+**Phase 2: Commit** (`--phase2-timeout`, default 600s)
+- Validates the plan from Phase 1 (file existence, denylist compliance)
+- Stages approved files with `git add`
+- Creates the commit with the generated message
+- Runs quality gates (linting, secret scan)
+- Optionally pushes to remote
+
+**Phase 3: Release** (`--phase3-timeout`, default 300s, requires `--with-release`)
+- Analyzes commit history since last tag
+- Determines appropriate version bump (patch/minor/major)
+- Creates git tag and optionally GitHub release
+- Respects per-repo release strategy configuration
+
+**Execution modes:**
+
+| Mode | Behavior |
+|------|----------|
+| `--execution-mode=agent` | Full AI-driven workflow (default) |
+| `--execution-mode=plan` | Phase 1 only: generate plan, stop |
+| `--execution-mode=apply` | Phase 2+3: execute existing plan |
+
+**Why separate phases?**
+- **Auditability**: Each phase produces inspectable output
+- **Recovery**: Can resume from any phase after interruption
+- **Control**: Can run planning across all repos, then review before applying
+- **Safety**: Validation happens between phases, catching issues early
+
 ### Preflight Checks
 
 Before spawning an agent, each repository undergoes preflight validation:
@@ -1919,7 +2015,54 @@ Before any push, files are scanned for secrets:
 
 **3. File Size Limits**
 
-Large or binary files are blocked from commits to prevent repository bloat.
+Large or binary files are blocked from commits to prevent repository bloat. The default limit is 1MB, configurable via `AGENT_SWEEP_MAX_FILE_MB` or per-repo config.
+
+**4. Plan Validation**
+
+Before executing any commit or release plan, ru validates the AI-generated JSON output:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Plan Validation Pipeline                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+   ┌──────────┐         ┌──────────┐         ┌──────────┐
+   │  JSON    │         │  Schema  │         │  File    │
+   │  Parse   │         │  Verify  │         │  Verify  │
+   └──────────┘         └──────────┘         └──────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+   ┌──────────┐         ┌──────────┐         ┌──────────┐
+   │ Extract  │         │ Required │         │  Files   │
+   │ between  │         │  fields  │         │  exist?  │
+   │ markers  │         │ present? │         │ Allowed? │
+   └──────────┘         └──────────┘         └──────────┘
+```
+
+**Validation checks for commit plans:**
+
+| Check | Validation | Failure Behavior |
+|-------|------------|------------------|
+| JSON structure | Valid JSON between `---PLAN-START---` and `---PLAN-END---` markers | Reject plan |
+| Required fields | `files` array, `commit_message` string | Reject plan |
+| File existence | Each file in `files[]` exists in working tree | Warn, filter out missing |
+| Denylist compliance | No file matches denylist patterns | Block file, continue with rest |
+| Commit message format | Non-empty, reasonable length | Reject if empty |
+
+**Validation checks for release plans:**
+
+| Check | Validation | Failure Behavior |
+|-------|------------|------------------|
+| Version format | Matches semver (X.Y.Z) | Reject plan |
+| Tag availability | Tag doesn't already exist | Reject plan |
+| Release strategy | Matches configured strategy | Adjust to match |
+| Changelog presence | Release notes provided | Warn, use default |
+
+**Why structured output with markers?**
+
+AI output often includes explanatory text before/after the JSON. The marker-based extraction (`---PLAN-START---` / `---PLAN-END---`) reliably isolates the machine-readable portion without complex parsing.
 
 ### Per-Repository Configuration
 
@@ -2409,6 +2552,61 @@ This is used throughout ru for:
 - Clone operations on rate-limited repos
 - Network-dependent status checks
 
+### JSON Utilities with Fallback Chain
+
+ru provides portable JSON handling that works across environments with varying tool availability:
+
+**`json_get_field(json, field)`** — Extract a field from JSON with graceful degradation:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   JSON Field Extraction                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┬───────────────┐
+              ▼               ▼               ▼               ▼
+       ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+       │    jq    │    │ python3  │    │   perl   │    │   sed    │
+       │  (best)  │    │ (good)   │    │ (ok)     │    │ (basic)  │
+       └──────────┘    └──────────┘    └──────────┘    └──────────┘
+              │               │               │               │
+              └───────────────┴───────────────┴───────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │  Field value    │
+                    └─────────────────┘
+```
+
+| Tool | Handles | Limitations |
+|------|---------|-------------|
+| `jq` | All JSON types, nested objects, arrays | None (preferred) |
+| `python3` | All JSON types | Requires Python 3 |
+| `perl` | All JSON types | Requires JSON::PP module |
+| `sed` | Simple string fields only | No nested objects, arrays, escapes |
+
+**`json_escape(string)`** — Safe string escaping for JSON embedding:
+
+```bash
+# Handles all JSON-sensitive characters
+json_escape 'Hello "World"'     # → Hello \"World\"
+json_escape $'Line1\nLine2'     # → Line1\nLine2
+json_escape 'Path: C:\Users'    # → Path: C:\\Users
+```
+
+**Characters escaped:** `\` → `\\`, `"` → `\"`, newline → `\n`, tab → `\t`, carriage return → `\r`, backspace → `\b`, form feed → `\f`
+
+**`json_validate(json)`** — Check if a string is valid JSON:
+
+```bash
+if json_validate "$response"; then
+    # Safe to parse
+    value=$(json_get_field "$response" "status")
+fi
+```
+
+The validate function uses the same fallback chain, returning success (0) if any available tool can parse the JSON.
+
 ---
 
 ## 🧭 Design Principles
@@ -2496,6 +2694,61 @@ log_error "gh not installed. Run with --install-deps or install manually."
 exit 3
 ```
 
+### 6. Progress Reporting
+
+ru provides real-time progress feedback through a unified progress API:
+
+```bash
+# Initialize progress tracking
+progress_init "$total_repos"
+
+# Report start of each repo
+progress_start_repo "$repo_name" "$current_index"
+
+# Report completion with result
+progress_complete_repo "$repo_name" "$status" "$duration"
+
+# Final summary
+progress_summary
+```
+
+**Output adapts to context:**
+
+| Context | Behavior |
+|---------|----------|
+| Interactive terminal | Live-updating progress line with spinner |
+| Non-interactive/CI | Simple line-by-line output |
+| `--quiet` mode | Errors only |
+| `--json` mode | NDJSON events to stdout, human summary to stderr |
+
+### 7. CI Environment Detection
+
+ru automatically detects CI environments and adjusts behavior accordingly:
+
+**Detected CI environments:**
+- GitHub Actions (`GITHUB_ACTIONS`)
+- GitLab CI (`GITLAB_CI`)
+- Jenkins (`JENKINS_URL`)
+- Travis CI (`TRAVIS`)
+- CircleCI (`CIRCLECI`)
+- Azure Pipelines (`TF_BUILD`)
+- Generic CI (`CI=true`)
+
+**Behavior changes in CI:**
+- Forces `--non-interactive` mode (no prompts)
+- Disables gum (uses ANSI fallbacks)
+- Suppresses spinners and live progress
+- Uses line-buffered output for proper log streaming
+- Enables stricter error handling
+
+```bash
+# Manual CI mode override
+CI=true ru sync
+
+# Explicit non-interactive
+ru sync --non-interactive
+```
+
 ---
 
 ## 🛡️ File Denylist System
@@ -2577,7 +2830,7 @@ echo -e "main.py\n.env\nREADME.md" | filter_files_denylist
 
 ## 🧪 Testing
 
-ru includes an extensive test suite with 58 test files covering unit tests, integration tests, and end-to-end workflows.
+ru includes an extensive test suite with 66 test files covering unit tests, integration tests, and end-to-end workflows.
 
 ### Test Structure
 

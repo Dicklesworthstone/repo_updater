@@ -1930,7 +1930,7 @@ declare -g SWEEP_LAST_SESSION_NAME=""
 # Initialize agent-sweep results tracking
 # Sets up state directory, run ID, and results file
 setup_agent_sweep_results() {
-    local state_base="${XDG_STATE_HOME:-$HOME/.local/state}/ru"
+    local state_base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
     AGENT_SWEEP_STATE_DIR="${state_base}/agent-sweep"
     ensure_dir "$AGENT_SWEEP_STATE_DIR"
     ensure_dir "${AGENT_SWEEP_STATE_DIR}/locks"
@@ -3310,7 +3310,24 @@ progress_summary() {
     duration_str=$(format_duration "$total_duration")
 
     if [[ "$PROGRESS_IS_INTERACTIVE" != "true" ]]; then
-        log_info "Agent-sweep complete: $PROGRESS_SUCCEEDED succeeded, $PROGRESS_FAILED failed, $PROGRESS_SKIPPED skipped"
+        local s="$PROGRESS_SUCCEEDED"
+        local f="$PROGRESS_FAILED"
+        local k="$PROGRESS_SKIPPED"
+
+        # In parallel mode, parent counters are not updated; derive from results file if available.
+        if (( s + f + k == 0 )) && [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
+            if command -v jq &>/dev/null; then
+                s=$(jq -r 'select(.type=="summary" and .status=="success") | .repo' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+                f=$(jq -r 'select(.type=="summary" and .status=="failed") | .repo' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+                k=$(jq -r 'select(.type=="summary" and .status=="skipped") | .repo' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+            else
+                s=$(grep -c '"type":"summary".*"status":"success"' "$RESULTS_FILE" 2>/dev/null || echo 0)
+                f=$(grep -c '"type":"summary".*"status":"failed"' "$RESULTS_FILE" 2>/dev/null || echo 0)
+                k=$(grep -c '"type":"summary".*"status":"skipped"' "$RESULTS_FILE" 2>/dev/null || echo 0)
+            fi
+        fi
+
+        log_info "Agent-sweep complete: $s succeeded, $f failed, $k skipped"
         log_info "Total time: $duration_str"
     fi
 
@@ -3645,6 +3662,7 @@ get_config_value() {
 # Resolve all configuration values
 resolve_config() {
     PROJECTS_DIR=$(get_config_value "PROJECTS_DIR" "$DEFAULT_PROJECTS_DIR" "$PROJECTS_DIR")
+    PROJECTS_DIR=$(expand_tilde "$PROJECTS_DIR")
     LAYOUT=$(get_config_value "LAYOUT" "$DEFAULT_LAYOUT" "$LAYOUT")
     UPDATE_STRATEGY=$(get_config_value "UPDATE_STRATEGY" "$DEFAULT_UPDATE_STRATEGY" "$UPDATE_STRATEGY")
     AUTOSTASH=$(get_config_value "AUTOSTASH" "$DEFAULT_AUTOSTASH" "$AUTOSTASH")
@@ -6509,6 +6527,8 @@ cmd_import() {
     for input_file in "${file_args[@]}"; do
         if [[ ! -f "$input_file" ]]; then
             log_error "File not found: $input_file"
+            ((skipped_error++))
+            error_repos+=("$input_file|file not found")
             continue
         fi
 
@@ -6526,17 +6546,25 @@ cmd_import() {
             ((total_lines++))
             ((file_line_count++))
 
+            # Parse the repo spec to get base URL and metadata
+            # shellcheck disable=SC2034 # Variables set by parse_repo_spec
+            local spec_url spec_branch spec_name
+            parse_repo_spec "$line" spec_url spec_branch spec_name
+
             # Parse the URL
             local host="" owner="" repo=""
-            if ! parse_repo_url "$line" host owner repo 2>/dev/null; then
+            if ! parse_repo_url "$spec_url" host owner repo 2>/dev/null; then
                 ((skipped_invalid++))
                 invalid_repos+=("$line")
                 continue
             fi
 
-            # Normalize to canonical form
-            local normalized
-            normalized=$(normalize_url "$line")
+            # Normalize to canonical form (preserve branch/custom name)
+            local normalized output_spec
+            normalized=$(normalize_url "$spec_url")
+            output_spec="$normalized"
+            [[ -n "$spec_branch" ]] && output_spec+="@$spec_branch"
+            [[ -n "$spec_name" ]] && output_spec+=" as $spec_name"
 
             # Check for duplicates using canonical ID
             local canonical_id="${host}/${owner}/${repo}"
@@ -6574,15 +6602,18 @@ cmd_import() {
             # Add to appropriate file
             if [[ "$is_private" == "true" ]]; then
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    printf '%s\n' "$normalized" >> "$private_file"
+                    printf '%s\n' "$output_spec" >> "$private_file"
                 fi
                 ((imported_private++))
             else
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    printf '%s\n' "$normalized" >> "$public_file"
+                    printf '%s\n' "$output_spec" >> "$public_file"
                 fi
                 ((imported_public++))
             fi
+
+            # Prevent duplicates within the same import run
+            existing_repos["$canonical_id"]=1
 
         done < "$input_file"
 
@@ -6677,9 +6708,13 @@ cmd_remove() {
     local removed=0 not_found=0
 
     for repo in "${ARGS[@]}"; do
-        # Normalize the repo URL for matching
+        # Normalize the repo URL for matching (accept @branch / "as name")
+        # shellcheck disable=SC2034  # spec_branch/spec_name set by parse_repo_spec, intentionally unused
+        local spec_url spec_branch spec_name
+        parse_repo_spec "$repo" spec_url spec_branch spec_name
+
         local host owner repo_name
-        if ! parse_repo_url "$repo" host owner repo_name; then
+        if ! parse_repo_url "$spec_url" host owner repo_name; then
             log_error "Invalid repo format: $repo"
             continue
         fi
@@ -6710,8 +6745,8 @@ cmd_remove() {
                 local line_host line_owner line_repo
                 local should_remove="false"
                 if parse_repo_url "$line_url" line_host line_owner line_repo; then
-                    # Match if owner and repo name are exactly the same
-                    if [[ "$line_owner" == "$owner" && "$line_repo" == "$repo_name" ]]; then
+                    # Match if host, owner, and repo name are exactly the same
+                    if [[ "$line_host" == "$host" && "$line_owner" == "$owner" && "$line_repo" == "$repo_name" ]]; then
                         should_remove="true"
                     fi
                 fi
@@ -11643,6 +11678,10 @@ parse_review_args() {
                 ;;
             -j[0-9]*)
                 REVIEW_PARALLEL="${arg#-j}"
+                if ! is_positive_int "$REVIEW_PARALLEL"; then
+                    log_error "Invalid -j value: $REVIEW_PARALLEL"
+                    exit 4
+                fi
                 ;;
             --repos=*)
                 REVIEW_REPOS_PATTERN="${arg#--repos=}"

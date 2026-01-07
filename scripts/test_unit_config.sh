@@ -25,6 +25,7 @@ source_ru_function "set_config_value"
 source_ru_function "ensure_config_exists"
 source_ru_function "log_verbose"
 source_ru_function "is_valid_config_key"
+source_ru_function "expand_tilde"
 source_ru_function "resolve_config"
 
 # Set XDG defaults for sourcing (we override in tests anyway)
@@ -746,6 +747,44 @@ EOF
     assert_equals "false" "$AUTOSTASH" "AUTOSTASH should use config file"
     assert_equals "8" "$PARALLEL" "PARALLEL should use config file"
 
+    log_test_pass "$test_name"
+}
+
+test_resolve_config_expands_tilde() {
+    local test_name="resolve_config: Expands tilde in PROJECTS_DIR"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local old_home="$HOME"
+    HOME="$test_env/home"
+    mkdir -p "$HOME"
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+PROJECTS_DIR=~/repos
+EOF
+
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    unset RU_PROJECTS_DIR RU_LAYOUT RU_UPDATE_STRATEGY RU_AUTOSTASH RU_PARALLEL 2>/dev/null || true
+    PROJECTS_DIR=""
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    resolve_config
+
+    assert_equals "$HOME/repos" "$PROJECTS_DIR" "PROJECTS_DIR should expand tilde"
+
+    HOME="$old_home"
     log_test_pass "$test_name"
 }
 
