@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Unit Tests: Core Utilities
-# Tests for ensure_dir, json_escape, write_result functions
+# Tests for ensure_dir, json_escape, json_get_field, json_is_success, write_result functions
 #
 # Test coverage:
 #   - ensure_dir creates directories
@@ -12,6 +12,14 @@
 #   - json_escape handles newlines, tabs, carriage returns
 #   - json_escape handles empty strings
 #   - json_escape handles complex strings
+#   - json_get_field extracts string fields
+#   - json_get_field extracts boolean true/false
+#   - json_get_field extracts numbers
+#   - json_get_field handles nested objects
+#   - json_get_field returns empty for missing fields
+#   - json_is_success detects success:true
+#   - json_is_success rejects success:false
+#   - json_is_success handles missing success field
 #   - write_result creates valid NDJSON
 #   - write_result includes all fields
 #   - write_result handles special characters in fields
@@ -80,6 +88,12 @@ extract_functions() {
 
     # Extract json_escape
     eval "$(sed -n '/^json_escape()/,/^}/p' "$RU_SCRIPT")"
+
+    # Extract json_get_field (multi-line with embedded code)
+    eval "$(sed -n '/^json_get_field()/,/^}/p' "$RU_SCRIPT")"
+
+    # Extract json_is_success
+    eval "$(sed -n '/^json_is_success()/,/^}/p' "$RU_SCRIPT")"
 
     # Extract write_result
     eval "$(sed -n '/^write_result()/,/^}/p' "$RU_SCRIPT")"
@@ -269,6 +283,184 @@ test_json_escape_preserves_simple_strings() {
 }
 
 #==============================================================================
+# Tests: json_get_field
+#==============================================================================
+
+test_json_get_field_string() {
+    echo -e "${BLUE}Test:${RESET} json_get_field extracts string field"
+
+    local json='{"name": "test-repo", "status": "active"}'
+    local result
+    result=$(json_get_field "$json" "name")
+
+    if [[ "$result" == "test-repo" ]]; then
+        pass "String field extracted correctly"
+    else
+        fail "String field not extracted correctly (got: '$result', expected: 'test-repo')"
+    fi
+}
+
+test_json_get_field_boolean_true() {
+    echo -e "${BLUE}Test:${RESET} json_get_field extracts boolean true"
+
+    local json='{"success": true, "data": "value"}'
+    local result
+    result=$(json_get_field "$json" "success")
+
+    if [[ "$result" == "true" ]]; then
+        pass "Boolean true extracted correctly"
+    else
+        fail "Boolean true not extracted correctly (got: '$result', expected: 'true')"
+    fi
+}
+
+test_json_get_field_boolean_false() {
+    echo -e "${BLUE}Test:${RESET} json_get_field extracts boolean false"
+
+    local json='{"success": false, "error": "failed"}'
+    local result
+    result=$(json_get_field "$json" "success")
+
+    if [[ "$result" == "false" ]]; then
+        pass "Boolean false extracted correctly"
+    else
+        fail "Boolean false not extracted correctly (got: '$result', expected: 'false')"
+    fi
+}
+
+test_json_get_field_number() {
+    echo -e "${BLUE}Test:${RESET} json_get_field extracts number"
+
+    local json='{"count": 42, "name": "test"}'
+    local result
+    result=$(json_get_field "$json" "count")
+
+    if [[ "$result" == "42" ]]; then
+        pass "Number extracted correctly"
+    else
+        fail "Number not extracted correctly (got: '$result', expected: '42')"
+    fi
+}
+
+test_json_get_field_missing() {
+    echo -e "${BLUE}Test:${RESET} json_get_field returns empty for missing field"
+
+    local json='{"name": "test"}'
+    local result
+    result=$(json_get_field "$json" "nonexistent")
+
+    if [[ -z "$result" ]]; then
+        pass "Missing field returns empty string"
+    else
+        fail "Missing field did not return empty (got: '$result')"
+    fi
+}
+
+test_json_get_field_empty_input() {
+    echo -e "${BLUE}Test:${RESET} json_get_field handles empty input"
+
+    local result
+    result=$(json_get_field "" "field")
+
+    if [[ -z "$result" ]]; then
+        pass "Empty input returns empty string"
+    else
+        fail "Empty input did not return empty (got: '$result')"
+    fi
+}
+
+test_json_get_field_nested_object() {
+    echo -e "${BLUE}Test:${RESET} json_get_field extracts nested object as JSON"
+
+    local json='{"data": {"nested": "value"}, "name": "test"}'
+    local result
+    result=$(json_get_field "$json" "data")
+
+    # Result should be JSON representation of nested object
+    if echo "$result" | grep -q "nested"; then
+        pass "Nested object extracted (contains expected key)"
+    else
+        fail "Nested object not extracted correctly (got: '$result')"
+    fi
+}
+
+test_json_get_field_with_spaces() {
+    echo -e "${BLUE}Test:${RESET} json_get_field handles JSON with extra spaces"
+
+    local json='{  "name"  :  "spaced-value"  ,  "other": 1  }'
+    local result
+    result=$(json_get_field "$json" "name")
+
+    if [[ "$result" == "spaced-value" ]]; then
+        pass "Field with spaces extracted correctly"
+    else
+        fail "Field with spaces not extracted correctly (got: '$result')"
+    fi
+}
+
+#==============================================================================
+# Tests: json_is_success
+#==============================================================================
+
+test_json_is_success_true() {
+    echo -e "${BLUE}Test:${RESET} json_is_success returns true for success:true"
+
+    local json='{"success": true, "data": "result"}'
+
+    if json_is_success "$json"; then
+        pass "success:true detected correctly"
+    else
+        fail "success:true not detected"
+    fi
+}
+
+test_json_is_success_false() {
+    echo -e "${BLUE}Test:${RESET} json_is_success returns false for success:false"
+
+    local json='{"success": false, "error": "message"}'
+
+    if json_is_success "$json"; then
+        fail "success:false incorrectly detected as true"
+    else
+        pass "success:false correctly returns false"
+    fi
+}
+
+test_json_is_success_missing() {
+    echo -e "${BLUE}Test:${RESET} json_is_success returns false when success field missing"
+
+    local json='{"data": "value", "status": "ok"}'
+
+    if json_is_success "$json"; then
+        fail "Missing success field incorrectly detected as true"
+    else
+        pass "Missing success field correctly returns false"
+    fi
+}
+
+test_json_is_success_empty() {
+    echo -e "${BLUE}Test:${RESET} json_is_success returns false for empty input"
+
+    if json_is_success ""; then
+        fail "Empty input incorrectly detected as true"
+    else
+        pass "Empty input correctly returns false"
+    fi
+}
+
+test_json_is_success_malformed() {
+    echo -e "${BLUE}Test:${RESET} json_is_success handles malformed JSON"
+
+    local json='not valid json at all'
+
+    if json_is_success "$json"; then
+        fail "Malformed JSON incorrectly detected as success"
+    else
+        pass "Malformed JSON correctly returns false"
+    fi
+}
+
+#==============================================================================
 # Tests: write_result
 #==============================================================================
 
@@ -452,6 +644,36 @@ echo ""
 test_json_escape_complex_string
 echo ""
 test_json_escape_preserves_simple_strings
+echo ""
+
+# json_get_field tests
+test_json_get_field_string
+echo ""
+test_json_get_field_boolean_true
+echo ""
+test_json_get_field_boolean_false
+echo ""
+test_json_get_field_number
+echo ""
+test_json_get_field_missing
+echo ""
+test_json_get_field_empty_input
+echo ""
+test_json_get_field_nested_object
+echo ""
+test_json_get_field_with_spaces
+echo ""
+
+# json_is_success tests
+test_json_is_success_true
+echo ""
+test_json_is_success_false
+echo ""
+test_json_is_success_missing
+echo ""
+test_json_is_success_empty
+echo ""
+test_json_is_success_malformed
 echo ""
 
 # write_result tests
