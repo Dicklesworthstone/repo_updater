@@ -1096,7 +1096,8 @@ PY
     fi
 
     local warn
-    for warn in "${VALIDATION_WARNINGS[@]}"; do
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for warn in ${VALIDATION_WARNINGS[@]+"${VALIDATION_WARNINGS[@]}"}; do
         log_warn "  ⚠ $warn"
     done
 
@@ -1473,7 +1474,8 @@ execute_release_plan() {
 
     # Log any warnings
     local warning
-    for warning in "${VALIDATION_WARNINGS[@]}"; do
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for warning in ${VALIDATION_WARNINGS[@]+"${VALIDATION_WARNINGS[@]}"}; do
         log_warn "$warning"
     done
 
@@ -1888,7 +1890,8 @@ should_skip_phase() {
     local phase="${1:-}"
     [[ -z "$phase" ]] && return 1
     local p
-    for p in "${AGENT_SWEEP_SKIP_PHASES[@]}"; do
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for p in ${AGENT_SWEEP_SKIP_PHASES[@]+"${AGENT_SWEEP_SKIP_PHASES[@]}"}; do
         [[ "$p" == "$phase" ]] && return 0
     done
     return 1
@@ -2276,7 +2279,8 @@ print(json.dumps(repos))
         # Fallback: manual JSON array construction
         local first=true item
         completed_json="["
-        for item in "${COMPLETED_REPOS[@]}"; do
+        # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+        for item in ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"}; do
             $first || completed_json+=","
             completed_json+="\"$(json_escape "$item")\""
             first=false
