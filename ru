@@ -15512,8 +15512,9 @@ run_sequential_agent_sweep() {
     # shellcheck disable=SC2178
     local -n repos_ref=$1
     local any_failed=false
+    local rn
     for repo_spec in "${repos_ref[@]}"; do
-        local rn=$(get_repo_name "$repo_spec")
+        rn=$(get_repo_name "$repo_spec")
         log_step "Processing: $rn"
         if run_single_agent_workflow "$repo_spec"; then
             record_repo_result "$rn" "success"
@@ -15537,8 +15538,9 @@ run_parallel_agent_sweep() {
 
 run_single_agent_workflow() {
     local repo_spec="$1"
-    local rn=$(get_repo_name "$repo_spec")
-    local rp=$(repo_spec_to_path "$repo_spec")
+    local rn rp
+    rn=$(get_repo_name "$repo_spec")
+    rp=$(repo_spec_to_path "$repo_spec")
     load_per_repo_agent_config "$rp"
     if [[ "$AGENT_SWEEP_ENABLED" != "true" ]]; then
         log_verbose "Skipping $rn (disabled)"
@@ -15557,7 +15559,8 @@ get_first_failed_session() {
 record_repo_result() {
     local rn="$1" st="$2" dt="${3:-}"
     local sf="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/results.ndjson"
-    local ts=$(date -Iseconds)
+    local ts
+    ts=$(date -Iseconds)
     printf '{"repo":"%s","status":"%s","detail":"%s","timestamp":"%s"}\n' \
         "$(json_escape "$rn")" "$st" "$dt" "$ts" >> "$sf"
     [[ "$st" == "success" || "$st" == "failed" ]] && \
