@@ -3997,7 +3997,11 @@ parse_args() {
                 shift
                 ;;
             --restart)
-                RESTART="true"
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
+                    ARGS+=("$1")
+                else
+                    RESTART="true"
+                fi
                 shift
                 ;;
             --timeout)
@@ -4005,11 +4009,15 @@ parse_args() {
                     log_error "--timeout requires a value in seconds"
                     exit 4
                 fi
-                GIT_TIMEOUT="$2"
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
+                    ARGS+=("--timeout=$2")
+                else
+                    GIT_TIMEOUT="$2"
+                fi
                 shift 2
                 ;;
             --parallel)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     if [[ $# -lt 2 ]]; then
                         log_error "--parallel requires a number"
                         exit 4
@@ -4033,7 +4041,7 @@ parse_args() {
                 fi
                 ;;
             --parallel=*)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
