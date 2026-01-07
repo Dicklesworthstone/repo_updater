@@ -93,20 +93,27 @@ test_clone_and_pull() {
     log_test_start "clone and pull workflow"
 
     # Create test environment with local repos
-    local info repo_dir remote_dir
+    local info repo_dir remote_dir dev_dir
     info=$(create_real_git_repo_with_remote "test-repo" 3)
     repo_dir="${info%|*}"
     remote_dir="${info#*|}"
 
-    # Add a commit directly to the bare remote (simulates someone else pushing)
-    git -C "$remote_dir" commit --allow-empty -m "Remote commit"
+    # Create a "dev" clone to simulate another developer pushing
+    # (Can't commit directly to bare repo - must push from a working copy)
+    dev_dir=$(mktemp -d)
+    git clone "$remote_dir" "$dev_dir" >/dev/null 2>&1
+    git -C "$dev_dir" config user.name "Other Dev"
+    git -C "$dev_dir" config user.email "dev@test.local"
+    git -C "$dev_dir" commit --allow-empty -m "Remote commit"
+    git -C "$dev_dir" push >/dev/null 2>&1
 
     # Test ru function
     source_ru_function "do_pull"
-    do_pull "$repo_dir" "ff-only" "false"
+    local pull_exit=0
+    do_pull "$repo_dir" "ff-only" "false" || pull_exit=$?
 
     # Verify
-    assert_equals "0" "$?" "pull succeeds"
+    assert_equals "0" "$pull_exit" "pull succeeds"
 
     log_test_pass "clone and pull workflow"
 }
@@ -126,6 +133,7 @@ Test full CLI workflows in isolated environments:
 #!/usr/bin/env bash
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/test_e2e_framework.sh"
 
 test_sync_command() {
