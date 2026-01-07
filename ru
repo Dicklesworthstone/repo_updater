@@ -4088,7 +4088,7 @@ parse_args() {
                 INIT_EXAMPLE="true"
                 shift
                 ;;
-            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review)
+            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep)
                 COMMAND="$1"
                 shift
                 ;;
