@@ -15570,6 +15570,14 @@ record_repo_result() {
 print_agent_sweep_summary() {
     local sf="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/results.ndjson"
     [[ ! -f "$sf" ]] && return
+
+    # Calculate duration
+    local end_time duration_seconds duration_str
+    end_time=$(date +%s)
+    duration_seconds=$((end_time - ${RUN_START_TIME:-$end_time}))
+    duration_str=$(format_duration "$duration_seconds")
+
+    # Count results
     local s=0 f=0 k=0
     while IFS= read -r l; do
         case "$(echo "$l" | jq -r '.status // empty' 2>/dev/null)" in
@@ -15577,16 +15585,45 @@ print_agent_sweep_summary() {
         esac
     done < "$sf"
     local t=$((s + f + k))
+
     if [[ "${AGENT_SWEEP_JSON_OUTPUT:-false}" == "true" ]]; then
-        jq -n --argjson t "$t" --argjson s "$s" --argjson f "$f" --argjson k "$k" \
-            '{summary:{total:$t,success:$s,failed:$f,skipped:$k}}'
+        # JSON output with full details
+        local timestamp repos_json
+        timestamp=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+        repos_json=$(jq -s '[.[] | {name:.repo,status:.status,duration:.duration,error:.error}]' "$sf" 2>/dev/null || echo '[]')
+        jq -n --arg ts "$timestamp" --arg rid "${RUN_ID:-unknown}" \
+            --argjson dur "$duration_seconds" \
+            --argjson t "$t" --argjson s "$s" --argjson f "$f" --argjson k "$k" \
+            --argjson repos "$repos_json" \
+            --arg art "${RUN_ARTIFACTS_DIR:-}" \
+            '{timestamp:$ts,run_id:$rid,duration_seconds:$dur,summary:{total:$t,succeeded:$s,failed:$f,skipped:$k},artifacts_dir:$art,repos:$repos}'
     else
-        echo ""
-        log_info "═══════════════════════════════════════════"
-        log_info "Agent Sweep Summary"
-        log_info "═══════════════════════════════════════════"
-        log_info "Total: $t | Success: $s | Failed: $f | Skipped: $k"
-        log_info "═══════════════════════════════════════════"
+        # Human-readable box output
+        cat >&2 <<EOF
+
+╭─────────────────────────────────────────────────────────────╮
+│                   Agent Sweep Complete                       │
+│                                                             │
+│  Processed: $t repos
+│  Succeeded: $s
+│  Failed:    $f
+│  Skipped:   $k
+│  Total time: $duration_str
+╰─────────────────────────────────────────────────────────────╯
+EOF
+
+        # Show failed repos if any
+        if (( f > 0 )); then
+            echo >&2 ""
+            echo >&2 "Failed repos:"
+            jq -r 'select(.status == "failed") | "  • \(.repo): \(.error // "unknown")"' "$sf" 2>/dev/null | head -10 >&2
+        fi
+
+        # Show artifacts location
+        if [[ -n "${RUN_ARTIFACTS_DIR:-}" && -d "$RUN_ARTIFACTS_DIR" ]]; then
+            echo >&2 ""
+            echo >&2 "Artifacts: $RUN_ARTIFACTS_DIR"
+        fi
     fi
 }
 
