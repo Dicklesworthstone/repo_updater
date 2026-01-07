@@ -840,6 +840,438 @@ extract_all_plans() {
 }
 
 #------------------------------------------------------------------------------
+# AGENT-SWEEP COMMIT PLAN VALIDATION
+#
+# Validate commit plan JSON for safety and guardrails.
+# Sets VALIDATION_ERROR (fatal) and VALIDATION_WARNINGS (non-fatal).
+#------------------------------------------------------------------------------
+
+# Validate commit plan before execution.
+# Args: $1=commit_plan_json, $2=repo_path
+# Returns: 0=valid, 1=blocked
+validate_commit_plan() {
+    local plan_json="$1"
+    local repo_path="$2"
+
+    VALIDATION_ERROR=""
+    VALIDATION_WARNINGS=()
+
+    if [[ -z "$plan_json" ]]; then
+        VALIDATION_ERROR="Commit plan is empty"
+        return 1
+    fi
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        VALIDATION_ERROR="Invalid repo path for commit plan validation"
+        return 1
+    fi
+
+    if ! echo "$plan_json" | json_validate; then
+        VALIDATION_ERROR="Invalid JSON structure in commit plan"
+        return 1
+    fi
+
+    local commits_json push_flag
+    commits_json=$(json_get_field "$plan_json" "commits" || echo "")
+    push_flag=$(json_get_field "$plan_json" "push" || echo "")
+
+    if [[ -z "$commits_json" || "$commits_json" == "null" ]]; then
+        VALIDATION_ERROR="Missing or empty commits array in plan"
+        return 1
+    fi
+
+    local commit_count=0
+
+    if command -v jq &>/dev/null; then
+        if ! echo "$commits_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            VALIDATION_ERROR="Missing or empty commits array in plan"
+            return 1
+        fi
+
+        while IFS= read -r commit_json; do
+            ((commit_count++))
+
+            if ! echo "$commit_json" | jq -e '.message | type == "string" and (gsub("^\\s+|\\s+$";"") | length > 0)' >/dev/null 2>&1; then
+                VALIDATION_ERROR="Commit $commit_count has no message"
+                return 1
+            fi
+
+            if ! echo "$commit_json" | jq -e '.files | type == "array" and length > 0 and all(.[]; type == "string" and (gsub("^\\s+|\\s+$";"") | length > 0))' >/dev/null 2>&1; then
+                VALIDATION_ERROR="Commit $commit_count has no files"
+                return 1
+            fi
+
+            local -a files=()
+            mapfile -t files < <(echo "$commit_json" | jq -r '.files[] | gsub("^\\s+|\\s+$";"")' 2>/dev/null)
+            if [[ ${#files[@]} -eq 0 ]]; then
+                VALIDATION_ERROR="Commit $commit_count has no files"
+                return 1
+            fi
+
+            local file
+            for file in "${files[@]}"; do
+                [[ -z "$file" ]] && continue
+                local normalized
+                normalized="${file#./}"
+                case "$normalized" in
+                    ""|".")
+                        VALIDATION_ERROR="Commit $commit_count has empty file path"
+                        return 1
+                        ;;
+                    /*)
+                        VALIDATION_ERROR="Commit $commit_count has absolute file path: $file"
+                        return 1
+                        ;;
+                    ../*|*/../*|*/..|..)
+                        VALIDATION_ERROR="Commit $commit_count has unsafe path: $file"
+                        return 1
+                        ;;
+                esac
+                file="$normalized"
+
+                if is_file_denied "$file"; then
+                    VALIDATION_ERROR="Denied file in commit $commit_count: $file"
+                    return 1
+                fi
+
+                if [[ ! -e "$repo_path/$file" ]]; then
+                    VALIDATION_WARNINGS+=("File not found: $file (will be skipped)")
+                    continue
+                fi
+
+                if [[ -f "$repo_path/$file" ]]; then
+                    if is_file_too_large "$repo_path/$file"; then
+                        local size_mb
+                        size_mb=$(get_file_size_mb "$repo_path/$file")
+                        VALIDATION_ERROR="File too large: $file (${size_mb}MB > ${AGENT_SWEEP_MAX_FILE_MB}MB limit)"
+                        return 1
+                    fi
+
+                    if is_binary_file "$repo_path/$file"; then
+                        if ! is_binary_allowed "$file"; then
+                            VALIDATION_ERROR="Binary file not allowed: $file"
+                            return 1
+                        fi
+                        VALIDATION_WARNINGS+=("Binary file included: $file (explicitly allowed)")
+                    fi
+                fi
+            done
+        done < <(echo "$commits_json" | jq -c '.[]' 2>/dev/null)
+    elif command -v python3 &>/dev/null; then
+        local parsed_lines
+        parsed_lines=$(PLAN_JSON="$plan_json" python3 - <<'PY'
+import json, os, sys
+
+try:
+    data = json.loads(os.environ.get("PLAN_JSON", ""))
+except Exception:
+    print("ERROR\tInvalid JSON structure in commit plan")
+    sys.exit(2)
+
+commits = data.get("commits")
+if not isinstance(commits, list) or len(commits) == 0:
+    print("ERROR\tMissing or empty commits array in plan")
+    sys.exit(2)
+
+print(f"COUNT\t{len(commits)}")
+for idx, commit in enumerate(commits, 1):
+    files = commit.get("files")
+    message = commit.get("message", "")
+    if not isinstance(files, list) or len(files) == 0:
+        print(f"ERROR\tCommit {idx} has no files")
+        sys.exit(2)
+    if not isinstance(message, str) or not message.strip():
+        print(f"ERROR\tCommit {idx} has no message")
+        sys.exit(2)
+    if not all(isinstance(f, str) and f.strip() for f in files):
+        print(f"ERROR\tCommit {idx} has invalid files")
+        sys.exit(2)
+    for f in files:
+        f = f.strip()
+        print(f"FILE\t{idx}\t{f}")
+PY
+)
+        local parse_status=$?
+        if [[ $parse_status -ne 0 ]]; then
+            local err_line
+            err_line=$(echo "$parsed_lines" | head -n1)
+            VALIDATION_ERROR="${err_line#ERROR	}"
+            [[ -z "$VALIDATION_ERROR" ]] && VALIDATION_ERROR="Invalid commit plan"
+            return 1
+        fi
+
+        local line
+        while IFS=$'\t' read -r kind idx file; do
+            case "$kind" in
+                COUNT)
+                    commit_count="$idx"
+                    ;;
+                FILE)
+                    [[ -z "$file" ]] && continue
+                    local normalized
+                    normalized="${file#./}"
+                    case "$normalized" in
+                        ""|".")
+                            VALIDATION_ERROR="Commit $idx has empty file path"
+                            return 1
+                            ;;
+                        /*)
+                            VALIDATION_ERROR="Commit $idx has absolute file path: $file"
+                            return 1
+                            ;;
+                        ../*|*/../*|*/..|..)
+                            VALIDATION_ERROR="Commit $idx has unsafe path: $file"
+                            return 1
+                            ;;
+                    esac
+                    file="$normalized"
+
+                    if is_file_denied "$file"; then
+                        VALIDATION_ERROR="Denied file in commit $idx: $file"
+                        return 1
+                    fi
+
+                    if [[ ! -e "$repo_path/$file" ]]; then
+                        VALIDATION_WARNINGS+=("File not found: $file (will be skipped)")
+                        continue
+                    fi
+
+                    if [[ -f "$repo_path/$file" ]]; then
+                        if is_file_too_large "$repo_path/$file"; then
+                            local size_mb
+                            size_mb=$(get_file_size_mb "$repo_path/$file")
+                            VALIDATION_ERROR="File too large: $file (${size_mb}MB > ${AGENT_SWEEP_MAX_FILE_MB}MB limit)"
+                            return 1
+                        fi
+
+                        if is_binary_file "$repo_path/$file"; then
+                            if ! is_binary_allowed "$file"; then
+                                VALIDATION_ERROR="Binary file not allowed: $file"
+                                return 1
+                            fi
+                            VALIDATION_WARNINGS+=("Binary file included: $file (explicitly allowed)")
+                        fi
+                    fi
+                    ;;
+            esac
+        done <<<"$parsed_lines"
+    else
+        VALIDATION_ERROR="Commit plan validation requires jq or python3"
+        return 1
+    fi
+
+    local max_commits="${AGENT_SWEEP_MAX_COMMITS:-50}"
+    if is_positive_int "$max_commits" && [[ "$commit_count" -gt "$max_commits" ]]; then
+        VALIDATION_ERROR="Too many commits in plan: $commit_count (max $max_commits)"
+        return 1
+    fi
+
+    local secret_mode="${AGENT_SWEEP_SECRET_SCAN:-warn}"
+    if [[ "$secret_mode" != "none" ]]; then
+        local secret_result secret_exit
+        secret_result=$(run_secret_scan "$repo_path")
+        secret_exit=$?
+        if [[ $secret_exit -ne 0 ]]; then
+            local findings="Secrets detected in changes"
+            if command -v jq &>/dev/null; then
+                local joined
+                joined=$(echo "$secret_result" | jq -r '.findings[]?' 2>/dev/null | paste -sd ';' -)
+                [[ -n "$joined" ]] && findings="$joined"
+            else
+                local raw_findings
+                raw_findings=$(json_get_field "$secret_result" "findings" || echo "")
+                [[ -n "$raw_findings" ]] && findings="$raw_findings"
+            fi
+
+            if [[ "$secret_mode" == "block" && $secret_exit -eq 1 ]]; then
+                VALIDATION_ERROR="Secrets detected: $findings"
+                return 1
+            fi
+            VALIDATION_WARNINGS+=("Secret scan warning: $findings")
+        fi
+    fi
+
+    local warn
+    for warn in "${VALIDATION_WARNINGS[@]}"; do
+        log_warn "  ⚠ $warn"
+    done
+
+    log_verbose "Commit plan validated: $commit_count commits, push=$push_flag"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP COMMIT PLAN EXECUTION
+#
+# Execute a validated commit plan with deterministic git operations.
+#------------------------------------------------------------------------------
+
+# Stage files and create a commit.
+# Args: $1=repo_path, $2=commit_index, $3=message, $4...=files
+# Returns: 0=success, 1=failure
+commit_plan_stage_and_commit() {
+    local repo_path="$1"
+    local commit_index="$2"
+    local message="$3"
+    shift 3
+    local -a files=("$@")
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        log_error "Invalid repo path for commit execution"
+        return 1
+    fi
+    if [[ -z "$message" ]]; then
+        log_error "Commit $commit_index has empty message"
+        return 1
+    fi
+
+    local staged_any=false
+    local file output exit_code
+
+    for file in "${files[@]}"; do
+        [[ -z "$file" ]] && continue
+
+        if [[ -d "$repo_path/$file" ]]; then
+            log_error "Commit $commit_index includes directory path: $file"
+            return 1
+        fi
+
+        if [[ -e "$repo_path/$file" ]]; then
+            if output=$(git -C "$repo_path" add -A -- "$file" 2>&1); then
+                staged_any=true
+            else
+                exit_code=$?
+                log_error "Failed to stage $file for commit $commit_index: $output"
+                return "$exit_code"
+            fi
+            continue
+        fi
+
+        if git -C "$repo_path" ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+            if output=$(git -C "$repo_path" add -A -- "$file" 2>&1); then
+                staged_any=true
+            else
+                exit_code=$?
+                log_error "Failed to stage deletion for $file in commit $commit_index: $output"
+                return "$exit_code"
+            fi
+            continue
+        fi
+
+        log_warn "File not found, skipping: $file"
+    done
+
+    if [[ "$staged_any" != "true" ]]; then
+        log_error "No files staged for commit $commit_index"
+        return 1
+    fi
+
+    if git -C "$repo_path" diff --cached --quiet 2>/dev/null; then
+        log_error "No staged changes for commit $commit_index"
+        return 1
+    fi
+
+    local commit_output commit_exit
+    if commit_output=$(git -C "$repo_path" commit -m "$message" 2>&1); then
+        commit_exit=0
+    else
+        commit_exit=$?
+    fi
+
+    if [[ $commit_exit -ne 0 ]]; then
+        log_error "Commit $commit_index failed: $commit_output"
+        return "$commit_exit"
+    fi
+
+    log_verbose "Created commit $commit_index: ${message%%$'\n'*}"
+    return 0
+}
+
+# Execute commit plan after validation.
+# Args: $1=commit_plan_json, $2=repo_path
+# Returns: 0=success, 1=failure
+execute_commit_plan() {
+    local plan_json="$1"
+    local repo_path="$2"
+
+    if [[ -z "$plan_json" ]]; then
+        log_error "Commit plan is empty"
+        return 1
+    fi
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        log_error "Invalid repo path for commit plan execution"
+        return 1
+    fi
+
+    local exec_mode="${AGENT_SWEEP_EXECUTION_MODE:-agent}"
+    if [[ "$exec_mode" == "plan" ]]; then
+        capture_plan_json "$repo_path" "commit" "$plan_json" || true
+        log_info "Plan mode enabled; skipping commit execution"
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required to execute commit plans"
+        return 1
+    fi
+
+    if ! validate_commit_plan "$plan_json" "$repo_path"; then
+        log_error "Commit plan validation failed: ${VALIDATION_ERROR:-unknown error}"
+        return 1
+    fi
+
+    local push_flag
+    push_flag=$(json_get_field "$plan_json" "push" || echo "")
+    [[ -z "$push_flag" || "$push_flag" == "null" ]] && push_flag="false"
+
+    local commit_index=0
+    local commit_json
+    while IFS= read -r commit_json; do
+        ((commit_index++))
+
+        local message
+        message=$(echo "$commit_json" | jq -r '.message // empty' 2>/dev/null)
+        if [[ -z "$message" ]]; then
+            log_error "Commit $commit_index has no message"
+            return 1
+        fi
+
+        local -a files=()
+        mapfile -t files < <(echo "$commit_json" | jq -r '.files[] | gsub("^\\s+|\\s+$";"")' 2>/dev/null)
+        if [[ ${#files[@]} -eq 0 ]]; then
+            log_error "Commit $commit_index has no files"
+            return 1
+        fi
+
+        log_info "Applying commit $commit_index..."
+        if ! commit_plan_stage_and_commit "$repo_path" "$commit_index" "$message" "${files[@]}"; then
+            return 1
+        fi
+    done < <(echo "$plan_json" | jq -c '.commits[]' 2>/dev/null)
+
+    if [[ $commit_index -eq 0 ]]; then
+        log_error "No commits to apply from plan"
+        return 1
+    fi
+
+    if [[ "$push_flag" == "true" ]]; then
+        local output exit_code
+        if output=$(git -C "$repo_path" push 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+
+        if [[ $exit_code -ne 0 ]]; then
+            log_error "Push failed: $output"
+            return "$exit_code"
+        fi
+        log_info "Pushed to remote"
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
 # AGENT-SWEEP RELEASE WORKFLOW DETECTION
 #
 # Determine if a repository should have release automation (Phase 3).
@@ -4501,6 +4933,19 @@ parse_args() {
                 ;;
             --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
+                    ARGS+=("$1")
+                    shift
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_review_args+=("$1")
+                    shift
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                ;;
+            --max-file-mb=*)
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                     shift
                 elif [[ -z "$COMMAND" ]]; then
