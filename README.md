@@ -128,6 +128,14 @@ ru sync
   - [Rate-Limit Governor](#rate-limit-governor)
   - [Quality Gates](#quality-gates)
   - [Session Health Monitoring](#session-health-monitoring)
+- [Agent-Driven Sweep](#-agent-driven-sweep)
+  - [Prerequisites](#agent-sweep-prerequisites)
+  - [Basic Usage](#basic-usage)
+  - [Preflight Checks](#preflight-checks)
+  - [Security Guardrails](#security-guardrails)
+  - [Per-Repository Configuration](#per-repository-configuration)
+  - [State Management](#state-management)
+  - [Troubleshooting Agent Sweep](#troubleshooting-agent-sweep)
 - [Exit Codes](#-exit-codes)
 - [Architecture](#-architecture)
   - [NDJSON Results Logging](#ndjson-results-logging)
@@ -356,6 +364,7 @@ ru [command] [options]
 | `config` | Show or set configuration values |
 | `prune` | Find and manage orphan repositories |
 | `review` | AI-assisted code review orchestration |
+| `agent-sweep` | Orchestrate AI agents across dirty repos |
 | `import` | Import repos from GitHub stars or org |
 
 ### Global Options
@@ -467,6 +476,27 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | `--user=NAME` | Import from a user's repos |
 | `--limit=N` | Maximum repos to import |
 | `--private` | Add to private repos list |
+
+**`ru agent-sweep`**
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview which repos would be processed |
+| `--parallel N`, `-jN` | Process N repos concurrently (default: 1) |
+| `--repos=PATTERN` | Filter repos by glob pattern |
+| `--with-release` | Include release step after commit |
+| `--resume` | Resume an interrupted sweep |
+| `--restart` | Clear previous state and start fresh |
+| `--keep-sessions` | Keep tmux sessions after completion |
+| `--keep-sessions-on-fail` | Keep sessions only on failure |
+| `--attach-on-fail` | Attach to session on failure |
+| `--execution-mode=MODE` | Mode: `plan`, `apply`, or `agent` (default: agent) |
+| `--secret-scan=MODE` | Secret scanning: `none`, `warn`, `block` (default: warn) |
+| `--phase1-timeout=N` | Phase 1 timeout in seconds (default: 300) |
+| `--phase2-timeout=N` | Phase 2 timeout in seconds (default: 600) |
+| `--phase3-timeout=N` | Phase 3 timeout in seconds (default: 300) |
+| `--json` | Output results as JSON |
+| `--verbose`, `-v` | Verbose output |
+| `--debug`, `-d` | Debug output (implies verbose) |
 
 ---
 
@@ -1582,6 +1612,338 @@ When a blocking prompt is detected, the session is marked as waiting and the rea
 ru review --status
 # Shows: Session owner/repo waiting on "Password:" (high risk)
 ```
+
+---
+
+## 🤖 Agent-Driven Sweep
+
+The `ru agent-sweep` command orchestrates AI coding agents (via Claude Code) to automatically process repositories with uncommitted changes. It spawns isolated tmux sessions for each repository, monitors agent progress, and aggregates results.
+
+### The Agent Sweep Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       ru agent-sweep                              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │  Load dirty     │
+                    │  repositories   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+       ┌──────────┐   ┌──────────┐   ┌──────────┐
+       │ Preflight│   │ Preflight│   │ Preflight│
+       │  Checks  │   │  Checks  │   │  Checks  │
+       └──────────┘   └──────────┘   └──────────┘
+              │              │              │
+              ▼              ▼              ▼
+       ┌──────────┐   ┌──────────┐   ┌──────────┐
+       │  Spawn   │   │  Spawn   │   │  Spawn   │
+       │  Agent   │   │  Agent   │   │  Agent   │
+       │ (tmux)   │   │ (tmux)   │   │ (tmux)   │
+       └──────────┘   └──────────┘   └──────────┘
+              │              │              │
+              └──────────────┼──────────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │  Monitor &      │
+                    │  Aggregate      │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+       ┌──────────┐   ┌──────────┐   ┌──────────┐
+       │  Secret  │   │  Quality │   │   Push   │
+       │   Scan   │   │  Gates   │   │  (opt)   │
+       └──────────┘   └──────────┘   └──────────┘
+```
+
+### Agent Sweep Prerequisites
+
+Before using `agent-sweep`, ensure you have:
+
+| Requirement | Description |
+|-------------|-------------|
+| **ntm** | Named Tmux Manager for session orchestration |
+| **tmux** | Terminal multiplexer for isolated sessions |
+| **Claude Code** | AI coding agent (`claude` command) |
+
+**Verify installation:**
+```bash
+# Check ntm
+ntm --version
+
+# Check tmux
+tmux -V
+
+# Check Claude Code
+claude --version
+```
+
+### Basic Usage
+
+```bash
+# Process all repos with uncommitted changes
+ru agent-sweep
+
+# Dry run - preview what would be processed
+ru agent-sweep --dry-run
+
+# Process 4 repos in parallel
+ru agent-sweep -j4
+
+# Filter to specific repos
+ru agent-sweep --repos="myproject*"
+
+# Include release step after commit
+ru agent-sweep --with-release
+
+# Resume an interrupted sweep
+ru agent-sweep --resume
+
+# Start fresh (clear previous state)
+ru agent-sweep --restart
+
+# Verbose output with file logging
+ru agent-sweep --verbose
+
+# Debug mode for troubleshooting
+ru agent-sweep --debug
+```
+
+### Preflight Checks
+
+Before spawning an agent, each repository undergoes preflight validation:
+
+| Check | Reason | Skip Reason |
+|-------|--------|-------------|
+| Is git repository | Basic requirement | `not_a_git_repo` |
+| Git email configured | For commits | `git_email_not_configured` |
+| Git name configured | For commits | `git_name_not_configured` |
+| Not a shallow clone | Some ops may fail | `shallow_clone` |
+| No dirty submodules | Avoid conflicts | `dirty_submodules` |
+| No rebase in progress | Unsafe state | `rebase_in_progress` |
+| No merge in progress | Unsafe state | `merge_in_progress` |
+| No cherry-pick in progress | Unsafe state | `cherry_pick_in_progress` |
+| Not detached HEAD | Need branch ref | `detached_HEAD` |
+| Has upstream branch | For push | `no_upstream_branch` |
+| Not diverged | Would need rebase | `diverged_from_upstream` |
+
+**Handling preflight failures:**
+```bash
+# View why a repo was skipped (JSON output)
+ru agent-sweep --json 2>/dev/null | jq '.repos[] | select(.status == "skipped")'
+
+# Fix common issues
+cd /data/projects/problematic-repo
+git config user.email "you@example.com"
+git config user.name "Your Name"
+git rebase --abort  # If rebase in progress
+```
+
+### Security Guardrails
+
+Agent-sweep includes multiple security layers to prevent accidents:
+
+**1. File Denylist**
+
+Certain files are never committed, regardless of agent output:
+
+| Category | Patterns |
+|----------|----------|
+| **Secrets** | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `credentials.json`, `secrets.json` |
+| **Build artifacts** | `node_modules`, `__pycache__`, `dist`, `build`, `.next`, `target`, `vendor` |
+| **Logs/temp** | `*.log`, `*.tmp`, `*.swp`, `.DS_Store` |
+| **IDE files** | `.idea`, `.vscode`, `*.iml` |
+
+**Extend the denylist:**
+```bash
+# Via environment variable
+export AGENT_SWEEP_DENYLIST_EXTRA="*.bak *.orig internal/*"
+
+# Via per-repo config (.ru/agent-sweep.conf)
+echo 'DENYLIST_EXTRA="*.backup proprietary/*"' >> .ru/agent-sweep.conf
+```
+
+**2. Secret Scanning**
+
+Before any push, files are scanned for secrets:
+
+```bash
+# Modes
+--secret-scan=none   # Disable scanning
+--secret-scan=warn   # Warn but continue (default)
+--secret-scan=block  # Block push on detection
+```
+
+**Patterns detected:**
+- API keys (`sk-`, `ghp_`, `xox`, `AKIA`)
+- Private keys (`BEGIN RSA PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`)
+- Connection strings and passwords
+- Cloud provider credentials
+
+**3. File Size Limits**
+
+Large or binary files are blocked from commits to prevent repository bloat.
+
+### Per-Repository Configuration
+
+Customize agent-sweep behavior per repository:
+
+**Option 1: In-repo config (`.ru/agent-sweep.conf`):**
+```bash
+# ~/.../your-repo/.ru/agent-sweep.conf
+AGENT_SWEEP_ENABLED=true
+AGENT_SWEEP_TIMEOUT=600
+DENYLIST_EXTRA="*.backup"
+PUSH_STRATEGY=none   # plan|apply|push|none
+```
+
+**Option 2: YAML config (`.ru-agent.yml`):**
+```yaml
+# ~/.../your-repo/.ru-agent.yml
+agent_sweep:
+  enabled: true
+  timeout: 600
+  denylist_extra:
+    - "*.backup"
+    - "internal/*"
+  push_strategy: none
+```
+
+**Option 3: User config (`~/.config/ru/agent-sweep.d/<repo>.conf`):**
+```bash
+# ~/.config/ru/agent-sweep.d/my-repo.conf
+# Overrides for specific repo without modifying the repo itself
+AGENT_SWEEP_TIMEOUT=1200
+```
+
+### State Management
+
+Agent-sweep tracks progress for resume capability:
+
+```
+~/.local/state/ru/agent-sweep/
+├── state.json            # Current sweep state
+├── results.ndjson        # Per-repo results
+├── completed_repos.txt   # Successfully completed repos
+├── instance.lock/        # Concurrent execution lock
+│   └── pid               # Lock holder PID
+└── logs/
+    └── YYYY-MM-DD/
+        ├── agent_sweep.log      # Main log
+        └── repos/
+            └── <repo>.log       # Per-repo logs
+```
+
+**State operations:**
+```bash
+# View current state
+cat ~/.local/state/ru/agent-sweep/state.json | jq .
+
+# Resume interrupted sweep
+ru agent-sweep --resume
+
+# Clear state and start fresh
+ru agent-sweep --restart
+
+# View per-repo results
+cat ~/.local/state/ru/agent-sweep/results.ndjson | jq -s .
+```
+
+### Troubleshooting Agent Sweep
+
+<details>
+<summary><strong>"ntm is not available"</strong></summary>
+
+**Cause:** Named Tmux Manager not installed or not in PATH.
+
+**Fix:**
+```bash
+# Install ntm (if available via package manager)
+# Or add to PATH if installed elsewhere
+export PATH="$HOME/.local/bin:$PATH"
+
+# Verify
+ntm --version
+```
+
+</details>
+
+<details>
+<summary><strong>"Another agent-sweep is already running"</strong></summary>
+
+**Cause:** Lock file exists from previous run.
+
+**Fix:**
+```bash
+# Check if actually running
+ps aux | grep "agent-sweep"
+
+# If stale, remove lock
+rm -rf ~/.local/state/ru/agent-sweep/instance.lock
+```
+
+</details>
+
+<details>
+<summary><strong>Agent session hangs</strong></summary>
+
+**Cause:** Agent waiting for input or slow network.
+
+**Fixes:**
+1. Increase timeouts: `--phase2-timeout=1200`
+2. Attach to session: `ru agent-sweep --attach-on-fail`
+3. Keep sessions for debugging: `--keep-sessions-on-fail`
+```bash
+# List active sessions
+tmux list-sessions
+
+# Attach to specific session
+tmux attach -t ru-sweep-myrepo
+```
+
+</details>
+
+<details>
+<summary><strong>"diverged_from_upstream" skip reason</strong></summary>
+
+**Cause:** Local and remote branches have diverged.
+
+**Fix:**
+```bash
+cd /data/projects/affected-repo
+git fetch origin
+git rebase origin/main  # Or merge
+```
+
+</details>
+
+<details>
+<summary><strong>Secret detected, push blocked</strong></summary>
+
+**Cause:** Agent committed a file matching secret patterns.
+
+**Fixes:**
+1. Remove the secret: `git reset HEAD~1 && git checkout -- file`
+2. If false positive, adjust denylist
+3. Use `--secret-scan=warn` to continue with warning
+
+</details>
+
+### Exit Codes for Agent Sweep
+
+| Code | Meaning |
+|------|---------|
+| `0` | All repos processed successfully |
+| `1` | Some repos failed (agent error, timeout) |
+| `2` | Quality gate failures (secrets, tests) |
+| `3` | System error (ntm, tmux missing) |
+| `4` | Invalid arguments |
+| `5` | Interrupted (use `--resume`) |
 
 ---
 
