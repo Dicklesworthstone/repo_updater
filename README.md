@@ -1731,6 +1731,9 @@ Before spawning an agent, each repository undergoes preflight validation:
 | Not detached HEAD | Need branch ref | `detached_HEAD` |
 | Has upstream branch | For push | `no_upstream_branch` |
 | Not diverged | Would need rebase | `diverged_from_upstream` |
+| No unmerged paths | Merge conflicts exist | `unmerged_paths` |
+| git diff --check clean | Whitespace/conflict markers | `diff_check_failed` |
+| Untracked files < 1000 | Too many untracked | `too_many_untracked_files` |
 
 **Handling preflight failures:**
 ```bash
@@ -1826,17 +1829,20 @@ AGENT_SWEEP_TIMEOUT=1200
 Agent-sweep tracks progress for resume capability:
 
 ```
-~/.local/state/ru/agent-sweep/
-├── state.json            # Current sweep state
-├── results.ndjson        # Per-repo results
-├── completed_repos.txt   # Successfully completed repos
-├── instance.lock/        # Concurrent execution lock
-│   └── pid               # Lock holder PID
+~/.local/state/ru/
+├── agent-sweep/
+│   ├── state.json            # Current sweep state
+│   ├── results.ndjson        # Per-repo results
+│   ├── completed_repos.txt   # Successfully completed repos
+│   ├── instance.lock/        # Concurrent execution lock
+│   │   └── pid               # Lock holder PID
+│   ├── locks/                # Coordination locks
+│   └── runs/<run-id>/        # Per-run artifacts
 └── logs/
     └── YYYY-MM-DD/
-        ├── agent_sweep.log      # Main log
+        ├── agent_sweep.log   # Main log
         └── repos/
-            └── <repo>.log       # Per-repo logs
+            └── <repo>.log    # Per-repo logs
 ```
 
 **State operations:**
