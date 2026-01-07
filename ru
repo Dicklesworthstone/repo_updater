@@ -4218,7 +4218,7 @@ parse_args() {
                 shift
                 ;;
             --resume)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
@@ -15650,7 +15650,8 @@ cmd_agent_sweep() {
     # Concurrent instance lock
     local lock_dir="$state_dir/instance.lock"
 
-    # Helper to release lock - uses state_dir which persists in closure
+    # Helper to release lock - only called within cmd_agent_sweep where state_dir is in scope
+    # Note: The EXIT trap uses inline expansion instead of this function to avoid scope issues
     release_lock() {
         rm -f "$state_dir/instance.lock/pid" 2>/dev/null
         rmdir "$state_dir/instance.lock" 2>/dev/null || true
