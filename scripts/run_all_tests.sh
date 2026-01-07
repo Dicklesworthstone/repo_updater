@@ -153,7 +153,8 @@ discover_tests() {
         done < <(find "$SCRIPT_DIR" -maxdepth 1 -name 'test_*.sh' -type f -print0 | sort -z)
     fi
 
-    printf '%s\n' "${tests[@]}"
+    # Only print if there are tests (empty array would output just newline)
+    [[ ${#tests[@]} -gt 0 ]] && printf '%s\n' "${tests[@]}"
 }
 
 #==============================================================================
