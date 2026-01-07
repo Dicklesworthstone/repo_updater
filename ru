@@ -697,6 +697,126 @@ extract_all_plans() {
     return 1
 }
 
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RELEASE WORKFLOW DETECTION
+#
+# Determine if a repository should have release automation (Phase 3).
+#------------------------------------------------------------------------------
+
+# Check if repo has release workflow configured.
+# Checks in order: per-repo config, user config, gh API, workflow files.
+# Usage: has_release_workflow /path/to/repo
+# Returns: 0 if release workflow detected, 1 otherwise
+has_release_workflow() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && return 1
+
+    local workflows_dir="$repo_path/.github/workflows"
+
+    # 1. Check explicit per-repo config first (highest priority)
+    local repo_config="$repo_path/.ru/agent-sweep.conf"
+    if [[ -f "$repo_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$repo_config" 2>/dev/null
+        case "${AGENT_SWEEP_RELEASE_STRATEGY:-}" in
+            never) return 1 ;;
+            tag-only|gh-release|auto) return 0 ;;
+        esac
+    fi
+
+    # 2. Check user-level per-repo config
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local user_config="${RU_CONFIG_DIR:-$HOME/.config/ru}/agent-sweep.d/${repo_name}.conf"
+    if [[ -f "$user_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$user_config" 2>/dev/null
+        case "${AGENT_SWEEP_RELEASE_STRATEGY:-}" in
+            never) return 1 ;;
+            tag-only|gh-release|auto) return 0 ;;
+        esac
+    fi
+
+    # 3. Use gh API if available (checks remote for release workflows)
+    if command -v gh &>/dev/null; then
+        local remote_url
+        remote_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null)
+        if [[ -n "$remote_url" ]]; then
+            # Extract owner/repo from URL
+            local repo_spec
+            repo_spec=$(echo "$remote_url" | sed -E 's#.*[:/]([^/]+/[^/]+)(\.git)?$#\1#')
+            if [[ -n "$repo_spec" ]]; then
+                # Check for release-related workflows
+                if gh workflow list -R "$repo_spec" 2>/dev/null | grep -qiE "release|deploy|publish"; then
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    # 4. Fallback: check local workflow files for release patterns
+    [[ -d "$workflows_dir" ]] || return 1
+
+    # Look for release-related triggers or jobs in workflow files
+    if compgen -G "$workflows_dir/*.yml" >/dev/null 2>&1 || \
+       compgen -G "$workflows_dir/*.yaml" >/dev/null 2>&1; then
+        # Check for common release patterns
+        if grep -riqE "(on:[[:space:]]*release|tags:|workflow_dispatch:|create:[[:space:]]*tags)" \
+           "$workflows_dir"/*.yml "$workflows_dir"/*.yaml 2>/dev/null; then
+            return 0
+        fi
+        # Check for release job names
+        if grep -riqE "(release|publish|deploy)" \
+           "$workflows_dir"/*.yml "$workflows_dir"/*.yaml 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Get the release strategy for a repo.
+# Returns: "never", "auto", "tag-only", or "gh-release"
+get_release_strategy() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && { echo "never"; return; }
+
+    # Check per-repo config
+    local repo_config="$repo_path/.ru/agent-sweep.conf"
+    if [[ -f "$repo_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$repo_config" 2>/dev/null
+        if [[ -n "$AGENT_SWEEP_RELEASE_STRATEGY" ]]; then
+            echo "$AGENT_SWEEP_RELEASE_STRATEGY"
+            return
+        fi
+    fi
+
+    # Check user config
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local user_config="${RU_CONFIG_DIR:-$HOME/.config/ru}/agent-sweep.d/${repo_name}.conf"
+    if [[ -f "$user_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$user_config" 2>/dev/null
+        if [[ -n "$AGENT_SWEEP_RELEASE_STRATEGY" ]]; then
+            echo "$AGENT_SWEEP_RELEASE_STRATEGY"
+            return
+        fi
+    fi
+
+    # Default: auto if has release workflow, never otherwise
+    if has_release_workflow "$repo_path"; then
+        echo "auto"
+    else
+        echo "never"
+    fi
+}
+
 # Load per-repo agent-sweep configuration.
 # Usage: load_repo_agent_config /path/to/repo
 # Returns: 0 on success (uses defaults if no config found), 1 on invalid args
