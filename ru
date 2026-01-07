@@ -175,7 +175,7 @@ fi
 RU_LOG_DIR="$RU_STATE_DIR/logs"
 
 # Default configuration values
-DEFAULT_PROJECTS_DIR="${RU_PROJECTS_DIR:-$HOME/projects}"
+DEFAULT_PROJECTS_DIR="${RU_PROJECTS_DIR:-/data/projects}"
 DEFAULT_LAYOUT="flat"           # flat | owner-repo | full
 DEFAULT_UPDATE_STRATEGY="ff-only"  # ff-only | rebase | merge
 DEFAULT_AUTOSTASH="false"
@@ -355,7 +355,7 @@ repo_spec_to_path() {
     # Extract repo name (last component)
     local repo_name="${repo##*/}"
     # Use configured projects directory
-    local projects_dir="${RU_PROJECTS_DIR:-$HOME/projects}"
+    local projects_dir="${RU_PROJECTS_DIR:-/data/projects}"
 
     echo "${projects_dir}/${repo_name}"
 }
