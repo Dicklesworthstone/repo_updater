@@ -608,10 +608,11 @@ log_test_result_json() {
         extra_args+=("stack_trace" "$(_json_stack_trace)")
     fi
 
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0 compatibility with set -u
     _json_log "test_result" \
         "result" "$result" \
         "duration_ms" "$duration_ms" \
-        "${extra_args[@]}"
+        ${extra_args[@]+"${extra_args[@]}"}
 }
 
 # Log assertion result (JSON)
