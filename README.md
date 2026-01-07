@@ -1796,32 +1796,44 @@ Large or binary files are blocked from commits to prevent repository bloat.
 
 Customize agent-sweep behavior per repository:
 
-**Option 1: In-repo config (`.ru/agent-sweep.conf`):**
-```bash
-# ~/.../your-repo/.ru/agent-sweep.conf
-AGENT_SWEEP_ENABLED=true
-AGENT_SWEEP_TIMEOUT=600
-DENYLIST_EXTRA="*.backup"
-PUSH_STRATEGY=none   # plan|apply|push|none
-```
-
-**Option 2: YAML config (`.ru-agent.yml`):**
+**Option 1: YAML config (`.ru-agent.yml`)** — Recommended:
 ```yaml
 # ~/.../your-repo/.ru-agent.yml
 agent_sweep:
   enabled: true
-  timeout: 600
+  max_file_size: 5242880  # 5MB
+  extra_context: "This is a Python project using FastAPI"
+  pre_hook: "make lint"
+  post_hook: "make test"
+  skip_phases: []
   denylist_extra:
     - "*.backup"
     - "internal/*"
-  push_strategy: none
 ```
 
-**Option 3: User config (`~/.config/ru/agent-sweep.d/<repo>.conf`):**
+**Option 2: JSON config (`.ru-agent.json`):**
+```json
+{
+  "agent_sweep": {
+    "enabled": true,
+    "max_file_size": 5242880,
+    "denylist_extra": ["*.backup", "internal/*"]
+  }
+}
+```
+
+**Option 3: Shell config for release strategy (`.ru/agent-sweep.conf`):**
+```bash
+# ~/.../your-repo/.ru/agent-sweep.conf
+# Only release strategy is configurable via shell config
+AGENT_SWEEP_RELEASE_STRATEGY=auto  # never|auto|tag-only|gh-release
+```
+
+**Option 4: User config (`~/.config/ru/agent-sweep.d/<repo>.conf`):**
 ```bash
 # ~/.config/ru/agent-sweep.d/my-repo.conf
-# Overrides for specific repo without modifying the repo itself
-AGENT_SWEEP_TIMEOUT=1200
+# Per-repo overrides without modifying the repo itself
+AGENT_SWEEP_RELEASE_STRATEGY=never
 ```
 
 ### State Management
