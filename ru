@@ -362,6 +362,7 @@ repo_spec_to_path() {
 # Usage: load_all_repos array_name
 # Populates the named array with repo specs
 load_all_repos() {
+    # shellcheck disable=SC2178  # repos_ref is a nameref to caller's array
     local -n repos_ref=$1
     repos_ref=()
 
@@ -14291,6 +14292,7 @@ preflight_skip_reason_action() {
 #   run_parallel_preflight repos
 #   # repos now contains only repos that passed preflight
 run_parallel_preflight() {
+    # shellcheck disable=SC2178  # repos_ref is a nameref to caller's array
     local -n repos_ref=$1
     local -a passed_repos=()
     local -a failed_repos=()

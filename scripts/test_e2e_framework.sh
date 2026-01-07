@@ -295,6 +295,38 @@ MOCK_EOF
 }
 
 #==============================================================================
+# Mock ntm/tmux CLIs
+#==============================================================================
+
+# Create mock ntm/tmux scripts in the E2E mock bin
+# Usage: e2e_create_mock_ntm [scenario]
+# Scenario defaults to "ok" (see scripts/test_bin/ntm for options)
+e2e_create_mock_ntm() {
+    local scenario="${1:-ok}"
+
+    e2e_log_operation "create_mock_ntm" "scenario=$scenario" "setup"
+
+    local source_dir="$E2E_PROJECT_DIR/scripts/test_bin"
+    local ntm_src="$source_dir/ntm"
+    local tmux_src="$source_dir/tmux"
+
+    if [[ ! -f "$ntm_src" || ! -f "$tmux_src" ]]; then
+        e2e_log_result "create_mock_ntm" "fail" 0 "missing mock scripts"
+        return 1
+    fi
+
+    cp "$ntm_src" "$E2E_MOCK_BIN/ntm"
+    cp "$tmux_src" "$E2E_MOCK_BIN/tmux"
+    chmod +x "$E2E_MOCK_BIN/ntm" "$E2E_MOCK_BIN/tmux"
+
+    export NTM_MOCK_SCENARIO="$scenario"
+    export NTM_MOCK_STATE_FILE="$E2E_TEMP_DIR/ntm_mock_state"
+    export NTM_MOCK_LAST_PROMPT="$E2E_TEMP_DIR/ntm_mock_last_prompt"
+
+    e2e_log_result "create_mock_ntm" "pass"
+}
+
+#==============================================================================
 # GraphQL Response Generators
 #==============================================================================
 
@@ -618,6 +650,7 @@ export E2E_SCRIPT_DIR E2E_PROJECT_DIR E2E_RU_SCRIPT
 export -f e2e_setup e2e_cleanup e2e_get_temp_dir e2e_get_log_dir
 export -f e2e_log_operation e2e_log_result e2e_log_command
 export -f e2e_create_mock_gh e2e_create_mock_gh_custom
+export -f e2e_create_mock_ntm
 export -f e2e_graphql_response_with_items e2e_graphql_response_empty
 export -f e2e_graphql_repo_with_items e2e_graphql_repo_empty e2e_graphql_error
 export -f e2e_assert_ru_exit e2e_assert_ru_json
