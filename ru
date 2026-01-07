@@ -585,10 +585,15 @@ json_validate() {
     elif command -v python3 &>/dev/null; then
         python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null
     else
-        # Best effort: check for opening { and closing }
+        # Best effort: check content starts with { and ends with }
+        # Note: bash regex '.' doesn't match newlines, so we compress first
         local content
         content=$(cat)
-        [[ "$content" =~ ^\{.*\}$ ]]
+        # Remove all whitespace to get a single-line representation
+        local compressed
+        compressed=$(printf '%s' "$content" | tr -d '\n\r\t ')
+        # Check first and last characters are braces
+        [[ "${compressed:0:1}" == "{" && "${compressed: -1}" == "}" ]]
     fi
 }
 
@@ -15412,7 +15417,7 @@ cmd_agent_sweep() {
         else
             log_success "No repositories with uncommitted changes found."
         fi
-        rmdir "$lock_dir" 2>/dev/null || true
+        release_lock
         return 0
     fi
 
@@ -15426,7 +15431,7 @@ cmd_agent_sweep() {
                 log_info "  - $(get_repo_name "$repo_spec")"
             done
         fi
-        rmdir "$lock_dir" 2>/dev/null || true
+        release_lock
         return 0
     fi
 
@@ -15454,7 +15459,7 @@ cmd_agent_sweep() {
 
     if [[ ${#dirty_repos[@]} -eq 0 ]]; then
         log_success "All repositories already processed."
-        rmdir "$lock_dir" 2>/dev/null || true
+        release_lock
         return 0
     fi
 
@@ -15463,7 +15468,7 @@ cmd_agent_sweep() {
     if ! run_parallel_preflight dirty_repos; then
         if [[ ${#dirty_repos[@]} -eq 0 ]]; then
             log_error "All repositories failed preflight checks"
-            rmdir "$lock_dir" 2>/dev/null || true
+            release_lock
             return 2
         fi
     fi
@@ -15508,7 +15513,7 @@ cmd_agent_sweep() {
         fi
     fi
 
-    rmdir "$lock_dir" 2>/dev/null || true
+    release_lock
     return $sweep_exit
 }
 
@@ -15546,7 +15551,7 @@ run_single_agent_workflow() {
     local rn rp
     rn=$(get_repo_name "$repo_spec")
     rp=$(repo_spec_to_path "$repo_spec")
-    load_per_repo_agent_config "$rp"
+    load_repo_agent_config "$rp"
     if [[ "$AGENT_SWEEP_ENABLED" != "true" ]]; then
         log_verbose "Skipping $rn (disabled)"
         return 0
@@ -15567,7 +15572,7 @@ record_repo_result() {
     local ts
     ts=$(date -Iseconds)
     printf '{"repo":"%s","status":"%s","detail":"%s","timestamp":"%s"}\n' \
-        "$(json_escape "$rn")" "$st" "$dt" "$ts" >> "$sf"
+        "$(json_escape "$rn")" "$st" "$(json_escape "$dt")" "$ts" >> "$sf"
     [[ "$st" == "success" || "$st" == "failed" ]] && \
         echo "$rn" >> "${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/completed_repos.txt"
 }
