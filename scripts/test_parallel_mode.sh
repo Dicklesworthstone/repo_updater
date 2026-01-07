@@ -270,9 +270,10 @@ test_parallel_sweep_falls_back_to_sequential_for_single_repo() {
     progress_init() { :; }
     progress_start_repo() { :; }
     progress_complete_repo() { :; }
+    progress_summary() { :; }
     record_repo_result() { :; }
     get_repo_name() { echo "${1##*/}"; }
-    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name
+    export -f progress_init progress_start_repo progress_complete_repo progress_summary record_repo_result get_repo_name
 
     local -a target_repos=("test/repo1")
     run_parallel_agent_sweep target_repos 4 2>/dev/null || true
@@ -313,10 +314,11 @@ test_parallel_sweep_processes_all_repos() {
     progress_init() { :; }
     progress_start_repo() { :; }
     progress_complete_repo() { :; }
+    progress_summary() { :; }
     record_repo_result() { :; }
     get_repo_name() { echo "${1##*/}"; }
     mktemp_file() { mktemp; }
-    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name mktemp_file
+    export -f progress_init progress_start_repo progress_complete_repo progress_summary record_repo_result get_repo_name mktemp_file
 
     local -a target_repos=("test/repo1" "test/repo2" "test/repo3" "test/repo4" "test/repo5")
     run_parallel_agent_sweep target_repos 3 2>/dev/null || true
@@ -377,10 +379,11 @@ test_parallel_sweep_respects_max_workers() {
     progress_init() { :; }
     progress_start_repo() { :; }
     progress_complete_repo() { :; }
+    progress_summary() { :; }
     record_repo_result() { :; }
     get_repo_name() { echo "${1##*/}"; }
     mktemp_file() { mktemp; }
-    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name mktemp_file
+    export -f progress_init progress_start_repo progress_complete_repo progress_summary record_repo_result get_repo_name mktemp_file
 
     local -a target_repos=("test/repo1" "test/repo2" "test/repo3" "test/repo4")
     run_parallel_agent_sweep target_repos 2 2>/dev/null || true
@@ -426,10 +429,11 @@ STATE_EOF
     progress_init() { :; }
     progress_start_repo() { :; }
     progress_complete_repo() { :; }
+    progress_summary() { :; }
     record_repo_result() { :; }
     get_repo_name() { echo "${1##*/}"; }
     mktemp_file() { mktemp; }
-    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name mktemp_file
+    export -f progress_init progress_start_repo progress_complete_repo progress_summary record_repo_result get_repo_name mktemp_file
 
     local -a target_repos=("test/repo1" "test/repo2")
     run_parallel_agent_sweep target_repos 2 2>/dev/null || true
@@ -438,9 +442,11 @@ STATE_EOF
     end_time=$(date +%s)
     elapsed=$((end_time - start_time))
 
-    # Workers should have waited at least briefly for backoff
-    # (Note: this is a weak test since backoff is checked before each dequeue)
-    assert_true "[[ $elapsed -ge 0 ]]" "workers completed after backoff"
+    # NOTE: This is a smoke test that verifies the function completes without
+    # hanging when backoff is active. The assertion checks completion time is
+    # reasonable (< 30s) rather than verifying exact backoff timing, since
+    # timing assertions are inherently flaky across different systems.
+    assert_true "[[ $elapsed -lt 30 ]]" "sweep completed in reasonable time with backoff active"
 
     log_test_pass "$test_name"
 }
