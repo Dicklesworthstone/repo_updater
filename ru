@@ -2758,6 +2758,8 @@ _progress_show_header() {
         local box_width=38
         local content_len=${#content}
         local total_padding=$((box_width - content_len))
+        # Clamp to 0 if content exceeds box width (defensive)
+        [[ $total_padding -lt 0 ]] && total_padding=0
         local left_pad=$((total_padding / 2))
         local right_pad=$((total_padding - left_pad))
         local left_spaces right_spaces
@@ -4833,6 +4835,8 @@ parse_args() {
             --restart)
                 if [[ "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
                 else
                     RESTART="true"
                 fi
@@ -4845,6 +4849,8 @@ parse_args() {
                 fi
                 if [[ "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("--timeout=$2")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("--timeout=$2")
                 else
                     GIT_TIMEOUT="$2"
                 fi
@@ -5012,6 +5018,9 @@ parse_args() {
                 case "$opt" in
                     --dry-run) DRY_RUN="true" ;;
                     --resume)  RESUME="true" ;;
+                    --restart) RESTART="true" ;;
+                    --json)    ;; # Already set JSON_OUTPUT at first pass
+                    --timeout=*) GIT_TIMEOUT="${opt#--timeout=}" ;;
                     --parallel=*) PARALLEL="${opt#--parallel=}" ;;
                     -j*) PARALLEL="${opt#-j}" ;;
                 esac
