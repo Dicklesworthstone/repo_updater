@@ -8926,13 +8926,15 @@ detect_session_state_raw() {
 # Args:
 #   $1 - Session ID
 #   $2 - New raw state
-#   $3 - Current confirmed state (optional)
+#   $3 - Current confirmed state (optional, default: generating)
+#   $4 - Output variable name (optional, for avoiding subshell)
 # Outputs:
-#   Confirmed state after hysteresis
+#   Confirmed state after hysteresis (via stdout or named variable)
 apply_state_hysteresis() {
     local session_id="$1"
     local new_state="$2"
     local current_state="${3:-generating}"
+    local out_var="${4:-}"
 
     # Append to history (comma-separated string)
     local history="${SESSION_STATE_HISTORY[$session_id]:-}"
@@ -8958,11 +8960,19 @@ apply_state_hysteresis() {
         { c=0; for(i=NF;i>=1;i--) if($i==state) c++; else break; print c }
     ')
 
+    local result
     if [[ "$consecutive" -ge "$required" ]]; then
-        echo "$new_state"
+        result="$new_state"
     else
         # Return current confirmed state
-        echo "$current_state"
+        result="$current_state"
+    fi
+
+    # Output result via named variable or stdout
+    if [[ -n "$out_var" ]]; then
+        _set_out_var "$out_var" "$result"
+    else
+        echo "$result"
     fi
 }
 
