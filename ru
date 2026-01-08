@@ -13934,8 +13934,10 @@ prepare_review_worktrees() {
 
         # Preserve branch pins/custom names from config when possible.
         local config_spec=""
-        if config_spec=$(find_repo_spec_for_repo_id "$repo_spec" 2>/dev/null); then
-            repo_spec="$config_spec"
+        if declare -F find_repo_spec_for_repo_id >/dev/null; then
+            if config_spec=$(find_repo_spec_for_repo_id "$repo_spec" 2>/dev/null); then
+                repo_spec="$config_spec"
+            fi
         fi
 
         # Resolve repo spec to get local path

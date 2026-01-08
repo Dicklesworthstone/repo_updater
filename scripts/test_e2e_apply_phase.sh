@@ -52,9 +52,6 @@ source_ru_function "execute_gh_actions"
 source_ru_function "get_gh_actions_log_file"
 source_ru_function "get_review_state_dir"
 
-# Track gh CLI calls
-declare -ga GH_CALL_LOG=()
-
 #------------------------------------------------------------------------------
 # Tests
 #------------------------------------------------------------------------------
