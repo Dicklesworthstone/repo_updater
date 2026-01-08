@@ -8668,6 +8668,626 @@ format_wait_info() {
 }
 
 #------------------------------------------------------------------------------
+# SESSION MONITORING & COMPLETION DETECTION (bd-eycs)
+# Monitor active Claude Code sessions, detect states with hysteresis,
+# handle errors, stalls, and completion
+#------------------------------------------------------------------------------
+
+# Session state history for hysteresis (session_id -> comma-separated states)
+declare -gA SESSION_STATE_HISTORY=()
+
+# Stall counters per session for recovery escalation
+declare -gA SESSION_STALL_COUNTS=()
+
+# Error patterns that indicate session failure
+# shellcheck disable=SC2034  # Array used by session_has_error
+SESSION_ERROR_PATTERNS=(
+    "rate.limit"
+    "429"
+    "quota.exceeded"
+    "panic:"
+    "SIGSEGV"
+    "killed"
+    "unauthorized"
+    "invalid.*key"
+    "connection refused"
+    "timed out"
+    "context.*exceeded"
+    "token.*limit"
+)
+
+# Calculate output velocity (characters per second) for a session
+# Args:
+#   $1 - Session ID
+#   $2 - Window in seconds (default: 5)
+# Outputs:
+#   Velocity as integer (chars/sec)
+calculate_output_velocity() {
+    local session_id="$1"
+    local window="${2:-5}"
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+
+    if [[ ! -f "$pipe_log" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local now file_size prev_size_file prev_size
+    now=$(date +%s)
+
+    # Store previous size for velocity calculation
+    prev_size_file="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.prev_size"
+
+    if [[ -f "$prev_size_file" ]]; then
+        prev_size=$(cat "$prev_size_file" 2>/dev/null || echo "0")
+    else
+        prev_size=0
+    fi
+
+    file_size=$(stat -c%s "$pipe_log" 2>/dev/null || stat -f%z "$pipe_log" 2>/dev/null || echo "0")
+
+    # Save current size for next call
+    echo "$file_size" > "$prev_size_file"
+
+    # Calculate chars added in the window
+    local chars_added=$((file_size - prev_size))
+    if [[ $chars_added -lt 0 ]]; then
+        chars_added=0
+    fi
+
+    # Velocity = chars / window
+    local velocity=$((chars_added / window))
+    echo "$velocity"
+}
+
+# Get last output timestamp for a session
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Unix timestamp of last output
+get_last_output_time() {
+    local session_id="$1"
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+
+    if [[ ! -f "$pipe_log" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    # Get file modification time
+    local mtime
+    mtime=$(stat -c%Y "$pipe_log" 2>/dev/null || stat -f%m "$pipe_log" 2>/dev/null || echo "0")
+    echo "$mtime"
+}
+
+# Check if session output contains thinking indicators
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if thinking indicators present, 1 otherwise
+has_thinking_indicators() {
+    local session_id="$1"
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+
+    if [[ ! -f "$pipe_log" ]]; then
+        return 1
+    fi
+
+    # Check last 1000 chars for thinking patterns
+    if tail -c 1000 "$pipe_log" 2>/dev/null | grep -qE '(thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\.{3,}|\.\.\.)'; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if session is at an input prompt (Claude waiting for input)
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if at prompt, 1 otherwise
+is_at_prompt() {
+    local session_id="$1"
+
+    # Use driver to get session state
+    local state_json
+    state_json=$(driver_get_session_state "$session_id" 2>/dev/null)
+
+    if [[ -z "$state_json" ]]; then
+        return 1
+    fi
+
+    # Check if state indicates waiting
+    local state
+    state=$(echo "$state_json" | jq -r '.state // "unknown"' 2>/dev/null)
+
+    case "$state" in
+        waiting|idle|prompt)
+            return 0
+            ;;
+    esac
+
+    # Also check pipe log for prompt patterns
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    if [[ -f "$pipe_log" ]]; then
+        # Look for Claude Code prompt patterns in last 500 chars
+        if tail -c 500 "$pipe_log" 2>/dev/null | grep -qE '(^>|claude>|❯|➜|\$\s*$)'; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Check if session has received a result event (completion)
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if result event found, 1 otherwise
+session_has_result() {
+    local session_id="$1"
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+
+    if [[ ! -f "$pipe_log" ]]; then
+        return 1
+    fi
+
+    # Check for result event in stream-json output
+    if grep -q '"type":"result"' "$pipe_log" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if session has error patterns in output
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if error found, 1 otherwise
+# Outputs:
+#   Error pattern to stderr if found
+session_has_error() {
+    local session_id="$1"
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+
+    if [[ ! -f "$pipe_log" ]]; then
+        return 1
+    fi
+
+    local pattern
+    for pattern in "${SESSION_ERROR_PATTERNS[@]}"; do
+        if grep -qiE "$pattern" "$pipe_log" 2>/dev/null; then
+            echo "$pattern" >&2
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Detect raw session state without hysteresis
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   State string: generating|waiting|thinking|stalled|error|complete
+detect_session_state_raw() {
+    local session_id="$1"
+
+    # Check for completion first (highest priority)
+    if session_has_result "$session_id"; then
+        echo "complete"
+        return 0
+    fi
+
+    # Check for error patterns (high priority)
+    local error_pattern
+    if error_pattern=$(session_has_error "$session_id" 2>&1); then
+        echo "error"
+        return 0
+    fi
+
+    # Calculate output velocity
+    local velocity
+    velocity=$(calculate_output_velocity "$session_id" 5)
+
+    # Check for waiting state
+    if is_at_prompt "$session_id"; then
+        if [[ "$velocity" -lt 1 ]]; then
+            echo "waiting"
+            return 0
+        fi
+    fi
+
+    # Check for thinking indicators
+    if has_thinking_indicators "$session_id"; then
+        echo "thinking"
+        return 0
+    fi
+
+    # Check for stall (no output but not at prompt)
+    local last_output_time now
+    last_output_time=$(get_last_output_time "$session_id")
+    now=$(date +%s)
+    if [[ $((now - last_output_time)) -gt 30 ]]; then
+        echo "stalled"
+        return 0
+    fi
+
+    # Active generation
+    if [[ "$velocity" -gt 10 ]]; then
+        echo "generating"
+    else
+        echo "thinking"
+    fi
+}
+
+# Apply hysteresis to prevent state flapping
+# Args:
+#   $1 - Session ID
+#   $2 - New raw state
+#   $3 - Current confirmed state (optional)
+# Outputs:
+#   Confirmed state after hysteresis
+apply_state_hysteresis() {
+    local session_id="$1"
+    local new_state="$2"
+    local current_state="${3:-generating}"
+
+    # Append to history (comma-separated string)
+    local history="${SESSION_STATE_HISTORY[$session_id]:-}"
+    history="${history:+$history,}$new_state"
+
+    # Keep last 5 samples using awk
+    history=$(echo "$history" | awk -F',' '{for(i=NF-4>1?NF-4:1;i<=NF;i++) printf "%s%s",$i,(i<NF?",":"")}')
+    SESSION_STATE_HISTORY["$session_id"]="$history"
+
+    # Determine required consecutive samples for each state
+    local required
+    case "$new_state" in
+        error|complete) required=1 ;;
+        generating|thinking) required=2 ;;
+        waiting) required=3 ;;
+        stalled) required=5 ;;
+        *) required=2 ;;
+    esac
+
+    # Count consecutive matching samples from end
+    local consecutive
+    consecutive=$(echo "$history" | awk -F',' -v state="$new_state" '
+        { c=0; for(i=NF;i>=1;i--) if($i==state) c++; else break; print c }
+    ')
+
+    if [[ "$consecutive" -ge "$required" ]]; then
+        echo "$new_state"
+    else
+        # Return current confirmed state
+        echo "$current_state"
+    fi
+}
+
+# Handle a session that is waiting for input
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 on success
+handle_waiting_session() {
+    local session_id="$1"
+
+    # Get wait reason
+    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local recent_output=""
+    if [[ -f "$pipe_log" ]]; then
+        recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
+    fi
+
+    local wait_info
+    wait_info=$(detect_wait_reason "$session_id" "" "$recent_output")
+
+    # Log the waiting state
+    log_verbose "Session $session_id waiting: $(echo "$wait_info" | jq -r '.reason // "unknown"')"
+
+    # Queue question if it's an ask_user_question
+    local reason
+    reason=$(echo "$wait_info" | jq -r '.reason // "unknown"')
+
+    if [[ "$reason" == "ask_user_question" ]]; then
+        # Extract and queue the question
+        local question_data
+        question_data=$(echo "$wait_info" | jq -c '.context // {}')
+        queue_question "$session_id" "$question_data" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+# Handle a stalled session with escalating recovery
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 on success
+handle_stalled_session() {
+    local session_id="$1"
+
+    local stall_count="${SESSION_STALL_COUNTS[$session_id]:-0}"
+    ((stall_count++))
+    SESSION_STALL_COUNTS["$session_id"]=$stall_count
+
+    log_warn "Session $session_id stalled (attempt $stall_count)"
+
+    if [[ $stall_count -le 2 ]]; then
+        # Soft restart: send Ctrl+C
+        driver_interrupt_session "$session_id" 2>/dev/null || true
+        sleep 5
+    elif [[ $stall_count -le 4 ]]; then
+        # Try /compact to reduce context
+        driver_send_to_session "$session_id" "/compact" 2>/dev/null || true
+        sleep 10
+    else
+        # Hard restart - stop and restart session
+        log_error "Session $session_id persistently stalled, stopping"
+        driver_stop_session "$session_id" 2>/dev/null || true
+        SESSION_STALL_COUNTS["$session_id"]=0
+
+        # Signal that session needs restart
+        return 1
+    fi
+
+    return 0
+}
+
+# Handle a session that encountered an error
+# Args:
+#   $1 - Session ID
+#   $2 - Error pattern (optional)
+# Returns:
+#   0 on success
+handle_session_error() {
+    local session_id="$1"
+    local error_pattern="${2:-unknown}"
+
+    log_error "Session $session_id error: $error_pattern"
+
+    # Check for rate limit errors specifically
+    if [[ "$error_pattern" =~ (429|rate.limit|quota) ]]; then
+        # Notify governor about rate limit
+        if declare -p GOVERNOR_STATE &>/dev/null 2>&1; then
+            governor_record_error 2>/dev/null || true
+        fi
+    fi
+
+    # Record session error outcome
+    record_session_outcome "$session_id" "error" "$error_pattern" 2>/dev/null || true
+
+    # Stop the errored session
+    driver_stop_session "$session_id" 2>/dev/null || true
+
+    return 0
+}
+
+# Handle a completed session
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 on success
+handle_session_complete() {
+    local session_id="$1"
+
+    # Get worktree path for this session
+    local wt_path
+    wt_path=$(get_worktree_for_session "$session_id" 2>/dev/null || echo "")
+
+    local outcome="unknown"
+    local items_count=0
+
+    if [[ -n "$wt_path" ]] && [[ -d "$wt_path" ]]; then
+        local plan_file="$wt_path/.ru/review-plan.json"
+
+        if [[ -f "$plan_file" ]]; then
+            if validate_review_plan "$plan_file" 2>/dev/null; then
+                items_count=$(jq '.items | length' "$plan_file" 2>/dev/null || echo "0")
+                log_info "Session $session_id completed: $items_count items reviewed"
+                outcome="success"
+            else
+                log_warn "Session $session_id produced invalid plan"
+                outcome="invalid_plan"
+            fi
+        else
+            log_warn "Session $session_id completed without plan artifact"
+            outcome="no_plan"
+        fi
+    else
+        log_warn "Session $session_id completed but worktree not found"
+        outcome="no_worktree"
+    fi
+
+    # Record outcome
+    record_session_outcome "$session_id" "$outcome" "$items_count" 2>/dev/null || true
+
+    # Clear stall counter
+    unset "SESSION_STALL_COUNTS[$session_id]"
+    unset "SESSION_STATE_HISTORY[$session_id]"
+
+    return 0
+}
+
+# Record session outcome (stub - integrates with checkpoint system)
+# Args:
+#   $1 - Session ID
+#   $2 - Outcome (success|error|invalid_plan|no_plan|no_worktree)
+#   $3 - Details (items count or error pattern)
+record_session_outcome() {
+    local session_id="$1"
+    local outcome="$2"
+    local details="${3:-}"
+
+    # Get repo ID from session mapping if available
+    local repo_id
+    repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "$session_id")
+
+    log_debug "Session $session_id ($repo_id) outcome: $outcome ($details)"
+
+    # If checkpoint system is available, record via that
+    if type -t record_repo_outcome &>/dev/null; then
+        record_repo_outcome "$repo_id" "$outcome" "0" "${details:-0}" "0" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+# Get repo ID for a session (stub - integrates with worktree mapping)
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Repo ID (owner/repo format)
+get_repo_for_session() {
+    local session_id="$1"
+
+    # Try to get from worktree mapping
+    if [[ -n "${RU_STATE_DIR:-}" ]]; then
+        local mapping_file="$RU_STATE_DIR/worktrees/${REVIEW_RUN_ID:-current}/mapping.json"
+        if [[ -f "$mapping_file" ]]; then
+            local repo_id
+            repo_id=$(jq -r --arg sid "$session_id" '.sessions[$sid].repo_id // empty' "$mapping_file" 2>/dev/null)
+            if [[ -n "$repo_id" ]]; then
+                echo "$repo_id"
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback to session ID
+    echo "$session_id"
+}
+
+# Get worktree path for a session
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Worktree path
+get_worktree_for_session() {
+    local session_id="$1"
+
+    # Try to get from worktree mapping
+    if [[ -n "${RU_STATE_DIR:-}" ]]; then
+        local mapping_file="$RU_STATE_DIR/worktrees/${REVIEW_RUN_ID:-current}/mapping.json"
+        if [[ -f "$mapping_file" ]]; then
+            local wt_path
+            wt_path=$(jq -r --arg sid "$session_id" '.sessions[$sid].worktree_path // empty' "$mapping_file" 2>/dev/null)
+            if [[ -n "$wt_path" ]]; then
+                echo "$wt_path"
+                return 0
+            fi
+        fi
+    fi
+
+    echo ""
+}
+
+# Main session monitoring loop
+# Args:
+#   $1 - Lock file path (loop exits when removed)
+#   $2 - Poll interval in seconds (default: 2)
+# Returns:
+#   0 when lock removed, 1 on error
+monitor_sessions() {
+    local lock_file="$1"
+    local poll_interval="${2:-2}"
+
+    declare -A sessions=()  # session_id -> confirmed_state
+
+    log_verbose "Starting session monitor (poll=${poll_interval}s)"
+
+    while [[ -f "$lock_file" ]]; do
+        # Get list of active sessions
+        local session_list
+        session_list=$(driver_list_sessions 2>/dev/null || echo "")
+
+        # Process each active session
+        local session_id
+        while IFS= read -r session_id; do
+            [[ -z "$session_id" ]] && continue
+
+            # Initialize if new session
+            if [[ -z "${sessions[$session_id]:-}" ]]; then
+                sessions["$session_id"]="generating"
+                log_debug "Monitoring new session: $session_id"
+            fi
+
+            # Detect raw state
+            local raw_state
+            raw_state=$(detect_session_state_raw "$session_id")
+
+            # Apply hysteresis
+            local confirmed_state
+            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "${sessions[$session_id]}")
+
+            log_debug "Session $session_id: raw=$raw_state confirmed=$confirmed_state"
+
+            # Handle state transitions
+            case "$confirmed_state" in
+                waiting)
+                    handle_waiting_session "$session_id"
+                    ;;
+                stalled)
+                    handle_stalled_session "$session_id"
+                    ;;
+                error)
+                    handle_session_error "$session_id"
+                    unset "sessions[$session_id]"
+                    ;;
+                complete)
+                    handle_session_complete "$session_id"
+                    unset "sessions[$session_id]"
+                    ;;
+            esac
+
+            sessions["$session_id"]="$confirmed_state"
+        done <<< "$session_list"
+
+        # Start new sessions if governor allows
+        while can_start_new_session 2>/dev/null && has_pending_repos 2>/dev/null; do
+            start_next_queued_session sessions 2>/dev/null || break
+        done
+
+        sleep "$poll_interval"
+    done
+
+    log_verbose "Session monitor stopped (lock removed)"
+    return 0
+}
+
+# Check if there are pending repos to process (stub)
+# Returns:
+#   0 if pending repos exist, 1 otherwise
+has_pending_repos() {
+    # Check review state for pending repos
+    if [[ -n "${RU_STATE_DIR:-}" ]]; then
+        local state_file
+        state_file=$(get_review_state_file 2>/dev/null || echo "")
+        if [[ -f "$state_file" ]]; then
+            local pending
+            pending=$(jq '[.repos | to_entries[] | select(.value.status == "pending")] | length' "$state_file" 2>/dev/null || echo "0")
+            [[ "$pending" -gt 0 ]] && return 0
+        fi
+    fi
+    return 1
+}
+
+# Start the next queued session (stub)
+# Args:
+#   $1 - Reference to sessions associative array
+# Returns:
+#   0 on success, 1 if no session started
+start_next_queued_session() {
+    local -n _sessions_ref=$1
+
+    # This would be implemented by the orchestration layer
+    # For now, return 1 to indicate no session started
+    return 1
+}
+
+#------------------------------------------------------------------------------
 # COMMAND VALIDATION AND BLOCKING (bd-hmw8)
 # Security: Validate commands before execution in agent sessions
 #------------------------------------------------------------------------------
@@ -12358,20 +12978,36 @@ is_recently_reviewed() {
         return 1
     fi
 
-    # Calculate cutoff date
-    local cutoff
-    if date --version 2>/dev/null | grep -q GNU; then
-        cutoff=$(date -u -d "$skip_days days ago" +%Y-%m-%dT%H:%M:%SZ)
-    else
-        cutoff=$(date -u -v-${skip_days}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+    # Use epoch-based comparison for portability across date implementations
+    # (works with GNU coreutils, BSD date, and uutils coreutils)
+    local now_epoch cutoff_epoch last_review_epoch
+    now_epoch=$(date +%s 2>/dev/null)
+    if [[ -z "$now_epoch" ]]; then
+        return 1
     fi
+    cutoff_epoch=$((now_epoch - skip_days * 24 * 60 * 60))
 
-    if [[ -z "$cutoff" ]]; then
+    # Convert last_review ISO timestamp to epoch
+    # Try date -d (GNU/uutils) first, then date -j -f (BSD)
+    if last_review_epoch=$(date -d "$last_review" +%s 2>/dev/null); then
+        : # success
+    elif last_review_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_review" +%s 2>/dev/null); then
+        : # BSD success
+    else
+        # Fallback: lexicographic comparison with calculated cutoff timestamp
+        local cutoff
+        cutoff=$(date -u --date="@$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+        if [[ -z "$cutoff" ]]; then
+            return 1
+        fi
+        if [[ "$last_review" > "$cutoff" ]]; then
+            return 0
+        fi
         return 1
     fi
 
-    # Compare timestamps (lexicographic comparison works for ISO format)
-    if [[ "$last_review" > "$cutoff" ]]; then
+    # Compare epochs
+    if [[ "$last_review_epoch" -ge "$cutoff_epoch" ]]; then
         return 0  # Recently reviewed
     fi
 

@@ -381,7 +381,7 @@ test_recently_reviewed_false() {
 }
 
 #==============================================================================
-# Tests: Questions Queue (if functions exist)
+# Tests: Questions Queue
 #==============================================================================
 
 test_questions_file_path() {
@@ -394,6 +394,108 @@ test_questions_file_path() {
 
     assert_contains "$questions_file" "review-questions.json" "Should have questions filename"
     assert_contains "$questions_file" "$RU_STATE_DIR" "Should be in state dir"
+
+    log_test_pass "$test_name"
+}
+
+test_question_queue_persistence() {
+    local test_name="questions queue: persists across writes/loads"
+    log_test_start "$test_name"
+    setup_checkpoint_test
+
+    local questions_file
+    questions_file=$(get_questions_file)
+    mkdir -p "$(dirname "$questions_file")"
+
+    # Write test questions
+    local test_questions='[{"id":"q1","question":"Test question 1"},{"id":"q2","question":"Test question 2"}]'
+    echo "$test_questions" > "$questions_file"
+
+    # Verify file exists
+    assert_file_exists "$questions_file" "Questions file should be created"
+
+    # Verify content persists
+    if command -v jq &>/dev/null; then
+        local loaded
+        loaded=$(cat "$questions_file")
+        local count
+        count=$(echo "$loaded" | jq 'length')
+        assert_equals "2" "$count" "Should have 2 questions"
+
+        local q1_id
+        q1_id=$(echo "$loaded" | jq -r '.[0].id')
+        assert_equals "q1" "$q1_id" "First question ID should match"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: Governor State
+#==============================================================================
+
+test_governor_state_persistence() {
+    local test_name="governor state: can be stored and retrieved"
+    log_test_start "$test_name"
+    setup_checkpoint_test
+
+    init_review_state
+
+    # Store governor state in review state
+    local gov_state='{"github_remaining":100,"effective_parallelism":4}'
+    update_review_state ".governor_state = $gov_state"
+
+    # Verify it persists
+    local state_file
+    state_file=$(get_review_state_file)
+    if command -v jq &>/dev/null; then
+        local stored
+        stored=$(jq -r '.governor_state.github_remaining' "$state_file")
+        assert_equals "100" "$stored" "Governor state should be persisted"
+
+        local parallelism
+        parallelism=$(jq -r '.governor_state.effective_parallelism' "$state_file")
+        assert_equals "4" "$parallelism" "Parallelism should be persisted"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: Interrupt Checkpoint
+#==============================================================================
+
+test_interrupt_checkpoint() {
+    local test_name="interrupt checkpoint: saves recoverable state"
+    log_test_start "$test_name"
+    setup_checkpoint_test
+
+    init_review_state
+
+    # Record some progress
+    record_repo_outcome "owner/repo1" "completed" "60" "1" "0"
+    record_item_outcome "owner/repo1" "issue" "42" "fixed" "Applied patch"
+
+    # Update state to mark as interrupted
+    update_review_state '.status = "interrupted"'
+
+    # Verify state is checkpointed correctly
+    local state_file
+    state_file=$(get_review_state_file)
+    if command -v jq &>/dev/null; then
+        local status
+        status=$(jq -r '.status' "$state_file")
+        assert_equals "interrupted" "$status" "Status should be interrupted"
+
+        # Verify completed work is preserved
+        local repo_outcome
+        repo_outcome=$(jq -r '.repos["owner/repo1"].outcome' "$state_file")
+        assert_equals "completed" "$repo_outcome" "Completed repo should be preserved"
+
+        local item_outcome
+        item_outcome=$(jq -r '.items["owner/repo1#issue-42"].outcome' "$state_file")
+        assert_equals "fixed" "$item_outcome" "Item outcome should be preserved"
+    fi
 
     log_test_pass "$test_name"
 }
@@ -428,6 +530,13 @@ run_test test_recently_reviewed_false
 
 # Questions queue tests
 run_test test_questions_file_path
+run_test test_question_queue_persistence
+
+# Governor state tests
+run_test test_governor_state_persistence
+
+# Interrupt checkpoint tests
+run_test test_interrupt_checkpoint
 
 # Print results
 print_results
