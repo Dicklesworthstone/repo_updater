@@ -154,8 +154,9 @@ e2e_setup() {
     mkdir -p "$E2E_TEMP_DIR/projects"
     mkdir -p "$E2E_TEMP_DIR/mock_bin"
 
-    # Set up log directory for this test run
+    # Set up log directory for this test run (export for mock helpers)
     E2E_LOG_DIR="$E2E_TEMP_DIR/test_logs"
+    export E2E_LOG_DIR
     mkdir -p "$E2E_LOG_DIR"
 
     # Export environment
@@ -198,7 +199,7 @@ e2e_cleanup() {
     # Temp dir cleanup handled by test_framework.sh trap
     E2E_TEMP_DIR=""
     E2E_MOCK_BIN=""
-    E2E_LOG_DIR=""
+    unset E2E_LOG_DIR
 
     e2e_log_result "cleanup" "pass"
 }

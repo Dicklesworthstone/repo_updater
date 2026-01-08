@@ -340,7 +340,7 @@ ensure_dir() {
 has_uncommitted_changes() {
     local repo_path="${1:-}"
     [[ -z "$repo_path" ]] && return 1
-    [[ -n "$(git -C "$repo_path" status --porcelain 2>/dev/null)" ]]
+    repo_is_dirty "$repo_path"
 }
 
 # Convert repo spec (owner/repo[@branch]) to local filesystem path
@@ -4491,6 +4491,48 @@ is_git_repo() {
     [[ -d "$dir/.git" ]] || git -C "$dir" rev-parse --git-dir &>/dev/null
 }
 
+# Check if repo has uncommitted changes (staged, unstaged, or untracked)
+# Returns: 0 if dirty, 1 if clean or not a git repo
+repo_is_dirty() {
+    local repo_path="$1"
+    [[ -z "$repo_path" ]] && return 1
+    if ! is_git_repo "$repo_path"; then
+        return 1
+    fi
+
+    if ! git -C "$repo_path" diff --quiet -- 2>/dev/null; then
+        return 0
+    fi
+    if ! git -C "$repo_path" diff --cached --quiet -- 2>/dev/null; then
+        return 0
+    fi
+    if [[ -n "$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if repo has changes excluding .ru artifacts
+# Returns: 0 if dirty (excluding .ru), 1 if clean or not a git repo
+repo_is_dirty_excluding_ru() {
+    local repo_path="$1"
+    [[ -z "$repo_path" ]] && return 1
+    if ! is_git_repo "$repo_path"; then
+        return 1
+    fi
+
+    local changed
+    changed=$(git -C "$repo_path" diff --name-only 2>/dev/null | grep -vE '^\.(ru)(/|$)' || true)
+    [[ -n "$changed" ]] && return 0
+    changed=$(git -C "$repo_path" diff --cached --name-only 2>/dev/null | grep -vE '^\.(ru)(/|$)' || true)
+    [[ -n "$changed" ]] && return 0
+    changed=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null | grep -vE '^\.(ru)(/|$)' || true)
+    [[ -n "$changed" ]] && return 0
+
+    return 1
+}
+
 # Get repository status using git plumbing
 # Returns: STATUS=<status> AHEAD=<n> BEHIND=<n> DIRTY=<bool> BRANCH=<name>
 # Status values: current, ahead, behind, diverged, no_upstream, not_git
@@ -4509,9 +4551,9 @@ get_repo_status() {
         git -C "$repo_path" fetch --quiet 2>/dev/null || true
     fi
 
-    # Check dirty status using porcelain (machine-readable)
+    # Check dirty status using plumbing (no status parsing)
     local dirty="false"
-    if [[ -n $(git -C "$repo_path" status --porcelain 2>/dev/null) ]]; then
+    if repo_is_dirty "$repo_path"; then
         dirty="true"
     fi
 
@@ -8039,14 +8081,15 @@ local_driver_start_session() {
 }
 EOF
 
-    # Build claude command with stream-json output
-    # shellcheck disable=SC2016  # Single quotes intentional for tmux
-    local claude_cmd
-    claude_cmd='claude -p '"$(printf '%q' "$prompt")"' --output-format stream-json'
+    # Build claude command with stream-json output (shell-escaped args)
+    local -a claude_args=(claude -p "$prompt" --output-format stream-json)
+    local claude_cmd=""
+    printf -v claude_cmd '%q ' "${claude_args[@]}"
+    claude_cmd="${claude_cmd% }"
 
     # Create tmux session running claude
     if ! tmux new-session -d -s "$session_name" -c "$wt_path" \
-        "exec bash -c '$claude_cmd 2>&1 | tee \"$log_file\" > \"$event_pipe\"'"; then
+        "exec bash -c \"$claude_cmd 2>&1 | tee \\\"$log_file\\\" > \\\"$event_pipe\\\"\""; then
         log_error "Failed to create tmux session: $session_name"
         rm -f "$event_pipe"
         return 1
@@ -12831,10 +12874,7 @@ ensure_clean_or_fail() {
         return 1
     fi
 
-    local status
-    status=$(git -C "$repo_path" status --porcelain 2>/dev/null)
-
-    if [[ -n "$status" ]]; then
+    if repo_is_dirty "$repo_path"; then
         log_error "Repository has uncommitted changes: $repo_path"
         log_error "Please commit or stash changes before running review"
         return 1
@@ -14755,14 +14795,7 @@ verify_push_safe() {
     fi
 
     if [[ -n "$wt_path" && -d "$wt_path" ]]; then
-        local wt_status
-        wt_status=$(git -C "$wt_path" status --porcelain 2>/dev/null || true)
-        # Ignore ru-managed artifacts stored under .ru/
-        if [[ -n "$wt_status" ]]; then
-            wt_status=$(echo "$wt_status" | grep -vE '^\?\? \.ru(/|$)' 2>/dev/null || true)
-        fi
-
-        if [[ -n "$wt_status" ]]; then
+        if repo_is_dirty_excluding_ru "$wt_path"; then
             log_error "Worktree has uncommitted changes for $repo_id (refusing to push)"
             return 1
         fi
@@ -14861,7 +14894,7 @@ push_worktree_changes() {
         return 1
     fi
 
-    if [[ -n "$(git -C "$main_repo" status --porcelain 2>/dev/null)" ]]; then
+    if repo_is_dirty "$main_repo"; then
         log_error "Main repo has uncommitted changes: $main_repo"
         return 1
     fi
