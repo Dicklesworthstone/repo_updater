@@ -586,6 +586,8 @@ test_check_model_rate_limit_clears_expired_backoff() {
     local log_dir
     log_dir="$RU_STATE_DIR/logs/$(date +%Y-%m-%d)"
     mkdir -p "$log_dir"
+    # Create a benign log file (no 429 errors) so the function has something to scan
+    echo "Normal operation log" > "$log_dir/clean.log"
 
     # Set backoff that has expired
     local now
