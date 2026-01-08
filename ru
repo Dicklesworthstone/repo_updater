@@ -9447,6 +9447,7 @@ run_review_orchestration() {
 
     # Initialize tracking
     declare -A active_sessions=()  # repo_id -> session_id
+    declare -A session_states=()   # session_id -> confirmed_state
     local -a pending_repos=()
     local -a completed_repos=()
     local repo_index=0
@@ -9478,6 +9479,7 @@ run_review_orchestration() {
 
     # Load driver
     load_review_driver "${REVIEW_DRIVER:-local}" || return 3
+    REVIEW_DRIVER_LOADED=1
 
     # Prepare worktrees for all repos
     log_step "Preparing isolated worktrees..."
@@ -9515,10 +9517,12 @@ run_review_orchestration() {
         # Monitor active sessions
         for repo_id in "${!active_sessions[@]}"; do
             local session_id="${active_sessions[$repo_id]}"
-            local raw_state confirmed_state
+            local raw_state confirmed_state prev_state
 
             raw_state=$(detect_session_state_raw "$session_id" 2>/dev/null || echo "generating")
-            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "${active_sessions[$repo_id]:-generating}")
+            prev_state="${session_states[$session_id]:-generating}"
+            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "$prev_state")
+            session_states["$session_id"]="$confirmed_state"
 
             log_debug "Session $session_id: state=$confirmed_state"
 
