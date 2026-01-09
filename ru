@@ -8696,6 +8696,31 @@ SESSION_ERROR_PATTERNS=(
     "token.*limit"
 )
 
+# Resolve the best available log file for a session
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Path to session log file (stdout)
+# Returns:
+#   0 if found, 1 otherwise
+get_session_log_path() {
+    local session_id="$1"
+
+    # Prefer worktree-local logs (local/ntm drivers)
+    local wt_path log_file
+    wt_path=$(get_worktree_for_session "$session_id" 2>/dev/null || true)
+    if [[ -n "$wt_path" ]]; then
+        log_file="$wt_path/.ru/session.log"
+        [[ -f "$log_file" ]] && { echo "$log_file"; return 0; }
+    fi
+
+    # Legacy fallback (if a pipe log is still used elsewhere)
+    log_file="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    [[ -f "$log_file" ]] && { echo "$log_file"; return 0; }
+
+    return 1
+}
+
 # Calculate output velocity (characters per second) for a session
 # Args:
 #   $1 - Session ID
@@ -8705,9 +8730,10 @@ SESSION_ERROR_PATTERNS=(
 calculate_output_velocity() {
     local session_id="$1"
     local window="${2:-5}"
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
 
-    if [[ ! -f "$pipe_log" ]]; then
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
         echo "0"
         return 0
     fi
@@ -8717,6 +8743,7 @@ calculate_output_velocity() {
 
     # Store previous size for velocity calculation
     prev_size_file="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.prev_size"
+    ensure_dir "$(dirname "$prev_size_file")"
 
     if [[ -f "$prev_size_file" ]]; then
         prev_size=$(cat "$prev_size_file" 2>/dev/null || echo "0")
@@ -8747,9 +8774,10 @@ calculate_output_velocity() {
 #   Unix timestamp of last output
 get_last_output_time() {
     local session_id="$1"
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
 
-    if [[ ! -f "$pipe_log" ]]; then
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
         echo "0"
         return 0
     fi
@@ -8767,9 +8795,10 @@ get_last_output_time() {
 #   0 if thinking indicators present, 1 otherwise
 has_thinking_indicators() {
     local session_id="$1"
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
 
-    if [[ ! -f "$pipe_log" ]]; then
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
         return 1
     fi
 
@@ -8807,9 +8836,10 @@ is_at_prompt() {
             ;;
     esac
 
-    # Also check pipe log for prompt patterns
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
-    if [[ -f "$pipe_log" ]]; then
+    # Also check log for prompt patterns
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
         # Look for Claude Code prompt patterns in last 500 chars
         if tail -c 500 "$pipe_log" 2>/dev/null | grep -qE '(^>|claude>|❯|➜|\$\s*$)'; then
             return 0
@@ -8826,9 +8856,10 @@ is_at_prompt() {
 #   0 if result event found, 1 otherwise
 session_has_result() {
     local session_id="$1"
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
 
-    if [[ ! -f "$pipe_log" ]]; then
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
         return 1
     fi
 
@@ -8849,9 +8880,10 @@ session_has_result() {
 #   Error pattern to stderr if found
 session_has_error() {
     local session_id="$1"
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
 
-    if [[ ! -f "$pipe_log" ]]; then
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
         return 1
     fi
 
@@ -8881,9 +8913,51 @@ detect_session_state_raw() {
     fi
 
     # Check for error patterns (high priority)
-    if session_has_error "$session_id" 2>/dev/null; then
+    local error_pattern
+    if error_pattern=$(session_has_error "$session_id" 2>/dev/null); then
         echo "error"
         return 0
+    fi
+
+    # Consult driver state for waiting/complete/error when available
+    local state_json driver_state
+    state_json=$(driver_get_session_state "$session_id" 2>/dev/null || echo "")
+    if [[ -n "$state_json" ]]; then
+        if command -v jq &>/dev/null; then
+            driver_state=$(echo "$state_json" | jq -r '.state // empty' 2>/dev/null)
+        else
+            driver_state=$(echo "$state_json" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        case "$driver_state" in
+            error)
+                echo "error"
+                return 0
+                ;;
+            complete|dead)
+                echo "complete"
+                return 0
+                ;;
+            waiting|idle)
+                echo "waiting"
+                return 0
+                ;;
+            stalled)
+                echo "stalled"
+                return 0
+                ;;
+        esac
+
+        # If we have no log visibility, fall back to driver hints.
+        local log_path=""
+        log_path=$(get_session_log_path "$session_id" 2>/dev/null || true)
+        if [[ -z "$log_path" && -n "$driver_state" ]]; then
+            case "$driver_state" in
+                generating|thinking)
+                    echo "$driver_state"
+                    return 0
+                    ;;
+            esac
+        fi
     fi
 
     # Calculate output velocity
@@ -8984,9 +9058,10 @@ handle_waiting_session() {
     local session_id="$1"
 
     # Get wait reason
-    local pipe_log="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
     local recent_output=""
-    if [[ -f "$pipe_log" ]]; then
+    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
         recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
     fi
 
@@ -9367,6 +9442,7 @@ start_next_queued_session() {
     local session_id="ru-review-${REVIEW_RUN_ID:-$$}-${repo_id//\//-}"
 
     # Build review prompt for this repo
+    # shellcheck disable=SC2190  # False positive: _repo_items_ref is a nameref to associative array
     local items_blob="${_repo_items_ref[$repo_id]:-}"
     local -a repo_items=()
     if [[ -n "$items_blob" ]]; then
@@ -10681,8 +10757,20 @@ update_github_rate_limit() {
 # Sets: GOVERNOR_STATE[model_in_backoff], GOVERNOR_STATE[model_backoff_until]
 check_model_rate_limit() {
     local state_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
-    local log_dir
-    log_dir="$state_dir/logs/$(date +%Y-%m-%d)"
+    local -a log_dirs=()
+    local today
+    today=$(date +%Y-%m-%d)
+    log_dirs+=("$state_dir/logs/$today")
+
+    local yesterday=""
+    if yesterday=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null); then
+        :
+    elif yesterday=$(date -v -1d +%Y-%m-%d 2>/dev/null); then
+        :
+    fi
+    if [[ -n "$yesterday" && "$yesterday" != "$today" ]]; then
+        log_dirs+=("$state_dir/logs/$yesterday")
+    fi
 
     # Look for 429 responses in recent log files (last 5 minutes)
     local recent_429s=0
@@ -10701,11 +10789,14 @@ check_model_rate_limit() {
     fi
 
     local -a log_files=()
-    if [[ -d "$log_dir" ]]; then
-        while IFS= read -r log_file; do
-            [[ -n "$log_file" ]] && log_files+=("$log_file")
-        done < <(find "$log_dir" -name "*.log" -type f 2>/dev/null)
-    fi
+    local log_dir
+    for log_dir in "${log_dirs[@]}"; do
+        if [[ -d "$log_dir" ]]; then
+            while IFS= read -r log_file; do
+                [[ -n "$log_file" ]] && log_files+=("$log_file")
+            done < <(find "$log_dir" -name "*.log" -type f 2>/dev/null)
+        fi
+    done
 
     # Also scan review session logs in active worktrees (if available)
     local run_id="${REVIEW_RUN_ID:-}"
@@ -16941,7 +17032,7 @@ run_test_gate() {
 
     # Summarize output (last 10 lines or key metrics)
     local output_summary
-    output_summary=$(echo "$output" | tail -10 | tr '\n' ' ' | cut -c1-200)
+    output_summary=$(printf '%s\n' "$output" | tail -10 | tr '\n' ' ' | cut -c1-200)
 
     jq -n \
         --argjson ran true \
@@ -16999,7 +17090,7 @@ run_lint_gate() {
     fi
 
     local output_summary
-    output_summary=$(echo "$output" | head -20 | tr '\n' ' ' | cut -c1-300)
+    output_summary=$(printf '%s\n' "$output" | head -20 | tr '\n' ' ' | cut -c1-300)
 
     jq -n \
         --argjson ran true \
