@@ -7851,10 +7851,14 @@ get_denylist_patterns() {
 
 # Detect which review driver to use
 detect_review_driver() {
-    # Check if ntm is available and running
-    if command -v ntm &>/dev/null; then
-        # Try to query ntm status
-        if ntm list --robot 2>/dev/null | grep -q "session"; then
+    # Prefer ntm when robot mode is available and healthy
+    if declare -F ntm_check_available >/dev/null 2>&1; then
+        if ntm_check_available; then
+            echo "ntm"
+            return
+        fi
+    elif command -v ntm &>/dev/null; then
+        if ntm --robot-status &>/dev/null; then
             echo "ntm"
             return
         fi
@@ -9347,7 +9351,11 @@ monitor_sessions() {
         local -a pending_repos=()
         local -A repo_items=()
         if has_pending_repos 2>/dev/null && get_pending_repos_from_state pending_repos 2>/dev/null; then
-            while can_start_new_session "${#sessions[@]}" 2>/dev/null && [[ ${#pending_repos[@]} -gt 0 ]]; do
+            local active_count="${#sessions[@]}"
+            if [[ ${#repo_sessions[@]} -gt $active_count ]]; then
+                active_count="${#repo_sessions[@]}"
+            fi
+            while can_start_new_session "$active_count" 2>/dev/null && [[ ${#pending_repos[@]} -gt 0 ]]; do
                 start_next_queued_session repo_sessions pending_repos repo_items 2>/dev/null || break
             done
         fi
@@ -9604,6 +9612,7 @@ run_review_orchestration() {
     # Initialize tracking
     declare -A active_sessions=()  # repo_id -> session_id
     declare -A session_states=()   # session_id -> confirmed_state
+    declare -A question_counted=()  # session_id -> 1 if question already counted
     local -a pending_repos=()
     local -a completed_repos=()
     local repo_index=0
@@ -9693,6 +9702,11 @@ run_review_orchestration() {
             confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "$prev_state")
             session_states["$session_id"]="$confirmed_state"
 
+            # Clear question counter when leaving waiting state (allows counting new questions)
+            if [[ "$prev_state" == "waiting" && "$confirmed_state" != "waiting" ]]; then
+                unset "question_counted[$session_id]"
+            fi
+
             log_debug "Session $session_id: state=$confirmed_state"
 
             case "$confirmed_state" in
@@ -9702,7 +9716,11 @@ run_review_orchestration() {
                     reason=$(echo "$wait_info" | jq -r '.reason // "unknown"' 2>/dev/null)
                     [[ -z "$reason" ]] && reason="unknown"
                     if [[ "$reason" == "ask_user_question" || "$reason" == "agent_question_text" ]]; then
-                        increment_questions_asked
+                        # Only count question once (not every poll cycle)
+                        if [[ -z "${question_counted[$session_id]:-}" ]]; then
+                            increment_questions_asked
+                            question_counted["$session_id"]=1
+                        fi
                         if ! check_cost_budget; then
                             log_warn "Question budget reached, auto-skipping"
                             driver_send_to_session "$session_id" "Skip this question and continue" 2>/dev/null || true
@@ -12540,315 +12558,6 @@ basic_mode_loop() {
         question_id=$(question_get_id "$question_json")
         [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
     done
-}
-
-#------------------------------------------------------------------------------
-# REVIEW POLICY CONFIGURATION (bd-cutq)
-# Per-repo customization of review behavior via configuration files
-#------------------------------------------------------------------------------
-
-# Get path to review policies directory
-get_review_policy_dir() {
-    echo "${RU_CONFIG_DIR}/review-policies.d"
-}
-
-# Load policy for a specific repo, merging defaults with overrides
-# Args: $1 = repo_id (owner/repo format)
-# Outputs: Sourced policy variables to stdout as KEY=VALUE pairs
-load_policy_for_repo() {
-    local repo_id="$1"
-    local policy_dir
-    policy_dir=$(get_review_policy_dir)
-
-    # Initialize with hardcoded defaults
-    local -A policy=(
-        [REVIEW_TEST_CMD]=""
-        [REVIEW_TEST_TIMEOUT]="300"
-        [REVIEW_LINT_CMD]=""
-        [REVIEW_LINT_REQUIRED]="false"
-        [REVIEW_SECRET_SCAN]="true"
-        [REVIEW_SECRET_PATTERNS]=""
-        [REVIEW_ALLOW_PUSH]="true"
-        [REVIEW_REQUIRE_APPROVAL]="false"
-        [REVIEW_BASE_PRIORITY]="0"
-        [REVIEW_LABELS_BOOST]=""
-        [REVIEW_MAX_ITEMS]="20"
-        [REVIEW_SKIP_PRS]="false"
-        [REVIEW_DEEP_MODE]="false"
-    )
-
-    # 1. Load _default.conf if exists
-    local default_policy="${policy_dir}/_default.conf"
-    if [[ -f "$default_policy" ]]; then
-        # shellcheck disable=SC1090
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" == \#* ]] && continue
-            key=$(echo "$key" | xargs)  # Trim whitespace
-            value=$(echo "$value" | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-            [[ -n "$key" ]] && policy["$key"]="$value"
-        done < <(grep -E '^[[:space:]]*REVIEW_' "$default_policy" 2>/dev/null)
-    fi
-
-    # 2. Find and load repo-specific policy (exact match or glob)
-    local safe_repo_id="${repo_id//\//_}"  # owner/repo -> owner_repo
-    local repo_policy="${policy_dir}/${safe_repo_id}.conf"
-
-    if [[ -f "$repo_policy" ]]; then
-        # Exact match found
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" == \#* ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-            [[ -n "$key" ]] && policy["$key"]="$value"
-        done < <(grep -E '^[[:space:]]*REVIEW_' "$repo_policy" 2>/dev/null)
-    else
-        # Try glob patterns (e.g., myorg_*.conf)
-        local owner="${repo_id%%/*}"
-        local glob_pattern="${policy_dir}/${owner}_*.conf"
-        # shellcheck disable=SC2086
-        for glob_file in $glob_pattern; do
-            if [[ -f "$glob_file" && "$glob_file" != *"_*.conf" ]]; then
-                while IFS='=' read -r key value; do
-                    [[ -z "$key" || "$key" == \#* ]] && continue
-                    key=$(echo "$key" | xargs)
-                    value=$(echo "$value" | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-                    [[ -n "$key" ]] && policy["$key"]="$value"
-                done < <(grep -E '^[[:space:]]*REVIEW_' "$glob_file" 2>/dev/null)
-                break  # Use first matching glob
-            fi
-        done
-    fi
-
-    # Output as JSON for easy consumption
-    jq -n \
-        --arg test_cmd "${policy[REVIEW_TEST_CMD]}" \
-        --arg test_timeout "${policy[REVIEW_TEST_TIMEOUT]}" \
-        --arg lint_cmd "${policy[REVIEW_LINT_CMD]}" \
-        --arg lint_required "${policy[REVIEW_LINT_REQUIRED]}" \
-        --arg secret_scan "${policy[REVIEW_SECRET_SCAN]}" \
-        --arg secret_patterns "${policy[REVIEW_SECRET_PATTERNS]}" \
-        --arg allow_push "${policy[REVIEW_ALLOW_PUSH]}" \
-        --arg require_approval "${policy[REVIEW_REQUIRE_APPROVAL]}" \
-        --arg base_priority "${policy[REVIEW_BASE_PRIORITY]}" \
-        --arg labels_boost "${policy[REVIEW_LABELS_BOOST]}" \
-        --arg max_items "${policy[REVIEW_MAX_ITEMS]}" \
-        --arg skip_prs "${policy[REVIEW_SKIP_PRS]}" \
-        --arg deep_mode "${policy[REVIEW_DEEP_MODE]}" \
-        '{
-            test_cmd: $test_cmd,
-            test_timeout: ($test_timeout | tonumber),
-            lint_cmd: $lint_cmd,
-            lint_required: ($lint_required == "true"),
-            secret_scan: ($secret_scan == "true"),
-            secret_patterns: $secret_patterns,
-            allow_push: ($allow_push == "true"),
-            require_approval: ($require_approval == "true"),
-            base_priority: ($base_priority | tonumber),
-            labels_boost: $labels_boost,
-            max_items: ($max_items | tonumber),
-            skip_prs: ($skip_prs == "true"),
-            deep_mode: ($deep_mode == "true")
-        }'
-}
-
-# Apply priority boost from policy to a work item score
-# Args: $1 = repo_id, $2 = current_score, $3 = labels (comma-separated)
-# Outputs: New score
-apply_policy_priority_boost() {
-    local repo_id="$1"
-    local current_score="$2"
-    local labels="$3"
-
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-
-    # Get base priority boost
-    local base_boost
-    base_boost=$(echo "$policy" | jq -r '.base_priority // 0')
-    current_score=$((current_score + base_boost))
-
-    # Get label boosts (format: "label1:30,label2:20")
-    local labels_boost
-    labels_boost=$(echo "$policy" | jq -r '.labels_boost // ""')
-
-    if [[ -n "$labels_boost" && -n "$labels" ]]; then
-        # Parse label boosts
-        IFS=',' read -ra boost_pairs <<< "$labels_boost"
-        for pair in "${boost_pairs[@]}"; do
-            local label="${pair%%:*}"
-            local boost="${pair#*:}"
-            # Check if this label is in the item's labels
-            if [[ ",$labels," == *",$label,"* ]]; then
-                current_score=$((current_score + boost))
-            fi
-        done
-    fi
-
-    echo "$current_score"
-}
-
-# Validate a policy file for syntax and value errors
-# Args: $1 = path to policy file
-# Returns: 0 if valid, 1 if invalid (with error message to stderr)
-validate_policy_file() {
-    local file="$1"
-
-    if [[ ! -f "$file" ]]; then
-        log_error "Policy file not found: $file"
-        return 1
-    fi
-
-    # Check bash syntax (the file should be sourceable)
-    if ! bash -n "$file" 2>/dev/null; then
-        log_error "Syntax error in policy file: $file"
-        return 1
-    fi
-
-    # Check for valid variable assignments
-    local line_num=0
-    while IFS= read -r line; do
-        ((line_num++))
-        # Skip empty lines and comments
-        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-
-        # Check for REVIEW_ variable assignments
-        if [[ "$line" =~ ^[[:space:]]*REVIEW_ ]]; then
-            # Validate it's a proper assignment
-            if ! [[ "$line" =~ ^[[:space:]]*REVIEW_[A-Z_]+=.* ]]; then
-                log_error "Invalid assignment at line $line_num in $file: $line"
-                return 1
-            fi
-
-            # Extract key and value for validation
-            local key value
-            key=$(echo "$line" | sed 's/=.*//' | xargs)
-            value=$(echo "$line" | sed 's/^[^=]*=//' | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-
-            # Validate numeric fields
-            case "$key" in
-                REVIEW_TEST_TIMEOUT|REVIEW_BASE_PRIORITY|REVIEW_MAX_ITEMS)
-                    if ! [[ "$value" =~ ^-?[0-9]+$ ]]; then
-                        log_error "$key must be numeric at line $line_num in $file"
-                        return 1
-                    fi
-                    ;;
-                REVIEW_LINT_REQUIRED|REVIEW_SECRET_SCAN|REVIEW_ALLOW_PUSH|REVIEW_REQUIRE_APPROVAL|REVIEW_SKIP_PRS|REVIEW_DEEP_MODE)
-                    if ! [[ "$value" =~ ^(true|false)$ ]]; then
-                        log_error "$key must be true or false at line $line_num in $file"
-                        return 1
-                    fi
-                    ;;
-            esac
-        fi
-    done < "$file"
-
-    return 0
-}
-
-# Initialize review policies directory with example configuration
-init_review_policies() {
-    local policy_dir
-    policy_dir=$(get_review_policy_dir)
-
-    if [[ ! -d "$policy_dir" ]]; then
-        mkdir -p "$policy_dir"
-        log_info "Created review policies directory: $policy_dir"
-    fi
-
-    # Create example default policy if no config exists
-    local default_policy="${policy_dir}/_default.conf"
-    local example_policy="${policy_dir}/_default.conf.example"
-
-    if [[ ! -f "$default_policy" && ! -f "$example_policy" ]]; then
-        cat > "$example_policy" << 'POLICY_EOF'
-# Default Review Policy (rename to _default.conf to activate)
-# These settings apply to all repos unless overridden by a repo-specific policy.
-#
-# To override for a specific repo, create a file named after the repo:
-#   owner_reponame.conf (e.g., myorg_backend.conf)
-#
-# For organization-wide settings, use glob patterns:
-#   myorg_*.conf (matches all repos in myorg)
-
-# Test Configuration
-# Auto-detect test command if empty (looks for Makefile, package.json, etc.)
-REVIEW_TEST_CMD=""
-REVIEW_TEST_TIMEOUT=300
-
-# Lint Configuration
-REVIEW_LINT_CMD=""
-REVIEW_LINT_REQUIRED=false
-
-# Secret Scanning
-# Scan for secrets before allowing push
-REVIEW_SECRET_SCAN=true
-# Additional patterns to detect (regex, pipe-separated)
-REVIEW_SECRET_PATTERNS=""
-
-# Push Policy
-# Allow pushing changes (false = never push for this repo)
-REVIEW_ALLOW_PUSH=true
-# Always ask before pushing (even with --apply)
-REVIEW_REQUIRE_APPROVAL=false
-
-# Priority Configuration
-# Base priority boost for all items from this repo
-REVIEW_BASE_PRIORITY=0
-# Label-based priority boosts (format: "label:boost,label:boost")
-# Example: "urgent:30,security:40,bug:20"
-REVIEW_LABELS_BOOST=""
-
-# Review Behavior
-# Maximum items to review per session
-REVIEW_MAX_ITEMS=20
-# Skip pull requests (only review issues)
-REVIEW_SKIP_PRS=false
-# Deep mode (comprehensive review, slower)
-REVIEW_DEEP_MODE=false
-# Non-interactive review behavior
-REVIEW_NON_INTERACTIVE=false
-# auto|skip|fail
-REVIEW_NON_INTERACTIVE_POLICY="auto"
-POLICY_EOF
-        log_info "Created example policy file: $example_policy"
-        log_info "Rename to _default.conf to activate default policies"
-    fi
-}
-
-# Get policy value for a repo
-# Args: $1 = repo_id, $2 = policy_key
-# Outputs: The value for that key
-get_policy_value() {
-    local repo_id="$1"
-    local key="$2"
-
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-    echo "$policy" | jq -r ".$key // empty"
-}
-
-# Check if a repo allows push based on policy
-# Args: $1 = repo_id
-# Returns: 0 if push allowed, 1 if not
-repo_allows_push() {
-    local repo_id="$1"
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-    local allow_push
-    allow_push=$(echo "$policy" | jq -r '.allow_push // true')
-    [[ "$allow_push" == "true" ]]
-}
-
-# Check if a repo requires approval before push
-# Args: $1 = repo_id
-# Returns: 0 if approval required, 1 if not
-repo_requires_approval() {
-    local repo_id="$1"
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-    local require_approval
-    require_approval=$(echo "$policy" | jq -r '.require_approval // false')
-    [[ "$require_approval" == "true" ]]
 }
 
 # Parse review-specific arguments
