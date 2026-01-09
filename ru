@@ -9227,7 +9227,9 @@ record_session_outcome() {
 # Args:
 #   $1 - Session ID
 # Outputs:
-#   Repo ID (owner/repo format)
+#   Repo ID (owner/repo format) or empty if not found
+# Returns:
+#   0 if found, 1 if not found
 get_repo_for_session() {
     local session_id="$1"
 
@@ -9245,8 +9247,8 @@ get_repo_for_session() {
         fi
     fi
 
-    # Fallback to session ID
-    echo "$session_id"
+    # Not found - return empty
+    return 1
 }
 
 # Get worktree path for a session
@@ -9615,7 +9617,6 @@ run_review_orchestration() {
     declare -A question_counted=()  # session_id -> 1 if question already counted
     local -a pending_repos=()
     local -a completed_repos=()
-    local repo_index=0
     local poll_interval=2
 
     # Extract unique repos from work items and group items per repo
@@ -9678,8 +9679,10 @@ run_review_orchestration() {
         fi
 
         # Pre-fetch next repos while we have active sessions
+        # Note: Always pass 0 as index since pending_repos shrinks (first element removed)
+        # as repos are started, so we always want to prefetch from the front of the queue
         if [[ ${#active_sessions[@]} -gt 0 && ${#pending_repos[@]} -gt 0 ]]; then
-            prefetch_next_repos "$repo_index" "${pending_repos[@]}"
+            prefetch_next_repos 0 "${pending_repos[@]}"
         fi
 
         # Start new sessions if capacity allows
@@ -9711,8 +9714,13 @@ run_review_orchestration() {
 
             case "$confirmed_state" in
                 waiting)
-                    local wait_info reason
-                    wait_info=$(detect_wait_reason "$session_id" 2>/dev/null || echo "")
+                    # Get session output for wait reason detection
+                    local pipe_log wait_info reason recent_output=""
+                    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+                    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
+                        recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
+                    fi
+                    wait_info=$(detect_wait_reason "$session_id" "" "$recent_output")
                     reason=$(echo "$wait_info" | jq -r '.reason // "unknown"' 2>/dev/null)
                     [[ -z "$reason" ]] && reason="unknown"
                     if [[ "$reason" == "ask_user_question" || "$reason" == "agent_question_text" ]]; then
@@ -10856,7 +10864,7 @@ check_model_rate_limit() {
     done
 
     if [[ "$recent_429s" -gt 0 ]]; then
-        local backoff_until=$((now + 60))
+        backoff_until=$((now + 60))
         GOVERNOR_STATE[model_in_backoff]="true"
         GOVERNOR_STATE[model_backoff_until]="$backoff_until"
         log_warn "Model rate limit detected ($recent_429s hits), backing off until $(date -d "@$backoff_until" +%H:%M:%S 2>/dev/null || date -r "$backoff_until" +%H:%M:%S 2>/dev/null || echo 'soon')"
