@@ -9689,7 +9689,6 @@ run_review_orchestration() {
         while can_start_new_session "${#active_sessions[@]}" && [[ ${#pending_repos[@]} -gt 0 ]]; do
             if start_next_queued_session active_sessions pending_repos repo_items; then
                 increment_repos_processed
-                ((repo_index++))
             else
                 break
             fi
