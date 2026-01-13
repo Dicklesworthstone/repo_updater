@@ -39,6 +39,35 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/mai
 
 ---
 
+## 🤖 Ready-made Blurb for AI Agents
+
+> [!IMPORTANT]
+> **Copy the blurb below to your project's `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` file for AI agent integration with ru.**
+
+````markdown
+## ru Quick Reference for AI Agents
+
+Syncs GitHub repos to local projects directory (clone missing, pull updates, detect conflicts).
+
+```bash
+ru sync                    # Sync all repos
+ru sync --dry-run          # Preview only
+ru sync -j4 --autostash    # Parallel + auto-stash
+ru status --no-fetch       # Quick local status
+ru list --paths            # Repo paths (stdout)
+```
+
+**Automation:** `--non-interactive --json` (json→stdout, human→stderr)
+
+**Exit:** 0=ok | 1=partial | 2=conflicts | 3=system | 4=bad args | 5=interrupted (`--resume`)
+
+**Critical:**
+- Never create worktrees/clones in projects dir → use `/tmp/`
+- Never parse human output → use `--json`
+````
+
+---
+
 ## 🎯 The Primary Use Case: Keeping Your Projects Directory in Sync
 
 **The scenario:** You work across multiple machines, contribute to dozens of repositories, and your local `/data/projects` directory needs to stay synchronized with GitHub. Manually running `git pull` in each directory is tedious and error-prone.
@@ -105,6 +134,7 @@ ru sync
 
 ## Table of Contents
 
+- [Ready-made Blurb for AI Agents](#-ready-made-blurb-for-ai-agents)
 - [The Primary Use Case](#-the-primary-use-case-keeping-your-projects-directory-in-sync)
 - [Why ru Exists](#-why-ru-exists)
 - [Highlights](#-highlights)
