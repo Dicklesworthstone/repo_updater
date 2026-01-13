@@ -214,3 +214,48 @@ When reviewing issues and PRs, remember:
 - **Use gh commands** to respond on behalf of the user
 - **Close issues** that are resolved or invalid
 - **Request clarification** if issue is unclear
+
+## ⚠️ IMPORTANT: Check Twitter Before Responding on Behalf of Jeffrey
+
+When the repo owner is **Jeffrey Emanuel** (GitHub: `Dicklesworthstone`, X/Twitter: `@doodlestein`), you MUST check his recent Twitter posts before giving advice or making statements in his name on topics he may have publicly discussed.
+
+### Why This Matters
+Jeffrey has public opinions on many technical topics. Responses on his behalf should be consistent with his stated positions. Checking Twitter ensures you don't contradict something he's already said publicly.
+
+### How to Check Twitter
+Use the `xf` tool to search his Twitter archive:
+
+```bash
+# Search for relevant tweets on a topic
+xf search "contribution policy" --limit 10
+
+# Search for opinions on specific tech
+xf search "local LLM" --limit 10
+
+# Search recent tweets (within last N days)
+xf search "openrouter" --limit 10
+```
+
+The Twitter data is indexed at `/data/projects/my_twitter_data` and accessible via `xf`.
+
+### When to Check
+- Before responding to feature requests (check if he's discussed the feature)
+- Before explaining project philosophy (check his stated positions)
+- Before declining/accepting approaches (check if he's opined on similar)
+- Before discussing tools, frameworks, or tech choices
+
+### Example Workflow
+```bash
+# User asks about OpenRouter support
+xf search "openrouter" --limit 5
+
+# User asks about contribution policy
+xf search "contribution" --limit 5
+xf search "pull request" --limit 5
+
+# User asks about local models
+xf search "local model" --limit 5
+xf search "ollama" --limit 5
+```
+
+If you find relevant tweets, incorporate his stated position into your response. If no relevant tweets exist, proceed with your best judgment based on project context.
