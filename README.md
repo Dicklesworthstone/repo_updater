@@ -35,6 +35,12 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/mai
 # You can omit the `?ru_cb=...` once installed; it's just a cache-buster for the installer fetch.
 ```
 
+**Or via Homebrew (macOS/Linux):**
+
+```bash
+brew install dicklesworthstone/tap/ru
+```
+
 </p>
 
 ---
