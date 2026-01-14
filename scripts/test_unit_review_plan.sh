@@ -485,7 +485,7 @@ run_all_tests() {
     run_test test_json_summary_valid_plan
 
     print_results
-    return "$(get_exit_code)"
+    return $TF_TESTS_FAILED
 }
 
 run_all_tests

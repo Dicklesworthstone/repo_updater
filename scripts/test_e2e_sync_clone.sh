@@ -50,9 +50,6 @@ setup_test_env() {
     export HOME="$TEMP_DIR/home"
     mkdir -p "$HOME"
 
-    # Force sequential mode for predictable output
-    export RU_PARALLEL=1
-
     # Create projects directory
     export TEST_PROJECTS_DIR="$TEMP_DIR/projects"
     mkdir -p "$TEST_PROJECTS_DIR"
@@ -222,7 +219,7 @@ init_test_config() {
 # Add a test repo to the config
 add_test_repo() {
     local repo="$1"
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
     echo "$repo" >> "$repos_file"
 }
 
@@ -518,4 +515,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-[[ $TESTS_FAILED -eq 0 ]]
+exit $TESTS_FAILED

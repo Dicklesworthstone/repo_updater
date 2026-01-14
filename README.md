@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.0-blue?style=for-the-badge" alt="Version" />
+  <img src="https://img.shields.io/badge/version-1.0.0-blue?style=for-the-badge" alt="Version" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blueviolet?style=for-the-badge" alt="Platform" />
   <img src="https://img.shields.io/badge/shell-Bash%204.0+-purple?style=for-the-badge" alt="Shell" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License" />
@@ -7,10 +7,6 @@
 
 <h1 align="center">ru</h1>
 <h3 align="center">Repo Updater</h3>
-
-<div align="center">
-  <img src="ru_illustration.webp" alt="ru - Repo Updater: Keep all your GitHub repositories synchronized with a single command">
-</div>
 
 <p align="center">
   <strong>A beautiful, automation-friendly CLI for synchronizing GitHub repositories</strong>
@@ -31,46 +27,10 @@
 <p align="center">
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
-# You can omit the `?ru_cb=...` once installed; it's just a cache-buster for the installer fetch.
-```
-
-**Or via Homebrew (macOS/Linux):**
-
-```bash
-brew install dicklesworthstone/tap/ru
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
 ```
 
 </p>
-
----
-
-## 🤖 Ready-made Blurb for AI Agents
-
-> [!IMPORTANT]
-> **Copy the blurb below to your project's `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` file for AI agent integration with ru.**
-
-````markdown
-## ru Quick Reference for AI Agents
-
-Syncs GitHub repos to local projects directory (clone missing, pull updates, detect conflicts).
-
-```bash
-ru sync                    # Sync all repos
-ru sync --dry-run          # Preview only
-ru sync -j4 --autostash    # Parallel + auto-stash
-ru status --no-fetch       # Quick local status
-ru list --paths            # Repo paths (stdout)
-```
-
-**Automation:** `--non-interactive --json` (json→stdout, human→stderr)
-
-**Exit:** 0=ok | 1=partial | 2=conflicts | 3=system | 4=bad args | 5=interrupted (`--resume`)
-
-**Critical:**
-- Never create worktrees/clones in projects dir → use `/tmp/`
-- Never parse human output → use `--json`
-````
 
 ---
 
@@ -140,7 +100,6 @@ ru sync
 
 ## Table of Contents
 
-- [Ready-made Blurb for AI Agents](#-ready-made-blurb-for-ai-agents)
 - [The Primary Use Case](#-the-primary-use-case-keeping-your-projects-directory-in-sync)
 - [Why ru Exists](#-why-ru-exists)
 - [Highlights](#-highlights)
@@ -157,36 +116,10 @@ ru sync
 - [Conflict Resolution](#-conflict-resolution)
 - [Managing Orphan Repositories](#-managing-orphan-repositories)
 - [Output Modes](#-output-modes)
-- [AI-Assisted Code Review](#-ai-assisted-code-review)
-  - [Priority Scoring Algorithm](#priority-scoring-algorithm)
-  - [Session Drivers](#session-drivers)
-    - [ntm Integration](#ntm-named-tmux-manager-integration)
-  - [Claude Code Integration](#claude-code-integration)
-  - [Git Worktree Isolation](#git-worktree-isolation)
-  - [GitHub Actions Execution](#github-actions-execution)
-  - [Review Policies](#review-policies)
-  - [GraphQL Batch Querying](#graphql-batch-querying)
-  - [Rate-Limit Governor](#rate-limit-governor)
-  - [Global Backoff Coordination](#global-backoff-coordination)
-  - [Quality Gates](#quality-gates)
-  - [Session Health Monitoring](#session-health-monitoring)
-- [Agent-Driven Sweep](#-agent-driven-sweep)
-  - [Prerequisites](#agent-sweep-prerequisites)
-  - [Basic Usage](#basic-usage)
-  - [Preflight Checks](#preflight-checks)
-  - [Security Guardrails](#security-guardrails)
-  - [Per-Repository Configuration](#per-repository-configuration)
-  - [State Management](#state-management)
-  - [Troubleshooting Agent Sweep](#troubleshooting-agent-sweep)
 - [Exit Codes](#-exit-codes)
 - [Architecture](#-architecture)
   - [NDJSON Results Logging](#ndjson-results-logging)
-  - [Portable Locking](#portable-locking)
-  - [Work-Stealing Queue](#work-stealing-queue)
-  - [Path Security Validation](#path-security-validation)
-  - [Retry with Exponential Backoff](#retry-with-exponential-backoff)
 - [Design Principles](#-design-principles)
-- [File Denylist System](#️-file-denylist-system)
 - [Testing](#-testing)
 - [Troubleshooting](#-troubleshooting)
 - [Environment Variables](#-environment-variables)
@@ -292,7 +225,7 @@ Actionable commands for every issue:
 ### Parallel & Resumable Syncs
 Efficient handling of large repo collections:
 - `--parallel N` for concurrent operations
-- Worker pool with portable coordination
+- Worker pool with flock-based coordination
 - `--resume` to continue interrupted syncs
 - State tracking for reliable restarts
 
@@ -318,63 +251,7 @@ Keep your projects directory clean:
 
 **One-liner (recommended):**
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
-```
-
-**If you suspect CDN caching (stale installer):**
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s).$$" | bash
-```
-
-**How cache-busting works:**
-
-GitHub's raw content is served through a CDN that caches aggressively. The `?ru_cb=...` query parameter ensures fresh content:
-
-| Technique | Cache Bypass |
-|-----------|-------------|
-| `$(date +%s)` | Unix timestamp (changes every second) |
-| `$(date +%s).$$` | Timestamp + PID (unique per invocation) |
-| `RU_CACHE_BUST_TOKEN=xyz` | Custom token override |
-
-**Installer self-refresh mechanism:**
-
-When the installer runs via `curl | bash`, it performs automatic self-refresh to ensure you always get the latest version:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   Installer Self-Refresh                          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  Detect piped   │◀─────── stdin is not a TTY?
-                    │  execution      │
-                    └────────┬────────┘
-                             │ yes
-                             ▼
-                    ┌─────────────────┐
-                    │  Download fresh │◀─────── Fetch latest install.sh
-                    │  installer      │         to temp file
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │  Validate       │◀─────── Check #!/usr/bin/env bash
-                    │  shebang        │         header is present
-                    └────────┬────────┘
-                             │ valid
-                             ▼
-                    ┌─────────────────┐
-                    │  Re-exec with   │◀─────── RU_INSTALLER_REFRESHED=1
-                    │  fresh copy     │         prevents infinite loop
-                    └─────────────────┘
-```
-
-This ensures that even if CDN caching serves a stale version initially, the installer will fetch and execute the latest code. The `RU_INSTALLER_REFRESHED=1` environment variable prevents recursion.
-
-To disable self-refresh (for airgapped environments):
-```bash
-RU_INSTALLER_NO_SELF_REFRESH=1 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
 ```
 
 <details>
@@ -447,9 +324,6 @@ ru [command] [options]
 | `self-update` | Update ru to the latest version |
 | `config` | Show or set configuration values |
 | `prune` | Find and manage orphan repositories |
-| `review` | AI-assisted code review orchestration |
-| `agent-sweep` | Orchestrate AI agents across dirty repos |
-| `import` | Import repos from GitHub stars or org |
 
 ### Global Options
 
@@ -532,55 +406,6 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | (none) | List orphan repos (dry run, default) |
 | `--archive` | Move orphan repos to archive directory |
 | `--delete` | Permanently delete orphan repos (requires confirmation) |
-
-**`ru review`**
-| Flag | Description |
-|------|-------------|
-| `--plan` | Discovery mode: find work items and plan review (default) |
-| `--apply` | Apply mode: process approved changes from a previous plan |
-| `--dry-run` | Show what would be discovered without starting sessions |
-| `--status` | Show current review state without running discovery |
-| `--analytics` | Display analytics dashboard for past reviews |
-| `--basic` | Use basic TUI instead of terminal multiplexer |
-| `--mode=MODE` | Session driver: `auto`, `ntm`, or `local` |
-| `--parallel N`, `-j N` | Run N review sessions concurrently (default: 4) |
-| `--repos=PATTERN` | Filter repos by pattern (glob or regex) |
-| `--priority=LEVEL` | Minimum priority threshold: `critical`, `high`, `normal`, `low`, `all` |
-| `--skip-days=N` | Skip items reviewed within N days (default: 7) |
-| `--max-repos=N` | Limit number of repos to review (cost budget) |
-| `--max-runtime=N` | Maximum runtime in minutes (time budget) |
-| `--resume` | Resume an interrupted review session |
-| `--push` | Allow pushing changes (with `--apply`) |
-
-**`ru import`**
-| Flag | Description |
-|------|-------------|
-| `--stars` | Import from your GitHub stars |
-| `--org=NAME` | Import from an organization |
-| `--user=NAME` | Import from a user's repos |
-| `--limit=N` | Maximum repos to import |
-| `--private` | Add to private repos list |
-
-**`ru agent-sweep`**
-| Flag | Description |
-|------|-------------|
-| `--dry-run` | Preview which repos would be processed |
-| `--parallel N`, `-jN` | Process N repos concurrently (default: 1) |
-| `--repos=PATTERN` | Filter repos by glob pattern |
-| `--with-release` | Include release step after commit |
-| `--resume` | Resume an interrupted sweep |
-| `--restart` | Clear previous state and start fresh |
-| `--keep-sessions` | Keep tmux sessions after completion |
-| `--keep-sessions-on-fail` | Keep sessions only on failure |
-| `--attach-on-fail` | Attach to session on failure |
-| `--execution-mode=MODE` | Mode: `plan`, `apply`, or `agent` (default: agent) |
-| `--secret-scan=MODE` | Secret scanning: `none`, `warn`, `block` (default: warn) |
-| `--phase1-timeout=N` | Phase 1 timeout in seconds (default: 300) |
-| `--phase2-timeout=N` | Phase 2 timeout in seconds (default: 600) |
-| `--phase3-timeout=N` | Phase 3 timeout in seconds (default: 300) |
-| `--json` | Output results as JSON |
-| `--verbose`, `-v` | Verbose output |
-| `--debug`, `-d` | Debug output (implies verbose) |
 
 ---
 
@@ -837,7 +662,7 @@ ru sync -j 8
 
 1. **Worker pool** — ru spawns N worker processes (specified by `--parallel` or `-j`)
 2. **Job queue** — Repositories are distributed among workers as they become available
-3. **Portable coordination** — Directory-based locking prevents race conditions in shared resources
+3. **flock coordination** — File-based locking prevents race conditions in shared resources
 4. **Aggregated results** — All worker results are collected and reported in a unified summary
 
 ```
@@ -873,7 +698,8 @@ export RU_PARALLEL=4
 ```
 
 **Requirements:**
-- None (portable locking is built in)
+- Parallel sync requires `flock` (available by default on Linux; install via Homebrew on macOS)
+- ru automatically falls back to serial execution if flock is unavailable
 
 ### Network Timeout Tuning
 
@@ -1163,7 +989,7 @@ ru sync --json 2>/dev/null
 
 ```json
 {
-  "version": "1.2.0",
+  "version": "1.0.0",
   "timestamp": "2025-01-03T14:30:00Z",
   "duration_seconds": 154,
   "config": {
@@ -1208,1072 +1034,6 @@ Only errors to stderr, still outputs paths to stdout:
 ru sync --quiet
 # Only shows errors, no progress
 ```
-
----
-
-## 🤖 AI-Assisted Code Review
-
-ru includes a powerful review orchestration system for managing AI-assisted code review across your repositories. It discovers open issues and pull requests, prioritizes them intelligently, and coordinates review sessions using Claude Code or other AI assistants.
-
-### The Review Workflow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       ru review --plan                           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-       ┌──────────┐    ┌──────────┐    ┌──────────┐
-       │  GraphQL │    │  Parse   │    │  Cache   │
-       │  Batch   │    │  Work    │    │  Digest  │
-       │  Query   │    │  Items   │    │  Check   │
-       └──────────┘    └──────────┘    └──────────┘
-              │               │               │
-              └───────────────┼───────────────┘
-                              ▼
-                    ┌─────────────────┐
-                    │  Priority       │
-                    │  Scoring        │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ▼
-       ┌──────────┐   ┌──────────┐   ┌──────────┐
-       │ CRITICAL │   │   HIGH   │   │  NORMAL  │
-       │ security │   │   bugs   │   │ features │
-       │ bugs >60d│   │ bugs >30d│   │          │
-       └──────────┘   └──────────┘   └──────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  Session Driver │
-                    │  (tmux/ntm)     │
-                    └────────┬────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         ▼                   ▼                   ▼
-  ┌────────────┐     ┌────────────┐     ┌────────────┐
-  │ Session 1  │     │ Session 2  │     │ Session 3  │
-  │ (worktree) │     │ (worktree) │     │ (worktree) │
-  └────────────┘     └────────────┘     └────────────┘
-```
-
-### Two-Phase Review: Plan then Apply
-
-**Phase 1: Discovery (`--plan`)**
-- Queries GitHub for open issues and PRs across all repos
-- Scores items by priority using label analysis and age
-- Creates isolated git worktrees for safe review
-- Spawns Claude Code sessions in terminal multiplexer
-- Checkpoints progress for interruption recovery
-
-**Phase 2: Application (`--apply`)**
-- Reviews proposed changes from discovery phase
-- Runs quality gates (ShellCheck, tests, lint)
-- Optionally pushes approved changes (`--push`)
-- Archives completed work items
-
-```bash
-# Discover and plan reviews
-ru review --plan
-
-# After reviewing AI suggestions, apply approved changes
-ru review --apply --push
-```
-
-### Priority Scoring Algorithm
-
-ru uses a multi-factor scoring system to prioritize work items intelligently:
-
-| Factor | Points | Logic |
-|--------|--------|-------|
-| **Type** | 0-20 | PRs: +20, Issues: +10, Draft PRs: -15 |
-| **Labels** | 0-50 | security/critical: +50, bug/urgent: +30, enhancement: +10 |
-| **Age (bugs)** | 0-50 | >60 days: +50, >30 days: +30, >14 days: +15 |
-| **Age (features)** | -10 to 0 | Very old (>180 days): -10 (likely stale) |
-| **Recency** | 0-15 | Updated <3 days: +15, <7 days: +10 |
-| **Staleness** | -20 | Recently reviewed: -20 |
-
-**Priority levels:**
-| Score | Level | Meaning |
-|-------|-------|---------|
-| ≥150 | CRITICAL | Security issues, long-standing bugs |
-| ≥100 | HIGH | Bugs, urgent items |
-| ≥50 | NORMAL | Regular features and issues |
-| <50 | LOW | Backlog items |
-
-### Session Drivers
-
-ru supports multiple backends for managing review sessions:
-
-| Driver | Description | Best For |
-|--------|-------------|----------|
-| `auto` | Automatically detect best available | Default choice |
-| `ntm` | Named Tmux Manager integration | Multi-agent workflows |
-| `local` | Direct tmux sessions | Simple setups |
-
-```bash
-# Use specific driver
-ru review --mode=ntm --plan
-
-# Parallel sessions
-ru review -j 4 --plan
-```
-
-#### ntm (Named Tmux Manager) Integration
-
-[ntm](https://github.com/dicklesworthstone/ntm) is a tmux session orchestration tool that provides a robot mode API for automated session management. When available, ru uses ntm for enhanced capabilities:
-
-**Robot Mode API Functions:**
-
-| Function | Purpose |
-|----------|---------|
-| `ntm --robot-spawn` | Create a Claude Code session in a new tmux pane |
-| `ntm --robot-send` | Send prompts with chunking for long messages |
-| `ntm --robot-wait` | Block until session completes with timeout |
-| `ntm --robot-activity` | Query real-time session state (idle/typing/thinking) |
-| `ntm --robot-status` | Get status of all managed sessions |
-| `ntm --robot-interrupt` | Send Ctrl+C to interrupt long operations |
-
-**Session Lifecycle:**
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    ntm Session Lifecycle                       │
-└───────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────┐
-│ ntm_spawn_    │◀─────── Creates tmux session with Claude Code
-│ session()     │         running in isolated worktree
-└───────┬───────┘
-        │
-        ▼
-┌───────────────┐
-│ ntm_send_     │◀─────── Delivers prompt (auto-chunks if >4KB)
-│ prompt()      │         Handles message delivery confirmation
-└───────┬───────┘
-        │
-        ▼
-┌───────────────┐
-│ ntm_wait_     │◀─────── Polls for completion with timeout
-│ completion()  │         Returns JSON with status/duration
-└───────┬───────┘
-        │
-        ▼
-┌───────────────┐
-│ ntm_kill_     │◀─────── Cleans up session when done
-│ session()     │         Idempotent—safe to call on gone sessions
-└───────────────┘
-```
-
-**Activity State Mapping:**
-
-ntm reports granular activity states that ru maps to unified states:
-
-| ntm State | ru Unified State | Meaning |
-|-----------|-----------------|---------|
-| `IDLE` | `idle` | Session waiting for input |
-| `TYPING` | `active` | User/agent is typing |
-| `THINKING` | `active` | AI processing |
-| `TOOL_USE` | `active` | Executing tool calls |
-| `COMPLETE` | `done` | Session finished |
-| `ERROR` | `error` | Something went wrong |
-
-**Fallback Behavior:**
-
-When ntm is not available, ru falls back to the `local` driver which uses raw tmux commands. The local driver provides the same core functionality but without:
-- Message chunking for long prompts
-- Activity state detection
-- Delivery confirmation
-
-### Claude Code Integration
-
-ru orchestrates AI review sessions using Claude Code with stream-json output parsing:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Claude Code Session                           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  stream-json    │
-                    │  NDJSON output  │
-                    └────────┬────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         ▼                   ▼                   ▼
-   ┌──────────┐       ┌──────────┐       ┌──────────┐
-   │  system  │       │ assistant│       │  result  │
-   │  events  │       │  events  │       │  events  │
-   └──────────┘       └──────────┘       └──────────┘
-```
-
-**Event types parsed:**
-
-| Event | Data Extracted |
-|-------|----------------|
-| `system.init` | Session ID, available tools, working directory |
-| `assistant` | Tool uses, text responses, thinking |
-| `result` | Status, duration, cost (USD) |
-
-**Interactive question detection:**
-
-When Claude Code uses `AskUserQuestion`, ru detects and surfaces these for human input:
-
-```bash
-# Session asks: "Should I refactor this function?"
-# ru detects and shows:
-#   [Session owner/repo] Question pending: "Should I refactor this function?"
-#   Options: 1) Yes  2) No  3) Skip
-```
-
-**Cost tracking:**
-
-Each session reports cost, enabling budget enforcement:
-
-```json
-{"type":"result","status":"success","duration_ms":45000,"cost_usd":0.0234}
-```
-
-### Git Worktree Isolation
-
-Each review session operates in an isolated git worktree, ensuring:
-- Main working directory stays untouched
-- Multiple reviews can run in parallel
-- Changes can be discarded without affecting HEAD
-- Clean state for each AI session
-
-```
-~/.local/state/ru/worktrees/
-└── 20250105-143022-1234/
-    ├── owner_repo1/          # Isolated worktree
-    ├── owner_repo2/          # Isolated worktree
-    └── mapping.json          # Worktree registry
-```
-
-### Digest Caching
-
-To avoid redundant API calls and repeated reviews, ru caches repository digests:
-
-```
-~/.local/state/ru/review/
-├── digests/                  # Cached repo digests
-│   ├── owner_repo.json       # Issues/PRs snapshot
-│   └── ...
-├── state.json                # Current review state
-├── checkpoint.json           # Resumable checkpoint
-└── results/                  # Review outcomes
-    └── 20250105-143022/
-        └── results.ndjson    # Per-item results
-```
-
-Cache invalidation:
-```bash
-# Invalidate specific repos
-ru review --invalidate-cache=owner/repo1,owner/repo2
-
-# Invalidate all caches
-ru review --invalidate-cache=all
-```
-
-### Cost Budgets
-
-Control resource usage with budget constraints:
-
-```bash
-# Limit to 10 repos
-ru review --max-repos=10 --plan
-
-# Maximum 30 minutes runtime
-ru review --max-runtime=30 --plan
-
-# Skip recently reviewed items
-ru review --skip-days=14 --plan
-```
-
-### Review Analytics
-
-View statistics on past reviews:
-
-```bash
-ru review --analytics
-```
-
-**Metrics tracked:**
-
-```
-~/.local/state/ru/metrics/
-├── 2025-01.json              # Monthly aggregates
-├── 2025-02.json
-└── decisions.jsonl           # Per-decision audit log
-```
-
-**Monthly metrics:**
-
-| Metric | Description |
-|--------|-------------|
-| `reviews.total` | Total review sessions started |
-| `reviews.repos_reviewed` | Unique repositories reviewed |
-| `reviews.issues_processed` | Issues examined by AI |
-| `reviews.issues_resolved` | Issues closed or fixed |
-| `reviews.questions_asked` | AI questions to human |
-| `reviews.questions_answered` | Human responses |
-| `timing.total_duration_minutes` | Cumulative review time |
-| `timing.avg_session_minutes` | Average session length |
-| `outcomes.changes_applied` | Commits made |
-| `outcomes.changes_rejected` | Changes discarded |
-
-**Decision logging:**
-
-Every significant action is logged to `decisions.jsonl` for auditability:
-
-```json
-{"timestamp":"2025-01-05T14:30:00Z","repo":"owner/repo","issue":42,"action":"close","reason":"Fixed by commit abc123","actor":"ai"}
-{"timestamp":"2025-01-05T14:31:00Z","repo":"owner/repo","issue":43,"action":"label","label":"wontfix","actor":"human"}
-```
-
-**Analytics dashboard:**
-
-```bash
-ru review --analytics
-```
-
-Shows:
-- Total reviews completed
-- Average resolution time
-- Most active repositories
-- Issue type distribution
-- Review velocity trends
-- Success/rejection ratios
-
-### GitHub Actions Execution
-
-After review sessions complete, ru can execute planned GitHub actions from the review plan:
-
-```bash
-# Actions are proposed during --plan, executed during --apply
-ru review --apply
-```
-
-**Supported actions:**
-
-| Action | Command | Description |
-|--------|---------|-------------|
-| `comment` | `gh issue comment` | Add comment to issue/PR |
-| `close` | `gh issue close` | Close an issue |
-| `label` | `gh issue edit --add-label` | Add labels to issue |
-
-**Idempotent execution:**
-
-Actions are logged and deduplicated to prevent repeated execution:
-
-```
-~/.local/state/ru/review/gh_actions.jsonl
-```
-
-```json
-{"timestamp":"2025-01-05T14:30:00Z","repo":"owner/repo","target":"issue/42","action":"close","status":"success"}
-{"timestamp":"2025-01-05T14:30:01Z","repo":"owner/repo","target":"issue/43","action":"comment","status":"success"}
-```
-
-If a session is restarted, already-executed actions are skipped automatically.
-
-**Action parsing:**
-
-Actions are extracted from review plan files with canonicalization:
-
-```
-owner/repo#42    → repo: owner/repo, type: issue, number: 42
-owner/repo/pull/5 → repo: owner/repo, type: pr, number: 5
-```
-
-### Review Policies
-
-Configure review behavior with policy files:
-
-```bash
-# ~/.config/ru/review/policy.json
-{
-  "REVIEW_LINT_REQUIRED": true,
-  "REVIEW_SECRET_SCAN": true,
-  "REVIEW_ALLOW_PUSH": false,
-  "REVIEW_REQUIRE_APPROVAL": true,
-  "REVIEW_SKIP_PRS": false,
-  "REVIEW_DEEP_MODE": false
-}
-```
-
-| Policy | Default | Description |
-|--------|---------|-------------|
-| `REVIEW_LINT_REQUIRED` | `true` | Run linters before applying |
-| `REVIEW_SECRET_SCAN` | `true` | Scan for secrets in changes |
-| `REVIEW_ALLOW_PUSH` | `false` | Allow pushing without `--push` |
-| `REVIEW_REQUIRE_APPROVAL` | `true` | Require explicit approval |
-| `REVIEW_SKIP_PRS` | `false` | Skip PRs (issues only) |
-| `REVIEW_DEEP_MODE` | `false` | Enable deep analysis |
-
-### GraphQL Batch Querying
-
-ru uses efficient GraphQL alias batching to minimize API calls when discovering work items across many repositories:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   GraphQL Batch Query                            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-   ┌──────────┐         ┌──────────┐         ┌──────────┐
-   │  repo0:  │         │  repo1:  │         │  repo24: │
-   │  issues  │   ...   │  issues  │   ...   │  issues  │
-   │  + PRs   │         │  + PRs   │         │  + PRs   │
-   └──────────┘         └──────────┘         └──────────┘
-         │                    │                    │
-         └────────────────────┼────────────────────┘
-                              ▼
-                    ┌─────────────────┐
-                    │  Single API     │
-                    │  Response       │
-                    └─────────────────┘
-```
-
-**How it works:**
-
-1. **Alias batching** — Up to 25 repositories per GraphQL query using named aliases (`repo0`, `repo1`, ...)
-2. **Parallel field fetching** — Issues, PRs, and labels retrieved in one request per batch
-3. **Automatic chunking** — Large repo lists split into optimal batch sizes
-4. **Retry on failure** — Failed batches retried with exponential backoff
-
-**Efficiency comparison:**
-
-| Approach | 100 Repos | API Calls |
-|----------|-----------|-----------|
-| Individual REST | 100 repos × 2 (issues + PRs) | 200 calls |
-| GraphQL batched | 100 repos ÷ 25 per batch | 4 calls |
-
-### Rate-Limit Governor
-
-ru includes an adaptive parallelism governor that adjusts concurrency based on GitHub API rate limits and error patterns:
-
-```bash
-# The governor tracks:
-#   - GitHub API remaining quota
-#   - Model rate limit (429) responses
-#   - Error frequency within sliding window
-#   - Circuit breaker state
-```
-
-**Adaptive behavior:**
-
-| Condition | Action |
-|-----------|--------|
-| GitHub remaining < 100 | Reduce parallelism to 1 |
-| GitHub remaining < 500 | Reduce parallelism by 50% |
-| Model 429 detected | Pause new sessions for 60s |
-| Error rate > 50% (5min window) | Open circuit breaker |
-| Circuit open > 2 minutes + no errors | Close circuit breaker |
-
-**Circuit breaker pattern:**
-
-```
-Normal Operation → Errors Spike → Circuit OPEN → Cool-down → Half-Open → Test → CLOSED
-                       ↑                              │
-                       └──────── More Errors ─────────┘
-```
-
-The governor runs as a background monitor during review sessions, checking rate limits every 30 seconds and adjusting `REVIEW_PARALLEL` dynamically.
-
-### Global Backoff Coordination
-
-When running parallel agent-sweep operations, ru uses a shared backoff mechanism to coordinate pause signals across all worker processes:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   Global Backoff Coordination                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  Worker detects │
-                    │  rate limit 429 │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ agent_sweep_    │◀─────── Acquire lock
-                    │ backoff_trigger │         Write pause_until + reason
-                    └────────┬────────┘         Release lock
-                             │
-    ┌────────────────────────┼────────────────────────┐
-    ▼                        ▼                        ▼
-┌─────────┐            ┌─────────┐            ┌─────────┐
-│Worker 1 │            │Worker 2 │            │Worker 3 │
-│ check   │            │ check   │            │ check   │
-│backoff.─┼────────────┼────┬────┼────────────┼─state   │
-│state    │            │    │    │            │         │
-└────┬────┘            └────┼────┘            └────┬────┘
-     │                      │                      │
-     ▼                      ▼                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│          All workers sleep until pause_until expires            │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Backoff behavior:**
-
-| Trigger | Initial Delay | Behavior |
-|---------|---------------|----------|
-| First rate limit | 30 seconds | Wait, then resume |
-| Repeated rate limit | Previous × 2 | Exponential backoff |
-| Maximum delay | 10 minutes | Capped to prevent infinite wait |
-| Jitter | ±25% | Prevents thundering herd |
-
-**State file format (`backoff.state`):**
-
-```json
-{
-  "reason": "rate_limited",
-  "pause_until": 1704307200,
-  "delay": 60
-}
-```
-
-Workers check this file before starting work on each repo. If `pause_until` is in the future, they sleep until it expires. This ensures all workers respect a global cooldown without requiring inter-process communication.
-
-### Quality Gates
-
-Before applying changes, ru runs automated quality gates to catch issues early:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Quality Gates                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-   ┌──────────┐         ┌──────────┐         ┌──────────┐
-   │   Test   │         │   Lint   │         │  Secret  │
-   │   Gate   │         │   Gate   │         │   Scan   │
-   └──────────┘         └──────────┘         └──────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-   ┌──────────┐         ┌──────────┐         ┌──────────┐
-   │  Auto-   │         │  Auto-   │         │  Pattern │
-   │  detect  │         │  detect  │         │  Match   │
-   └──────────┘         └──────────┘         └──────────┘
-```
-
-**Auto-detection by project type:**
-
-| Project Type | Test Command | Lint Command |
-|--------------|--------------|--------------|
-| npm/yarn | `npm test` / `yarn test` | `npm run lint` / `eslint` |
-| Cargo (Rust) | `cargo test` | `cargo clippy` |
-| Go | `go test ./...` | `golangci-lint run` |
-| Python | `pytest` / `python -m pytest` | `ruff check` / `flake8` |
-| Makefile | `make test` | `make lint` |
-| Shell scripts | (none) | `shellcheck *.sh` |
-
-**Secret scanning patterns:**
-
-The secret scanner checks for accidentally committed credentials:
-- API keys and tokens (`sk-`, `ghp_`, `xox`, `AKIA`)
-- Private keys (`BEGIN RSA PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`)
-- Connection strings and passwords
-- Cloud provider credentials
-
-```bash
-# Run quality gates on a specific directory
-ru review --apply  # Gates run automatically before pushing
-
-# Skip gates (not recommended)
-REVIEW_LINT_REQUIRED=false REVIEW_SECRET_SCAN=false ru review --apply
-```
-
-### Session Health Monitoring
-
-ru monitors review sessions for external prompts and blocking conditions:
-
-**Detected wait reasons:**
-
-| Pattern | Risk Level | Description |
-|---------|------------|-------------|
-| `Password:` | High | Credential prompt |
-| `Enter passphrase` | High | SSH key passphrase |
-| `Enter OTP` | High | Two-factor authentication |
-| `CONFLICT.*Merge` | Medium | Git merge conflict |
-| `(yes/no)` | Medium | Host key verification |
-| `Please enter.*commit` | Low | Git commit message prompt |
-
-**Risk classification:**
-
-- **High risk** — Credentials, authentication, permissions (requires human intervention)
-- **Medium risk** — Merge conflicts, host verification (may need review)
-- **Low risk** — Informational prompts (often auto-resolvable)
-
-When a blocking prompt is detected, the session is marked as waiting and the reason is logged for review:
-
-```bash
-ru review --status
-# Shows: Session owner/repo waiting on "Password:" (high risk)
-```
-
----
-
-## 🤖 Agent-Driven Sweep
-
-The `ru agent-sweep` command orchestrates AI coding agents (via Claude Code) to automatically process repositories with uncommitted changes. It spawns isolated tmux sessions for each repository, monitors agent progress, and aggregates results.
-
-### The Agent Sweep Workflow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       ru agent-sweep                              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  Load dirty     │
-                    │  repositories   │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ▼
-       ┌──────────┐   ┌──────────┐   ┌──────────┐
-       │ Preflight│   │ Preflight│   │ Preflight│
-       │  Checks  │   │  Checks  │   │  Checks  │
-       └──────────┘   └──────────┘   └──────────┘
-              │              │              │
-              ▼              ▼              ▼
-       ┌──────────┐   ┌──────────┐   ┌──────────┐
-       │  Spawn   │   │  Spawn   │   │  Spawn   │
-       │  Agent   │   │  Agent   │   │  Agent   │
-       │ (tmux)   │   │ (tmux)   │   │ (tmux)   │
-       └──────────┘   └──────────┘   └──────────┘
-              │              │              │
-              └──────────────┼──────────────┘
-                             ▼
-                    ┌─────────────────┐
-                    │  Monitor &      │
-                    │  Aggregate      │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ▼
-       ┌──────────┐   ┌──────────┐   ┌──────────┐
-       │  Secret  │   │  Quality │   │   Push   │
-       │   Scan   │   │  Gates   │   │  (opt)   │
-       └──────────┘   └──────────┘   └──────────┘
-```
-
-### Agent Sweep Prerequisites
-
-Before using `agent-sweep`, ensure you have:
-
-| Requirement | Description |
-|-------------|-------------|
-| **ntm** | Named Tmux Manager for session orchestration |
-| **tmux** | Terminal multiplexer for isolated sessions |
-| **Claude Code** | AI coding agent (`claude` command) |
-
-**Verify installation:**
-```bash
-# Check ntm
-ntm --version
-
-# Check tmux
-tmux -V
-
-# Check Claude Code
-claude --version
-```
-
-### Basic Usage
-
-```bash
-# Process all repos with uncommitted changes
-ru agent-sweep
-
-# Dry run - preview what would be processed
-ru agent-sweep --dry-run
-
-# Process 4 repos in parallel
-ru agent-sweep -j4
-
-# Filter to specific repos
-ru agent-sweep --repos="myproject*"
-
-# Include release step after commit
-ru agent-sweep --with-release
-
-# Resume an interrupted sweep
-ru agent-sweep --resume
-
-# Start fresh (clear previous state)
-ru agent-sweep --restart
-
-# Verbose output with file logging
-ru agent-sweep --verbose
-
-# Debug mode for troubleshooting
-ru agent-sweep --debug
-```
-
-### Three-Phase Agent Workflow
-
-Each repository goes through a structured three-phase workflow that separates planning from execution:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Three-Phase Workflow                           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-       ┌──────────┐    ┌──────────┐    ┌──────────┐
-       │  PHASE 1 │    │  PHASE 2 │    │  PHASE 3 │
-       │ Planning │───▶│  Commit  │───▶│ Release  │
-       └──────────┘    └──────────┘    └──────────┘
-              │               │               │
-              ▼               ▼               ▼
-       ┌──────────┐    ┌──────────┐    ┌──────────┐
-       │  Analyze │    │  Execute │    │  Create  │
-       │  changes │    │   plan   │    │   tag/   │
-       │  + plan  │    │ + commit │    │  release │
-       └──────────┘    └──────────┘    └──────────┘
-```
-
-**Phase 1: Planning** (`--phase1-timeout`, default 300s)
-- Claude Code analyzes the uncommitted changes in the repository
-- Determines which files should be staged (respecting denylist)
-- Generates a structured commit message following conventional commit format
-- Outputs a JSON plan with files, message, and rationale
-
-**Phase 2: Commit** (`--phase2-timeout`, default 600s)
-- Validates the plan from Phase 1 (file existence, denylist compliance)
-- Stages approved files with `git add`
-- Creates the commit with the generated message
-- Runs quality gates (linting, secret scan)
-- Optionally pushes to remote
-
-**Phase 3: Release** (`--phase3-timeout`, default 300s, requires `--with-release`)
-- Analyzes commit history since last tag
-- Determines appropriate version bump (patch/minor/major)
-- Creates git tag and optionally GitHub release
-- Respects per-repo release strategy configuration
-
-**Execution modes:**
-
-| Mode | Behavior |
-|------|----------|
-| `--execution-mode=agent` | Full AI-driven workflow (default) |
-| `--execution-mode=plan` | Phase 1 only: generate plan, stop |
-| `--execution-mode=apply` | Phase 2+3: execute existing plan |
-
-**Why separate phases?**
-- **Auditability**: Each phase produces inspectable output
-- **Recovery**: Can resume from any phase after interruption
-- **Control**: Can run planning across all repos, then review before applying
-- **Safety**: Validation happens between phases, catching issues early
-
-### Preflight Checks
-
-Before spawning an agent, each repository undergoes preflight validation:
-
-| Check | Reason | Skip Reason |
-|-------|--------|-------------|
-| Is git repository | Basic requirement | `not_a_git_repo` |
-| Git email configured | For commits | `git_email_not_configured` |
-| Git name configured | For commits | `git_name_not_configured` |
-| Not a shallow clone | Some ops may fail | `shallow_clone` |
-| No dirty submodules | Avoid conflicts | `dirty_submodules` |
-| No rebase in progress | Unsafe state | `rebase_in_progress` |
-| No merge in progress | Unsafe state | `merge_in_progress` |
-| No cherry-pick in progress | Unsafe state | `cherry_pick_in_progress` |
-| Not detached HEAD | Need branch ref | `detached_HEAD` |
-| Has upstream branch | For push | `no_upstream_branch` |
-| Not diverged | Would need rebase | `diverged_from_upstream` |
-| No unmerged paths | Merge conflicts exist | `unmerged_paths` |
-| git diff --check clean | Whitespace/conflict markers | `diff_check_failed` |
-| Untracked files < 1000 | Too many untracked | `too_many_untracked_files` |
-
-**Handling preflight failures:**
-```bash
-# View why a repo was skipped (JSON output)
-ru agent-sweep --json 2>/dev/null | jq '.repos[] | select(.status == "skipped")'
-
-# Fix common issues
-cd /data/projects/problematic-repo
-git config user.email "you@example.com"
-git config user.name "Your Name"
-git rebase --abort  # If rebase in progress
-```
-
-### Security Guardrails
-
-Agent-sweep includes multiple security layers to prevent accidents:
-
-**1. File Denylist**
-
-Certain files are never committed, regardless of agent output:
-
-| Category | Patterns |
-|----------|----------|
-| **Secrets** | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `credentials.json`, `secrets.json` |
-| **Build artifacts** | `node_modules`, `__pycache__`, `dist`, `build`, `.next`, `target`, `vendor` |
-| **Logs/temp** | `*.log`, `*.tmp`, `*.swp`, `.DS_Store` |
-| **IDE files** | `.idea`, `.vscode`, `*.iml` |
-
-**Extend the denylist:**
-```bash
-# Via environment variable
-export AGENT_SWEEP_DENYLIST_EXTRA="*.bak *.orig internal/*"
-
-# Via per-repo config (.ru/agent-sweep.conf)
-echo 'DENYLIST_EXTRA="*.backup proprietary/*"' >> .ru/agent-sweep.conf
-```
-
-**2. Secret Scanning**
-
-Before any push, files are scanned for secrets:
-
-```bash
-# Modes
---secret-scan=none   # Disable scanning
---secret-scan=warn   # Warn but continue (default)
---secret-scan=block  # Block push on detection
-```
-
-**Patterns detected:**
-- API keys (`sk-`, `ghp_`, `xox`, `AKIA`)
-- Private keys (`BEGIN RSA PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`)
-- Connection strings and passwords
-- Cloud provider credentials
-
-**3. File Size Limits**
-
-Large or binary files are blocked from commits to prevent repository bloat. The default limit is 1MB, configurable via `AGENT_SWEEP_MAX_FILE_MB` or per-repo config.
-
-**4. Plan Validation**
-
-Before executing any commit or release plan, ru validates the AI-generated JSON output:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Plan Validation Pipeline                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-   ┌──────────┐         ┌──────────┐         ┌──────────┐
-   │  JSON    │         │  Schema  │         │  File    │
-   │  Parse   │         │  Verify  │         │  Verify  │
-   └──────────┘         └──────────┘         └──────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-   ┌──────────┐         ┌──────────┐         ┌──────────┐
-   │ Extract  │         │ Required │         │  Files   │
-   │ between  │         │  fields  │         │  exist?  │
-   │ markers  │         │ present? │         │ Allowed? │
-   └──────────┘         └──────────┘         └──────────┘
-```
-
-**Validation checks for commit plans:**
-
-| Check | Validation | Failure Behavior |
-|-------|------------|------------------|
-| JSON structure | Valid JSON between `---PLAN-START---` and `---PLAN-END---` markers | Reject plan |
-| Required fields | `files` array, `commit_message` string | Reject plan |
-| File existence | Each file in `files[]` exists in working tree | Warn, filter out missing |
-| Denylist compliance | No file matches denylist patterns | Block file, continue with rest |
-| Commit message format | Non-empty, reasonable length | Reject if empty |
-
-**Validation checks for release plans:**
-
-| Check | Validation | Failure Behavior |
-|-------|------------|------------------|
-| Version format | Matches semver (X.Y.Z) | Reject plan |
-| Tag availability | Tag doesn't already exist | Reject plan |
-| Release strategy | Matches configured strategy | Adjust to match |
-| Changelog presence | Release notes provided | Warn, use default |
-
-**Why structured output with markers?**
-
-AI output often includes explanatory text before/after the JSON. The marker-based extraction (`---PLAN-START---` / `---PLAN-END---`) reliably isolates the machine-readable portion without complex parsing.
-
-### Per-Repository Configuration
-
-Customize agent-sweep behavior per repository:
-
-**Option 1: YAML config (`.ru-agent.yml`)** — Recommended:
-```yaml
-# ~/.../your-repo/.ru-agent.yml
-agent_sweep:
-  enabled: true
-  max_file_size: 5242880  # 5MB
-  extra_context: "This is a Python project using FastAPI"
-  pre_hook: "make lint"
-  post_hook: "make test"
-  skip_phases: []
-  denylist_extra:
-    - "*.backup"
-    - "internal/*"
-```
-
-**Option 2: JSON config (`.ru-agent.json`):**
-```json
-{
-  "agent_sweep": {
-    "enabled": true,
-    "max_file_size": 5242880,
-    "denylist_extra": ["*.backup", "internal/*"]
-  }
-}
-```
-
-**Option 3: Shell config for release strategy (`.ru/agent-sweep.conf`):**
-```bash
-# ~/.../your-repo/.ru/agent-sweep.conf
-# Only release strategy is configurable via shell config
-AGENT_SWEEP_RELEASE_STRATEGY=auto  # never|auto|tag-only|gh-release
-```
-
-**Option 4: User config (`~/.config/ru/agent-sweep.d/<repo>.conf`):**
-```bash
-# ~/.config/ru/agent-sweep.d/my-repo.conf
-# Per-repo overrides without modifying the repo itself
-AGENT_SWEEP_RELEASE_STRATEGY=never
-```
-
-### State Management
-
-Agent-sweep tracks progress for resume capability:
-
-```
-~/.local/state/ru/
-├── agent-sweep/
-│   ├── state.json            # Current sweep state
-│   ├── results.ndjson        # Per-repo results
-│   ├── completed_repos.txt   # Successfully completed repos
-│   ├── instance.lock/        # Concurrent execution lock
-│   │   └── pid               # Lock holder PID
-│   ├── locks/                # Coordination locks
-│   └── runs/<run-id>/        # Per-run artifacts
-└── logs/
-    └── YYYY-MM-DD/
-        ├── agent_sweep.log   # Main log
-        └── repos/
-            └── <repo>.log    # Per-repo logs
-```
-
-**State operations:**
-```bash
-# View current state
-cat ~/.local/state/ru/agent-sweep/state.json | jq .
-
-# Resume interrupted sweep
-ru agent-sweep --resume
-
-# Clear state and start fresh
-ru agent-sweep --restart
-
-# View per-repo results
-cat ~/.local/state/ru/agent-sweep/results.ndjson | jq -s .
-```
-
-### Troubleshooting Agent Sweep
-
-<details>
-<summary><strong>"ntm is not available"</strong></summary>
-
-**Cause:** Named Tmux Manager not installed or not in PATH.
-
-**Fix:**
-```bash
-# Install ntm (if available via package manager)
-# Or add to PATH if installed elsewhere
-export PATH="$HOME/.local/bin:$PATH"
-
-# Verify
-ntm --version
-```
-
-</details>
-
-<details>
-<summary><strong>"Another agent-sweep is already running"</strong></summary>
-
-**Cause:** Lock file exists from previous run.
-
-**Fix:**
-```bash
-# Check if actually running
-ps aux | grep "agent-sweep"
-
-# If stale, remove lock
-rm -rf ~/.local/state/ru/agent-sweep/instance.lock
-```
-
-</details>
-
-<details>
-<summary><strong>Agent session hangs</strong></summary>
-
-**Cause:** Agent waiting for input or slow network.
-
-**Fixes:**
-1. Increase timeouts: `--phase2-timeout=1200`
-2. Attach to session: `ru agent-sweep --attach-on-fail`
-3. Keep sessions for debugging: `--keep-sessions-on-fail`
-```bash
-# List active sessions
-tmux list-sessions
-
-# Attach to specific session
-tmux attach -t ru-sweep-myrepo
-```
-
-</details>
-
-<details>
-<summary><strong>"diverged_from_upstream" skip reason</strong></summary>
-
-**Cause:** Local and remote branches have diverged.
-
-**Fix:**
-```bash
-cd /data/projects/affected-repo
-git fetch origin
-git rebase origin/main  # Or merge
-```
-
-</details>
-
-<details>
-<summary><strong>Secret detected, push blocked</strong></summary>
-
-**Cause:** Agent committed a file matching secret patterns.
-
-**Fixes:**
-1. Remove the secret: `git reset HEAD~1 && git checkout -- file`
-2. If false positive, adjust denylist
-3. Use `--secret-scan=warn` to continue with warning
-
-</details>
-
-### Exit Codes for Agent Sweep
-
-| Code | Meaning |
-|------|---------|
-| `0` | All repos processed successfully |
-| `1` | Some repos failed (agent error, timeout) |
-| `2` | Quality gate failures (secrets, tests) |
-| `3` | System error (ntm, tmux missing) |
-| `4` | Invalid arguments |
-| `5` | Interrupted (use `--resume`) |
 
 ---
 
@@ -2331,150 +1091,60 @@ esac
 
 ### Component Overview
 
-ru is organized into logical layers, with each layer building on the ones below. The full implementation is approximately 17,700 lines of pure Bash, with no external dependencies beyond git, curl, and optionally `gh` CLI and `gum` for enhanced UX.
-
 ```
-ru (bash, ~17,700 LOC)
+ru (bash, ~800-1000 LOC)
+├── Core Utilities
+│   ├── is_interactive()      # TTY detection
+│   ├── can_prompt()          # Interactive + non-CI
+│   ├── ensure_dir()          # Create if missing
+│   └── write_result()        # NDJSON logging
 │
-├── Core Foundation Layer
-│   ├── Utilities & Guards
-│   │   ├── is_interactive()      # TTY detection for prompts
-│   │   ├── can_prompt()          # Interactive + non-CI guard
-│   │   ├── ensure_dir()          # Create directory if missing
-│   │   └── json_escape()         # Safe JSON string escaping
-│   │
-│   ├── Logging (stderr=humans, stdout=data)
-│   │   ├── log_info/warn/error() # Human messages to stderr
-│   │   ├── log_step/success()    # Progress indicators
-│   │   └── write_result()        # NDJSON structured logging
-│   │
-│   ├── Configuration
-│   │   ├── get_config_value()    # Read from ini-style file
-│   │   ├── set_config_value()    # Write to file atomically
-│   │   └── resolve_config()      # CLI > env > file > default
-│   │
-│   └── Path Security
-│       ├── validate_path()       # Reject traversal attacks
-│       ├── safe_path_concat()    # Prevent /a + ../b escapes
-│       └── canonicalize_path()   # Resolve symlinks safely
+├── Configuration
+│   ├── get_config_value()    # Read from file
+│   ├── set_config_value()    # Write to file
+│   └── resolve_config()      # CLI > env > file > default
 │
-├── Infrastructure Layer
-│   ├── Portable Locking
-│   │   ├── dir_lock_try_acquire() # Atomic mkdir-based locks
-│   │   ├── dir_lock_wait()        # Blocking lock with timeout
-│   │   └── dir_lock_release()     # rmdir-based release
-│   │
-│   ├── URL & Path Parsing
-│   │   ├── parse_repo_url()      # Extract host/owner/repo
-│   │   ├── normalize_url()       # Canonical URL form
-│   │   ├── parse_repo_spec()     # owner/repo@branch as name
-│   │   └── url_to_local_path()   # Layout-aware path resolution
-│   │
-│   ├── Dependency Detection
-│   │   ├── detect_os()           # macOS/Linux detection
-│   │   ├── check_gh_*()          # gh CLI status checks
-│   │   └── ensure_dependencies() # Full dependency flow
-│   │
-│   └── Gum Integration
-│       ├── check_gum()           # Feature availability
-│       ├── gum_confirm()         # Y/N with fallback
-│       └── print_banner()        # Styled box output
+├── Logging (stderr=human, stdout=data)
+│   ├── log_info/warn/error() # Human messages
+│   ├── log_step/success()    # Progress indicators
+│   └── output_json()         # Structured output
 │
-├── Git Operations Layer (no cd, plumbing-based)
-│   ├── Status Detection
-│   │   ├── get_repo_status()     # Ahead/behind via rev-list
-│   │   ├── is_dirty()            # status --porcelain
-│   │   └── is_shallow()          # rev-parse --is-shallow
-│   │
-│   ├── Actions
-│   │   ├── do_clone()            # gh repo clone with retry
-│   │   ├── do_pull()             # Strategy-aware pull
-│   │   └── do_fetch()            # Fetch with timeout handling
-│   │
-│   └── Worktree Management
-│       ├── create_worktree()     # Isolated checkout for review
-│       ├── cleanup_worktree()    # Safe removal
-│       └── get_worktree_list()   # Active worktree tracking
+├── Gum Integration
+│   ├── check_gum()           # Availability check
+│   ├── gum_confirm()         # Y/N with fallback
+│   └── print_banner()        # Styled header
 │
-├── Sync Orchestration Layer
-│   ├── Repo List Management
-│   │   ├── load_repo_list()      # Parse list files
-│   │   ├── detect_collisions()   # Path collision warnings
-│   │   └── enumerate_repos()     # Combine public + private
-│   │
-│   ├── Work-Stealing Queue
-│   │   ├── queue_init()          # Write repos to temp file
-│   │   ├── queue_dequeue()       # Atomic pop with lock
-│   │   └── worker_loop()         # Process until empty
-│   │
-│   ├── Sync State Management
-│   │   ├── sync_state_init()     # Create run directory
-│   │   ├── sync_state_save()     # Persist resume state
-│   │   └── sync_state_load()     # Resume interrupted sync
-│   │
-│   └── Result Aggregation
-│       ├── tally_results()       # Count by status
-│       ├── format_summary()      # Human-readable report
-│       └── format_json()         # Machine-readable output
+├── Dependency Management
+│   ├── detect_os()           # macOS/Linux
+│   ├── check_gh_*()          # Installed + authenticated
+│   └── ensure_dependencies() # Full check flow
 │
-├── Review & Agent Coordination Layer
-│   ├── Discovery & Prioritization
-│   │   ├── discover_items()      # Find issues/PRs to review
-│   │   ├── score_priority()      # Multi-factor ranking
-│   │   └── filter_by_policy()    # Apply review policies
-│   │
-│   ├── Session Management
-│   │   ├── create_review_session() # Initialize session
-│   │   ├── monitor_session()     # Health tracking
-│   │   └── cleanup_session()     # Resource cleanup
-│   │
-│   ├── Quality Gates
-│   │   ├── validate_commit_plan() # Security & size checks
-│   │   ├── check_file_allowlist() # Denylist enforcement
-│   │   └── verify_tests_passed()  # Test requirement gate
-│   │
-│   └── GitHub Actions Execution
-│       ├── execute_gh_action()   # Comment, close, merge, etc.
-│       ├── verify_action_safe()  # Security validation
-│       └── batch_actions()       # Rate-limit aware batching
+├── URL & Path Parsing
+│   ├── parse_repo_url()      # Extract components
+│   ├── normalize_url()       # Canonical form
+│   └── url_to_local_path()   # Layout-aware path
 │
-├── Agent Sweep Layer
-│   ├── Preflight & Safety
-│   │   ├── preflight_checks()    # Environment validation
-│   │   ├── check_repo_config()   # Per-repo review settings
-│   │   └── abort_conditions()    # Safety circuit breakers
-│   │
-│   ├── Orchestration
-│   │   ├── agent_sweep_loop()    # Main iteration logic
-│   │   ├── spawn_review()        # ntm/Claude Code session
-│   │   └── wait_for_completion() # Timeout handling
-│   │
-│   └── State & Recovery
-│       ├── sweep_state_save()    # Progress checkpointing
-│       ├── sweep_state_load()    # Resume after interrupt
-│       └── cleanup_stale()       # Remove orphaned worktrees
+├── Git Operations (no cd, plumbing-based)
+│   ├── get_repo_status()     # Ahead/behind/dirty
+│   ├── do_clone()            # gh repo clone
+│   └── do_pull()             # Strategy-aware pull
 │
-└── Command Layer
-    ├── Core Commands
-    │   ├── cmd_sync()            # Clone and pull repos
-    │   ├── cmd_status()          # Read-only status check
-    │   ├── cmd_init()            # Create configuration
-    │   ├── cmd_add()             # Add repo to list
-    │   └── cmd_remove()          # Remove from list
-    │
-    ├── Maintenance Commands
-    │   ├── cmd_prune()           # Detect orphan repos
-    │   ├── cmd_doctor()          # System diagnostics
-    │   └── cmd_self_update()     # Version checking
-    │
-    ├── Review Commands
-    │   ├── cmd_review()          # Single-repo review mode
-    │   └── cmd_agent_sweep()     # Multi-repo agent sweep
-    │
-    └── CLI Infrastructure
-        ├── show_help()           # Usage message
-        ├── dispatch_command()    # Route to handler
-        └── on_exit()             # Cleanup trap
+├── Repo List Management
+│   ├── load_repo_list()      # Parse list file
+│   ├── parse_repo_spec()     # repo@branch syntax
+│   └── detect_collisions()   # Path collision warning
+│
+├── Subcommand Implementations
+│   ├── cmd_sync()            # Main sync logic
+│   ├── cmd_status()          # Read-only check
+│   ├── cmd_init()            # Create config
+│   ├── cmd_add()             # Add to list
+│   └── cmd_doctor()          # Diagnostics
+│
+└── Main & CLI Dispatch
+    ├── show_help()           # Usage message
+    ├── dispatch_command()    # Route to handler
+    └── on_exit()             # Cleanup trap
 ```
 
 ### Data Flow
@@ -2537,205 +1207,6 @@ cat ~/.local/state/ru/logs/latest/results.ndjson | jq -s 'group_by(.status) | ma
 # Find failures
 cat ~/.local/state/ru/logs/latest/results.ndjson | jq -r 'select(.status == "failed") | "\(.repo): \(.message)"'
 ```
-
-### Portable Locking
-
-ru uses directory-based locking for coordination across parallel workers and concurrent processes. This approach works on all POSIX systems without requiring `flock` (which isn't available on all platforms):
-
-```bash
-# Lock acquisition via atomic mkdir
-dir_lock_try_acquire() {
-    local lock_dir="$1"
-    if mkdir "$lock_dir" 2>/dev/null; then
-        # Write lock info for debugging
-        echo "$$" > "$lock_dir/pid"
-        return 0
-    fi
-    return 1
-}
-```
-
-**How it works:**
-- `mkdir` is atomic on POSIX filesystems—only one process can create a directory
-- Lock holder's PID is written to a file inside the lock directory
-- Timeout-based acquisition retries with configurable duration
-- Automatic cleanup on process exit via trap handlers
-
-**Use cases:**
-- Parallel sync workers accessing shared state
-- Worktree mapping updates during concurrent reviews
-- Sync state file coordination
-
-### Work-Stealing Queue
-
-For parallel sync operations (`--parallel N`), ru uses a work-stealing queue pattern where multiple worker processes compete for work items atomically:
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                      Work Queue (temp file)                     │
-│  ┌─────────┬─────────┬─────────┬─────────┬─────────┐           │
-│  │ repo1   │ repo2   │ repo3   │ repo4   │ repo5   │ ...       │
-│  └─────────┴─────────┴─────────┴─────────┴─────────┘           │
-└────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-   ┌──────────┐         ┌──────────┐         ┌──────────┐
-   │ Worker 1 │         │ Worker 2 │         │ Worker 3 │
-   │ (subshell)│        │ (subshell)│        │ (subshell)│
-   └──────────┘         └──────────┘         └──────────┘
-         │                    │                    │
-         │     ┌──────────────┴──────────────┐     │
-         │     ▼                             ▼     │
-         │  ┌────────────────────────────────────┐ │
-         └─▶│       Queue Lock (mkdir)           │◀┘
-            │   - Atomic dequeue via head/tail   │
-            │   - Spin-wait with timeout         │
-            └────────────────────────────────────┘
-```
-
-**Algorithm:**
-
-1. **Queue initialization**: Write all repo specs to a temporary file, one per line
-2. **Worker spawning**: Fork N worker subshells that compete for work
-3. **Atomic dequeue**:
-   - Acquire directory lock via `mkdir` (atomic on POSIX)
-   - Read first line from queue file (`head -1`)
-   - Remove first line (`tail -n +2 > tmp && mv tmp queue`)
-   - Release lock via `rmdir`
-4. **Work completion**: Worker processes repo, appends result to shared results file (also lock-protected)
-5. **Progress tracking**: Atomic counter updated under separate lock
-
-**Why work-stealing?**
-- **Load balancing**: Fast repos don't block slow ones—workers grab more work when free
-- **No coordinator bottleneck**: Workers self-organize without a central scheduler
-- **Graceful degradation**: If a worker dies, remaining workers continue
-
-**Lock contention handling:**
-- Spin-wait with 100ms sleep between attempts
-- Configurable timeout (default 60s)
-- Workers exit cleanly if they can't acquire lock
-
-### Path Security Validation
-
-ru includes two security functions that guard against path traversal attacks, especially important when paths come from state files or user input:
-
-**`_is_safe_path_segment(segment)`** — Validates individual path components:
-
-| Check | Blocks | Reason |
-|-------|--------|--------|
-| Empty string | `""` | Invalid path component |
-| Dot-only | `.`, `..` | Path traversal attack |
-| Leading dash | `-rf` | Git option confusion |
-| Path separators | `foo/bar` | Unexpected subdirectory |
-| Control characters | `\x1b[31m` | Terminal escape injection |
-
-**`_is_path_under_base(path, base)`** — Verifies a path is safely within a base directory:
-
-```bash
-# These pass:
-_is_path_under_base "/data/projects/repo" "/data/projects"     # ✓ Direct child
-_is_path_under_base "/data/projects/a/b/c" "/data/projects"    # ✓ Nested child
-
-# These fail:
-_is_path_under_base "../etc/passwd" "/data/projects"           # ✗ Traversal
-_is_path_under_base "/data/projects/../etc" "/data/projects"   # ✗ Dot segment
-_is_path_under_base "relative/path" "/data/projects"           # ✗ Not absolute
-_is_path_under_base "/data/projects" "/"                       # ✗ Base is root
-```
-
-**Key design decisions:**
-- **Lexical checks only**: Does NOT resolve symlinks. This is intentional—`rm -rf` on a symlink removes the link, not the target, so lexical containment is the correct safety check.
-- **Rejects dot segments**: Any `/.` or `/..` in path or base causes rejection, preventing `path/../../../etc/passwd` attacks.
-- **Requires absolute paths**: Relative paths are rejected to prevent confusion about the current directory.
-
-These functions are used throughout ru to protect `rm -rf` operations on worktrees and state directories.
-
-### Retry with Exponential Backoff
-
-Network operations and API calls use intelligent retry logic with exponential backoff and jitter:
-
-```bash
-retry_with_backoff MAX_ATTEMPTS BASE_DELAY_SECONDS -- command args...
-```
-
-**Algorithm:**
-1. Attempt the operation
-2. On failure, wait `BASE_DELAY * 2^(attempt-1)` seconds
-3. Add random jitter (±25%) to prevent thundering herd
-4. Retry until `MAX_ATTEMPTS` exhausted
-5. Return last exit code on final failure
-
-**Example:**
-```bash
-# Retry GitHub API call up to 5 times with 2-second base delay
-retry_with_backoff 5 2 -- gh api repos/owner/repo
-# Delays: 2s, 4s, 8s, 16s (with jitter)
-```
-
-**Capture modes:**
-- `--capture=all` — Capture both stdout and stderr (default)
-- `--capture=stdout` — Capture only stdout, let stderr pass through
-
-This is used throughout ru for:
-- GitHub GraphQL batch queries
-- Clone operations on rate-limited repos
-- Network-dependent status checks
-
-### JSON Utilities with Fallback Chain
-
-ru provides portable JSON handling that works across environments with varying tool availability:
-
-**`json_get_field(json, field)`** — Extract a field from JSON with graceful degradation:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   JSON Field Extraction                          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┬───────────────┐
-              ▼               ▼               ▼               ▼
-       ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-       │    jq    │    │ python3  │    │   perl   │    │   sed    │
-       │  (best)  │    │ (good)   │    │ (ok)     │    │ (basic)  │
-       └──────────┘    └──────────┘    └──────────┘    └──────────┘
-              │               │               │               │
-              └───────────────┴───────────────┴───────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  Field value    │
-                    └─────────────────┘
-```
-
-| Tool | Handles | Limitations |
-|------|---------|-------------|
-| `jq` | All JSON types, nested objects, arrays | None (preferred) |
-| `python3` | All JSON types | Requires Python 3 |
-| `perl` | All JSON types | Requires JSON::PP module |
-| `sed` | Simple string fields only | No nested objects, arrays, escapes |
-
-**`json_escape(string)`** — Safe string escaping for JSON embedding:
-
-```bash
-# Handles all JSON-sensitive characters
-json_escape 'Hello "World"'     # → Hello \"World\"
-json_escape $'Line1\nLine2'     # → Line1\nLine2
-json_escape 'Path: C:\Users'    # → Path: C:\\Users
-```
-
-**Characters escaped:** `\` → `\\`, `"` → `\"`, newline → `\n`, tab → `\t`, carriage return → `\r`, backspace → `\b`, form feed → `\f`
-
-**`json_validate(json)`** — Check if a string is valid JSON:
-
-```bash
-if json_validate "$response"; then
-    # Safe to parse
-    value=$(json_get_field "$response" "status")
-fi
-```
-
-The validate function uses the same fallback chain, returning success (0) if any available tool can parse the JSON.
 
 ---
 
@@ -2824,296 +1295,40 @@ log_error "gh not installed. Run with --install-deps or install manually."
 exit 3
 ```
 
-### 6. Progress Reporting
-
-ru provides real-time progress feedback through a unified progress API:
-
-```bash
-# Initialize progress tracking
-progress_init "$total_repos"
-
-# Report start of each repo
-progress_start_repo "$repo_name" "$current_index"
-
-# Report completion with result
-progress_complete_repo "$repo_name" "$status" "$duration"
-
-# Final summary
-progress_summary
-```
-
-**Output adapts to context:**
-
-| Context | Behavior |
-|---------|----------|
-| Interactive terminal | Live-updating progress line with spinner |
-| Non-interactive/CI | Simple line-by-line output |
-| `--quiet` mode | Errors only |
-| `--json` mode | NDJSON events to stdout, human summary to stderr |
-
-### 7. CI Environment Detection
-
-ru automatically detects CI environments and adjusts behavior accordingly:
-
-**Detected CI environments:**
-- GitHub Actions (`GITHUB_ACTIONS`)
-- GitLab CI (`GITLAB_CI`)
-- Jenkins (`JENKINS_URL`)
-- Travis CI (`TRAVIS`)
-- CircleCI (`CIRCLECI`)
-- Azure Pipelines (`TF_BUILD`)
-- Generic CI (`CI=true`)
-
-**Behavior changes in CI:**
-- Forces `--non-interactive` mode (no prompts)
-- Disables gum (uses ANSI fallbacks)
-- Suppresses spinners and live progress
-- Uses line-buffered output for proper log streaming
-- Enables stricter error handling
-
-```bash
-# Manual CI mode override
-CI=true ru sync
-
-# Explicit non-interactive
-ru sync --non-interactive
-```
-
----
-
-## 🛡️ File Denylist System
-
-When scanning repositories or processing file changes, ru applies a comprehensive denylist to prevent accidental exposure of secrets, processing of large build artifacts, or noise from IDE/editor files.
-
-### Default Denylist Patterns
-
-The built-in denylist covers four categories:
-
-| Category | Patterns | Examples |
-|----------|----------|----------|
-| **Secrets & Credentials** | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `credentials.json`, `secrets.json`, `.netrc`, `.npmrc`, `.pypirc` | API keys, TLS certificates, SSH keys |
-| **Build Artifacts** | `node_modules`, `__pycache__`, `dist`, `build`, `.next`, `target`, `vendor`, `*.pyc` | Dependencies, compiled output |
-| **Logs & Temp Files** | `*.log`, `*.tmp`, `*.temp`, `*.swp`, `*.swo`, `*~`, `.DS_Store`, `Thumbs.db` | Debug logs, swap files, OS metadata |
-| **IDE/Editor** | `.idea`, `.vscode`, `*.iml` | JetBrains, VS Code settings |
-
-### Pattern Matching Algorithm
-
-The `is_file_denied()` function uses a three-tier matching approach:
-
-```bash
-is_file_denied "frontend/node_modules/lodash/index.js"  # ✗ Blocked
-is_file_denied "src/.env.local"                          # ✗ Blocked
-is_file_denied "src/components/Button.tsx"               # ✓ Allowed
-```
-
-**Matching order:**
-1. **Full path match**: Compare entire path against pattern (e.g., `dist/*` matches `dist/bundle.js`)
-2. **Basename match**: Compare just the filename (e.g., `.env` matches `config/.env`)
-3. **Directory containment**: Check if file is inside a denied directory at any nesting level (e.g., `node_modules` blocks `frontend/node_modules/pkg/index.js`)
-
-### Extending the Denylist
-
-**Via environment variable (space-separated):**
-```bash
-export AGENT_SWEEP_DENYLIST_EXTRA="*.custom internal_docs/*"
-ru agent-sweep
-```
-
-**Via config file (YAML):**
-```yaml
-# ~/.config/ru/config.yml
-agent_sweep:
-  denylist_extra:
-    - "*.custom"
-    - "internal_docs/*"
-    - "vendor/private/*"
-```
-
-**Via config file (JSON):**
-```json
-{
-  "agent_sweep": {
-    "denylist_extra": ["*.custom", "internal_docs/*"]
-  }
-}
-```
-
-### Programmatic Access
-
-```bash
-# List all active denylist patterns
-ru agent-sweep --show-denylist
-
-# From scripts, use the exported functions:
-source /path/to/ru
-if is_file_denied "path/to/file"; then
-    echo "File is blocked by denylist"
-fi
-
-# Filter a list of files
-echo -e "main.py\n.env\nREADME.md" | filter_files_denylist
-# Output: main.py
-#         README.md
-```
-
 ---
 
 ## 🧪 Testing
 
-ru includes a comprehensive test suite with 70+ test files covering unit tests, integration tests, and end-to-end workflows. The testing infrastructure is designed around a key principle: **tests must work offline and deterministically**.
+ru includes a comprehensive test suite to ensure reliability across updates.
 
-### Why Offline Testing Matters
-
-Git operations are notoriously difficult to test reliably:
-- Network dependencies make tests flaky and slow
-- Real repositories can change unexpectedly
-- CI environments may have restricted network access
-- Authentication tokens expire or get revoked
-
-ru solves this with a **local git harness** that creates temporary repositories with precisely controlled states—ahead, behind, diverged, dirty, shallow, detached—all without touching the network.
-
-### Test Architecture
+### Test Structure
 
 ```
 scripts/
-├── test_framework.sh              # Core assertion library and utilities
-├── test_git_harness.sh            # Offline git repository factory
-├── test_e2e_framework.sh          # E2E test isolation and helpers
-│
-├── Unit Tests (test_unit_*.sh) — 36 files
-│   ├── test_unit_config.sh        # Configuration loading and resolution
-│   ├── test_unit_core_utils.sh    # Core utility functions
-│   ├── test_unit_parsing_functions.sh # URL/spec parsing (40 tests)
-│   ├── test_unit_git_harness.sh   # Git harness self-tests (24 tests)
-│   ├── test_unit_dependencies.sh  # Dependency checking logic
-│   ├── test_unit_quality_gates.sh # Commit plan validation
-│   ├── test_unit_command_validation.sh # Argument validation
-│   └── ... (29 more unit test files)
-│
-├── Integration Tests
-│   ├── test_parsing.sh            # URL parsing (76 tests, 156 assertions)
-│   ├── test_local_git.sh          # Local git operations with harness
-│   └── test_sync_state.sh         # Sync state management
-│
-└── End-to-End Tests (test_e2e_*.sh) — 20 files
-    ├── test_e2e_sync_clone.sh     # Clone operations
-    ├── test_e2e_sync_pull.sh      # Pull operations
-    ├── test_e2e_sync_edge_cases.sh # Edge case handling
-    ├── test_e2e_add_remove.sh     # Repo list management
-    ├── test_e2e_status.sh         # Status command
-    └── ... (15 more E2E test files)
+├── test_framework.sh         # Shared test utilities
+├── test_parsing.sh           # URL and repo spec parsing
+├── test_unit_config.sh       # Configuration handling
+├── test_unit_gum_wrappers.sh # Gum fallback behavior
+├── test_e2e_init.sh          # Init workflow
+├── test_e2e_add.sh           # Add command
+├── test_e2e_sync.sh          # Sync workflow
+├── test_e2e_status.sh        # Status command
+├── test_e2e_prune.sh         # Prune command
+└── test_e2e_self_update.sh   # Self-update workflow
 ```
-
-### Git Harness: Deterministic Repository States
-
-The git harness (`test_git_harness.sh`) creates temporary git repositories with specific states for testing. It uses bare repositories as "remotes" in `/tmp`, enabling complete offline testing of sync operations.
-
-```bash
-# Create a repo that's 2 commits ahead of remote
-git_harness_setup
-repo=$(git_harness_create_repo "myrepo" --ahead=2)
-# $repo now contains a working directory with 2 unpushed commits
-
-# Create a diverged state (local and remote have different commits)
-repo=$(git_harness_create_repo "diverged" --ahead=1 --behind=3)
-
-# Create various states
-repo=$(git_harness_create_repo "dirty" --dirty)           # Uncommitted changes
-repo=$(git_harness_create_repo "shallow" --shallow=5)     # Shallow clone
-repo=$(git_harness_create_repo "detached" --detached)     # Detached HEAD
-repo=$(git_harness_create_repo "nobranch" --no-remote)    # No tracking branch
-
-git_harness_cleanup  # Removes all temp directories
-```
-
-**Available state options:**
-
-| Option | Effect |
-|--------|--------|
-| `--ahead=N` | Create N local commits not on remote |
-| `--behind=N` | Create N remote commits not in local |
-| `--diverged` | Shortcut for `--ahead=1 --behind=1` |
-| `--dirty` | Add uncommitted changes to working tree |
-| `--shallow=N` | Create shallow clone with depth N |
-| `--detached` | Checkout detached HEAD state |
-| `--no-remote` | Create repo without remote tracking |
-| `--branch=NAME` | Use NAME instead of 'main' |
-
-**Manipulation helpers:**
-
-```bash
-git_harness_add_commit "$repo" "feat: new feature"     # Add local commit
-git_harness_add_commit_and_push "$repo" "fix: bug"     # Add and push
-git_harness_make_dirty "$repo"                          # Add uncommitted changes
-git_harness_make_staged "$repo"                         # Add staged changes
-git_harness_add_untracked "$repo" "newfile.txt"        # Add untracked file
-git_harness_simulate_rebase "$repo"                     # Create rebase state
-git_harness_simulate_merge "$repo"                      # Create merge conflict
-```
-
-**Query helpers:**
-
-```bash
-status=$(git_harness_get_status "$repo")   # Returns: current|ahead|behind|diverged
-git_harness_is_dirty "$repo" && echo "Has uncommitted changes"
-git_harness_is_shallow "$repo" && echo "Is shallow clone"
-git_harness_is_detached "$repo" && echo "HEAD is detached"
-```
-
-**Why this design?** The harness uses git plumbing commands exclusively (per AGENTS.md guidelines), ensuring reliable detection regardless of locale or git version. Each test runs against known states, making failures reproducible and debuggable.
 
 ### Running Tests
 
 ```bash
 # Run all tests
-./scripts/run_all_tests.sh
+./scripts/test_all.sh
 
 # Run specific test file
 ./scripts/test_parsing.sh
 
 # Run with verbose output
-VERBOSE=1 ./scripts/test_unit_review.sh
-
-# Run only unit tests
-for f in scripts/test_unit_*.sh; do "$f"; done
-
-# Run E2E tests
-for f in scripts/test_e2e_*.sh; do "$f"; done
-
-# Check test coverage summary
-./scripts/test_coverage.sh
+./scripts/test_e2e_sync.sh
 ```
-
-### Test Tiers and Requirements
-
-**Unit tests** use extracted `ru` functions and avoid external network dependencies.  
-**Integration tests** use local git repos under `/tmp` (no network).  
-**E2E tests** run full CLI flows in isolated XDG roots and capture detailed logs.
-
-**Required tools:**
-- `bash` 4.0+, `git`
-- `jq` for JSON-oriented tests (skips when missing)
-- `gh` for tests that exercise GitHub auth behavior (skips when missing or unauthenticated)
-- `ntm`/`tmux` only for agent-sweep tests (mocked by default in E2E)
-
-### Logging and Artifacts
-
-The test frameworks support structured logs and artifact capture:
-
-- `TF_LOG_LEVEL=debug|info|warn|error|none` controls verbosity.
-- `TF_LOG_FILE=/path/to/test.log` writes human-readable logs.
-- `TF_JSON_LOG_FILE=/path/to/test.jsonl` writes machine-readable JSON lines.
-- E2E runs create `$E2E_TEMP_DIR/test_logs/` with per-test stdout/stderr captures.
-- Failed-test artifacts can be preserved under `TF_FAILED_ARTIFACTS_DIR` (default: `/tmp/ru-test-failures`).
-
-### Gated Tests (gh/ntm)
-
-Some tests require external tooling and will skip gracefully:
-
-- **GitHub auth**: use `require_gh_auth` (from `scripts/test_framework.sh`) in tests that need authenticated `gh`.
-  - Force-skip with `TF_SKIP_GH_AUTH=1|true|yes`.
-- **ntm/tmux**: E2E tests use mocks via `e2e_create_mock_ntm`; you can control behavior with
-  `NTM_MOCK_SCENARIO` (see `scripts/test_bin/ntm`).
 
 ### Test Categories
 
@@ -3129,131 +1344,39 @@ Some tests require external tooling and will skip gracefully:
 - Self-update version checking
 - Error handling and edge cases
 
-### Test Framework: Assertion Library
+### Test Framework Features
 
-The test framework (`test_framework.sh`) provides a comprehensive assertion library designed for Bash testing. It tracks pass/fail counts, supports structured logging, and handles cleanup automatically.
+The test framework (`test_framework.sh`) provides:
 
-**Core assertions:**
-
-```bash
-# Value comparisons
-assert_equals "expected" "$actual" "Values should match"
-assert_not_equals "bad" "$actual" "Should differ"
-assert_contains "$haystack" "needle" "Should contain substring"
-assert_not_contains "$output" "error" "Should not have errors"
-
-# Boolean assertions (execute expressions)
-assert_true "[[ -f '$file' ]]" "File should exist"
-assert_false "[[ -d '$dir' ]]" "Directory should not exist"
-
-# Exit code testing
-assert_exit_code 0 some_command arg1 arg2 "Command should succeed"
-assert_exit_code 1 failing_command "Command should fail"
-
-# File system assertions
-assert_file_exists "/path/to/file" "Config file created"
-assert_dir_exists "/path/to/dir" "Directory created"
-assert_file_contains "/path/to/file" "pattern" "File has expected content"
-```
-
-**Test lifecycle:**
-
-```bash
-# Run a test with automatic timing and result tracking
-run_test test_my_feature
-
-# Skip tests conditionally
-skip_test "Requires network access"
-
-# Print final results with exit code
-print_results
-exit "$(get_exit_code)"
-```
-
-**Structured logging:**
-
-The framework supports both human-readable and machine-readable output:
-
-```bash
-# Control log level
-TF_LOG_LEVEL=debug ./scripts/test_unit_config.sh
-
-# Write human logs to file
-TF_LOG_FILE=/tmp/test.log ./scripts/test_unit_config.sh
-
-# Write NDJSON for CI integration
-TF_JSON_LOG_FILE=/tmp/test.jsonl ./scripts/test_unit_config.sh
-```
-
-**Function extraction for unit testing:**
-
-Unit tests can source individual functions from `ru` without executing the whole script:
-
-```bash
-source_function "parse_repo_url"
-source_function "normalize_url"
-
-# Now test the isolated functions
-local host owner repo
-parse_repo_url "https://github.com/owner/repo" host owner repo
-assert_equals "github.com" "$host" "Host extracted"
-```
+- **Isolation** — Each test runs in a fresh temporary directory
+- **TAP output** — Machine-readable test results
+- **Assertions** — `assert_equals`, `assert_contains`, `assert_file_exists`, etc.
+- **Function extraction** — Sources individual functions from `ru` for unit testing
+- **Cleanup** — Automatic cleanup of temporary directories
 
 ### Writing Tests
 
 ```bash
-#!/usr/bin/env bash
-source "$(dirname "${BASH_SOURCE[0]}")/test_framework.sh"
-
+# Example unit test
 test_parse_url_https_basic() {
-    log_test_start "parse_repo_url handles HTTPS URLs"
-
-    local host owner repo
-    parse_repo_url "https://github.com/owner/repo" host owner repo
-
-    assert_equals "github.com" "$host" "Host extracted"
-    assert_equals "owner" "$owner" "Owner extracted"
-    assert_equals "repo" "$repo" "Repo extracted"
-
-    log_test_pass "parse_repo_url handles HTTPS URLs"
+    assert_parse_url "https://github.com/owner/repo" \
+        "github.com" "owner" "repo" \
+        "HTTPS basic URL"
 }
 
-test_sync_with_dirty_repo() {
-    log_test_start "sync skips dirty repos"
+# Example E2E test
+test_sync_clones_missing_repo() {
+    setup_initialized_env
+    "$RU_SCRIPT" add owner/repo >/dev/null 2>&1
 
-    # Create a dirty repo using the git harness
-    git_harness_setup
-    local repo=$(git_harness_create_repo "dirtytest" --dirty)
-
-    # Test sync behavior
     local output
-    output=$("$RU_SCRIPT" sync --dir="$(dirname "$repo")" 2>&1)
+    output=$("$RU_SCRIPT" sync 2>&1)
 
-    assert_contains "$output" "dirty" "Reports dirty state"
-    assert_exit_code 0 git -C "$repo" status --porcelain "Still has changes"
-
-    git_harness_cleanup
-    log_test_pass "sync skips dirty repos"
+    assert_contains "$output" "Cloning" "Should report cloning"
+    assert_dir_exists "$RU_PROJECTS_DIR/repo" "Repo directory created"
+    cleanup_test_env
 }
-
-# Register and run tests
-setup_cleanup_trap
-run_test test_parse_url_https_basic
-run_test test_sync_with_dirty_repo
-print_results
-exit "$(get_exit_code)"
 ```
-
-### Test Best Practices
-
-The test suite follows these principles:
-
-1. **No network dependencies** — Use the git harness for repository states
-2. **Isolated environments** — Each test gets fresh XDG directories
-3. **Deterministic results** — Same input always produces same output
-4. **Fast execution** — Unit tests complete in milliseconds
-5. **Clear failures** — Assertion messages explain what went wrong
-6. **Bash 4.0 compatible** — Uses `${arr[@]+"${arr[@]}"}` pattern for empty arrays
 
 ---
 
@@ -3377,6 +1500,7 @@ ru doctor
 | Repo count | Number of repositories configured |
 | Projects directory | Existence and write permissions |
 | gum (optional) | Availability for prettier terminal UI |
+| flock (optional) | Availability for parallel sync |
 
 **Example output:**
 ```
@@ -3389,6 +1513,7 @@ ru doctor
 ✓ Config: ~/.config/ru/ (47 repos configured)
 ✓ Projects: /data/projects (writable)
 ✓ gum: 0.13.0 (optional)
+✓ flock: available (optional)
 
 All checks passed!
 ```
@@ -3430,7 +1555,6 @@ All checks passed!
 | `RU_SYSTEM` | Install to `/usr/local/bin` | unset |
 | `RU_VERSION` | Specific version to install | latest |
 | `RU_UNSAFE_MAIN` | Install from main branch | unset |
-| `RU_INSTALLER_NO_SELF_REFRESH` | Disable installer self-refresh when piped | unset |
 
 ---
 
@@ -3451,6 +1575,7 @@ All checks passed!
 |------------|---------|
 | gum | Beautiful terminal UI |
 | jq | JSON processing (for scripts) |
+| flock | Parallel sync coordination (Linux default, `brew install util-linux` on macOS) |
 
 ### System Requirements
 
