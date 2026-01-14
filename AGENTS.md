@@ -52,6 +52,34 @@ If that audit trail is missing, then you must act as if the operation never happ
 
 ---
 
+## Development Workspace Hygiene
+
+**CRITICAL**: Do NOT create git worktrees, clones, or any other directories in `/data/projects/` (or the user's projects directory). This directory is managed by `ru` and should only contain repositories that are configured in `ru`.
+
+### Forbidden Actions
+
+- `git worktree add /data/projects/repo_updater_*` — creates clutter that confuses users
+- Cloning repos to `/data/projects/` for "testing" or "exploration"
+- Creating any subdirectories in the projects folder that aren't managed by `ru`
+
+### Correct Approaches
+
+For development/testing that requires separate working directories:
+
+1. **Use `/tmp/`** — create temporary directories with `mktemp -d`
+2. **Use the existing repo** — work in the current checkout, create branches if needed
+3. **Clean up after yourself** — if you must create temporary files/dirs, remove them when done
+
+The E2E tests demonstrate the correct pattern:
+```bash
+TEMP_DIR=$(mktemp -d)
+export RU_PROJECTS_DIR="$TEMP_DIR/projects"
+# ... run tests ...
+rm -rf "$TEMP_DIR"  # cleanup
+```
+
+---
+
 ## Project Architecture
 
 **ru** (repo_updater) is a robust, automation-friendly CLI tool that synchronizes a collection of GitHub repositories to a local projects directory.

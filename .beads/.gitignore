@@ -11,6 +11,9 @@ daemon.log
 daemon.pid
 bd.sock
 
+# Sync runtime/backoff state (created/removed by bd sync)
+sync-state.json
+
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
 
@@ -30,3 +33,6 @@ beads.right.meta.json
 !issues.jsonl
 !metadata.json
 !config.json
+
+# bv (beads viewer) lock file
+.bv.lock

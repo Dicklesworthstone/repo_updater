@@ -112,9 +112,10 @@ assert_stderr_not_contains() {
 # Mock Helpers
 #==============================================================================
 
-# Create a mock curl that returns a specific response
+# Create a mock curl that simulates GitHub redirect probing used by ru.
+# ru uses: curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/<owner>/<repo>/releases/latest
 create_mock_curl() {
-    local response="$1"
+    local effective_url="$1"
     local exit_code="${2:-0}"
 
     cat > "$TEMP_DIR/mock_bin/curl" << EOF
@@ -123,9 +124,7 @@ create_mock_curl() {
 if [[ "$exit_code" -ne 0 ]]; then
     exit $exit_code
 fi
-cat << 'RESPONSE'
-$response
-RESPONSE
+printf '%s' "$effective_url"
 EOF
     chmod +x "$TEMP_DIR/mock_bin/curl"
 }
@@ -147,11 +146,11 @@ test_self_update_check_option() {
     echo -e "${BLUE}Test:${RESET} self-update --check option is recognized"
     setup_test_env
 
-    # Create mock curl that returns "up to date" response
+    # Simulate /releases/latest redirecting to the current tag.
     local current_version
     current_version=$(grep -m1 'VERSION=' "$RU_SCRIPT" | cut -d'"' -f2)
 
-    create_mock_curl '{"tag_name": "v'"$current_version"'"}'
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases/tag/v${current_version}"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" self-update --check 2>&1)
@@ -175,7 +174,7 @@ test_self_update_network_error() {
     exit_code=$?
 
     assert_exit_code 3 "$exit_code" "Exits with code 3 on network error"
-    assert_stderr_contains "$stderr_output" "Failed to fetch" "Reports fetch failure"
+    assert_stderr_contains "$stderr_output" "Failed to determine latest release version" "Reports fetch failure"
 
     cleanup_test_env
 }
@@ -184,15 +183,15 @@ test_self_update_no_releases() {
     echo -e "${BLUE}Test:${RESET} self-update handles no releases gracefully"
     setup_test_env
 
-    # Create mock curl that returns "Not Found" (no releases)
-    create_mock_curl '{"message": "Not Found"}'
+    # Simulate /releases/latest NOT redirecting to /tag/... (no releases exist).
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" self-update --check 2>&1)
     exit_code=$?
 
     assert_exit_code 0 "$exit_code" "Exits with code 0 when no releases"
-    assert_stderr_contains "$stderr_output" "No releases found" "Reports no releases"
+    assert_stderr_contains "$stderr_output" "No releases found on GitHub" "Reports no releases"
 
     cleanup_test_env
 }
@@ -201,8 +200,8 @@ test_self_update_detects_newer_version() {
     echo -e "${BLUE}Test:${RESET} self-update detects newer version available"
     setup_test_env
 
-    # Create mock curl that returns a newer version
-    create_mock_curl '{"tag_name": "v99.99.99"}'
+    # Simulate /releases/latest redirecting to a newer tag.
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases/tag/v99.99.99"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" self-update --check 2>&1)
@@ -217,18 +216,18 @@ test_self_update_detects_newer_version() {
 }
 
 test_self_update_parse_error() {
-    echo -e "${BLUE}Test:${RESET} self-update handles malformed API response"
+    echo -e "${BLUE}Test:${RESET} self-update handles malformed redirect response"
     setup_test_env
 
-    # Create mock curl that returns invalid JSON
-    create_mock_curl 'this is not valid json at all'
+    # Simulate a malformed redirect URL that contains /tag/ but no version.
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases/tag/v"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" self-update --check 2>&1)
     exit_code=$?
 
     assert_exit_code 3 "$exit_code" "Exits with code 3 on parse error"
-    assert_stderr_contains "$stderr_output" "Could not parse" "Reports parse failure"
+    assert_stderr_contains "$stderr_output" "Failed to determine latest release version" "Reports parse failure"
 
     cleanup_test_env
 }
@@ -240,8 +239,8 @@ test_self_update_v_prefix_handling() {
     local current_version
     current_version=$(grep -m1 'VERSION=' "$RU_SCRIPT" | cut -d'"' -f2)
 
-    # Create mock curl that returns version WITH v prefix
-    create_mock_curl '{"tag_name": "v'"$current_version"'"}'
+    # /releases/latest redirects include 'v' prefixes by convention.
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases/tag/v${current_version}"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" self-update --check 2>&1)
@@ -260,7 +259,7 @@ test_self_update_non_interactive_mode() {
     # Create mock curl that returns a newer version
     # In non-interactive mode with update available, it should still work
     # for --check (which doesn't require confirmation)
-    create_mock_curl '{"tag_name": "v99.99.99"}'
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases/tag/v99.99.99"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" --non-interactive self-update --check 2>&1)
@@ -279,7 +278,7 @@ test_self_update_step_output() {
     local current_version
     current_version=$(grep -m1 'VERSION=' "$RU_SCRIPT" | cut -d'"' -f2)
 
-    create_mock_curl '{"tag_name": "v'"$current_version"'"}'
+    create_mock_curl "https://github.com/Dicklesworthstone/repo_updater/releases/tag/v${current_version}"
 
     local stderr_output exit_code
     stderr_output=$(PATH="$TEMP_DIR/mock_bin:$PATH" "$RU_SCRIPT" self-update --check 2>&1)
@@ -320,4 +319,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

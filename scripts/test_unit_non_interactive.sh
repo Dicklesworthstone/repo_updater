@@ -175,4 +175,4 @@ run_test test_handle_question_non_interactive_external_prompt_fails
 run_test test_handle_question_non_interactive_fail_policy_fails
 
 print_results
-exit $?
+exit "$(get_exit_code)"

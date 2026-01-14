@@ -4,13 +4,13 @@
 # Tests adding and removing repositories from the config
 #
 # Test coverage:
-#   - ru add adds repos to repos.txt
+#   - ru add adds repos to public.txt
 #   - ru add validates repo format
 #   - ru add detects duplicates
 #   - ru add supports multiple repos at once
 #   - ru list shows configured repos
 #   - ru list --paths shows local paths
-#   - ru remove removes repos from repos.txt
+#   - ru remove removes repos from public.txt
 #   - ru remove matches by owner/repo (not substring)
 #   - ru remove handles not-found gracefully
 #
@@ -123,7 +123,7 @@ test_add_single_repo() {
     echo "Test: ru add adds a single repo"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
     local output
     output=$("$RU_SCRIPT" add owner/repo 2>&1)
@@ -131,7 +131,7 @@ test_add_single_repo() {
 
     assert_exit_code 0 "$exit_code" "ru add exits with code 0"
     assert_output_contains "$output" "Added" "Output confirms repo added"
-    assert_file_contains "$repos_file" "owner/repo" "repos.txt contains the repo"
+    assert_file_contains "$repos_file" "owner/repo" "public.txt contains the repo"
 
     cleanup_test_env
 }
@@ -140,13 +140,13 @@ test_add_multiple_repos() {
     echo "Test: ru add adds multiple repos at once"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
     "$RU_SCRIPT" add cli/cli charmbracelet/gum koalaman/shellcheck 2>&1
 
-    assert_file_contains "$repos_file" "cli/cli" "repos.txt contains cli/cli"
-    assert_file_contains "$repos_file" "charmbracelet/gum" "repos.txt contains charmbracelet/gum"
-    assert_file_contains "$repos_file" "koalaman/shellcheck" "repos.txt contains koalaman/shellcheck"
+    assert_file_contains "$repos_file" "cli/cli" "public.txt contains cli/cli"
+    assert_file_contains "$repos_file" "charmbracelet/gum" "public.txt contains charmbracelet/gum"
+    assert_file_contains "$repos_file" "koalaman/shellcheck" "public.txt contains koalaman/shellcheck"
 
     cleanup_test_env
 }
@@ -181,7 +181,7 @@ test_add_https_url() {
     echo "Test: ru add accepts HTTPS URL format"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
     "$RU_SCRIPT" add "https://github.com/owner/repo" 2>&1
 
@@ -258,7 +258,7 @@ test_remove_single_repo() {
     echo "Test: ru remove removes a repo"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
     "$RU_SCRIPT" add owner/repo 2>&1
 
@@ -268,7 +268,7 @@ test_remove_single_repo() {
 
     assert_exit_code 0 "$exit_code" "ru remove exits with code 0"
     assert_output_contains "$output" "Removed" "Output confirms repo removed"
-    assert_file_not_contains "$repos_file" "^owner/repo$" "repos.txt no longer contains the repo"
+    assert_file_not_contains "$repos_file" "^owner/repo$" "public.txt no longer contains the repo"
 
     cleanup_test_env
 }
@@ -291,7 +291,7 @@ test_remove_no_substring_match() {
     echo "Test: ru remove matches exactly (not substring)"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
     # Add two repos with similar names
     "$RU_SCRIPT" add owner/repo owner/repo-extra 2>&1
@@ -320,10 +320,10 @@ test_remove_no_args() {
 }
 
 test_remove_preserves_comments() {
-    echo "Test: ru remove preserves comments in repos.txt"
+    echo "Test: ru remove preserves comments in public.txt"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
     "$RU_SCRIPT" add owner/repo 2>&1
 
@@ -345,7 +345,7 @@ test_add_private_repo() {
     echo "Test: ru add --private adds to private.txt"
     setup_test_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     local private_file="$XDG_CONFIG_HOME/ru/repos.d/private.txt"
 
     local output
@@ -355,7 +355,7 @@ test_add_private_repo() {
     assert_exit_code 0 "$exit_code" "ru add --private exits with code 0"
     assert_output_contains "$output" "Added" "Output confirms repo added"
     assert_output_contains "$output" "private" "Output mentions private"
-    assert_file_not_contains "$repos_file" "secret/repo" "repos.txt does NOT contain the private repo"
+    assert_file_not_contains "$repos_file" "secret/repo" "public.txt does NOT contain the private repo"
 
     if [[ -f "$private_file" ]] && grep -q "secret/repo" "$private_file"; then
         pass "private.txt contains the private repo"
@@ -490,4 +490,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

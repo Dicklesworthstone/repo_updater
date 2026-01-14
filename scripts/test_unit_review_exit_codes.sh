@@ -114,4 +114,4 @@ run_test test_aggregate_exit_code_rules
 run_test test_finalize_review_exit_messages
 
 print_results
-exit $?
+exit "$(get_exit_code)"

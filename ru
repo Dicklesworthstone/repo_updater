@@ -67,9 +67,9 @@ set -uo pipefail
 # Basic sanity: this script relies heavily on $HOME for defaults.
 : "${HOME:?ru: HOME must be set}"
 
-# Bash >= 4.3 is required (namerefs + associative arrays). macOS ships Bash 3.2 by default.
-if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    printf 'ru: Bash >= 4.3 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
+# Bash >= 4.0 is required (associative arrays). macOS ships Bash 3.2 by default.
+if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 )); then
+    printf 'ru: Bash >= 4.0 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
 
     # Check if we're on macOS and can offer to install via Homebrew
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -110,7 +110,7 @@ if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO
             printf 'Then run: $(brew --prefix)/bin/bash %s\n' "${BASH_SOURCE[0]}" >&2
         fi
     else
-        printf 'ru: Install Bash 4.3+ from your package manager\n' >&2
+        printf 'ru: Install Bash 4.0+ from your package manager\n' >&2
     fi
     exit 3
 fi
@@ -120,7 +120,7 @@ fi
 #==============================================================================
 
 # Version: read from VERSION file, fallback to embedded
-VERSION="1.0.0"
+VERSION="1.2.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
     VERSION="$(cat "$SCRIPT_DIR/VERSION")"
@@ -165,12 +165,21 @@ RU_STATE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_STATE_DIR:-}" "$XDG_S
 RU_CACHE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_CACHE_DIR:-}" "$XDG_CACHE_HOME/ru")"
 RU_LOG_DIR="$RU_STATE_DIR/logs"
 
+# Harden state directory paths against relative values
+if [[ "$XDG_STATE_HOME" != /* ]]; then
+    XDG_STATE_HOME="$HOME/$XDG_STATE_HOME"
+fi
+if [[ "$RU_STATE_DIR" != /* ]]; then
+    RU_STATE_DIR="$HOME/$RU_STATE_DIR"
+fi
+RU_LOG_DIR="$RU_STATE_DIR/logs"
+
 # Default configuration values
-DEFAULT_PROJECTS_DIR="${RU_PROJECTS_DIR:-$HOME/projects}"
+DEFAULT_PROJECTS_DIR="${RU_PROJECTS_DIR:-/data/projects}"
 DEFAULT_LAYOUT="flat"           # flat | owner-repo | full
 DEFAULT_UPDATE_STRATEGY="ff-only"  # ff-only | rebase | merge
 DEFAULT_AUTOSTASH="false"
-DEFAULT_PARALLEL="1"
+DEFAULT_PARALLEL="4"
 
 #==============================================================================
 # SECTION 2: ANSI COLOR DEFINITIONS
@@ -206,6 +215,8 @@ PARALLEL=""
 JSON_OUTPUT="false"
 QUIET="false"
 VERBOSE="false"
+DEBUG="false"
+LOG_LEVEL=0  # 0=normal, 1=verbose, 2=debug
 NON_INTERACTIVE="false"
 DRY_RUN="false"
 CLONE_ONLY="false"
@@ -214,7 +225,7 @@ FETCH_REMOTES="true"
 
 # Results tracking (NDJSON temp file)
 RESULTS_FILE=""
-RESULTS_LOCK_FILE=""
+RESULTS_LOCK_DIR=""
 
 # Resume support
 RESUME="false"
@@ -245,12 +256,4290 @@ can_prompt() {
     is_interactive && [[ "$NON_INTERACTIVE" != "true" ]]
 }
 
+_is_valid_var_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]
+}
+
+_set_out_var() {
+    local name="$1"
+    local value="${2-}"
+
+    _is_valid_var_name "$name" || return 1
+    printf -v "$name" '%s' "$value"
+}
+
+_set_out_array() {
+    local out_name="$1"
+    shift
+
+    _is_valid_var_name "$out_name" || return 1
+
+    local -a tmp=("$@")
+    # Use eval to assign into the caller scope.
+    # Note: This works when called from the main script but NOT when the
+    # caller has a local array variable (eval creates a new variable).
+    # For functions using nameref (local -n), this is not needed.
+    eval "$out_name=(\"\${tmp[@]}\")"
+}
+
+#------------------------------------------------------------------------------
+# PORTABLE LOCKS (directory-based)
+#
+# We avoid hard-depending on external `flock` for cross-platform reliability.
+# A lock is represented by an on-filesystem directory created via `mkdir`,
+# which is atomic on POSIX filesystems.
+#------------------------------------------------------------------------------
+
+dir_lock_try_acquire() {
+    local lock_dir="$1"
+    mkdir "$lock_dir" 2>/dev/null
+}
+
+dir_lock_release() {
+    local lock_dir="$1"
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+
+# Blocking acquire with timeout (seconds). Returns 0 if acquired.
+dir_lock_acquire() {
+    local lock_dir="$1"
+    local timeout_secs="${2:-30}"
+    local start now
+    start=$(date +%s)
+
+    while true; do
+        if dir_lock_try_acquire "$lock_dir"; then
+            return 0
+        fi
+
+        now=$(date +%s)
+        if [[ "$timeout_secs" =~ ^[0-9]+$ ]] && (( now - start >= timeout_secs )); then
+            return 1
+        fi
+
+        sleep 0.1
+    done
+}
 # Ensure a directory exists
 ensure_dir() {
     local dir="$1"
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"
     fi
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP UTILITY FUNCTIONS
+# Shared utilities used by agent-sweep command and related functions.
+#------------------------------------------------------------------------------
+
+# Check if repo has uncommitted changes (staged, unstaged, or untracked)
+# Usage: has_uncommitted_changes /path/to/repo
+# Returns: 0 if dirty (has changes), 1 if clean
+has_uncommitted_changes() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" ]] && return 1
+    repo_is_dirty "$repo_path"
+}
+
+# Convert repo spec (owner/repo[@branch]) to local filesystem path
+# Usage: repo_spec_to_path "owner/repo@branch"
+# Outputs: path to stdout
+repo_spec_to_path() {
+    local repo_spec="${1:-}"
+    [[ -z "$repo_spec" ]] && return 1
+
+    # Use resolved config first, then env override, then default
+    local projects_dir="${PROJECTS_DIR:-${RU_PROJECTS_DIR:-/data/projects}}"
+    local layout="${LAYOUT:-flat}"
+
+    # Prefer full repo spec resolution (handles custom names + layouts)
+    local url branch custom_name path repo_id
+    if resolve_repo_spec "$repo_spec" "$projects_dir" "$layout" \
+        url branch custom_name path repo_id 2>/dev/null; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+
+    return 1
+}
+
+# Load all repos from config files into an array
+# Usage: load_all_repos array_name
+# Populates the named array with repo specs
+load_all_repos() {
+    # shellcheck disable=SC2178  # repos_ref is a nameref to caller's array
+    local -n repos_ref=$1
+    repos_ref=()
+
+    local config_dir="${RU_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ru}"
+    local repos_d="${config_dir}/repos.d"
+
+    # Load from each file in repos.d
+    if [[ -d "$repos_d" ]]; then
+        local file
+        for file in "$repos_d"/*.txt; do
+            [[ -f "$file" ]] || continue
+            local line
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                # Skip comments and empty lines
+                [[ "$line" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "${line// }" ]] && continue
+                repos_ref+=("$line")
+            done < "$file"
+        done
+    fi
+}
+
+# Strip ANSI escape codes from input (useful for parsing pane output)
+# Usage: echo "$text" | strip_ansi
+strip_ansi() {
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'
+}
+
+# Get file size in MB (for display/validation)
+# Usage: get_file_size_mb /path/to/file
+# Outputs: size in MB (one decimal place)
+get_file_size_mb() {
+    local file="${1:-}"
+    [[ -z "$file" || ! -f "$file" ]] && { echo "0"; return; }
+
+    local size_bytes
+    # Try GNU stat first, fall back to BSD stat
+    size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+
+    # Use awk for portability (bc may not be available)
+    awk "BEGIN { printf \"%.1f\", $size_bytes / 1048576 }"
+}
+
+# Check if value is a positive integer (>0)
+agent_sweep_is_positive_int() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
+}
+
+# Set max file size in MB and keep bytes in sync
+set_agent_sweep_max_file_mb() {
+    local max_mb="${1:-}"
+    if agent_sweep_is_positive_int "$max_mb"; then
+        AGENT_SWEEP_MAX_FILE_MB="$max_mb"
+        AGENT_SWEEP_MAX_FILE_SIZE=$((max_mb * 1024 * 1024))
+        return 0
+    fi
+    return 1
+}
+
+# Set max file size in bytes and keep MB in sync (rounded up)
+set_agent_sweep_max_file_bytes() {
+    local max_bytes="${1:-}"
+    if agent_sweep_is_positive_int "$max_bytes"; then
+        AGENT_SWEEP_MAX_FILE_SIZE="$max_bytes"
+        AGENT_SWEEP_MAX_FILE_MB=$(((max_bytes + 1048575) / 1048576))
+        return 0
+    fi
+    return 1
+}
+
+# Apply max file size from config values (MB preferred, then bytes)
+apply_agent_sweep_max_file_limit() {
+    local raw_mb="${1:-}"
+    local raw_bytes="${2:-}"
+
+    if [[ -n "$raw_mb" && "$raw_mb" != "null" ]]; then
+        set_agent_sweep_max_file_mb "$raw_mb" || true
+        return 0
+    fi
+
+    if [[ -n "$raw_bytes" && "$raw_bytes" != "null" ]]; then
+        set_agent_sweep_max_file_bytes "$raw_bytes" || true
+    fi
+}
+
+# Apply CLI override for max file size (MB)
+apply_agent_sweep_max_file_override() {
+    local override="${AGENT_SWEEP_MAX_FILE_MB_OVERRIDE:-}"
+    [[ -z "$override" ]] && return 0
+    set_agent_sweep_max_file_mb "$override" || true
+}
+
+# Check if a file exceeds the max size (MB)
+# Usage: is_file_too_large /path/to/file [max_mb]
+# Returns: 0 if too large, 1 otherwise
+is_file_too_large() {
+    local file="${1:-}"
+    local max_mb="${2:-${AGENT_SWEEP_MAX_FILE_MB:-0}}"
+    [[ -z "$file" || ! -f "$file" ]] && return 1
+
+    local max_bytes=""
+    if agent_sweep_is_positive_int "$max_mb"; then
+        max_bytes=$((max_mb * 1024 * 1024))
+    elif agent_sweep_is_positive_int "${AGENT_SWEEP_MAX_FILE_SIZE:-0}"; then
+        max_bytes="$AGENT_SWEEP_MAX_FILE_SIZE"
+    else
+        return 1
+    fi
+    local size_bytes
+    size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    [[ "$size_bytes" -gt "$max_bytes" ]]
+}
+
+# Detect if a file is likely binary
+# Returns: 0 if binary, 1 otherwise
+is_binary_file() {
+    local file="${1:-}"
+    [[ -z "$file" || ! -f "$file" ]] && return 1
+
+    if command -v file &>/dev/null; then
+        local info
+        info=$(file -b "$file" 2>/dev/null || echo "")
+        if echo "$info" | grep -qiE '(text|script|json|xml|empty|ascii|utf-8|unicode)'; then
+            return 1
+        fi
+        return 0
+    fi
+
+    # Fallback: detect NUL bytes
+    if LC_ALL=C grep -q $'\x00' "$file" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if a binary file is explicitly allowed by patterns
+# Usage: is_binary_allowed "path/to/file.bin"
+# Returns: 0 if allowed, 1 otherwise
+is_binary_allowed() {
+    local file_path="${1:-}"
+    [[ -z "$file_path" ]] && return 1
+
+    file_path="${file_path#./}"
+    file_path="${file_path%/}"
+    local basename="${file_path##*/}"
+
+    local -a patterns=("${AGENT_SWEEP_ALLOW_BINARY_PATTERNS_DEFAULT[@]}")
+    if [[ -n "${AGENT_SWEEP_ALLOW_BINARY_PATTERNS:-}" ]]; then
+        read -ra extra <<<"$AGENT_SWEEP_ALLOW_BINARY_PATTERNS"
+        patterns+=("${extra[@]}")
+    fi
+
+    local pattern
+    for pattern in "${patterns[@]}"; do
+        # shellcheck disable=SC2254
+        case "$file_path" in
+            $pattern) return 0 ;;
+        esac
+        # shellcheck disable=SC2254
+        case "$basename" in
+            $pattern) return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
+# Check if array contains an element
+# Usage: array_contains array_name "element"
+# Returns: 0 if found, 1 if not found
+array_contains() {
+    local -n arr=$1
+    local elem="$2"
+    local item
+    for item in "${arr[@]}"; do
+        [[ "$item" == "$elem" ]] && return 0
+    done
+    return 1
+}
+
+# Extract repo name from path or spec
+# Usage: get_repo_name "/path/to/repo" or "owner/repo@branch"
+# Outputs: repo name to stdout
+get_repo_name() {
+    local input="${1:-}"
+    [[ -z "$input" ]] && return 1
+    # Handle both /path/to/repo and owner/repo formats
+    # Strip @branch suffix if present
+    basename "${input%%@*}"
+}
+
+#------------------------------------------------------------------------------
+# PACKAGE MANAGER DETECTION
+# Detect which package manager(s) a repository uses for dep-update feature.
+#------------------------------------------------------------------------------
+
+# Detect package managers in a repository by checking for manifest/lockfiles.
+# Usage: detect_package_managers /path/to/repo
+# Output: JSON to stdout with detected managers and trigger files
+# Returns: 0 if any manager detected, 1 if none found
+# Example output: {"managers":["npm","pip"],"files":{"npm":"package.json","pip":"requirements.txt"}}
+detect_package_managers() {
+    local repo_path="${1:-}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        echo '{"managers":[],"files":{},"error":"Invalid or missing repo path"}'
+        return 1
+    fi
+
+    local -a managers=()
+    local -A files=()
+
+    # npm/yarn/pnpm (Node.js)
+    if [[ -f "$repo_path/package.json" ]]; then
+        managers+=("npm")
+        files["npm"]="package.json"
+    elif [[ -f "$repo_path/package-lock.json" ]]; then
+        managers+=("npm")
+        files["npm"]="package-lock.json"
+    elif [[ -f "$repo_path/yarn.lock" ]]; then
+        managers+=("yarn")
+        files["yarn"]="yarn.lock"
+    elif [[ -f "$repo_path/pnpm-lock.yaml" ]]; then
+        managers+=("pnpm")
+        files["pnpm"]="pnpm-lock.yaml"
+    fi
+
+    # pip (Python)
+    if [[ -f "$repo_path/pyproject.toml" ]]; then
+        managers+=("pip")
+        files["pip"]="pyproject.toml"
+    elif [[ -f "$repo_path/requirements.txt" ]]; then
+        managers+=("pip")
+        files["pip"]="requirements.txt"
+    elif [[ -f "$repo_path/setup.py" ]]; then
+        managers+=("pip")
+        files["pip"]="setup.py"
+    elif [[ -f "$repo_path/Pipfile" ]]; then
+        managers+=("pipenv")
+        files["pipenv"]="Pipfile"
+    fi
+
+    # cargo (Rust)
+    if [[ -f "$repo_path/Cargo.toml" ]]; then
+        managers+=("cargo")
+        files["cargo"]="Cargo.toml"
+    fi
+
+    # go modules (Go)
+    if [[ -f "$repo_path/go.mod" ]]; then
+        managers+=("go")
+        files["go"]="go.mod"
+    fi
+
+    # composer (PHP)
+    if [[ -f "$repo_path/composer.json" ]]; then
+        managers+=("composer")
+        files["composer"]="composer.json"
+    fi
+
+    # bundler (Ruby)
+    if [[ -f "$repo_path/Gemfile" ]]; then
+        managers+=("bundler")
+        files["bundler"]="Gemfile"
+    fi
+
+    # maven (Java)
+    if [[ -f "$repo_path/pom.xml" ]]; then
+        managers+=("maven")
+        files["maven"]="pom.xml"
+    fi
+
+    # gradle (Java/Kotlin)
+    if [[ -f "$repo_path/build.gradle" ]] || [[ -f "$repo_path/build.gradle.kts" ]]; then
+        managers+=("gradle")
+        if [[ -f "$repo_path/build.gradle.kts" ]]; then
+            files["gradle"]="build.gradle.kts"
+        else
+            files["gradle"]="build.gradle"
+        fi
+    fi
+
+    # Build JSON output
+    local json_managers json_files
+
+    # Build managers array
+    if [[ ${#managers[@]} -eq 0 ]]; then
+        json_managers="[]"
+    else
+        json_managers=$(printf '%s\n' "${managers[@]}" | jq -R . | jq -s .)
+    fi
+
+    # Build files object
+    if [[ ${#files[@]} -eq 0 ]]; then
+        json_files="{}"
+    else
+        json_files="{"
+        local first=true
+        local mgr
+        for mgr in "${!files[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                json_files+=","
+            fi
+            # Escape values for JSON
+            local escaped_mgr escaped_file
+            escaped_mgr=$(printf '%s' "$mgr" | sed 's/"/\\"/g')
+            escaped_file=$(printf '%s' "${files[$mgr]}" | sed 's/"/\\"/g')
+            json_files+="\"$escaped_mgr\":\"$escaped_file\""
+        done
+        json_files+="}"
+    fi
+
+    printf '{"managers":%s,"files":%s}\n' "$json_managers" "$json_files"
+
+    [[ ${#managers[@]} -gt 0 ]]
+}
+
+#------------------------------------------------------------------------------
+# TEST RUNNER DETECTION
+# Detect the appropriate test command for a repository
+#------------------------------------------------------------------------------
+
+# Detect the test command for a repository based on config files.
+# Usage: detect_test_command /path/to/repo
+# Output: Test command string to stdout (empty if none detected)
+# Returns: 0 if test command found, 1 if none found
+detect_test_command() {
+    local repo_path="${1:-}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        return 1
+    fi
+
+    # 1. Check package.json scripts.test (npm/node projects)
+    if [[ -f "$repo_path/package.json" ]]; then
+        local test_script
+        test_script=$(jq -r '.scripts.test // empty' "$repo_path/package.json" 2>/dev/null)
+        if [[ -n "$test_script" && "$test_script" != "null" ]]; then
+            echo "npm test"
+            return 0
+        fi
+
+        # Check for jest config
+        if [[ -f "$repo_path/jest.config.js" || -f "$repo_path/jest.config.ts" || -f "$repo_path/jest.config.json" ]]; then
+            echo "npx jest"
+            return 0
+        fi
+
+        # Check for vitest
+        if [[ -f "$repo_path/vitest.config.js" || -f "$repo_path/vitest.config.ts" ]]; then
+            echo "npx vitest run"
+            return 0
+        fi
+    fi
+
+    # 2. Cargo (Rust)
+    if [[ -f "$repo_path/Cargo.toml" ]]; then
+        echo "cargo test"
+        return 0
+    fi
+
+    # 3. Go modules
+    if [[ -f "$repo_path/go.mod" ]]; then
+        # Check if there are test files
+        if find "$repo_path" -maxdepth 3 -name "*_test.go" -type f 2>/dev/null | head -1 | grep -q .; then
+            echo "go test ./..."
+            return 0
+        fi
+    fi
+
+    # 4. Python - pytest
+    if [[ -f "$repo_path/pytest.ini" || -f "$repo_path/conftest.py" || -f "$repo_path/pyproject.toml" ]]; then
+        # Check for pytest in pyproject.toml
+        if [[ -f "$repo_path/pyproject.toml" ]] && grep -q "pytest" "$repo_path/pyproject.toml" 2>/dev/null; then
+            echo "pytest"
+            return 0
+        fi
+        # Check for pytest.ini or conftest.py
+        if [[ -f "$repo_path/pytest.ini" || -f "$repo_path/conftest.py" ]]; then
+            echo "pytest"
+            return 0
+        fi
+    fi
+
+    # Check for test directory with python tests
+    if [[ -d "$repo_path/tests" ]] && find "$repo_path/tests" -maxdepth 2 -name "test_*.py" -type f 2>/dev/null | head -1 | grep -q .; then
+        echo "pytest"
+        return 0
+    fi
+
+    # 5. Ruby - bundler/rake
+    if [[ -f "$repo_path/Gemfile" ]]; then
+        if grep -q "rspec" "$repo_path/Gemfile" 2>/dev/null; then
+            echo "bundle exec rspec"
+            return 0
+        fi
+        if [[ -f "$repo_path/Rakefile" ]] && grep -q "test" "$repo_path/Rakefile" 2>/dev/null; then
+            echo "bundle exec rake test"
+            return 0
+        fi
+    fi
+
+    # 6. Maven (Java)
+    if [[ -f "$repo_path/pom.xml" ]]; then
+        echo "mvn test"
+        return 0
+    fi
+
+    # 7. Gradle (Java/Kotlin)
+    if [[ -f "$repo_path/build.gradle" || -f "$repo_path/build.gradle.kts" ]]; then
+        if [[ -f "$repo_path/gradlew" ]]; then
+            echo "./gradlew test"
+        else
+            echo "gradle test"
+        fi
+        return 0
+    fi
+
+    # 8. Makefile with test target (fallback)
+    if [[ -f "$repo_path/Makefile" ]]; then
+        if grep -qE "^test:" "$repo_path/Makefile" 2>/dev/null; then
+            echo "make test"
+            return 0
+        fi
+    fi
+
+    # 9. PHP Composer
+    if [[ -f "$repo_path/composer.json" ]]; then
+        local test_script
+        test_script=$(jq -r '.scripts.test // empty' "$repo_path/composer.json" 2>/dev/null)
+        if [[ -n "$test_script" && "$test_script" != "null" ]]; then
+            echo "composer test"
+            return 0
+        fi
+        if [[ -f "$repo_path/phpunit.xml" || -f "$repo_path/phpunit.xml.dist" ]]; then
+            echo "vendor/bin/phpunit"
+            return 0
+        fi
+    fi
+
+    # No test command detected
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# DEPENDENCY VERSION CHECKING
+# Check for outdated dependencies per package manager
+#------------------------------------------------------------------------------
+
+# Check for outdated dependencies in a repository.
+# Usage: check_outdated_deps <repo_path> [manager]
+# Output: JSON to stdout with outdated dependencies
+# Returns: 0 if any outdated deps found, 1 if all current or error
+# If manager is omitted, checks all detected managers
+check_outdated_deps() {
+    local repo_path="${1:-}"
+    local specific_manager="${2:-}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        echo '{"error":"Invalid or missing repo path","outdated":[]}'
+        return 1
+    fi
+
+    # Get detected managers if not specified
+    local -a managers=()
+    if [[ -n "$specific_manager" ]]; then
+        managers=("$specific_manager")
+    else
+        local detected
+        detected=$(detect_package_managers "$repo_path")
+        if [[ -n "$detected" ]]; then
+            readarray -t managers < <(echo "$detected" | jq -r '.managers[]' 2>/dev/null)
+        fi
+    fi
+
+    if [[ ${#managers[@]} -eq 0 ]]; then
+        echo '{"managers":[],"outdated":[],"error":"No package managers detected"}'
+        return 1
+    fi
+
+    local -a all_results=()
+    local total_outdated=0
+
+    for manager in "${managers[@]}"; do
+        local result
+        result=$(_check_outdated_for_manager "$repo_path" "$manager")
+        if [[ -n "$result" ]]; then
+            all_results+=("$result")
+            local count
+            count=$(echo "$result" | jq '.outdated | length' 2>/dev/null || echo 0)
+            total_outdated=$((total_outdated + count))
+        fi
+    done
+
+    # Combine results
+    if [[ ${#all_results[@]} -eq 0 ]]; then
+        echo '{"managers":[],"outdated":[]}'
+        return 1
+    fi
+
+    # Build combined JSON
+    printf '{"managers":%s,"results":[%s],"total_outdated":%d}\n' \
+        "$(printf '%s\n' "${managers[@]}" | jq -R . | jq -s .)" \
+        "$(IFS=,; echo "${all_results[*]}")" \
+        "$total_outdated"
+
+    [[ $total_outdated -gt 0 ]]
+}
+
+# Internal function to check outdated deps for a specific manager.
+# Usage: _check_outdated_for_manager <repo_path> <manager>
+_check_outdated_for_manager() {
+    local repo_path="$1"
+    local manager="$2"
+    local output=""
+
+    case "$manager" in
+        npm|yarn|pnpm)
+            # npm outdated --json returns non-zero if outdated packages exist
+            output=$(cd "$repo_path" && npm outdated --json 2>/dev/null || true)
+            if [[ -n "$output" && "$output" != "{}" ]]; then
+                # Parse npm outdated JSON format: {"pkg": {"current": "x", "wanted": "y", "latest": "z"}}
+                local json_array
+                json_array=$(echo "$output" | jq -r 'to_entries | map({name: .key, current: .value.current, wanted: .value.wanted, latest: .value.latest, type: .value.type})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        pip|pipenv)
+            output=$(cd "$repo_path" && pip list --outdated --format=json 2>/dev/null || true)
+            if [[ -n "$output" && "$output" != "[]" ]]; then
+                # pip returns: [{"name": "pkg", "version": "current", "latest_version": "latest"}]
+                local json_array
+                json_array=$(echo "$output" | jq 'map({name: .name, current: .version, latest: .latest_version, type: .latest_filetype})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        cargo)
+            # cargo-outdated is an optional tool
+            if ! command -v cargo-outdated &>/dev/null && ! cargo outdated --version &>/dev/null 2>&1; then
+                printf '{"manager":"%s","outdated":[],"warning":"cargo-outdated not installed"}\n' "$manager"
+                return
+            fi
+            output=$(cd "$repo_path" && cargo outdated --format json 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # cargo outdated returns: {"dependencies": [{"name": "pkg", "project": "cur", "latest": "x"}]}
+                local json_array
+                json_array=$(echo "$output" | jq '.dependencies | map({name: .name, current: .project, latest: .latest})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        go)
+            output=$(cd "$repo_path" && go list -m -u -json all 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # go list returns NDJSON, parse it
+                local json_array
+                json_array=$(echo "$output" | jq -s '[.[] | select(.Update != null) | {name: .Path, current: .Version, latest: .Update.Version}]' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        composer)
+            output=$(cd "$repo_path" && composer outdated --format=json 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # composer returns: {"installed": [{"name": "pkg", "version": "cur", "latest": "x"}]}
+                local json_array
+                json_array=$(echo "$output" | jq '.installed // [] | map({name: .name, current: .version, latest: .latest})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        bundler)
+            output=$(cd "$repo_path" && bundle outdated --parseable 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # bundle outdated --parseable returns: pkg (newest x.y.z, installed a.b.c)
+                # Build JSON array using jq for proper escaping
+                local json_array="[]"
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && continue
+                    local name current latest
+                    # Parse: "pkg (newest x.y.z, installed a.b.c, requested ~> m.n)"
+                    name=$(echo "$line" | sed -E 's/^([^ ]+) .*/\1/')
+                    latest=$(echo "$line" | sed -E 's/.*newest ([^,)]+).*/\1/')
+                    current=$(echo "$line" | sed -E 's/.*installed ([^,)]+).*/\1/')
+                    if [[ -n "$name" && -n "$current" && -n "$latest" ]]; then
+                        json_array=$(echo "$json_array" | jq --arg n "$name" --arg c "$current" --arg l "$latest" \
+                            '. + [{name: $n, current: $c, latest: $l}]')
+                    fi
+                done <<< "$output"
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        maven)
+            # Maven versions plugin requires specific setup
+            output=$(cd "$repo_path" && mvn versions:display-dependency-updates -DprocessDependencyManagement=false -q 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # Parse Maven output (text format) - this is a simplified version
+                local json_array="[]"
+                printf '{"manager":"%s","outdated":%s,"note":"Run mvn versions:display-dependency-updates for details"}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        gradle)
+            # Gradle requires plugins for version checking
+            printf '{"manager":"%s","outdated":[],"note":"Use gradle-versions-plugin for dependency updates"}\n' "$manager"
+            ;;
+
+        *)
+            printf '{"manager":"%s","outdated":[],"error":"Unsupported manager"}\n' "$manager"
+            ;;
+    esac
+}
+
+#------------------------------------------------------------------------------
+# CHANGELOG FETCHER
+# Fetch release notes/changelogs for package updates
+#------------------------------------------------------------------------------
+
+# Fetch changelog/release notes for a package between versions.
+# Usage: fetch_changelog <package_name> <from_version> <to_version> [--manager=npm]
+# Output: Markdown text to stdout with relevant changelog entries
+# Returns: 0 if changelog found, 1 if not found
+fetch_changelog() {
+    local package_name=""
+    local from_version=""
+    local to_version=""
+    local manager="npm"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --manager=*)
+                manager="${1#*=}"
+                shift
+                ;;
+            -*)
+                shift
+                ;;
+            *)
+                if [[ -z "$package_name" ]]; then
+                    package_name="$1"
+                elif [[ -z "$from_version" ]]; then
+                    from_version="$1"
+                elif [[ -z "$to_version" ]]; then
+                    to_version="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$package_name" || -z "$from_version" || -z "$to_version" ]]; then
+        echo "# No changelog found"
+        echo "Missing required arguments (package, from_version, to_version)"
+        return 1
+    fi
+
+    # Try to get changelog based on manager
+    local changelog=""
+    case "$manager" in
+        npm|yarn|pnpm)
+            changelog=$(_fetch_npm_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        pip|pipenv)
+            changelog=$(_fetch_pypi_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        cargo)
+            changelog=$(_fetch_crates_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        go)
+            changelog=$(_fetch_go_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        *)
+            echo "# No changelog found"
+            echo "Unsupported package manager: $manager"
+            return 1
+            ;;
+    esac
+
+    if [[ -n "$changelog" ]]; then
+        echo "$changelog"
+        return 0
+    fi
+
+    echo "# No changelog found"
+    echo "Could not find changelog for $package_name ($from_version -> $to_version)"
+    return 1
+}
+
+# Fetch changelog for npm package via GitHub releases.
+# Usage: _fetch_npm_changelog <package> <from> <to>
+_fetch_npm_changelog() {
+    local package="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Get package info from npm registry
+    local npm_info
+    npm_info=$(curl -sf "https://registry.npmjs.org/$package" 2>/dev/null)
+    if [[ -z "$npm_info" ]]; then
+        return 1
+    fi
+
+    # Extract repository URL
+    local repo_url
+    repo_url=$(echo "$npm_info" | jq -r '.repository.url // .repository // empty' 2>/dev/null)
+    if [[ -z "$repo_url" ]]; then
+        return 1
+    fi
+
+    # Convert to GitHub API URL
+    local github_repo
+    github_repo=$(_extract_github_repo "$repo_url")
+    if [[ -z "$github_repo" ]]; then
+        return 1
+    fi
+
+    # Fetch GitHub releases
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Fetch changelog for PyPI package via GitHub releases.
+_fetch_pypi_changelog() {
+    local package="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Get package info from PyPI
+    local pypi_info
+    pypi_info=$(curl -sf "https://pypi.org/pypi/$package/json" 2>/dev/null)
+    if [[ -z "$pypi_info" ]]; then
+        return 1
+    fi
+
+    # Extract project URLs
+    local repo_url
+    repo_url=$(echo "$pypi_info" | jq -r '.info.project_urls.Repository // .info.project_urls.Source // .info.home_page // empty' 2>/dev/null)
+    if [[ -z "$repo_url" ]]; then
+        return 1
+    fi
+
+    local github_repo
+    github_repo=$(_extract_github_repo "$repo_url")
+    if [[ -z "$github_repo" ]]; then
+        return 1
+    fi
+
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Fetch changelog for crates.io package.
+_fetch_crates_changelog() {
+    local package="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Get crate info
+    local crate_info
+    crate_info=$(curl -sf "https://crates.io/api/v1/crates/$package" 2>/dev/null)
+    if [[ -z "$crate_info" ]]; then
+        return 1
+    fi
+
+    local repo_url
+    repo_url=$(echo "$crate_info" | jq -r '.crate.repository // empty' 2>/dev/null)
+    if [[ -z "$repo_url" ]]; then
+        return 1
+    fi
+
+    local github_repo
+    github_repo=$(_extract_github_repo "$repo_url")
+    if [[ -z "$github_repo" ]]; then
+        return 1
+    fi
+
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Fetch changelog for Go module (usually from GitHub).
+_fetch_go_changelog() {
+    local module="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Go modules typically are GitHub repos
+    local github_repo=""
+    if [[ "$module" == github.com/* ]]; then
+        github_repo="${module#github.com/}"
+        # Take only owner/repo (first two path segments)
+        github_repo=$(echo "$github_repo" | cut -d'/' -f1-2)
+    else
+        return 1
+    fi
+
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Extract GitHub owner/repo from various URL formats.
+_extract_github_repo() {
+    local url="$1"
+
+    # Handle various formats:
+    # https://github.com/owner/repo
+    # git+https://github.com/owner/repo.git
+    # git://github.com/owner/repo.git
+    # git@github.com:owner/repo.git
+    # github:owner/repo
+
+    local repo=""
+
+    if [[ "$url" == *"github.com"* ]]; then
+        # Extract owner/repo from URL
+        repo=$(echo "$url" | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?.*|\1|')
+    elif [[ "$url" == github:* ]]; then
+        repo="${url#github:}"
+    fi
+
+    if [[ -n "$repo" && "$repo" != "$url" ]]; then
+        echo "$repo"
+    fi
+}
+
+# Fetch GitHub releases between versions.
+# Usage: _fetch_github_releases <owner/repo> <from_version> <to_version>
+_fetch_github_releases() {
+    local repo="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Fetch recent releases from GitHub
+    local releases
+    releases=$(curl -sf "https://api.github.com/repos/$repo/releases?per_page=50" 2>/dev/null)
+    if [[ -z "$releases" || "$releases" == "[]" ]]; then
+        # Try tags if no releases
+        return 1
+    fi
+
+    # Get recent releases and format as markdown
+    # Note: Proper semantic version filtering is complex; we fetch recent releases
+    # and let the AI agent determine which are relevant for the upgrade path
+    local changelog=""
+    changelog=$(echo "$releases" | jq -r '
+        .[:10] | .[] |
+        "## " + .tag_name + " (" + (.published_at // .created_at | split("T")[0]) + ")\n\n" + (.body // "No release notes") + "\n"
+    ' 2>/dev/null)
+
+    if [[ -n "$changelog" ]]; then
+        echo "# Changelog for $repo"
+        echo "## Versions: $from_version -> $to_version"
+        echo ""
+        echo "$changelog"
+        return 0
+    fi
+
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# DIRTY REPO DETECTION
+# Find repos with uncommitted changes (staged, unstaged, untracked)
+#------------------------------------------------------------------------------
+
+# Get list of repos with uncommitted changes.
+# Usage: get_dirty_repos [--no-untracked] [--json]
+# Output: Newline-separated repo paths to stdout (or JSON array with --json)
+# Returns: 0 if any dirty repos found, 1 if all clean
+# Example: get_dirty_repos --json → [{"path":"/data/projects/foo","status":"dirty"}]
+get_dirty_repos() {
+    local include_untracked="true"
+    local json_output="false"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-untracked)
+                include_untracked="false"
+                shift
+                ;;
+            --json)
+                json_output="true"
+                shift
+                ;;
+            *)
+                log_error "get_dirty_repos: Unknown option: $1"
+                return 4
+                ;;
+        esac
+    done
+
+    local -a dirty_repos=()
+    local spec url branch custom_name local_path repo_id
+
+    # Iterate through all configured repos
+    while IFS= read -r spec; do
+        [[ -z "$spec" ]] && continue
+
+        # Resolve spec to get local path
+        if ! resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+            log_warn "get_dirty_repos: Cannot resolve spec: $spec"
+            continue
+        fi
+
+        # Skip if repo doesn't exist
+        if [[ ! -d "$local_path" ]]; then
+            log_debug "get_dirty_repos: Repo not cloned: $local_path"
+            continue
+        fi
+
+        # Skip if not a git repo
+        if [[ ! -d "$local_path/.git" ]]; then
+            log_warn "get_dirty_repos: Not a git repo: $local_path"
+            continue
+        fi
+
+        # Check for dirty status using git plumbing
+        local status_output
+        if [[ "$include_untracked" == "true" ]]; then
+            # Include untracked files
+            status_output=$(git -C "$local_path" status --porcelain 2>/dev/null)
+        else
+            # Exclude untracked files (only staged and unstaged changes)
+            status_output=$(git -C "$local_path" status --porcelain --untracked-files=no 2>/dev/null)
+        fi
+
+        if [[ -n "$status_output" ]]; then
+            dirty_repos+=("$local_path")
+        fi
+    done < <(get_all_repos)
+
+    # Output results
+    if [[ "$json_output" == "true" ]]; then
+        if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+            echo "[]"
+        else
+            local json_array="["
+            local first="true"
+            for path in "${dirty_repos[@]}"; do
+                if [[ "$first" == "true" ]]; then
+                    first="false"
+                else
+                    json_array+=","
+                fi
+                local safe_path
+                safe_path=$(json_escape "$path")
+                json_array+="{\"path\":\"$safe_path\",\"status\":\"dirty\"}"
+            done
+            json_array+="]"
+            echo "$json_array"
+        fi
+    else
+        # Plain text output - one path per line
+        for path in "${dirty_repos[@]}"; do
+            printf '%s\n' "$path"
+        done
+    fi
+
+    [[ ${#dirty_repos[@]} -gt 0 ]]
+}
+
+#------------------------------------------------------------------------------
+# NTM SESSION SPAWNING
+# Wrapper for spawning AI coding sessions via ntm (Named Tmux Manager)
+#------------------------------------------------------------------------------
+
+# Spawn an ntm session for AI-assisted operations on a repository.
+# Usage: spawn_ai_session <repo_path> <prompt_file> [timeout_seconds] [--agent=claude|codex|gemini]
+# Output: JSON status to stdout {"session":"name","status":"success|timeout|failed","duration_seconds":N}
+# Returns: 0 on success, 1 on timeout, 2 on failure
+spawn_ai_session() {
+    local repo_path=""
+    local prompt_file=""
+    local timeout_seconds=600
+    local agent_type="claude"
+    local session_prefix="ru-ai"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --agent=*)
+                agent_type="${1#*=}"
+                shift
+                ;;
+            --timeout=*)
+                timeout_seconds="${1#*=}"
+                shift
+                ;;
+            --prefix=*)
+                session_prefix="${1#*=}"
+                shift
+                ;;
+            -*)
+                log_error "spawn_ai_session: Unknown option: $1"
+                return 2
+                ;;
+            *)
+                if [[ -z "$repo_path" ]]; then
+                    repo_path="$1"
+                elif [[ -z "$prompt_file" ]]; then
+                    prompt_file="$1"
+                else
+                    timeout_seconds="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ -z "$repo_path" ]]; then
+        log_error "spawn_ai_session: repo_path is required"
+        echo '{"session":"","status":"failed","error":"repo_path required"}'
+        return 2
+    fi
+
+    if [[ ! -d "$repo_path" ]]; then
+        log_error "spawn_ai_session: repo not found: $repo_path"
+        echo '{"session":"","status":"failed","error":"repo not found"}'
+        return 2
+    fi
+
+    if [[ -z "$prompt_file" ]]; then
+        log_error "spawn_ai_session: prompt_file is required"
+        echo '{"session":"","status":"failed","error":"prompt_file required"}'
+        return 2
+    fi
+
+    if [[ ! -f "$prompt_file" ]]; then
+        log_error "spawn_ai_session: prompt file not found: $prompt_file"
+        echo '{"session":"","status":"failed","error":"prompt file not found"}'
+        return 2
+    fi
+
+    # Check ntm availability
+    if ! command -v ntm &>/dev/null; then
+        log_error "spawn_ai_session: ntm not installed"
+        echo '{"session":"","status":"failed","error":"ntm not installed"}'
+        return 2
+    fi
+
+    # Generate unique session name from repo path
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local timestamp
+    timestamp=$(date +%s)
+    local session_name="${session_prefix}-${repo_name}-${timestamp}"
+
+    # Map agent type to ntm flags
+    # agent_flag is for spawn (--cc=1), send_flag is for send (--cc)
+    local agent_flag send_flag
+    case "$agent_type" in
+        claude|cc)  agent_flag="--cc=1"; send_flag="--cc" ;;
+        codex|cod)  agent_flag="--cod=1"; send_flag="--cod" ;;
+        gemini|gmi) agent_flag="--gmi=1"; send_flag="--gmi" ;;
+        *)
+            log_error "spawn_ai_session: Unknown agent type: $agent_type"
+            echo '{"session":"","status":"failed","error":"unknown agent type"}'
+            return 2
+            ;;
+    esac
+
+    local start_time
+    start_time=$(date +%s)
+
+    # Spawn the session with initial prompt
+    log_info "Spawning ntm session: $session_name"
+    if ! ntm spawn "$session_name" $agent_flag --no-user 2>/dev/null; then
+        log_error "spawn_ai_session: Failed to spawn session"
+        echo '{"session":"'"$session_name"'","status":"failed","error":"spawn failed"}'
+        return 2
+    fi
+
+    # Change to repo directory and send the prompt
+    # Use tmux to cd first, then send the prompt file contents
+    local pane_target="${session_name}:0.0"
+
+    # CD to repo directory
+    tmux send-keys -t "$pane_target" "cd $(printf '%q' "$repo_path")" Enter 2>/dev/null
+    sleep 1
+
+    # Send the prompt from file
+    if ! ntm send "$session_name" $send_flag --file "$prompt_file" 2>/dev/null; then
+        log_error "spawn_ai_session: Failed to send prompt"
+        ntm kill "$session_name" --force 2>/dev/null
+        echo '{"session":"'"$session_name"'","status":"failed","error":"send prompt failed"}'
+        return 2
+    fi
+
+    # Wait for completion with timeout
+    # Poll health status until agent shows as idle/completed or timeout
+    local elapsed=0
+    local poll_interval=10
+    local status="running"
+
+    log_info "Waiting for session completion (timeout: ${timeout_seconds}s)"
+
+    while [[ $elapsed -lt $timeout_seconds ]]; do
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+
+        # Check if session still exists
+        if ! tmux has-session -t "$session_name" 2>/dev/null; then
+            status="completed"
+            break
+        fi
+
+        # Check agent health
+        local health_output
+        health_output=$(ntm health "$session_name" --json 2>/dev/null)
+
+        if [[ -n "$health_output" ]]; then
+            # Check if agent is idle (no recent activity)
+            local activity
+            activity=$(echo "$health_output" | jq -r '.panes[0].activity // "unknown"' 2>/dev/null)
+
+            if [[ "$activity" == "idle" || "$activity" == "stale" ]]; then
+                # Agent appears to be done - give it a moment then check again
+                sleep 5
+                health_output=$(ntm health "$session_name" --json 2>/dev/null)
+                activity=$(echo "$health_output" | jq -r '.panes[0].activity // "unknown"' 2>/dev/null)
+
+                if [[ "$activity" == "idle" || "$activity" == "stale" ]]; then
+                    status="completed"
+                    break
+                fi
+            fi
+        fi
+
+        log_debug "Session $session_name still running (${elapsed}s/${timeout_seconds}s)"
+    done
+
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    # Clean up the session
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        ntm kill "$session_name" --force 2>/dev/null
+    fi
+
+    # Return results
+    if [[ "$status" == "completed" ]]; then
+        log_success "Session completed in ${duration}s"
+        printf '{"session":"%s","status":"success","duration_seconds":%d}\n' "$session_name" "$duration"
+        return 0
+    else
+        log_warn "Session timed out after ${duration}s"
+        printf '{"session":"%s","status":"timeout","duration_seconds":%d}\n' "$session_name" "$duration"
+        return 1
+    fi
+}
+
+# Check if an ntm session is still running.
+# Usage: is_session_active <session_name>
+# Returns: 0 if active, 1 if not
+is_session_active() {
+    local session_name="$1"
+    [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null
+}
+
+# Kill an ntm session forcefully.
+# Usage: kill_ai_session <session_name>
+# Returns: 0 on success, 1 on failure
+kill_ai_session() {
+    local session_name="$1"
+    if [[ -z "$session_name" ]]; then
+        log_error "kill_ai_session: session_name required"
+        return 1
+    fi
+
+    if is_session_active "$session_name"; then
+        ntm kill "$session_name" --force 2>/dev/null
+        return $?
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AI-SYNC PROMPT TEMPLATES
+# Two-phase prompts for intelligent repository sync via AI agents
+#------------------------------------------------------------------------------
+
+# Generate Phase 1 prompt for context acquisition.
+# Usage: generate_aisync_prompt_phase1 <repo_path>
+# Output: Prompt text to stdout
+generate_aisync_prompt_phase1() {
+    local repo_path="$1"
+    local has_agents_md="false"
+    local has_readme="false"
+
+    [[ -f "$repo_path/AGENTS.md" ]] && has_agents_md="true"
+    [[ -f "$repo_path/README.md" || -f "$repo_path/readme.md" ]] && has_readme="true"
+
+    # Build dynamic prompt based on available documentation
+    local prompt=""
+
+    if [[ "$has_agents_md" == "true" && "$has_readme" == "true" ]]; then
+        prompt="First read ALL of the AGENTS.md file and README.md file super carefully and understand ALL of both!
+Then use your code investigation agent mode to fully understand the code, technical architecture, and purpose of the project."
+    elif [[ "$has_agents_md" == "true" ]]; then
+        prompt="First read ALL of the AGENTS.md file super carefully and understand everything in it!
+Then use your code investigation agent mode to fully understand the code, technical architecture, and purpose of the project."
+    elif [[ "$has_readme" == "true" ]]; then
+        prompt="First read ALL of the README.md file super carefully and understand everything in it!
+Then use your code investigation agent mode to fully understand the code, technical architecture, and purpose of the project."
+    else
+        prompt="Use your code investigation agent mode to fully understand the code, technical architecture, and purpose of this project.
+Explore the directory structure, key files, and understand what this codebase does."
+    fi
+
+    printf '%s\n' "$prompt"
+}
+
+# Generate Phase 2 prompt for intelligent commit.
+# Usage: generate_aisync_prompt_phase2 [--branch=NAME] [--remote=NAME] [--no-push]
+# Output: Prompt text to stdout
+generate_aisync_prompt_phase2() {
+    local branch_name=""
+    local remote_name="origin"
+    local push_enabled="true"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch=*)
+                branch_name="${1#*=}"
+                shift
+                ;;
+            --remote=*)
+                remote_name="${1#*=}"
+                shift
+                ;;
+            --no-push)
+                push_enabled="false"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local prompt="Now, based on your knowledge of the project, commit all changed files now in a series of logically connected groupings with super detailed commit messages for each"
+
+    if [[ "$push_enabled" == "true" ]]; then
+        prompt+=" and then push"
+        if [[ -n "$branch_name" ]]; then
+            prompt+=" to $remote_name/$branch_name"
+        fi
+    fi
+
+    prompt+=".
+
+Take your time to do it right. Don't edit the code at all. Don't commit obviously ephemeral files (like .pyc, node_modules, __pycache__, etc). Use ultrathink.
+
+Guidelines:
+- Group related changes into logical commits (e.g., 'fix: auth bug' separate from 'chore: update deps')
+- Write detailed commit messages explaining WHY, not just what
+- If there are staged vs unstaged changes, consider if they should be separate commits
+- Skip any temporary or generated files
+- Review each change before committing to ensure it makes sense"
+
+    printf '%s\n' "$prompt"
+}
+
+# Write prompt to a temporary file for use with spawn_ai_session.
+# Usage: write_prompt_to_file <prompt_text>
+# Output: Path to temp file on stdout
+# Returns: 0 on success, 1 on failure
+write_prompt_to_file() {
+    local prompt="$1"
+    local temp_file
+
+    temp_file=$(mktemp_file) || return 1
+    printf '%s\n' "$prompt" > "$temp_file"
+    echo "$temp_file"
+}
+
+# Generate combined two-phase prompt for single session (alternative approach).
+# Usage: generate_aisync_prompt_combined <repo_path> [--no-push]
+# Output: Combined prompt text to stdout
+generate_aisync_prompt_combined() {
+    local repo_path="$1"
+    shift
+
+    local phase1
+    local phase2
+    phase1=$(generate_aisync_prompt_phase1 "$repo_path")
+    phase2=$(generate_aisync_prompt_phase2 "$@")
+
+    printf '%s\n\n---\n\nOnce you have fully understood the project:\n\n%s\n' "$phase1" "$phase2"
+}
+
+#------------------------------------------------------------------------------
+# DEP-UPDATE PROMPT TEMPLATES
+# Two-phase prompts for AI-powered dependency updates
+#------------------------------------------------------------------------------
+
+# Generate Phase 1 prompt for dep-update: Analysis of outdated dependencies.
+# Usage: generate_depupdate_prompt_phase1 <repo_path> <outdated_json> [changelog_text]
+# Arguments:
+#   repo_path     - Path to repository being updated
+#   outdated_json - JSON output from check_outdated_deps()
+#   changelog_text - Optional: Pre-fetched changelog content
+# Output: Prompt text to stdout
+generate_depupdate_prompt_phase1() {
+    local repo_path="$1"
+    local outdated_json="$2"
+    local changelog_text="${3:-}"
+    local repo_name
+    repo_name=$(basename "$repo_path")
+
+    local prompt
+    prompt="You are a dependency update assistant analyzing the '$repo_name' project.
+
+## Project Location
+$repo_path
+
+## Your Task - ANALYSIS ONLY
+
+Review the outdated dependencies below and create an update plan. Do NOT make any changes yet.
+
+## Outdated Dependencies
+
+$outdated_json
+
+## Changelogs & Release Notes
+
+${changelog_text:-No changelogs provided. Check package documentation for breaking changes.}
+
+## Analysis Steps
+
+1. **Review Each Dependency**: For each outdated package:
+   - Note the current version vs latest version
+   - Check if it's a major/minor/patch update
+   - Review changelog for breaking changes
+
+2. **Identify Breaking Changes**: Look for:
+   - API changes that require code modifications
+   - Deprecated features being removed
+   - New required configuration
+   - Peer dependency conflicts
+
+3. **Create Migration Plan**: For each dependency:
+   - List specific code changes needed (if any)
+   - Note the order of updates (dependencies first)
+   - Flag any risky updates that need extra testing
+
+4. **Risk Assessment**:
+   - LOW: Patch updates, no breaking changes
+   - MEDIUM: Minor updates with deprecation warnings
+   - HIGH: Major updates with breaking changes
+
+Output your analysis in markdown format with sections for each dependency."
+
+    printf '%s\n' "$prompt"
+}
+
+# Generate Phase 2 prompt for dep-update: Update, test, and fix loop.
+# Usage: generate_depupdate_prompt_phase2 <repo_path> <test_command> [--max-attempts=N]
+# Arguments:
+#   repo_path    - Path to repository being updated
+#   test_command - Command to run tests (e.g., "npm test")
+#   --max-attempts=N - Maximum fix attempts per dependency (default: 3)
+# Output: Prompt text to stdout
+generate_depupdate_prompt_phase2() {
+    local repo_path="$1"
+    local test_command="$2"
+    shift 2
+
+    local max_attempts=3
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-attempts=*)
+                max_attempts="${1#*=}"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local prompt
+    prompt="## Your Task - UPDATE DEPENDENCIES
+
+Now implement the migration plan. For each dependency:
+
+### Update Loop (repeat for each dependency)
+
+1. **Update the dependency version**
+   - Edit the manifest file (package.json, Cargo.toml, etc.)
+   - Run the package manager's install/update command
+
+2. **Make code changes** (if needed from your analysis)
+   - Update import statements
+   - Fix deprecated API usage
+   - Add any new required configuration
+
+3. **Run tests**
+   \`\`\`bash
+   ${test_command:-echo 'No test command detected - check manually'}
+   \`\`\`
+
+4. **If tests fail** (max $max_attempts attempts per dependency):
+   - Read the error messages carefully
+   - Fix the issues in the code
+   - Re-run tests
+   - If still failing after $max_attempts attempts, revert this dependency and note it as blocked
+
+5. **Commit the change**
+   - One commit per dependency (or logical group)
+   - Format: \"chore(deps): update <package> from <old> to <new>\"
+   - Include any code changes in the same commit
+
+### Important Guidelines
+
+- **Order matters**: Update dependencies before dependents
+- **Atomic commits**: Each dependency update should be a single working commit
+- **Don't break the build**: If an update can't be fixed, revert it
+- **Document blockers**: Note any dependencies that couldn't be updated and why
+
+### After All Updates
+
+1. Run the full test suite one more time
+2. Check for any peer dependency warnings
+3. Summarize what was updated and what was blocked"
+
+    printf '%s\n' "$prompt"
+}
+
+# Generate combined dep-update prompt for single session.
+# Usage: generate_depupdate_prompt_combined <repo_path> <outdated_json> <test_command> [options]
+# Options:
+#   --changelog=TEXT   Pre-fetched changelog content
+#   --max-attempts=N   Max fix attempts per dep (default: 3)
+# Output: Combined prompt text to stdout
+generate_depupdate_prompt_combined() {
+    local repo_path="$1"
+    local outdated_json="$2"
+    local test_command="$3"
+    shift 3
+
+    local changelog_text=""
+    local max_attempts=3
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --changelog=*)
+                changelog_text="${1#*=}"
+                shift
+                ;;
+            --max-attempts=*)
+                max_attempts="${1#*=}"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local phase1
+    local phase2
+    phase1=$(generate_depupdate_prompt_phase1 "$repo_path" "$outdated_json" "$changelog_text")
+    phase2=$(generate_depupdate_prompt_phase2 "$repo_path" "$test_command" "--max-attempts=$max_attempts")
+
+    printf '%s\n\n---\n\nOnce you have completed your analysis:\n\n%s\n' "$phase1" "$phase2"
+}
+
+#------------------------------------------------------------------------------
+# AI-SYNC SUBCOMMAND
+# Automatically sync dirty repos using AI-powered commits via ntm
+#------------------------------------------------------------------------------
+
+# cmd_ai_sync - Main entry point for ai-sync subcommand
+# Usage: ru ai-sync [OPTIONS]
+#   --dry-run       Show which repos would be processed
+#   --include=PAT   Only process repos matching pattern
+#   --exclude=PAT   Skip repos matching pattern
+#   --sequential    Process one at a time (default)
+#   --timeout=SEC   Per-repo timeout (default: 600)
+#   --no-push       Commit but don't push
+#   --agent=TYPE    Agent type: claude (default), codex, gemini
+cmd_ai_sync() {
+    local dry_run="false"
+    local include_pattern=""
+    local exclude_pattern=""
+    local timeout_seconds=600
+    local no_push="false"
+    local agent_type="claude"
+    local include_untracked="true"
+
+    # Parse command arguments from ARGS array
+    local arg
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            -h|--help)
+                _ai_sync_help
+                return 0
+                ;;
+            --dry-run)
+                dry_run="true"
+                ;;
+            --include=*)
+                include_pattern="${arg#*=}"
+                ;;
+            --exclude=*)
+                exclude_pattern="${arg#*=}"
+                ;;
+            --timeout=*)
+                timeout_seconds="${arg#*=}"
+                ;;
+            --no-push)
+                no_push="true"
+                ;;
+            --agent=*)
+                agent_type="${arg#*=}"
+                ;;
+            --no-untracked)
+                include_untracked="false"
+                ;;
+            --sequential)
+                # Default behavior, ignored
+                ;;
+            *)
+                log_error "ai-sync: Unknown option: $arg"
+                _ai_sync_help
+                return 4
+                ;;
+        esac
+    done
+
+    # Check dependencies
+    if ! command -v ntm &>/dev/null; then
+        log_error "ai-sync requires ntm (Named Tmux Manager) to be installed"
+        log_error "Install from: https://github.com/Dicklesworthstone/ntm"
+        return 3
+    fi
+
+    if ! command -v claude &>/dev/null && [[ "$agent_type" == "claude" ]]; then
+        log_error "ai-sync with Claude requires claude-code to be installed"
+        log_error "Install from: https://github.com/anthropics/claude-code"
+        return 3
+    fi
+
+    # Get dirty repos
+    log_info "Scanning for repositories with uncommitted changes..."
+    local dirty_repos_output
+    local dirty_args=""
+    [[ "$include_untracked" == "false" ]] && dirty_args="--no-untracked"
+
+    dirty_repos_output=$(get_dirty_repos $dirty_args)
+    if [[ -z "$dirty_repos_output" ]]; then
+        log_success "All repositories are clean - nothing to sync"
+        return 0
+    fi
+
+    # Convert to array
+    local -a dirty_repos=()
+    while IFS= read -r repo_path; do
+        [[ -z "$repo_path" ]] && continue
+
+        # Apply include filter
+        if [[ -n "$include_pattern" ]]; then
+            if [[ ! "$repo_path" == *"$include_pattern"* ]]; then
+                log_debug "Skipping (not matching include): $repo_path"
+                continue
+            fi
+        fi
+
+        # Apply exclude filter
+        if [[ -n "$exclude_pattern" ]]; then
+            if [[ "$repo_path" == *"$exclude_pattern"* ]]; then
+                log_debug "Skipping (matching exclude): $repo_path"
+                continue
+            fi
+        fi
+
+        dirty_repos+=("$repo_path")
+    done <<< "$dirty_repos_output"
+
+    if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+        log_success "No dirty repositories match the filters"
+        return 0
+    fi
+
+    log_info "Found ${#dirty_repos[@]} dirty repository(s)"
+
+    # Dry run mode - just list
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "Dry run - would process these repositories:"
+        for repo_path in "${dirty_repos[@]}"; do
+            local repo_name
+            repo_name=$(basename "$repo_path")
+            printf '  %s (%s)\n' "$repo_name" "$repo_path" >&2
+        done
+
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            local json_array="["
+            local first="true"
+            for repo_path in "${dirty_repos[@]}"; do
+                [[ "$first" == "true" ]] && first="false" || json_array+=","
+                local safe_path
+                safe_path=$(json_escape "$repo_path")
+                json_array+="{\"path\":\"$safe_path\",\"status\":\"pending\"}"
+            done
+            json_array+="]"
+            echo "$json_array"
+        fi
+        return 0
+    fi
+
+    # Process each dirty repo
+    local succeeded=0
+    local failed=0
+    local -a results=()
+
+    for repo_path in "${dirty_repos[@]}"; do
+        local repo_name
+        repo_name=$(basename "$repo_path")
+
+        log_info "Processing: $repo_name"
+
+        # Generate the combined prompt for this repo
+        local prompt_args=""
+        [[ "$no_push" == "true" ]] && prompt_args="--no-push"
+        local prompt
+        prompt=$(generate_aisync_prompt_combined "$repo_path" $prompt_args)
+
+        # Write prompt to temp file
+        local prompt_file
+        prompt_file=$(write_prompt_to_file "$prompt")
+        if [[ -z "$prompt_file" || ! -f "$prompt_file" ]]; then
+            log_error "Failed to create prompt file for $repo_name"
+            ((failed++))
+            results+=("{\"repo\":\"$(json_escape "$repo_path")\",\"status\":\"failed\",\"error\":\"prompt file creation\"}")
+            continue
+        fi
+
+        # Spawn AI session and wait
+        local session_result
+        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" --timeout="$timeout_seconds" --agent="$agent_type")
+        local exit_code=$?
+
+        # Clean up prompt file
+        rm -f "$prompt_file" 2>/dev/null
+
+        # Parse result
+        local status
+        status=$(echo "$session_result" | jq -r '.status // "unknown"' 2>/dev/null)
+
+        if [[ "$status" == "success" ]]; then
+            log_success "Completed: $repo_name"
+            ((succeeded++))
+            results+=("$session_result")
+        else
+            log_error "Failed: $repo_name ($status)"
+            ((failed++))
+            results+=("$session_result")
+        fi
+    done
+
+    # Print summary
+    local total=$((succeeded + failed))
+    log_info "AI-Sync complete: $succeeded/$total repositories processed successfully"
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local json_results="["
+        local first="true"
+        for result in "${results[@]}"; do
+            [[ "$first" == "true" ]] && first="false" || json_results+=","
+            json_results+="$result"
+        done
+        json_results+="]"
+        printf '{"total":%d,"succeeded":%d,"failed":%d,"repos":%s}\n' "$total" "$succeeded" "$failed" "$json_results"
+    fi
+
+    # Exit code based on results
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Print ai-sync help
+_ai_sync_help() {
+    cat >&2 <<'EOF'
+Usage: ru ai-sync [OPTIONS]
+
+Automatically commit uncommitted changes across repositories using AI.
+
+Options:
+  --dry-run       Show which repos would be processed (no changes)
+  --include=PAT   Only process repos with paths matching pattern
+  --exclude=PAT   Skip repos with paths matching pattern
+  --timeout=SEC   Per-repo timeout in seconds (default: 600)
+  --no-push       Commit changes but don't push to remote
+  --agent=TYPE    Agent type: claude (default), codex, gemini
+  --no-untracked  Ignore untracked files when detecting dirty repos
+
+The AI agent will:
+1. Read AGENTS.md and README.md to understand each project
+2. Review all changes and group them logically
+3. Create detailed commit messages explaining the changes
+4. Push to the remote (unless --no-push specified)
+
+Examples:
+  ru ai-sync                        # Process all dirty repos
+  ru ai-sync --dry-run              # Show what would be processed
+  ru ai-sync --include=my-project   # Only process matching repos
+  ru ai-sync --timeout=1200         # Allow 20 minutes per repo
+  ru ai-sync --no-push              # Commit but don't push
+
+Exit Codes:
+  0  All repos processed successfully
+  1  Some repos failed
+  3  Missing dependencies (ntm, claude-code)
+  4  Invalid arguments
+EOF
+}
+
+#------------------------------------------------------------------------------
+# DEP-UPDATE SUBCOMMAND
+# Update dependencies across repos using AI-powered analysis and testing
+#------------------------------------------------------------------------------
+
+# cmd_dep_update - Main entry point for dep-update subcommand
+# Usage: ru dep-update [OPTIONS]
+#   --dry-run           Show what would be updated (no changes)
+#   --manager=NAME      Only update deps for specific manager
+#   --include=PAT       Only update deps matching pattern
+#   --exclude=PAT       Skip deps matching pattern
+#   --major             Include major version updates (default: skip)
+#   --test-cmd=CMD      Custom test command (overrides detection)
+#   --max-fix-attempts=N  Max iterations for test/fix loop (default: 5)
+#   --no-push           Commit but don't push
+#   --repo=PATH         Single repo mode (default: all repos)
+#   --agent=TYPE        Agent type: claude (default), codex, gemini
+cmd_dep_update() {
+    local dry_run="false"
+    local manager_filter=""
+    local include_pattern=""
+    local exclude_pattern=""
+    local include_major="false"
+    local custom_test_cmd=""
+    local max_fix_attempts=5
+    local no_push="false"
+    local single_repo=""
+    local agent_type="claude"
+    local timeout_seconds=900
+
+    # Parse command arguments from ARGS array
+    local arg
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            -h|--help)
+                _dep_update_help
+                return 0
+                ;;
+            --dry-run)
+                dry_run="true"
+                ;;
+            --manager=*)
+                manager_filter="${arg#*=}"
+                ;;
+            --include=*)
+                include_pattern="${arg#*=}"
+                ;;
+            --exclude=*)
+                exclude_pattern="${arg#*=}"
+                ;;
+            --major)
+                include_major="true"
+                ;;
+            --test-cmd=*)
+                custom_test_cmd="${arg#*=}"
+                ;;
+            --max-fix-attempts=*)
+                max_fix_attempts="${arg#*=}"
+                ;;
+            --no-push)
+                no_push="true"
+                ;;
+            --repo=*)
+                single_repo="${arg#*=}"
+                ;;
+            --agent=*)
+                agent_type="${arg#*=}"
+                ;;
+            --timeout=*)
+                timeout_seconds="${arg#*=}"
+                ;;
+            *)
+                log_error "dep-update: Unknown option: $arg"
+                _dep_update_help
+                return 4
+                ;;
+        esac
+    done
+
+    # Check dependencies
+    if ! command -v ntm &>/dev/null; then
+        log_error "dep-update requires ntm (Named Tmux Manager)"
+        log_error "Install from: https://github.com/Dicklesworthstone/ntm"
+        return 3
+    fi
+
+    case "$agent_type" in
+        claude)
+            if ! command -v claude &>/dev/null; then
+                log_error "dep-update requires claude-code for agent type 'claude'"
+                log_error "Install from: https://github.com/anthropics/claude-code"
+                return 3
+            fi
+            ;;
+        codex)
+            if ! command -v codex &>/dev/null; then
+                log_error "dep-update requires codex for agent type 'codex'"
+                return 3
+            fi
+            ;;
+        gemini)
+            if ! command -v gemini &>/dev/null; then
+                log_error "dep-update requires gemini CLI for agent type 'gemini'"
+                return 3
+            fi
+            ;;
+        *)
+            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
+            return 4
+            ;;
+    esac
+
+    # Build list of repos to process
+    local -a repos_to_process=()
+    if [[ -n "$single_repo" ]]; then
+        if [[ ! -d "$single_repo" ]]; then
+            log_error "Repository not found: $single_repo"
+            return 4
+        fi
+        repos_to_process+=("$single_repo")
+    else
+        # Get all configured repos
+        local repo_list
+        repo_list=$(_list_local_repos 2>/dev/null) || repo_list=""
+        if [[ -z "$repo_list" ]]; then
+            log_warn "No repositories configured. Run 'ru add <repo>' first."
+            return 0
+        fi
+        while IFS= read -r repo; do
+            [[ -n "$repo" && -d "$repo" ]] && repos_to_process+=("$repo")
+        done <<< "$repo_list"
+    fi
+
+    if [[ ${#repos_to_process[@]} -eq 0 ]]; then
+        log_info "No repositories to process"
+        return 0
+    fi
+
+    # Process each repo
+    local processed=0
+    local updated=0
+    local failed=0
+    local skipped=0
+    local -a results=()
+
+    for repo_path in "${repos_to_process[@]}"; do
+        local repo_name
+        repo_name=$(basename "$repo_path")
+
+        # Detect package managers in this repo
+        local managers_json
+        managers_json=$(detect_package_managers "$repo_path")
+        local managers_array
+        managers_array=$(echo "$managers_json" | jq -r '.managers // []' 2>/dev/null)
+        if [[ -z "$managers_array" || "$managers_array" == "[]" ]]; then
+            log_debug "No package managers found in $repo_name, skipping"
+            ((skipped++))
+            continue
+        fi
+
+        # Filter by manager if specified
+        if [[ -n "$manager_filter" ]]; then
+            if ! echo "$managers_json" | jq -e ".managers[] | select(. == \"$manager_filter\")" &>/dev/null; then
+                log_debug "Repo $repo_name does not use manager '$manager_filter', skipping"
+                ((skipped++))
+                continue
+            fi
+        fi
+
+        # Check for outdated dependencies
+        local outdated_json
+        outdated_json=$(check_outdated_deps "$repo_path" "$manager_filter")
+        local total_outdated
+        total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+
+        if [[ "$total_outdated" -eq 0 ]]; then
+            log_debug "No outdated dependencies in $repo_name"
+            ((skipped++))
+            continue
+        fi
+
+        # Filter by include/exclude patterns (on package names)
+        if [[ -n "$include_pattern" || -n "$exclude_pattern" ]]; then
+            outdated_json=$(_filter_outdated_deps "$outdated_json" "$include_pattern" "$exclude_pattern")
+            total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+            if [[ "$total_outdated" -eq 0 ]]; then
+                log_debug "No matching dependencies after filtering in $repo_name"
+                ((skipped++))
+                continue
+            fi
+        fi
+
+        # Filter out major updates unless --major specified
+        if [[ "$include_major" != "true" ]]; then
+            outdated_json=$(_filter_major_updates "$outdated_json")
+            total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+            if [[ "$total_outdated" -eq 0 ]]; then
+                log_debug "No non-major updates in $repo_name (use --major to include)"
+                ((skipped++))
+                continue
+            fi
+        fi
+
+        ((processed++))
+        log_info "Processing $repo_name: $total_outdated outdated dependencies"
+
+        if [[ "$dry_run" == "true" ]]; then
+            echo "Would update $total_outdated deps in: $repo_path"
+            echo "$outdated_json" | jq -r '
+                .results // [] | .[] |
+                "\(.manager):" as $mgr |
+                .outdated // [] | .[] |
+                "  \($mgr) \(.name): \(.current) -> \(.latest)"
+            ' 2>/dev/null || true
+            continue
+        fi
+
+        # Fetch changelogs for outdated deps
+        log_info "Fetching changelogs for $repo_name..."
+        local changelog_text=""
+        changelog_text=$(_fetch_changelogs_for_outdated "$outdated_json")
+
+        # Detect or use custom test command
+        local test_cmd
+        if [[ -n "$custom_test_cmd" ]]; then
+            test_cmd="$custom_test_cmd"
+        else
+            test_cmd=$(detect_test_command "$repo_path")
+        fi
+        if [[ -z "$test_cmd" ]]; then
+            log_warn "No test command detected for $repo_name, tests will be skipped"
+            test_cmd="echo 'No tests configured'"
+        fi
+
+        # Generate the combined prompt
+        local prompt
+        prompt=$(generate_depupdate_prompt_combined \
+            "$repo_path" \
+            "$outdated_json" \
+            "$test_cmd" \
+            "--changelog=$changelog_text" \
+            "--max-attempts=$max_fix_attempts")
+
+        # Write prompt to temp file
+        local prompt_file
+        prompt_file=$(write_prompt_to_file "$prompt")
+        if [[ -z "$prompt_file" || ! -f "$prompt_file" ]]; then
+            log_error "Failed to create prompt file for $repo_name"
+            ((failed++))
+            continue
+        fi
+
+        # Spawn AI session
+        log_info "Spawning AI session for $repo_name..."
+        local session_result
+        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" \
+            "--timeout=$timeout_seconds" \
+            "--agent=$agent_type" \
+            "--prefix=dep-update")
+
+        # Clean up prompt file
+        rm -f "$prompt_file" 2>/dev/null
+
+        # Parse result
+        local status
+        status=$(echo "$session_result" | jq -r '.status // "unknown"')
+
+        case "$status" in
+            completed|idle)
+                log_success "Successfully updated dependencies in $repo_name"
+                ((updated++))
+                results+=("$(jq -n --arg repo "$repo_path" --argjson deps "$total_outdated" \
+                    '{repo: $repo, status: "success", deps_updated: $deps}')")
+
+                # Push if not --no-push
+                if [[ "$no_push" != "true" ]]; then
+                    log_info "Pushing changes for $repo_name..."
+                    if ! git -C "$repo_path" push 2>/dev/null; then
+                        log_warn "Failed to push $repo_name (changes are committed locally)"
+                    fi
+                fi
+                ;;
+            timeout)
+                log_warn "Timeout while updating $repo_name"
+                ((failed++))
+                results+=("$(jq -n --arg repo "$repo_path" '{repo: $repo, status: "timeout"}')")
+                ;;
+            error|*)
+                local error_msg
+                error_msg=$(echo "$session_result" | jq -r '.error // "Unknown error"')
+                log_error "Failed to update $repo_name: $error_msg"
+                ((failed++))
+                results+=("$(jq -n --arg repo "$repo_path" --arg err "$error_msg" \
+                    '{repo: $repo, status: "error", error: $err}')")
+                ;;
+        esac
+    done
+
+    # Print summary
+    echo ""
+    log_info "=== dep-update Summary ==="
+    log_info "Processed: $processed repos"
+    log_info "Updated:   $updated repos"
+    log_info "Failed:    $failed repos"
+    log_info "Skipped:   $skipped repos (no outdated deps or filtered out)"
+
+    # JSON output if requested
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local results_json
+        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.')
+        jq -n \
+            --argjson results "$results_json" \
+            --arg processed "$processed" \
+            --arg updated "$updated" \
+            --arg failed "$failed" \
+            --arg skipped "$skipped" \
+            '{processed: ($processed|tonumber), updated: ($updated|tonumber), failed: ($failed|tonumber), skipped: ($skipped|tonumber), results: $results}'
+    fi
+
+    # Exit code based on results
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Filter outdated deps JSON by include/exclude patterns.
+# Usage: _filter_outdated_deps <outdated_json> <include_pattern> <exclude_pattern>
+# Returns: Filtered JSON with recalculated total_outdated
+_filter_outdated_deps() {
+    local json="$1"
+    local include_pat="$2"
+    local exclude_pat="$3"
+
+    # Use jq to filter packages in the results array
+    local filtered
+    filtered=$(echo "$json" | jq --arg inc "$include_pat" --arg exc "$exclude_pat" '
+        .results = (.results // [] | map(
+            .outdated = (.outdated // [] | map(
+                select(
+                    (if $inc != "" then (.name | test($inc)) else true end) and
+                    (if $exc != "" then (.name | test($exc) | not) else true end)
+                )
+            ))
+        )) |
+        .total_outdated = ([.results[].outdated | length] | add // 0)
+    ' 2>/dev/null) || filtered="$json"
+
+    echo "$filtered"
+}
+
+# Filter out major version updates from outdated deps JSON.
+# Usage: _filter_major_updates <outdated_json>
+# Returns: Filtered JSON without major updates
+_filter_major_updates() {
+    local json="$1"
+
+    # Filter out packages where major version differs
+    local filtered
+    filtered=$(echo "$json" | jq '
+        def is_major_update:
+            (.current // "0") as $curr |
+            (.latest // "0") as $lat |
+            ($curr | split(".")[0] // "0") as $curr_major |
+            ($lat | split(".")[0] // "0") as $lat_major |
+            $curr_major != $lat_major;
+
+        .results = (.results // [] | map(
+            .outdated = (.outdated // [] | map(select(is_major_update | not)))
+        )) |
+        .total_outdated = ([.results[].outdated | length] | add // 0)
+    ' 2>/dev/null) || filtered="$json"
+
+    echo "$filtered"
+}
+
+# Fetch changelogs for all outdated packages.
+# Usage: _fetch_changelogs_for_outdated <outdated_json>
+# Returns: Combined changelog text
+_fetch_changelogs_for_outdated() {
+    local json="$1"
+    local changelog_text=""
+    local max_changelogs=10
+    local count=0
+
+    # Extract package info and fetch changelogs
+    local packages
+    packages=$(echo "$json" | jq -r '
+        .results // [] | .[] |
+        .manager as $mgr |
+        .outdated // [] | .[] |
+        "\($mgr)|\(.name)|\(.current)|\(.latest)"
+    ' 2>/dev/null)
+
+    while IFS='|' read -r manager name current latest; do
+        [[ -z "$name" ]] && continue
+        ((count >= max_changelogs)) && break
+
+        log_debug "Fetching changelog for $name ($current -> $latest)..."
+        local changelog
+        changelog=$(fetch_changelog "$name" "$current" "$latest" "--manager=$manager" 2>/dev/null) || changelog=""
+
+        if [[ -n "$changelog" ]]; then
+            changelog_text+="
+### $name ($current -> $latest)
+$changelog
+"
+            ((count++))
+        fi
+    done <<< "$packages"
+
+    if [[ -z "$changelog_text" ]]; then
+        changelog_text="No changelogs could be fetched. Check package documentation manually."
+    fi
+
+    echo "$changelog_text"
+}
+
+# Print dep-update help
+_dep_update_help() {
+    cat >&2 <<'EOF'
+Usage: ru dep-update [OPTIONS]
+
+Update dependencies across repositories using AI-powered analysis.
+
+Options:
+  --dry-run             Show what would be updated (no changes)
+  --manager=NAME        Only update deps for specific manager (npm, pip, cargo, etc.)
+  --include=PATTERN     Only update deps matching regex pattern
+  --exclude=PATTERN     Skip deps matching regex pattern
+  --major               Include major version updates (default: skip major)
+  --test-cmd=CMD        Custom test command (overrides auto-detection)
+  --max-fix-attempts=N  Max fix iterations per dependency (default: 5)
+  --no-push             Commit changes but don't push to remote
+  --repo=PATH           Process single repo only (default: all repos)
+  --agent=TYPE          Agent type: claude (default), codex, gemini
+  --timeout=SEC         Per-repo timeout in seconds (default: 900)
+
+The AI agent will:
+1. Analyze outdated dependencies and changelogs for breaking changes
+2. Create a migration plan based on risk assessment
+3. Update each dependency one at a time
+4. Run tests after each update and fix failures
+5. Commit each successful update with descriptive message
+6. Roll back and report any dependencies that can't be updated
+
+Examples:
+  ru dep-update                          # Update all deps in all repos
+  ru dep-update --dry-run                # Show what would be updated
+  ru dep-update --repo=./my-project      # Update single repo
+  ru dep-update --manager=npm            # Only npm packages
+  ru dep-update --major                  # Include major version updates
+  ru dep-update --include='react|vue'    # Only update matching packages
+  ru dep-update --exclude='typescript'   # Skip matching packages
+
+Exit Codes:
+  0  All updates successful
+  1  Some dependencies failed to update
+  3  Missing dependencies (ntm, claude-code)
+  4  Invalid arguments
+EOF
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP PER-REPO CONFIGURATION
+# Load per-repository agent-sweep configuration from .ru-agent.yml/.json
+#------------------------------------------------------------------------------
+
+# Default agent-sweep per-repo config values
+declare -g AGENT_SWEEP_ENABLED="true"
+declare -g AGENT_SWEEP_MAX_FILE_MB="10"
+declare -g AGENT_SWEEP_MAX_FILE_SIZE="10485760"
+declare -g AGENT_SWEEP_MAX_FILE_MB_OVERRIDE=""
+declare -ga AGENT_SWEEP_SKIP_PHASES=()
+declare -g AGENT_SWEEP_EXTRA_CONTEXT=""
+declare -g AGENT_SWEEP_PRE_HOOK=""
+declare -g AGENT_SWEEP_POST_HOOK=""
+declare -ga AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
+declare -a AGENT_SWEEP_ALLOW_BINARY_PATTERNS_DEFAULT=(
+    "*.png"
+    "*.jpg"
+    "*.jpeg"
+    "*.gif"
+    "*.ico"
+    "*.woff"
+    "*.woff2"
+)
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP PHASE PROMPTS
+# Default prompts for each phase of the agent-sweep workflow.
+# Each phase produces structured JSON output between markers.
+#------------------------------------------------------------------------------
+
+# Phase 1: Understanding - analyze the codebase and changes
+# Output markers: RU_UNDERSTANDING_JSON_BEGIN / RU_UNDERSTANDING_JSON_END
+read -r -d '' AGENT_SWEEP_PHASE1_PROMPT_DEFAULT << 'EOF_PHASE1'
+First read AGENTS.md (if present) and README.md (if present) carefully.
+If a file is missing, explicitly note that and continue.
+Then use your investigation mode to understand the codebase architecture,
+entrypoints, conventions, and what the current changes appear to be.
+At the end, output a short structured summary as JSON between:
+RU_UNDERSTANDING_JSON_BEGIN
+{ "summary": "...", "conventions": [...], "risks": [...], "notes": [...] }
+RU_UNDERSTANDING_JSON_END
+EOF_PHASE1
+
+# Phase 2: Commit Plan - plan the commits without executing
+# Output markers: RU_COMMIT_PLAN_JSON_BEGIN / RU_COMMIT_PLAN_JSON_END
+read -r -d '' AGENT_SWEEP_PHASE2_PROMPT_DEFAULT << 'EOF_PHASE2'
+Now, based on your knowledge of the project, DO NOT run git commands.
+Instead, produce a COMMIT PLAN as JSON between these markers:
+RU_COMMIT_PLAN_JSON_BEGIN
+{ ... }
+RU_COMMIT_PLAN_JSON_END
+
+Rules:
+- Do not edit any code or files.
+- Do not include ephemeral/ignored files (.pyc, node_modules, __pycache__, etc.).
+- Group changes into logically connected commits.
+- For each commit, include:
+  - "files": explicit list of paths to stage
+  - "message": full commit message (subject + body)
+- Include "push": true/false
+- Include "excluded_files": list of files excluded and why
+Use ultrathink.
+
+Expected schema:
+{
+  "commits": [
+    {"files": ["path/a", "path/b"], "message": "feat(x): summary\n\nBody..."},
+    {"files": ["path/c"], "message": "fix(y): summary\n\nBody..."}
+  ],
+  "push": true,
+  "excluded_files": [
+    {"path": "__pycache__/foo.pyc", "reason": "bytecode cache"}
+  ],
+  "assumptions": ["No breaking changes detected"],
+  "risks": ["Large diff in core module"]
+}
+EOF_PHASE2
+
+# Phase 3: Release Plan - plan any release actions without executing
+# Output markers: RU_RELEASE_PLAN_JSON_BEGIN / RU_RELEASE_PLAN_JSON_END
+read -r -d '' AGENT_SWEEP_PHASE3_PROMPT_DEFAULT << 'EOF_PHASE3'
+If a release is warranted based on the changes, DO NOT execute release commands.
+Produce a RELEASE PLAN as JSON between:
+RU_RELEASE_PLAN_JSON_BEGIN
+{ ... }
+RU_RELEASE_PLAN_JSON_END
+
+Include:
+- "version": proposed version (or null if no release needed)
+- "tag": proposed tag (or null)
+- "changelog_entry": text to add to CHANGELOG
+- "version_files": files to update with new version
+- "checks": actions to verify before release (tests/CI)
+Use ultrathink.
+
+Expected schema:
+{
+  "version": "1.2.0",
+  "tag": "v1.2.0",
+  "changelog_entry": "## v1.2.0 (2026-01-06)\n\n### Added\n- ...",
+  "version_files": [
+    {"path": "VERSION", "old": "1.1.0", "new": "1.2.0"}
+  ],
+  "checks": ["tests", "lint"]
+}
+EOF_PHASE3
+
+# Effective phase prompts (may be overridden by env vars or per-repo files)
+declare -g AGENT_SWEEP_PHASE1_PROMPT="${AGENT_SWEEP_PHASE1_PROMPT:-$AGENT_SWEEP_PHASE1_PROMPT_DEFAULT}"
+declare -g AGENT_SWEEP_PHASE2_PROMPT="${AGENT_SWEEP_PHASE2_PROMPT:-$AGENT_SWEEP_PHASE2_PROMPT_DEFAULT}"
+declare -g AGENT_SWEEP_PHASE3_PROMPT="${AGENT_SWEEP_PHASE3_PROMPT:-$AGENT_SWEEP_PHASE3_PROMPT_DEFAULT}"
+
+# Get the effective prompt for a given phase, with override precedence:
+# 1. Per-repo file: $repo_path/.ru/phase{1,2,3}-prompt.txt (highest priority)
+# 2. Environment variable: AGENT_SWEEP_PHASE{1,2,3}_PROMPT
+# 3. Default prompt (lowest priority)
+# Usage: get_effective_phase_prompt <phase_number> [repo_path]
+# Args:
+#   phase_number: 1, 2, or 3
+#   repo_path: optional path to repo for per-repo overrides
+# Returns: The effective prompt text
+get_effective_phase_prompt() {
+    local phase="${1:-}"
+    local repo_path="${2:-}"
+
+    # Validate phase number
+    case "$phase" in
+        1|2|3) ;;
+        *)
+            echo "Invalid phase: $phase. Must be 1, 2, or 3." >&2
+            return 1
+            ;;
+    esac
+
+    # Check for per-repo prompt file first (highest priority)
+    if [[ -n "$repo_path" && -d "$repo_path" ]]; then
+        local prompt_file="$repo_path/.ru/phase${phase}-prompt.txt"
+        if [[ -f "$prompt_file" ]]; then
+            cat "$prompt_file"
+            return 0
+        fi
+    fi
+
+    # Return the effective prompt (env var override or default)
+    case "$phase" in
+        1) echo "$AGENT_SWEEP_PHASE1_PROMPT" ;;
+        2) echo "$AGENT_SWEEP_PHASE2_PROMPT" ;;
+        3) echo "$AGENT_SWEEP_PHASE3_PROMPT" ;;
+    esac
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP PLAN EXTRACTION
+# Functions to extract structured JSON plans from agent pane output.
+#------------------------------------------------------------------------------
+
+# Validate JSON structure
+# Reads JSON from stdin and validates it
+# Returns: 0 if valid JSON, 1 otherwise
+json_validate() {
+    if command -v jq &>/dev/null; then
+        jq empty 2>/dev/null
+    elif command -v python3 &>/dev/null; then
+        python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null
+    else
+        # Best effort: check content starts with { and ends with }
+        # Note: bash regex '.' doesn't match newlines, so we compress first
+        local content
+        content=$(cat)
+        # Remove all whitespace to get a single-line representation
+        local compressed
+        compressed=$(printf '%s' "$content" | tr -d '\n\r\t ')
+        # Check first and last characters are braces
+        [[ "${compressed:0:1}" == "{" && "${compressed: -1}" == "}" ]]
+    fi
+}
+
+# Extract JSON between markers from pane output
+# Usage: extract_plan_json "$pane_output" "COMMIT_PLAN"
+# Args:
+#   $1: pane_output - raw output from agent pane
+#   $2: marker_name - one of: UNDERSTANDING, COMMIT_PLAN, RELEASE_PLAN
+# Returns: JSON string on stdout, or empty if not found
+# Exit: 0 if valid JSON extracted, 1 if not found or invalid
+extract_plan_json() {
+    local pane_output="$1"
+    local marker="${2:-}"
+
+    [[ -z "$marker" ]] && return 1
+
+    local begin_marker="RU_${marker}_JSON_BEGIN"
+    local end_marker="RU_${marker}_JSON_END"
+
+    # Strip ANSI escape codes before processing
+    local clean_output
+    clean_output=$(echo "$pane_output" | sed 's/\x1b\[[0-9;]*m//g')
+
+    # Extract content between markers (excluding the marker lines)
+    local json
+    json=$(echo "$clean_output" | sed -n "/${begin_marker}/,/${end_marker}/p" | \
+           sed "1d;\$d")
+
+    # Check if we got anything
+    if [[ -z "$json" ]]; then
+        return 1  # Markers not found
+    fi
+
+    # Validate it's valid JSON
+    if echo "$json" | json_validate; then
+        echo "$json"
+        return 0
+    else
+        # Log warning but don't fail - preserve raw output for debugging
+        log_warn "Extracted content between ${begin_marker}...${end_marker} is not valid JSON"
+        return 1
+    fi
+}
+
+# Capture output from a tmux pane
+# Usage: capture_pane_output "session_name" [lines]
+# Args:
+#   $1: session - tmux session name
+#   $2: lines - number of lines to capture (default: 10000)
+# Returns: pane content on stdout
+# Exit: 0 on success, 1 on failure
+capture_pane_output() {
+    local session="$1"
+    local lines="${2:-10000}"
+
+    [[ -z "$session" ]] && return 1
+
+    # Check if session exists
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        log_warn "Session '$session' not found"
+        return 1
+    fi
+
+    # Capture pane output (pane 1 is the agent pane in our layout)
+    # -p: print to stdout, -S: start line (negative = from scrollback)
+    tmux capture-pane -t "${session}:0.1" -p -S -"$lines" 2>/dev/null
+}
+
+# Extract all plans from pane output
+# Usage: extract_all_plans "$pane_output" "$artifacts_dir"
+# Args:
+#   $1: pane_output - raw output from agent pane
+#   $2: artifacts_dir - directory to save extracted plans
+# Returns: 0 if at least one plan extracted, 1 if none found
+extract_all_plans() {
+    local pane_output="$1"
+    local artifacts_dir="$2"
+    local found=0
+
+    [[ -z "$pane_output" || -z "$artifacts_dir" ]] && return 1
+
+    ensure_dir "$artifacts_dir"
+
+    # Try to extract each plan type
+    local plan_json
+
+    # Understanding plan (Phase 1)
+    if plan_json=$(extract_plan_json "$pane_output" "UNDERSTANDING"); then
+        echo "$plan_json" > "$artifacts_dir/understanding.json"
+        found=1
+    fi
+
+    # Commit plan (Phase 2)
+    if plan_json=$(extract_plan_json "$pane_output" "COMMIT_PLAN"); then
+        echo "$plan_json" > "$artifacts_dir/commit_plan.json"
+        found=1
+    fi
+
+    # Release plan (Phase 3)
+    if plan_json=$(extract_plan_json "$pane_output" "RELEASE_PLAN"); then
+        echo "$plan_json" > "$artifacts_dir/release_plan.json"
+        found=1
+    fi
+
+    [[ $found -eq 1 ]] && return 0
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP COMMIT PLAN VALIDATION
+#
+# Validate commit plan JSON for safety and guardrails.
+# Sets VALIDATION_ERROR (fatal) and VALIDATION_WARNINGS (non-fatal).
+#------------------------------------------------------------------------------
+
+# Validate commit plan before execution.
+# Args: $1=commit_plan_json, $2=repo_path
+# Returns: 0=valid, 1=blocked
+validate_commit_plan() {
+    local plan_json="$1"
+    local repo_path="$2"
+
+    VALIDATION_ERROR=""
+    VALIDATION_WARNINGS=()
+
+    if [[ -z "$plan_json" ]]; then
+        VALIDATION_ERROR="Commit plan is empty"
+        return 1
+    fi
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        VALIDATION_ERROR="Invalid repo path for commit plan validation"
+        return 1
+    fi
+
+    if ! echo "$plan_json" | json_validate; then
+        VALIDATION_ERROR="Invalid JSON structure in commit plan"
+        return 1
+    fi
+
+    local commits_json push_flag
+    commits_json=$(json_get_field "$plan_json" "commits" || echo "")
+    push_flag=$(json_get_field "$plan_json" "push" || echo "")
+
+    if [[ -z "$commits_json" || "$commits_json" == "null" ]]; then
+        VALIDATION_ERROR="Missing or empty commits array in plan"
+        return 1
+    fi
+
+    local commit_count=0
+
+    if command -v jq &>/dev/null; then
+        if ! echo "$commits_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            VALIDATION_ERROR="Missing or empty commits array in plan"
+            return 1
+        fi
+
+        while IFS= read -r commit_json; do
+            ((commit_count++))
+
+            if ! echo "$commit_json" | jq -e '.message | type == "string" and (gsub("^\\s+|\\s+$";"") | length > 0)' >/dev/null 2>&1; then
+                VALIDATION_ERROR="Commit $commit_count has no message"
+                return 1
+            fi
+
+            if ! echo "$commit_json" | jq -e '.files | type == "array" and length > 0 and all(.[]; type == "string" and (gsub("^\\s+|\\s+$";"") | length > 0))' >/dev/null 2>&1; then
+                VALIDATION_ERROR="Commit $commit_count has no files"
+                return 1
+            fi
+
+            local -a files=()
+            mapfile -t files < <(echo "$commit_json" | jq -r '.files[] | gsub("^\\s+|\\s+$";"")' 2>/dev/null)
+            if [[ ${#files[@]} -eq 0 ]]; then
+                VALIDATION_ERROR="Commit $commit_count has no files"
+                return 1
+            fi
+
+            local file
+            for file in "${files[@]}"; do
+                [[ -z "$file" ]] && continue
+                local normalized
+                normalized="${file#./}"
+                case "$normalized" in
+                    ""|".")
+                        VALIDATION_ERROR="Commit $commit_count has empty file path"
+                        return 1
+                        ;;
+                    /*)
+                        VALIDATION_ERROR="Commit $commit_count has absolute file path: $file"
+                        return 1
+                        ;;
+                    ../*|*/../*|*/..|..)
+                        VALIDATION_ERROR="Commit $commit_count has unsafe path: $file"
+                        return 1
+                        ;;
+                esac
+                file="$normalized"
+
+                if is_file_denied "$file"; then
+                    VALIDATION_ERROR="Denied file in commit $commit_count: $file"
+                    return 1
+                fi
+
+                if [[ ! -e "$repo_path/$file" ]]; then
+                    VALIDATION_WARNINGS+=("File not found: $file (will be skipped)")
+                    continue
+                fi
+
+                if [[ -f "$repo_path/$file" ]]; then
+                    if is_file_too_large "$repo_path/$file"; then
+                        local size_mb
+                        size_mb=$(get_file_size_mb "$repo_path/$file")
+                        VALIDATION_ERROR="File too large: $file (${size_mb}MB > ${AGENT_SWEEP_MAX_FILE_MB}MB limit)"
+                        return 1
+                    fi
+
+                    if is_binary_file "$repo_path/$file"; then
+                        if ! is_binary_allowed "$file"; then
+                            VALIDATION_ERROR="Binary file not allowed: $file"
+                            return 1
+                        fi
+                        VALIDATION_WARNINGS+=("Binary file included: $file (explicitly allowed)")
+                    fi
+                fi
+            done
+        done < <(echo "$commits_json" | jq -c '.[]' 2>/dev/null)
+    elif command -v python3 &>/dev/null; then
+        local parsed_lines
+        parsed_lines=$(PLAN_JSON="$plan_json" python3 - <<'PY'
+import json, os, sys
+
+try:
+    data = json.loads(os.environ.get("PLAN_JSON", ""))
+except Exception:
+    print("ERROR\tInvalid JSON structure in commit plan")
+    sys.exit(2)
+
+commits = data.get("commits")
+if not isinstance(commits, list) or len(commits) == 0:
+    print("ERROR\tMissing or empty commits array in plan")
+    sys.exit(2)
+
+print(f"COUNT\t{len(commits)}")
+for idx, commit in enumerate(commits, 1):
+    files = commit.get("files")
+    message = commit.get("message", "")
+    if not isinstance(files, list) or len(files) == 0:
+        print(f"ERROR\tCommit {idx} has no files")
+        sys.exit(2)
+    if not isinstance(message, str) or not message.strip():
+        print(f"ERROR\tCommit {idx} has no message")
+        sys.exit(2)
+    if not all(isinstance(f, str) and f.strip() for f in files):
+        print(f"ERROR\tCommit {idx} has invalid files")
+        sys.exit(2)
+    for f in files:
+        f = f.strip()
+        print(f"FILE\t{idx}\t{f}")
+PY
+)
+        local parse_status=$?
+        if [[ $parse_status -ne 0 ]]; then
+            local err_line
+            err_line=$(echo "$parsed_lines" | head -n1)
+            VALIDATION_ERROR="${err_line#ERROR	}"
+            [[ -z "$VALIDATION_ERROR" ]] && VALIDATION_ERROR="Invalid commit plan"
+            return 1
+        fi
+
+        local line
+        while IFS=$'\t' read -r kind idx file; do
+            case "$kind" in
+                COUNT)
+                    commit_count="$idx"
+                    ;;
+                FILE)
+                    [[ -z "$file" ]] && continue
+                    local normalized
+                    normalized="${file#./}"
+                    case "$normalized" in
+                        ""|".")
+                            VALIDATION_ERROR="Commit $idx has empty file path"
+                            return 1
+                            ;;
+                        /*)
+                            VALIDATION_ERROR="Commit $idx has absolute file path: $file"
+                            return 1
+                            ;;
+                        ../*|*/../*|*/..|..)
+                            VALIDATION_ERROR="Commit $idx has unsafe path: $file"
+                            return 1
+                            ;;
+                    esac
+                    file="$normalized"
+
+                    if is_file_denied "$file"; then
+                        VALIDATION_ERROR="Denied file in commit $idx: $file"
+                        return 1
+                    fi
+
+                    if [[ ! -e "$repo_path/$file" ]]; then
+                        VALIDATION_WARNINGS+=("File not found: $file (will be skipped)")
+                        continue
+                    fi
+
+                    if [[ -f "$repo_path/$file" ]]; then
+                        if is_file_too_large "$repo_path/$file"; then
+                            local size_mb
+                            size_mb=$(get_file_size_mb "$repo_path/$file")
+                            VALIDATION_ERROR="File too large: $file (${size_mb}MB > ${AGENT_SWEEP_MAX_FILE_MB}MB limit)"
+                            return 1
+                        fi
+
+                        if is_binary_file "$repo_path/$file"; then
+                            if ! is_binary_allowed "$file"; then
+                                VALIDATION_ERROR="Binary file not allowed: $file"
+                                return 1
+                            fi
+                            VALIDATION_WARNINGS+=("Binary file included: $file (explicitly allowed)")
+                        fi
+                    fi
+                    ;;
+            esac
+        done <<<"$parsed_lines"
+    else
+        VALIDATION_ERROR="Commit plan validation requires jq or python3"
+        return 1
+    fi
+
+    local max_commits="${AGENT_SWEEP_MAX_COMMITS:-50}"
+    if is_positive_int "$max_commits" && [[ "$commit_count" -gt "$max_commits" ]]; then
+        VALIDATION_ERROR="Too many commits in plan: $commit_count (max $max_commits)"
+        return 1
+    fi
+
+    local secret_mode="${AGENT_SWEEP_SECRET_SCAN:-warn}"
+    if [[ "$secret_mode" != "none" ]]; then
+        local secret_result secret_exit
+        secret_result=$(run_secret_scan "$repo_path")
+        secret_exit=$?
+        if [[ $secret_exit -ne 0 ]]; then
+            local findings="Secrets detected in changes"
+            if command -v jq &>/dev/null; then
+                local joined
+                joined=$(echo "$secret_result" | jq -r '.findings[]?' 2>/dev/null | paste -sd ';' -)
+                [[ -n "$joined" ]] && findings="$joined"
+            else
+                local raw_findings
+                raw_findings=$(json_get_field "$secret_result" "findings" || echo "")
+                [[ -n "$raw_findings" ]] && findings="$raw_findings"
+            fi
+
+            if [[ "$secret_mode" == "block" && $secret_exit -eq 1 ]]; then
+                VALIDATION_ERROR="Secrets detected: $findings"
+                return 1
+            fi
+            VALIDATION_WARNINGS+=("Secret scan warning: $findings")
+        fi
+    fi
+
+    local warn
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for warn in ${VALIDATION_WARNINGS[@]+"${VALIDATION_WARNINGS[@]}"}; do
+        log_warn "  ⚠ $warn"
+    done
+
+    log_verbose "Commit plan validated: $commit_count commits, push=$push_flag"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP COMMIT PLAN EXECUTION
+#
+# Execute a validated commit plan with deterministic git operations.
+#------------------------------------------------------------------------------
+
+# Stage files and create a commit.
+# Args: $1=repo_path, $2=commit_index, $3=message, $4...=files
+# Returns: 0=success, 1=failure
+commit_plan_stage_and_commit() {
+    local repo_path="$1"
+    local commit_index="$2"
+    local message="$3"
+    shift 3
+    local -a files=("$@")
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        log_error "Invalid repo path for commit execution"
+        return 1
+    fi
+    if [[ -z "$message" ]]; then
+        log_error "Commit $commit_index has empty message"
+        return 1
+    fi
+
+    local staged_any=false
+    local file output exit_code
+
+    for file in "${files[@]}"; do
+        [[ -z "$file" ]] && continue
+
+        if [[ -d "$repo_path/$file" ]]; then
+            log_error "Commit $commit_index includes directory path: $file"
+            return 1
+        fi
+
+        if [[ -e "$repo_path/$file" ]]; then
+            if output=$(git -C "$repo_path" add -A -- "$file" 2>&1); then
+                staged_any=true
+            else
+                exit_code=$?
+                log_error "Failed to stage $file for commit $commit_index: $output"
+                return "$exit_code"
+            fi
+            continue
+        fi
+
+        if git -C "$repo_path" ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+            if output=$(git -C "$repo_path" add -A -- "$file" 2>&1); then
+                staged_any=true
+            else
+                exit_code=$?
+                log_error "Failed to stage deletion for $file in commit $commit_index: $output"
+                return "$exit_code"
+            fi
+            continue
+        fi
+
+        log_warn "File not found, skipping: $file"
+    done
+
+    if [[ "$staged_any" != "true" ]]; then
+        log_error "No files staged for commit $commit_index"
+        return 1
+    fi
+
+    if git -C "$repo_path" diff --cached --quiet 2>/dev/null; then
+        log_error "No staged changes for commit $commit_index"
+        return 1
+    fi
+
+    local commit_output commit_exit
+    if commit_output=$(git -C "$repo_path" commit -m "$message" 2>&1); then
+        commit_exit=0
+    else
+        commit_exit=$?
+    fi
+
+    if [[ $commit_exit -ne 0 ]]; then
+        log_error "Commit $commit_index failed: $commit_output"
+        return "$commit_exit"
+    fi
+
+    log_verbose "Created commit $commit_index: ${message%%$'\n'*}"
+    return 0
+}
+
+# Execute commit plan after validation.
+# Args: $1=commit_plan_json, $2=repo_path
+# Returns: 0=success, 1=failure
+execute_commit_plan() {
+    local plan_json="$1"
+    local repo_path="$2"
+
+    if [[ -z "$plan_json" ]]; then
+        log_error "Commit plan is empty"
+        return 1
+    fi
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        log_error "Invalid repo path for commit plan execution"
+        return 1
+    fi
+
+    local exec_mode="${AGENT_SWEEP_EXECUTION_MODE:-agent}"
+    if [[ "$exec_mode" == "plan" ]]; then
+        capture_plan_json "$repo_path" "commit" "$plan_json" || true
+        log_info "Plan mode enabled; skipping commit execution"
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required to execute commit plans"
+        return 1
+    fi
+
+    if ! validate_commit_plan "$plan_json" "$repo_path"; then
+        log_error "Commit plan validation failed: ${VALIDATION_ERROR:-unknown error}"
+        return 1
+    fi
+
+    local push_flag
+    push_flag=$(json_get_field "$plan_json" "push" || echo "")
+    [[ -z "$push_flag" || "$push_flag" == "null" ]] && push_flag="false"
+
+    local commit_index=0
+    local commit_json
+    while IFS= read -r commit_json; do
+        ((commit_index++))
+
+        local message
+        message=$(echo "$commit_json" | jq -r '.message // empty' 2>/dev/null)
+        if [[ -z "$message" ]]; then
+            log_error "Commit $commit_index has no message"
+            return 1
+        fi
+
+        local -a files=()
+        mapfile -t files < <(echo "$commit_json" | jq -r '.files[] | gsub("^\\s+|\\s+$";"")' 2>/dev/null)
+        if [[ ${#files[@]} -eq 0 ]]; then
+            log_error "Commit $commit_index has no files"
+            return 1
+        fi
+
+        log_info "Applying commit $commit_index..."
+        if ! commit_plan_stage_and_commit "$repo_path" "$commit_index" "$message" "${files[@]}"; then
+            return 1
+        fi
+    done < <(echo "$plan_json" | jq -c '.commits[]' 2>/dev/null)
+
+    if [[ $commit_index -eq 0 ]]; then
+        log_error "No commits to apply from plan"
+        return 1
+    fi
+
+    if [[ "$push_flag" == "true" ]]; then
+        local output exit_code
+        if output=$(git -C "$repo_path" push 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+
+        if [[ $exit_code -ne 0 ]]; then
+            log_error "Push failed: $output"
+            return "$exit_code"
+        fi
+        log_info "Pushed to remote"
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RELEASE PLAN VALIDATION
+#
+# Validate release plan JSON for safety and guardrails.
+# Sets VALIDATION_ERROR (fatal) and VALIDATION_WARNINGS (non-fatal).
+#------------------------------------------------------------------------------
+
+# Validate release plan before execution.
+# Args: $1=release_plan_json, $2=repo_path
+# Returns: 0=valid, 1=blocked
+# Side effects: Sets VALIDATION_ERROR on failure, VALIDATION_WARNINGS array
+validate_release_plan() {
+    local plan_json="$1"
+    local repo_path="$2"
+
+    VALIDATION_ERROR=""
+    VALIDATION_WARNINGS=()
+
+    if [[ -z "$plan_json" ]]; then
+        VALIDATION_ERROR="Release plan is empty"
+        return 1
+    fi
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        VALIDATION_ERROR="Invalid repo path for release plan validation"
+        return 1
+    fi
+
+    if ! echo "$plan_json" | json_validate; then
+        VALIDATION_ERROR="Invalid JSON structure in release plan"
+        return 1
+    fi
+
+    # Extract required fields
+    local version tag_name title body files_json
+    version=$(json_get_field "$plan_json" "version" || echo "")
+    tag_name=$(json_get_field "$plan_json" "tag_name" || echo "")
+    title=$(json_get_field "$plan_json" "title" || echo "")
+    body=$(json_get_field "$plan_json" "body" || echo "")
+    files_json=$(json_get_field "$plan_json" "files" || echo "")
+
+    # 1. Validate version format (semver: vX.Y.Z or X.Y.Z)
+    if [[ -z "$version" || "$version" == "null" ]]; then
+        VALIDATION_ERROR="Missing version in release plan"
+        return 1
+    fi
+    if ! [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$ ]]; then
+        VALIDATION_ERROR="Invalid version format: $version (expected semver like v1.2.3 or 1.2.3)"
+        return 1
+    fi
+
+    # 2. Validate tag_name
+    if [[ -z "$tag_name" || "$tag_name" == "null" ]]; then
+        # Default to version if tag_name not provided
+        tag_name="$version"
+    fi
+    # Align with execute_release_plan behavior: prefix v if version has v
+    if [[ "$version" == v* && "$tag_name" != v* ]]; then
+        tag_name="v$tag_name"
+    fi
+    # Check tag doesn't already exist
+    if git -C "$repo_path" rev-parse "refs/tags/$tag_name" >/dev/null 2>&1; then
+        VALIDATION_ERROR="Tag already exists: $tag_name"
+        return 1
+    fi
+    # Validate tag name characters (no shell metacharacters)
+    if [[ "$tag_name" =~ [\;\&\|\$\`\(\)\{\}\<\>\'\"\!\#\*\?\\] ]]; then
+        VALIDATION_ERROR="Tag name contains unsafe characters: $tag_name"
+        return 1
+    fi
+
+    # 3. Validate title length
+    if [[ -n "$title" && "$title" != "null" ]]; then
+        local title_len=${#title}
+        if [[ $title_len -gt 200 ]]; then
+            VALIDATION_ERROR="Release title too long: $title_len chars (max 200)"
+            return 1
+        fi
+        # Check for shell metacharacters
+        if [[ "$title" =~ [\;\&\|\$\`] ]]; then
+            VALIDATION_ERROR="Release title contains unsafe shell characters"
+            return 1
+        fi
+    fi
+
+    # 4. Validate body length
+    if [[ -n "$body" && "$body" != "null" ]]; then
+        local body_len=${#body}
+        if [[ $body_len -gt 10000 ]]; then
+            VALIDATION_ERROR="Release body too long: $body_len chars (max 10000)"
+            return 1
+        fi
+    fi
+
+    # 5. Validate files array (release assets)
+    if [[ -n "$files_json" && "$files_json" != "null" && "$files_json" != "[]" ]]; then
+        if ! command -v jq &>/dev/null; then
+            VALIDATION_WARNINGS+=("jq not available, skipping release files validation")
+        else
+            if ! echo "$files_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                VALIDATION_ERROR="Release files must be an array"
+                return 1
+            fi
+
+            local -a files=()
+            mapfile -t files < <(echo "$files_json" | jq -r '.[]' 2>/dev/null)
+
+            local file
+            for file in "${files[@]}"; do
+                [[ -z "$file" ]] && continue
+
+                # Normalize path
+                local normalized="${file#./}"
+                case "$normalized" in
+                    ""|".")
+                        VALIDATION_ERROR="Release files contains empty path"
+                        return 1
+                        ;;
+                    /*)
+                        VALIDATION_ERROR="Release files contains absolute path: $file"
+                        return 1
+                        ;;
+                    ../*|*/../*|*/..|..)
+                        VALIDATION_ERROR="Release files contains unsafe path: $file"
+                        return 1
+                        ;;
+                esac
+
+                # Check against denylist
+                if is_file_denied "$normalized"; then
+                    VALIDATION_ERROR="Denied file in release assets: $normalized"
+                    return 1
+                fi
+
+                # Verify file exists
+                if [[ ! -f "$repo_path/$normalized" ]]; then
+                    VALIDATION_WARNINGS+=("Release asset not found: $normalized")
+                fi
+            done
+        fi
+    fi
+
+    # 6. Validate changelog if specified
+    local changelog
+    changelog=$(json_get_field "$plan_json" "changelog" || echo "")
+    if [[ -n "$changelog" && "$changelog" != "null" ]]; then
+        if [[ ! -f "$repo_path/$changelog" ]]; then
+            VALIDATION_WARNINGS+=("Changelog file not found: $changelog")
+        else
+            # Check if changelog mentions the version
+            local version_pattern="${version#v}"  # Remove leading v for matching
+            if ! grep -qE "(^#+.*${version_pattern}|^## \\[?${version_pattern})" "$repo_path/$changelog" 2>/dev/null; then
+                VALIDATION_WARNINGS+=("Changelog may not contain version $version header")
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Execute release plan after validation.
+# Args: $1=release_plan_json, $2=repo_path
+# Returns: 0=success, 1=failure
+# Side effects: Creates git tag, pushes to remote, creates GitHub release
+execute_release_plan() {
+    local plan_json="$1"
+    local repo_path="$2"
+
+    if [[ -z "$plan_json" ]]; then
+        log_error "Release plan is empty"
+        return 1
+    fi
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        log_error "Invalid repo path for release plan execution"
+        return 1
+    fi
+
+    # Check execution mode
+    local exec_mode="${AGENT_SWEEP_EXECUTION_MODE:-agent}"
+    if [[ "$exec_mode" == "plan" ]]; then
+        capture_plan_json "$repo_path" "release" "$plan_json" || true
+        log_info "Plan mode enabled; skipping release execution"
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required to execute release plans"
+        return 1
+    fi
+
+    # Validate the plan first
+    if ! validate_release_plan "$plan_json" "$repo_path"; then
+        log_error "Release plan validation failed: ${VALIDATION_ERROR:-unknown error}"
+        return 1
+    fi
+
+    # Log any warnings
+    local warning
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for warning in ${VALIDATION_WARNINGS[@]+"${VALIDATION_WARNINGS[@]}"}; do
+        log_warn "$warning"
+    done
+
+    # Extract fields
+    local version tag_name title body
+    version=$(echo "$plan_json" | jq -r '.version // empty' 2>/dev/null)
+    tag_name=$(echo "$plan_json" | jq -r '.tag_name // empty' 2>/dev/null)
+    title=$(echo "$plan_json" | jq -r '.title // empty' 2>/dev/null)
+    body=$(echo "$plan_json" | jq -r '.body // empty' 2>/dev/null)
+
+    # Default tag_name to version if not specified
+    [[ -z "$tag_name" ]] && tag_name="$version"
+    # Ensure tag starts with v if version does
+    [[ "$version" == v* && "$tag_name" != v* ]] && tag_name="v$tag_name"
+
+    # Default title to tag_name if not specified
+    [[ -z "$title" ]] && title="Release $tag_name"
+
+    # Check release strategy
+    local strategy
+    strategy=$(get_release_strategy "$repo_path")
+    case "$strategy" in
+        never)
+            log_info "Release strategy is 'never', skipping release for $repo_path"
+            return 0
+            ;;
+        tag-only)
+            log_info "Release strategy is 'tag-only', will create tag but no GitHub release"
+            ;;
+    esac
+
+    # Step 1: Create git tag locally
+    log_info "Creating tag: $tag_name"
+    local tag_output tag_exit
+    if tag_output=$(git -C "$repo_path" tag -a "$tag_name" -m "$title" 2>&1); then
+        tag_exit=0
+    else
+        tag_exit=$?
+    fi
+
+    if [[ $tag_exit -ne 0 ]]; then
+        log_error "Failed to create tag: $tag_output"
+        return 1
+    fi
+
+    # Step 2: Push tag to origin
+    log_info "Pushing tag to origin..."
+    local push_output push_exit
+    if push_output=$(git -C "$repo_path" push origin "$tag_name" 2>&1); then
+        push_exit=0
+    else
+        push_exit=$?
+    fi
+
+    if [[ $push_exit -ne 0 ]]; then
+        log_error "Failed to push tag: $push_output"
+        # Cleanup: delete local tag
+        git -C "$repo_path" tag -d "$tag_name" 2>/dev/null || true
+        return 1
+    fi
+
+    # If tag-only strategy, we're done
+    if [[ "$strategy" == "tag-only" ]]; then
+        log_info "Tag $tag_name created and pushed successfully"
+        return 0
+    fi
+
+    # Step 3: Check gh CLI availability
+    if ! command -v gh &>/dev/null; then
+        log_warn "gh CLI not available, cannot create GitHub release"
+        log_info "Tag $tag_name created and pushed, but GitHub release skipped"
+        return 0
+    fi
+
+    # Step 4: Create GitHub release
+    log_info "Creating GitHub release..."
+    local -a gh_args=("release" "create" "$tag_name")
+    gh_args+=("--title" "$title")
+
+    if [[ -n "$body" ]]; then
+        gh_args+=("--notes" "$body")
+    else
+        gh_args+=("--generate-notes")
+    fi
+
+    # Add release assets
+    local -a files=()
+    local files_json
+    files_json=$(echo "$plan_json" | jq -c '.files // []' 2>/dev/null || echo "[]")
+    if [[ "$files_json" != "[]" ]]; then
+        mapfile -t files < <(echo "$files_json" | jq -r '.[]' 2>/dev/null)
+        for file in "${files[@]}"; do
+            [[ -z "$file" ]] && continue
+            local asset_path="$repo_path/${file#./}"
+            if [[ -f "$asset_path" ]]; then
+                gh_args+=("$asset_path")
+            else
+                log_warn "Release asset not found, skipping: $file"
+            fi
+        done
+    fi
+
+    # Execute gh release create
+    local gh_output gh_exit
+    if gh_output=$(cd "$repo_path" && gh "${gh_args[@]}" 2>&1); then
+        gh_exit=0
+    else
+        gh_exit=$?
+    fi
+
+    if [[ $gh_exit -ne 0 ]]; then
+        log_error "Failed to create GitHub release: $gh_output"
+        # Note: We don't delete the tag here since it's already pushed
+        # The user can retry or manually create the release
+        return 1
+    fi
+
+    # Extract release URL from output
+    local release_url
+    release_url=$(echo "$gh_output" | grep -oE 'https://github.com/[^[:space:]]+' | head -1)
+    if [[ -n "$release_url" ]]; then
+        log_info "Release created: $release_url"
+    else
+        log_info "Release $tag_name created successfully"
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RELEASE WORKFLOW DETECTION
+#
+# Determine if a repository should have release automation (Phase 3).
+#------------------------------------------------------------------------------
+
+# Check if repo has release workflow configured.
+# Checks in order: per-repo config, user config, gh API, workflow files.
+# Usage: has_release_workflow /path/to/repo
+# Returns: 0 if release workflow detected, 1 otherwise
+has_release_workflow() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && return 1
+
+    local workflows_dir="$repo_path/.github/workflows"
+
+    # 1. Check explicit per-repo config first (highest priority)
+    local repo_config="$repo_path/.ru/agent-sweep.conf"
+    if [[ -f "$repo_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$repo_config" 2>/dev/null
+        case "${AGENT_SWEEP_RELEASE_STRATEGY:-}" in
+            never) return 1 ;;
+            tag-only|gh-release|auto) return 0 ;;
+        esac
+    fi
+
+    # 2. Check user-level per-repo config
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local user_config="${RU_CONFIG_DIR:-$HOME/.config/ru}/agent-sweep.d/${repo_name}.conf"
+    if [[ -f "$user_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$user_config" 2>/dev/null
+        case "${AGENT_SWEEP_RELEASE_STRATEGY:-}" in
+            never) return 1 ;;
+            tag-only|gh-release|auto) return 0 ;;
+        esac
+    fi
+
+    # 3. Use gh API if available (checks remote for release workflows)
+    if command -v gh &>/dev/null; then
+        local remote_url
+        remote_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null)
+        if [[ -n "$remote_url" ]]; then
+            # Extract owner/repo from URL
+            local repo_spec
+            repo_spec=$(echo "$remote_url" | sed -E 's#.*[:/]([^/]+/[^/]+)(\.git)?$#\1#')
+            if [[ -n "$repo_spec" ]]; then
+                # Check for release-related workflows
+                if gh workflow list -R "$repo_spec" 2>/dev/null | grep -qiE "release|deploy|publish"; then
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    # 4. Fallback: check local workflow files for release patterns
+    [[ -d "$workflows_dir" ]] || return 1
+
+    # Look for release-related triggers or jobs in workflow files
+    if compgen -G "$workflows_dir/*.yml" >/dev/null 2>&1 || \
+       compgen -G "$workflows_dir/*.yaml" >/dev/null 2>&1; then
+        # Check for common release patterns
+        if grep -riqE "(on:[[:space:]]*release|tags:|workflow_dispatch:|create:[[:space:]]*tags)" \
+           "$workflows_dir"/*.yml "$workflows_dir"/*.yaml 2>/dev/null; then
+            return 0
+        fi
+        # Check for release job names
+        if grep -riqE "(release|publish|deploy)" \
+           "$workflows_dir"/*.yml "$workflows_dir"/*.yaml 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Get the release strategy for a repo.
+# Returns: "never", "auto", "tag-only", or "gh-release"
+get_release_strategy() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && { echo "never"; return; }
+
+    # Check per-repo config
+    local repo_config="$repo_path/.ru/agent-sweep.conf"
+    if [[ -f "$repo_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$repo_config" 2>/dev/null
+        if [[ -n "$AGENT_SWEEP_RELEASE_STRATEGY" ]]; then
+            echo "$AGENT_SWEEP_RELEASE_STRATEGY"
+            return
+        fi
+    fi
+
+    # Check user config
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local user_config="${RU_CONFIG_DIR:-$HOME/.config/ru}/agent-sweep.d/${repo_name}.conf"
+    if [[ -f "$user_config" ]]; then
+        local AGENT_SWEEP_RELEASE_STRATEGY=""
+        # shellcheck disable=SC1090
+        source "$user_config" 2>/dev/null
+        if [[ -n "$AGENT_SWEEP_RELEASE_STRATEGY" ]]; then
+            echo "$AGENT_SWEEP_RELEASE_STRATEGY"
+            return
+        fi
+    fi
+
+    # Default: auto if has release workflow, never otherwise
+    if has_release_workflow "$repo_path"; then
+        echo "auto"
+    else
+        echo "never"
+    fi
+}
+
+# Load per-repo agent-sweep configuration.
+# Usage: load_repo_agent_config /path/to/repo
+# Returns: 0 on success (uses defaults if no config found), 1 on invalid args
+# Side effects: Sets AGENT_SWEEP_* globals based on config file
+load_repo_agent_config() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && return 1
+
+    # Reset to defaults before loading
+    AGENT_SWEEP_ENABLED="true"
+    AGENT_SWEEP_MAX_FILE_MB="10"
+    set_agent_sweep_max_file_mb "$AGENT_SWEEP_MAX_FILE_MB"
+    AGENT_SWEEP_SKIP_PHASES=()
+    AGENT_SWEEP_EXTRA_CONTEXT=""
+    AGENT_SWEEP_PRE_HOOK=""
+    AGENT_SWEEP_POST_HOOK=""
+    AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
+
+    # Find config file (YAML preferred, then JSON)
+    local config_file=""
+    for cfg in "$repo_path/.ru-agent.yml" "$repo_path/.ru-agent.yaml" "$repo_path/.ru-agent.json"; do
+        [[ -f "$cfg" ]] && { config_file="$cfg"; break; }
+    done
+    if [[ -z "$config_file" ]]; then
+        apply_agent_sweep_max_file_override
+        return 0  # No config = use defaults + CLI override
+    fi
+
+    # Parse config with layered fallbacks: yq > python3 > jq (JSON only)
+    local is_yaml=false
+    [[ "$config_file" == *.yml || "$config_file" == *.yaml ]] && is_yaml=true
+
+    # Helper: normalize truthy/falsy values to "true"/"false"
+    _normalize_bool() {
+        case "${1,,}" in  # ${1,,} lowercases the value (Bash 4.0+)
+            true|yes|1|on) echo "true" ;;
+            false|no|0|off|"") echo "false" ;;
+            *) echo "true" ;;  # Default to true for unknown values
+        esac
+    }
+
+    # shellcheck disable=SC2034  # AGENT_SWEEP_* vars are used by other functions
+    if $is_yaml && command -v yq &>/dev/null; then
+        # yq for YAML (preferred)
+        local raw_enabled
+        raw_enabled=$(yq -r '.agent_sweep.enabled // "true"' "$config_file" 2>/dev/null || echo "true")
+        AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
+        local raw_max_mb raw_max_bytes
+        raw_max_mb=$(yq -r '.agent_sweep.max_file_mb // ""' "$config_file" 2>/dev/null || echo "")
+        raw_max_bytes=$(yq -r '.agent_sweep.max_file_size // ""' "$config_file" 2>/dev/null || echo "")
+        apply_agent_sweep_max_file_limit "$raw_max_mb" "$raw_max_bytes"
+        AGENT_SWEEP_EXTRA_CONTEXT=$(yq -r '.agent_sweep.extra_context // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_PRE_HOOK=$(yq -r '.agent_sweep.pre_hook // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_POST_HOOK=$(yq -r '.agent_sweep.post_hook // ""' "$config_file" 2>/dev/null || echo "")
+        # Use direct array element extraction (each element on separate line)
+        mapfile -t AGENT_SWEEP_SKIP_PHASES < <(yq -r '.agent_sweep.skip_phases // [] | .[]' "$config_file" 2>/dev/null)
+        mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL < <(yq -r '.agent_sweep.denylist_extra // [] | .[]' "$config_file" 2>/dev/null)
+    elif $is_yaml && command -v python3 &>/dev/null; then
+        # python3 fallback for YAML
+        local py_output
+        py_output=$(python3 -c "
+import sys, yaml, json
+try:
+    with open(sys.argv[1]) as f:
+        data = yaml.safe_load(f) or {}
+    cfg = data.get('agent_sweep', {})
+    print(json.dumps({
+        'enabled': str(cfg.get('enabled', True)).lower(),
+        'max_file_mb': cfg.get('max_file_mb', None),
+        'max_file_size': cfg.get('max_file_size', 5242880),
+        'extra_context': cfg.get('extra_context', ''),
+        'pre_hook': cfg.get('pre_hook', ''),
+        'post_hook': cfg.get('post_hook', ''),
+        'skip_phases': cfg.get('skip_phases', []),
+        'denylist_extra': cfg.get('denylist_extra', [])
+    }))
+except Exception as e:
+    print('{\"error\": \"' + str(e) + '\"}', file=sys.stderr)
+    sys.exit(1)
+" "$config_file" 2>/dev/null)
+        if [[ $? -eq 0 && -n "$py_output" ]]; then
+            local raw_enabled
+            raw_enabled=$(json_get_field "$py_output" "enabled" || echo "true")
+            AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
+            local raw_max_mb raw_max_bytes
+            raw_max_mb=$(json_get_field "$py_output" "max_file_mb" || echo "")
+            raw_max_bytes=$(json_get_field "$py_output" "max_file_size" || echo "")
+            apply_agent_sweep_max_file_limit "$raw_max_mb" "$raw_max_bytes"
+            AGENT_SWEEP_EXTRA_CONTEXT=$(json_get_field "$py_output" "extra_context" || echo "")
+            AGENT_SWEEP_PRE_HOOK=$(json_get_field "$py_output" "pre_hook" || echo "")
+            AGENT_SWEEP_POST_HOOK=$(json_get_field "$py_output" "post_hook" || echo "")
+            local skip_arr deny_arr
+            skip_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('skip_phases',[])))" 2>/dev/null)
+            deny_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('denylist_extra',[])))" 2>/dev/null)
+            [[ -n "$skip_arr" ]] && mapfile -t AGENT_SWEEP_SKIP_PHASES <<< "$skip_arr"
+            [[ -n "$deny_arr" ]] && mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL <<< "$deny_arr"
+        fi
+    elif ! $is_yaml && command -v jq &>/dev/null; then
+        # jq for JSON
+        local raw_enabled
+        raw_enabled=$(jq -r '.agent_sweep.enabled // true' "$config_file" 2>/dev/null || echo "true")
+        AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
+        local raw_max_mb raw_max_bytes
+        raw_max_mb=$(jq -r '.agent_sweep.max_file_mb // empty' "$config_file" 2>/dev/null || echo "")
+        raw_max_bytes=$(jq -r '.agent_sweep.max_file_size // empty' "$config_file" 2>/dev/null || echo "")
+        apply_agent_sweep_max_file_limit "$raw_max_mb" "$raw_max_bytes"
+        AGENT_SWEEP_EXTRA_CONTEXT=$(jq -r '.agent_sweep.extra_context // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_PRE_HOOK=$(jq -r '.agent_sweep.pre_hook // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_POST_HOOK=$(jq -r '.agent_sweep.post_hook // ""' "$config_file" 2>/dev/null || echo "")
+        mapfile -t AGENT_SWEEP_SKIP_PHASES < <(jq -r '.agent_sweep.skip_phases // [] | .[]' "$config_file" 2>/dev/null)
+        mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL < <(jq -r '.agent_sweep.denylist_extra // [] | .[]' "$config_file" 2>/dev/null)
+    elif ! $is_yaml && command -v python3 &>/dev/null; then
+        # python3 fallback for JSON
+        local py_output
+        py_output=$(python3 -c "
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    cfg = data.get('agent_sweep', {})
+    print(json.dumps({
+        'enabled': str(cfg.get('enabled', True)).lower(),
+        'max_file_mb': cfg.get('max_file_mb', None),
+        'max_file_size': cfg.get('max_file_size', 5242880),
+        'extra_context': cfg.get('extra_context', ''),
+        'pre_hook': cfg.get('pre_hook', ''),
+        'post_hook': cfg.get('post_hook', ''),
+        'skip_phases': cfg.get('skip_phases', []),
+        'denylist_extra': cfg.get('denylist_extra', [])
+    }))
+except Exception as e:
+    print('{\"error\": \"' + str(e) + '\"}', file=sys.stderr)
+    sys.exit(1)
+" "$config_file" 2>/dev/null)
+        if [[ $? -eq 0 && -n "$py_output" ]]; then
+            local raw_enabled
+            raw_enabled=$(json_get_field "$py_output" "enabled" || echo "true")
+            AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
+            local raw_max_mb raw_max_bytes
+            raw_max_mb=$(json_get_field "$py_output" "max_file_mb" || echo "")
+            raw_max_bytes=$(json_get_field "$py_output" "max_file_size" || echo "")
+            apply_agent_sweep_max_file_limit "$raw_max_mb" "$raw_max_bytes"
+            AGENT_SWEEP_EXTRA_CONTEXT=$(json_get_field "$py_output" "extra_context" || echo "")
+            AGENT_SWEEP_PRE_HOOK=$(json_get_field "$py_output" "pre_hook" || echo "")
+            AGENT_SWEEP_POST_HOOK=$(json_get_field "$py_output" "post_hook" || echo "")
+            local skip_arr deny_arr
+            skip_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('skip_phases',[])))" 2>/dev/null)
+            deny_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('denylist_extra',[])))" 2>/dev/null)
+            [[ -n "$skip_arr" ]] && mapfile -t AGENT_SWEEP_SKIP_PHASES <<< "$skip_arr"
+            [[ -n "$deny_arr" ]] && mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL <<< "$deny_arr"
+        fi
+    fi
+    # Apply CLI override (if provided)
+    apply_agent_sweep_max_file_override
+    # If no parser available, stay with defaults (already set)
+    return 0
+}
+
+# Check if a phase should be skipped based on per-repo config.
+# Usage: should_skip_phase "phase_name"
+# Returns: 0 if phase should be skipped, 1 otherwise
+should_skip_phase() {
+    local phase="${1:-}"
+    [[ -z "$phase" ]] && return 1
+    local p
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for p in ${AGENT_SWEEP_SKIP_PHASES[@]+"${AGENT_SWEEP_SKIP_PHASES[@]}"}; do
+        [[ "$p" == "$phase" ]] && return 0
+    done
+    return 1
+}
+
+# Get combined denylist (global + per-repo local additions).
+# Outputs: newline-separated list of patterns
+get_combined_denylist() {
+    # Output global denylist patterns (if any)
+    if [[ ${#AGENT_SWEEP_DENYLIST_PATTERNS[@]} -gt 0 ]]; then
+        printf '%s\n' "${AGENT_SWEEP_DENYLIST_PATTERNS[@]}"
+    fi
+    # Append local additions (if any)
+    if [[ ${#AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]} -gt 0 ]]; then
+        printf '%s\n' "${AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]}"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RESULT TRACKING
+# Functions for tracking per-repo results during sweep execution.
+#------------------------------------------------------------------------------
+
+# Global result tracking state (initialized by setup_agent_sweep_results)
+declare -g AGENT_SWEEP_STATE_DIR=""
+declare -g AGENT_SWEEP_LOG_FILE=""
+declare -g AGENT_SWEEP_REPO_LOG_DIR=""
+declare -g AGENT_SWEEP_INSTANCE_LOCK_DIR=""
+declare -g AGENT_SWEEP_INSTANCE_LOCK_BASE=""
+declare -g RUN_ID=""
+declare -g RUN_START_TIME=""
+declare -g RUN_ARTIFACTS_DIR=""
+declare -g SWEEP_SUCCESS_COUNT=0
+declare -g SWEEP_FAIL_COUNT=0
+declare -g SWEEP_SKIP_COUNT=0
+declare -ga COMPLETED_REPOS=()
+declare -g SWEEP_LAST_SESSION_NAME=""
+
+# Initialize agent-sweep results tracking
+# Sets up state directory, run ID, and results file
+setup_agent_sweep_results() {
+    local state_base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
+    AGENT_SWEEP_STATE_DIR="${state_base}/agent-sweep"
+    ensure_dir "$AGENT_SWEEP_STATE_DIR"
+    ensure_dir "${AGENT_SWEEP_STATE_DIR}/locks"
+
+    RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+    export RUN_START_TIME
+    RUN_START_TIME=$(date +%s)
+
+    # Create run directory for artifacts
+    RUN_ARTIFACTS_DIR="${AGENT_SWEEP_STATE_DIR}/runs/${RUN_ID}"
+    ensure_dir "$RUN_ARTIFACTS_DIR"
+
+    # Set up log files (if verbose/debug mode)
+    local log_date_dir
+    log_date_dir="${state_base}/logs/$(date +%Y-%m-%d)"
+    ensure_dir "$log_date_dir"
+    AGENT_SWEEP_LOG_FILE="${log_date_dir}/agent_sweep.log"
+    AGENT_SWEEP_REPO_LOG_DIR="${log_date_dir}/repos"
+    ensure_dir "$AGENT_SWEEP_REPO_LOG_DIR"
+
+    # Log session start
+    if [[ $LOG_LEVEL -ge 1 || "$VERBOSE" == "true" ]]; then
+        log_verbose "Agent-sweep session starting: run_id=$RUN_ID"
+        log_verbose "Log file: $AGENT_SWEEP_LOG_FILE"
+    fi
+
+    # Set up results file (used by existing write_result function)
+    export RESULTS_FILE="${AGENT_SWEEP_STATE_DIR}/results.ndjson"
+    export RESULTS_LOCK_DIR="${AGENT_SWEEP_STATE_DIR}/locks/results.lock"
+
+    # Write header record
+    local header_ts
+    header_ts=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "{\"run_id\":\"$RUN_ID\",\"started_at\":\"$header_ts\",\"type\":\"header\"}" > "$RESULTS_FILE"
+
+    # Reset counts
+    SWEEP_SUCCESS_COUNT=0
+    SWEEP_FAIL_COUNT=0
+    SWEEP_SKIP_COUNT=0
+    COMPLETED_REPOS=()
+}
+
+# Aggregate results from NDJSON file for summary reporting
+# Usage: get_results_summary [results_file]
+# Outputs: JSON summary to stdout
+get_results_summary() {
+    local results_file="${1:-${RESULTS_FILE:-}}"
+    [[ -z "$results_file" || ! -f "$results_file" ]] && {
+        echo '{"total":0,"succeeded":0,"failed":0,"skipped":0}'
+        return
+    }
+
+    if command -v jq &>/dev/null; then
+        jq -s '
+            [.[] | select(.type == "result" or .type == "summary" or .type == null)] |
+            {
+                total: length,
+                succeeded: [.[] | select(.status == "success")] | length,
+                failed: [.[] | select(.status | . == "failed" or . == "error")] | length,
+                skipped: [.[] | select(.status | . == "skipped" or . == "preflight")] | length,
+                repos: [.[] | {repo, status, duration}]
+            }
+        ' < "$results_file" 2>/dev/null || echo '{"total":0,"succeeded":0,"failed":0,"skipped":0}'
+    else
+        # Fallback: derive counts from results file when possible
+        local summary_lines
+        summary_lines=$(grep -c '"type":"summary"' "$results_file" 2>/dev/null || echo "0")
+
+        local success=0 failed=0 skipped=0 total=0
+        if [[ "$summary_lines" =~ ^[0-9]+$ ]] && (( summary_lines > 0 )); then
+            success=$(grep -c '"type":"summary".*"status":"success"' "$results_file" 2>/dev/null || echo "0")
+            failed=$(grep -c '"type":"summary".*"status":"failed"' "$results_file" 2>/dev/null || echo "0")
+            local error_count
+            error_count=$(grep -c '"type":"summary".*"status":"error"' "$results_file" 2>/dev/null || echo "0")
+            failed=$((failed + error_count))
+            skipped=$(grep -c '"type":"summary".*"status":"skipped"' "$results_file" 2>/dev/null || echo "0")
+            total=$((success + failed + skipped))
+        else
+            # Fall back to tracked counts if summary lines are unavailable
+            success=${SWEEP_SUCCESS_COUNT:-0}
+            failed=${SWEEP_FAIL_COUNT:-0}
+            skipped=${SWEEP_SKIP_COUNT:-0}
+            total=$((success + failed + skipped))
+        fi
+
+        echo "{\"total\":$total,\"succeeded\":$success,\"failed\":$failed,\"skipped\":$skipped}"
+    fi
+}
+
+# Mark a repo as completed for resume tracking
+# Usage: mark_repo_completed repo_spec
+mark_repo_completed() {
+    local repo_spec="${1:-}"
+    [[ -z "$repo_spec" ]] && return 1
+    COMPLETED_REPOS+=("$repo_spec")
+
+    # Update status based on most recent operation
+    case "${2:-success}" in
+        success) ((SWEEP_SUCCESS_COUNT++)) ;;
+        failed|error) ((SWEEP_FAIL_COUNT++)) ;;
+        skipped|preflight) ((SWEEP_SKIP_COUNT++)) ;;
+    esac
+}
+
+# Check if a repo was already completed in agent-sweep (for resume)
+# Usage: is_sweep_repo_completed repo_spec
+is_sweep_repo_completed() {
+    local repo_spec="${1:-}"
+    array_contains COMPLETED_REPOS "$repo_spec"
+}
+
+# Filter out completed repos from an array (for agent-sweep resume)
+# Usage: filter_sweep_completed_repos array_name
+filter_sweep_completed_repos() {
+    local -n arr_ref=$1
+    local filtered=()
+    local repo
+    for repo in "${arr_ref[@]}"; do
+        is_sweep_repo_completed "$repo" || filtered+=("$repo")
+    done
+    arr_ref=("${filtered[@]}")
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP ARTIFACT CAPTURE
+# Functions for capturing debugging artifacts (git state, pane output, etc.)
+# Artifacts are stored under: $RUN_ARTIFACTS_DIR/<repo_name>/
+#------------------------------------------------------------------------------
+
+# Set up artifact directory for a specific repo.
+# Usage: setup_repo_artifact_dir repo_path
+# Returns: Path to repo artifact directory (creates if needed)
+# Sets: CURRENT_REPO_ARTIFACT_DIR global
+declare -g CURRENT_REPO_ARTIFACT_DIR=""
+
+setup_repo_artifact_dir() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" ]] && return 1
+    [[ -z "$RUN_ARTIFACTS_DIR" ]] && {
+        log_warn "setup_repo_artifact_dir: RUN_ARTIFACTS_DIR not set"
+        return 1
+    }
+
+    # Derive repo name from path (last component)
+    local repo_name
+    repo_name=$(basename "$repo_path")
+
+    CURRENT_REPO_ARTIFACT_DIR="${RUN_ARTIFACTS_DIR}/${repo_name}"
+    ensure_dir "$CURRENT_REPO_ARTIFACT_DIR"
+    echo "$CURRENT_REPO_ARTIFACT_DIR"
+}
+
+# Capture git state to a file for debugging.
+# Usage: capture_git_state repo_path output_file
+# Captures: status, recent log, branch info, HEAD, stash
+capture_git_state() {
+    local repo_path="${1:-}"
+    local output_file="${2:-}"
+
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && return 1
+    [[ -z "$output_file" ]] && return 1
+
+    {
+        echo "=== Captured at: $(date -Iseconds 2>/dev/null || date) ==="
+        echo ""
+        echo "=== git status ==="
+        git -C "$repo_path" status 2>&1
+        echo ""
+        echo "=== git log -5 --oneline ==="
+        git -C "$repo_path" log -5 --oneline 2>&1 || echo "(no commits)"
+        echo ""
+        echo "=== git branch -vv ==="
+        git -C "$repo_path" branch -vv 2>&1
+        echo ""
+        echo "=== HEAD ==="
+        git -C "$repo_path" rev-parse HEAD 2>&1 || echo "(no HEAD)"
+        echo ""
+        echo "=== git stash list ==="
+        git -C "$repo_path" stash list 2>&1 || echo "(no stash)"
+        echo ""
+        echo "=== git diff --stat ==="
+        git -C "$repo_path" diff --stat 2>&1 || echo "(no diff)"
+    } > "$output_file" 2>&1
+}
+
+# Capture last N lines from tmux pane to file.
+# Usage: capture_pane_tail session_name output_file [lines]
+# Args:
+#   session_name: tmux session name
+#   output_file: where to write captured output
+#   lines: number of lines to capture (default 400)
+capture_pane_tail() {
+    local session="${1:-}"
+    local output_file="${2:-}"
+    local lines="${3:-400}"
+
+    [[ -z "$session" || -z "$output_file" ]] && return 1
+
+    # Capture pane content - pane 1 is typically the agent workspace
+    # Use negative -S value to scroll back from current position
+    if tmux has-session -t "$session" 2>/dev/null; then
+        tmux capture-pane -t "${session}:0.1" -p -S -"$lines" > "$output_file" 2>/dev/null || {
+            # Fallback: try pane 0 if pane 1 doesn't exist
+            tmux capture-pane -t "${session}:0.0" -p -S -"$lines" > "$output_file" 2>/dev/null || true
+        }
+    else
+        echo "(session not found: $session)" > "$output_file"
+    fi
+}
+
+# Capture spawn response JSON to artifact file.
+# Usage: capture_spawn_response repo_path spawn_json
+capture_spawn_response() {
+    local repo_path="${1:-}"
+    local spawn_json="${2:-}"
+
+    [[ -z "$repo_path" || -z "$spawn_json" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+    echo "$spawn_json" > "${artifact_dir}/spawn.json"
+}
+
+# Capture plan JSON (commit or release) to artifact file.
+# Usage: capture_plan_json repo_path plan_type plan_json
+# Args:
+#   plan_type: "commit" or "release"
+capture_plan_json() {
+    local repo_path="${1:-}"
+    local plan_type="${2:-}"
+    local plan_json="${3:-}"
+
+    [[ -z "$repo_path" || -z "$plan_type" || -z "$plan_json" ]] && return 1
+    [[ "$plan_type" != "commit" && "$plan_type" != "release" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+    echo "$plan_json" > "${artifact_dir}/${plan_type}_plan.json"
+}
+
+# Append activity snapshot to NDJSON log.
+# Usage: log_activity_snapshot repo_path phase status [extra_json]
+log_activity_snapshot() {
+    local repo_path="${1:-}"
+    local phase="${2:-}"
+    local status="${3:-}"
+    local extra_json="${4:-}"
+
+    [[ -z "$repo_path" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+
+    local ts
+    ts=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Build JSON - phase/status are controlled strings (no special chars expected)
+    local json="{\"ts\":\"$ts\",\"phase\":\"$phase\",\"status\":\"$status\""
+    [[ -n "$extra_json" ]] && json="${json},${extra_json}"
+    json="${json}}"
+
+    echo "$json" >> "${artifact_dir}/activity.ndjson"
+}
+
+# Capture full artifact set before killing session.
+# Usage: capture_final_artifacts repo_path session_name
+# Should be called BEFORE ntm_kill_session
+capture_final_artifacts() {
+    local repo_path="${1:-}"
+    local session_name="${2:-}"
+
+    [[ -z "$repo_path" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+
+    # Capture pane output before session is killed (CRITICAL)
+    if [[ -n "$session_name" ]]; then
+        capture_pane_tail "$session_name" "${artifact_dir}/pane_tail.txt" 400
+    fi
+
+    # Capture final git state
+    capture_git_state "$repo_path" "${artifact_dir}/git_after.txt"
+
+    # Log final activity
+    log_activity_snapshot "$repo_path" "complete" "captured"
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP STATE PERSISTENCE
+#
+# Save/load/cleanup state for --resume and --restart functionality.
+# State file: ${AGENT_SWEEP_STATE_DIR}/state.json
+#------------------------------------------------------------------------------
+
+# Additional state tracking (global)
+declare -g SWEEP_WITH_RELEASE="false"
+declare -g SWEEP_CURRENT_REPO=""
+declare -g SWEEP_CURRENT_PHASE=0
+
+# Save agent-sweep state for resume capability.
+# Args: $1 = status (in_progress|completed|interrupted)
+# Uses atomic write (temp + mv) for safety.
+save_agent_sweep_state() {
+    local status="${1:-in_progress}"
+
+    # Guard: require state dir to be initialized
+    if [[ -z "$AGENT_SWEEP_STATE_DIR" ]]; then
+        log_verbose "save_agent_sweep_state: state dir not initialized, skipping"
+        return 1
+    fi
+
+    local state_file="${AGENT_SWEEP_STATE_DIR}/state.json"
+    local tmp_file="${state_file}.tmp.$$"
+    local completed_json
+    local completed_file="${AGENT_SWEEP_STATE_DIR}/completed_repos.txt"
+
+    # Merge completed repos from file (parallel workers) into memory
+    if [[ -s "$completed_file" ]]; then
+        if [[ ${#COMPLETED_REPOS[@]} -eq 0 ]]; then
+            mapfile -t COMPLETED_REPOS < "$completed_file"
+        else
+            local repo
+            while IFS= read -r repo; do
+                [[ -z "$repo" ]] && continue
+                if ! array_contains COMPLETED_REPOS "$repo"; then
+                    COMPLETED_REPOS+=("$repo")
+                fi
+            done < "$completed_file"
+        fi
+    fi
+
+    # Build JSON arrays for repos
+    if command -v jq &>/dev/null; then
+        # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+        completed_json=$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo '[]')
+    elif command -v python3 &>/dev/null; then
+        completed_json=$(python3 -c "
+import json, sys
+repos = [line.strip() for line in sys.stdin if line.strip()]
+print(json.dumps(repos))
+" <<<"$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null)" 2>/dev/null || echo '[]')
+    else
+        # Fallback: manual JSON array construction
+        local first=true item
+        completed_json="["
+        # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+        for item in ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"}; do
+            $first || completed_json+=","
+            completed_json+="\"$(json_escape "$item")\""
+            first=false
+        done
+        completed_json+="]"
+    fi
+
+    # Ensure valid JSON booleans/numbers (prevent empty values)
+    local with_release_json="${SWEEP_WITH_RELEASE:-false}"
+    [[ "$with_release_json" != "true" ]] && with_release_json="false"
+    local current_phase="${SWEEP_CURRENT_PHASE:-0}"
+    local success_count="${SWEEP_SUCCESS_COUNT:-0}"
+    local fail_count="${SWEEP_FAIL_COUNT:-0}"
+    local skip_count="${SWEEP_SKIP_COUNT:-0}"
+
+    # Escape string values for JSON safety
+    local run_id_escaped current_repo_escaped
+    run_id_escaped=$(json_escape "$RUN_ID")
+    current_repo_escaped=$(json_escape "$SWEEP_CURRENT_REPO")
+
+    # Write state atomically
+    cat > "$tmp_file" <<EOF
+{
+  "run_id": "$run_id_escaped",
+  "status": "$status",
+  "started_at": "$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "with_release": $with_release_json,
+  "repos_completed": $completed_json,
+  "current_repo": "$current_repo_escaped",
+  "current_phase": $current_phase,
+  "success_count": $success_count,
+  "fail_count": $fail_count,
+  "skip_count": $skip_count
+}
+EOF
+
+    mv "$tmp_file" "$state_file"
+    log_verbose "Saved agent-sweep state: $status"
+}
+
+# Load agent-sweep state from previous run.
+# Returns 0 if state loaded successfully, 1 if no state or invalid.
+# Populates: RUN_ID, COMPLETED_REPOS[], SWEEP_* globals
+load_agent_sweep_state() {
+    # Guard: require state dir to be initialized
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 1
+
+    local state_file="${AGENT_SWEEP_STATE_DIR}/state.json"
+    [[ ! -f "$state_file" ]] && return 1
+
+    local state_json
+    state_json=$(cat "$state_file" 2>/dev/null) || return 1
+    [[ -z "$state_json" ]] && return 1
+
+    # Extract fields
+    local saved_run_id saved_status
+    saved_run_id=$(json_get_field "$state_json" "run_id")
+    saved_status=$(json_get_field "$state_json" "status")
+
+    # Validate required fields
+    if [[ -z "$saved_run_id" ]]; then
+        log_verbose "State file missing run_id, cannot resume"
+        return 1
+    fi
+
+    # Only resume in_progress or interrupted states
+    if [[ "$saved_status" != "in_progress" && "$saved_status" != "interrupted" ]]; then
+        log_verbose "Previous run was '$saved_status', not resumable"
+        return 1
+    fi
+
+    # Restore state with defaults for empty/missing values
+    RUN_ID="$saved_run_id"
+    local val
+    val=$(json_get_field "$state_json" "with_release")
+    SWEEP_WITH_RELEASE="${val:-false}"
+    SWEEP_CURRENT_REPO=$(json_get_field "$state_json" "current_repo")
+    val=$(json_get_field "$state_json" "current_phase")
+    SWEEP_CURRENT_PHASE="${val:-0}"
+    val=$(json_get_field "$state_json" "success_count")
+    SWEEP_SUCCESS_COUNT="${val:-0}"
+    val=$(json_get_field "$state_json" "fail_count")
+    SWEEP_FAIL_COUNT="${val:-0}"
+    val=$(json_get_field "$state_json" "skip_count")
+    SWEEP_SKIP_COUNT="${val:-0}"
+
+    # Load completed repos array
+    COMPLETED_REPOS=()
+    local completed_json
+    completed_json=$(json_get_field "$state_json" "repos_completed")
+    if [[ -n "$completed_json" ]]; then
+        if command -v jq &>/dev/null; then
+            while IFS= read -r repo; do
+                [[ -n "$repo" ]] && COMPLETED_REPOS+=("$repo")
+            done < <(echo "$completed_json" | jq -r '.[]' 2>/dev/null)
+        elif command -v python3 &>/dev/null; then
+            while IFS= read -r repo; do
+                [[ -n "$repo" ]] && COMPLETED_REPOS+=("$repo")
+            done < <(python3 -c "import json,sys; [print(r) for r in json.loads(sys.stdin.read())]" <<<"$completed_json" 2>/dev/null)
+        else
+            log_warn "Cannot parse completed repos: neither jq nor python3 available"
+            log_warn "Resume may re-process already completed repositories"
+        fi
+    fi
+
+    # Merge any completed repos recorded by parallel workers
+    local completed_file="${AGENT_SWEEP_STATE_DIR}/completed_repos.txt"
+    if [[ -s "$completed_file" ]]; then
+        local repo
+        while IFS= read -r repo; do
+            [[ -z "$repo" ]] && continue
+            if ! array_contains COMPLETED_REPOS "$repo"; then
+                COMPLETED_REPOS+=("$repo")
+            fi
+        done < "$completed_file"
+    fi
+
+    log_info "Resuming run $RUN_ID: ${#COMPLETED_REPOS[@]} repos already completed"
+    return 0
+}
+
+# Remove agent-sweep state file (for --restart or clean completion).
+cleanup_agent_sweep_state() {
+    # Guard: require state dir to be initialized
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 0
+
+    local state_file="${AGENT_SWEEP_STATE_DIR}/state.json"
+    rm -f "$state_file"
+    log_verbose "Cleaned up agent-sweep state"
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RATE LIMIT BACKOFF
+#
+# Coordinate global pause across all parallel workers when rate limited.
+# Uses exponential backoff with jitter to avoid thundering herd.
+#------------------------------------------------------------------------------
+
+# Trigger global rate limit backoff.
+# All workers will pause until pause_until timestamp.
+# Args:
+#   $1: reason - description of why backoff triggered
+#   $2: current_delay - initial delay in seconds (default: 30)
+# Behavior:
+#   - Uses exponential backoff (doubles on repeated triggers)
+#   - Adds ±25% jitter to prevent thundering herd
+#   - Caps at 10 minutes max delay
+agent_sweep_backoff_trigger() {
+    local reason="${1:-rate_limited}"
+    local current_delay="${2:-30}"
+    local max_delay=600  # 10 minutes cap
+
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 1
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+    local backoff_lock="${AGENT_SWEEP_STATE_DIR}/locks/backoff.lock"
+
+    # Try to acquire lock with 10 second timeout
+    if dir_lock_acquire "$backoff_lock" 10; then
+        local now pause_until new_delay
+
+        # Check if already in backoff and extend with exponential increase
+        if [[ -f "$backoff_state_file" ]]; then
+            local current_pause
+            current_pause=$(json_get_field "$(cat "$backoff_state_file")" "pause_until" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            if [[ "$current_pause" -gt "$now" ]]; then
+                # Already paused, double the delay (exponential backoff)
+                new_delay=$((current_delay * 2))
+                [[ "$new_delay" -gt "$max_delay" ]] && new_delay=$max_delay
+            else
+                new_delay=$current_delay
+            fi
+        else
+            new_delay=$current_delay
+        fi
+
+        # Add jitter (±25%) to prevent thundering herd
+        # RANDOM is 0-32767, scale to ±25% of delay
+        local max_jitter=$((new_delay / 4))
+        local jitter=0
+        if [[ $max_jitter -gt 0 ]]; then
+            jitter=$(( (RANDOM % (2 * max_jitter + 1)) - max_jitter ))
+        fi
+        new_delay=$((new_delay + jitter))
+        [[ "$new_delay" -lt 5 ]] && new_delay=5  # Minimum 5 seconds
+
+        pause_until=$(($(date +%s) + new_delay))
+
+        # Write state atomically
+        local escaped_reason
+        escaped_reason=$(json_escape "$reason")
+        echo "{\"reason\":\"$escaped_reason\",\"pause_until\":$pause_until,\"delay\":$new_delay}" > "$backoff_state_file"
+
+        log_warn "Rate limit detected ($reason), global pause for ${new_delay}s"
+        dir_lock_release "$backoff_lock"
+        return 0
+    else
+        log_warn "Could not acquire backoff lock"
+        return 1
+    fi
+}
+
+# Wait if global backoff is active.
+# Should be called before starting work on a repo.
+# Returns: 0 after wait completes or no wait needed, 1 on error
+agent_sweep_backoff_wait_if_needed() {
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 0
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+
+    [[ ! -f "$backoff_state_file" ]] && return 0
+
+    local pause_until now
+    pause_until=$(json_get_field "$(cat "$backoff_state_file")" "pause_until" 2>/dev/null || echo 0)
+    now=$(date +%s)
+
+    if [[ "$pause_until" -gt "$now" ]]; then
+        local wait_secs=$((pause_until - now))
+        log_warn "Global backoff active, waiting ${wait_secs}s..."
+        sleep "$wait_secs"
+    fi
+    return 0
+}
+
+# Clear backoff state (call on successful completion).
+agent_sweep_backoff_clear() {
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 0
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+    rm -f "$backoff_state_file"
+    log_verbose "Cleared rate limit backoff state"
+}
+
+# Check if currently in backoff (non-blocking check).
+# Returns: 0 if in backoff, 1 if not
+agent_sweep_backoff_active() {
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 1
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+    [[ ! -f "$backoff_state_file" ]] && return 1
+
+    local pause_until now
+    pause_until=$(json_get_field "$(cat "$backoff_state_file")" "pause_until" 2>/dev/null || echo 0)
+    now=$(date +%s)
+
+    [[ "$pause_until" -gt "$now" ]]
 }
 
 # mktemp compatibility: BSD (macOS) mktemp requires a template or -t.
@@ -291,6 +4580,128 @@ expand_tilde() {
 is_positive_int() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#${1:-0} > 0 )); }
 is_boolean() { [[ "${1:-}" == "true" || "${1:-}" == "false" ]]; }
 is_valid_config_key() { [[ "${1:-}" =~ ^[A-Z][A-Z0-9_]*$ ]]; }
+
+#------------------------------------------------------------------------------
+# PORTABLE JSON PARSING
+#
+# Provides json_get_field(), json_is_success(), and json_escape() with layered
+# fallbacks: jq → python3 → perl (JSON::PP) → minimal sed (fragile, flat only).
+# This enables ntm robot mode parsing on systems without jq installed.
+#------------------------------------------------------------------------------
+
+# Extract a field value from a JSON object.
+# Usage: json_get_field "$json_string" "field_name"
+# Returns: The field value on stdout. For nested objects, returns JSON string.
+# Fallback order: jq > python3 > perl+JSON::PP > sed (flat strings only)
+json_get_field() {
+    local json="${1:-}"
+    local field="${2:-}"
+
+    [[ -z "$json" || -z "$field" ]] && return 1
+
+    # Best: jq (most reliable, handles all JSON types correctly)
+    if command -v jq &>/dev/null; then
+        # Note: Can't use `// empty` as it treats false as falsy
+        jq -r --arg f "$field" '
+            if has($f) then
+                .[$f] | if type == "null" then empty
+                        elif type == "boolean" then (if . then "true" else "false" end)
+                        else .
+                        end
+            else empty end
+        ' <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Fallback: python3 (widely available, handles complex JSON)
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    val = data.get(sys.argv[1], '')
+    if isinstance(val, (dict, list)):
+        print(json.dumps(val))
+    elif val is True:
+        print('true')
+    elif val is False:
+        print('false')
+    elif val is None:
+        pass  # empty output
+    else:
+        print(val)
+except:
+    pass
+" "$field" <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Fallback: perl with JSON::PP (often available on Linux)
+    if command -v perl &>/dev/null && perl -MJSON::PP -e1 2>/dev/null; then
+        perl -MJSON::PP -e '
+            my $field = shift;
+            local $/; my $json = <STDIN>;
+            my $data = eval { decode_json($json) };
+            exit 0 unless defined $data && ref($data) eq "HASH";
+            my $val = $data->{$field};
+            if (!defined $val) { exit 0; }
+            if (ref($val)) { print encode_json($val); }
+            elsif (JSON::PP::is_bool($val)) { print $val ? "true" : "false"; }
+            else { print $val; }
+        ' "$field" <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Last resort: minimal sed (ONLY works for simple flat string values!)
+    # WARNING: This is fragile and won't handle nested objects, arrays,
+    # escaped quotes, or boolean/numeric types correctly. Use with caution.
+    local result
+    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"([^"\\]*(\\.[^"\\]*)*)".*/\1/p' <<<"$json" | head -n1)
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+        return 0
+    fi
+
+    # Try simple arrays first: extract ["item1","item2"] as-is (bd-kgg5)
+    # This must come before unquoted values to avoid partial array matching
+    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*(\[[^]]*\]).*/\1/p' <<<"$json" | head -n1)
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+        return 0
+    fi
+
+    # Try unquoted values (numbers, booleans)
+    # Note: [^],}] puts ] first in negated class for correct literal matching
+    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*([^],}]+).*/\1/p' <<<"$json" | head -n1 | tr -d '[:space:]')
+    [[ -n "$result" ]] && printf '%s\n' "$result"
+    return 0
+}
+
+# Check if JSON has "success": true
+# Usage: if json_is_success "$json_string"; then echo "success"; fi
+# Returns: 0 if success:true, 1 otherwise
+json_is_success() {
+    local json="${1:-}"
+    local success_val
+    success_val=$(json_get_field "$json" "success")
+    [[ "$success_val" == "true" ]]
+}
+
+# Escape a string for safe embedding in JSON.
+# Usage: escaped=$(json_escape "$raw_string")
+# Handles: backslash, double-quote, newline, tab, carriage return, backspace, form feed
+json_escape() {
+    local str="${1:-}"
+    # Order matters: escape backslashes first, then other chars
+    str="${str//\\/\\\\}"      # \ -> \\
+    str="${str//\"/\\\"}"      # " -> \"
+    str="${str//$'\n'/\\n}"    # newline -> \n
+    str="${str//$'\t'/\\t}"    # tab -> \t
+    str="${str//$'\r'/\\r}"    # carriage return -> \r
+    str="${str//$'\b'/\\b}"    # backspace -> \b
+    str="${str//$'\f'/\\f}"    # form feed -> \f
+    printf '%s' "$str"
+}
 
 # Retry a command with exponential backoff (+/-25% jitter).
 # Usage: retry_with_backoff [--capture=all|--capture=stdout] MAX_ATTEMPTS BASE_DELAY_SECONDS -- cmd arg...
@@ -377,20 +4788,6 @@ retry_with_backoff() {
     return "$exit_code"
 }
 
-# Escape a string for JSON (handles quotes, backslashes, control characters)
-json_escape() {
-    local str="$1"
-    # Escape backslashes first, then quotes, then control characters
-    str="${str//\\/\\\\}"
-    str="${str//\"/\\\"}"
-    str="${str//$'\n'/\\n}"
-    str="${str//$'\r'/\\r}"
-    str="${str//$'\t'/\\t}"
-    str="${str//$'\b'/\\b}"
-    str="${str//$'\f'/\\f}"
-    printf '%s\n' "$str"
-}
-
 # Write a result to the NDJSON results file
 write_result() {
     local repo_name="$1"
@@ -418,9 +4815,17 @@ write_result() {
         printf -v line '{"repo":"%s","path":"%s","action":"%s","status":"%s","duration":%s,"message":"%s","timestamp":"%s"}\n' \
             "$safe_repo" "$safe_path" "$safe_action" "$safe_status" "$duration_num" "$safe_message" "$ts"
 
-        # In parallel mode multiple processes append concurrently; lock if flock is available
-        if [[ -n "${RESULTS_LOCK_FILE:-}" ]] && command -v flock &>/dev/null; then
-            { flock -x 200; printf '%s' "$line" >> "$RESULTS_FILE"; } 200>"$RESULTS_LOCK_FILE"
+        # Multiple processes may append concurrently (parallel sync); guard writes.
+        if [[ -n "${RESULTS_LOCK_DIR:-}" ]]; then
+            if dir_lock_acquire "$RESULTS_LOCK_DIR" 30; then
+                printf '%s' "$line" >> "$RESULTS_FILE"
+                dir_lock_release "$RESULTS_LOCK_DIR"
+            else
+                # Best-effort fallback: write without lock if the lock can't be acquired.
+                # Log warning to stderr (visible to user) so they know there may be data issues.
+                log_warn "Could not acquire results lock after 30s, writing without lock (may cause data issues)"
+                printf '%s' "$line" >> "$RESULTS_FILE"
+            fi
         else
             printf '%s' "$line" >> "$RESULTS_FILE"
         fi
@@ -456,15 +4861,495 @@ log_step() {
 }
 
 log_verbose() {
-    [[ "$VERBOSE" != "true" ]] && return
-    printf '%b\n' "${DIM}$*${RESET}" >&2
+    [[ $LOG_LEVEL -lt 1 && "$VERBOSE" != "true" ]] && return
+    printf '%b\n' "${DIM}[VERBOSE] $*${RESET}" >&2
+    _log_to_file "VERBOSE" "$*"
+}
+
+log_debug() {
+    [[ $LOG_LEVEL -lt 2 && "$DEBUG" != "true" ]] && return
+    printf '%b\n' "${DIM}[DEBUG] $*${RESET}" >&2
+    _log_to_file "DEBUG" "$*"
+}
+
+# Write log message to file (if file logging is enabled)
+_log_to_file() {
+    local level="$1" msg="$2"
+    [[ -z "$AGENT_SWEEP_LOG_FILE" ]] && return
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$AGENT_SWEEP_LOG_FILE" 2>/dev/null
+}
+
+# Redact sensitive data from log messages
+redact_sensitive() {
+    local msg="$1"
+    # Redact common secret patterns
+    msg="${msg//sk-[a-zA-Z0-9_-]*/sk-***REDACTED***}"
+    msg="${msg//ghp_[a-zA-Z0-9]*/ghp_***REDACTED***}"
+    msg="${msg//gho_[a-zA-Z0-9]*/gho_***REDACTED***}"
+    msg="${msg//AKIA[A-Z0-9]*/AKIA***REDACTED***}"
+    msg="${msg//password=[^[:space:]]*/password=***REDACTED***}"
+    msg="${msg//api_key=[^[:space:]]*/api_key=***REDACTED***}"
+    msg="${msg//token=[^[:space:]]*/token=***REDACTED***}"
+    echo "$msg"
 }
 
 # Output JSON to stdout (only in --json mode)
 output_json() {
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo "$1"
+        printf '%s\n' "$1"
     fi
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP ERROR FORMATTING
+#
+# User-friendly, actionable error messages for agent-sweep failures.
+# These functions produce consistent, helpful messages with fix suggestions.
+#------------------------------------------------------------------------------
+
+# Format a structured error message with reason and fix suggestion.
+# Args:
+#   $1: category - brief error category (e.g., "Cannot run agent-sweep on owner/repo")
+#   $2: reason - why the error occurred
+#   $3: fix - optional multiline fix suggestion
+# All output goes to stderr
+format_agent_sweep_error() {
+    local category="${1:-Unknown error}"
+    local reason="${2:-}"
+    local fix="${3:-}"
+
+    echo "" >&2
+    printf '%b\n' "${RED}ERROR:${RESET} $category" >&2
+    if [[ -n "$reason" ]]; then
+        printf '%b\n' "  ${DIM}Reason:${RESET} $reason" >&2
+    fi
+    if [[ -n "$fix" ]]; then
+        echo "" >&2
+        printf '%b\n' "  ${CYAN}To fix:${RESET}" >&2
+        echo "$fix" | sed 's/^/    /' >&2
+    fi
+    echo "" >&2
+}
+
+# Format a warning message (non-fatal but needs attention)
+format_agent_sweep_warning() {
+    local category="${1:-Warning}"
+    local message="${2:-}"
+    local options="${3:-}"
+
+    echo "" >&2
+    printf '%b\n' "${YELLOW}WARNING:${RESET} $category" >&2
+    if [[ -n "$message" ]]; then
+        printf '%b\n' "  $message" >&2
+    fi
+    if [[ -n "$options" ]]; then
+        echo "" >&2
+        printf '%b\n' "  ${CYAN}Options:${RESET}" >&2
+        echo "$options" | sed 's/^/    /' >&2
+    fi
+    echo "" >&2
+}
+
+# Preflight failure error
+error_preflight_uncommitted() {
+    local repo_path="$1"
+    format_agent_sweep_error \
+        "Cannot run agent-sweep on $(basename "$repo_path")" \
+        "Repository has uncommitted changes" \
+        "cd $repo_path
+git stash       # Save changes temporarily
+ru agent-sweep  # Run sweep
+git stash pop   # Restore changes"
+}
+
+error_preflight_conflicts() {
+    local repo_path="$1"
+    format_agent_sweep_error \
+        "Cannot run agent-sweep on $(basename "$repo_path")" \
+        "Repository has unresolved merge conflicts" \
+        "cd $repo_path
+git status      # See conflicting files
+# Resolve conflicts manually, then:
+git add .
+git commit"
+}
+
+error_preflight_detached() {
+    local repo_path="$1"
+    format_agent_sweep_error \
+        "Cannot run agent-sweep on $(basename "$repo_path")" \
+        "Repository is in detached HEAD state" \
+        "cd $repo_path
+git checkout main    # Or your default branch
+ru agent-sweep"
+}
+
+# NTM errors
+error_ntm_not_found() {
+    format_agent_sweep_error \
+        "ntm (Named Tmux Manager) not found" \
+        "agent-sweep requires ntm to spawn and manage AI agent sessions" \
+        "Install ntm from: https://github.com/dicklesworthstone/ntm
+Or check your PATH"
+}
+
+error_ntm_spawn_failed() {
+    local reason="$1"
+    format_agent_sweep_error \
+        "Failed to start AI agent session" \
+        "$reason" \
+        "Ensure ANTHROPIC_API_KEY or OPENAI_API_KEY is set
+Run: ntm doctor
+Check: ntm list (to see running sessions)"
+}
+
+error_ntm_no_api_key() {
+    format_agent_sweep_error \
+        "No API key configured for AI agent" \
+        "ntm requires an API key to communicate with AI providers" \
+        "Set one of:
+  export ANTHROPIC_API_KEY=sk-...
+  export OPENAI_API_KEY=sk-..."
+}
+
+# Agent timeout/failure
+warning_agent_timeout() {
+    local repo_name="$1"
+    local phase="$2"
+    local timeout_secs="$3"
+    format_agent_sweep_warning \
+        "Agent timed out during Phase $phase for $repo_name" \
+        "The agent did not complete within $timeout_secs seconds." \
+        "--timeout $((timeout_secs * 2))    # Increase timeout
+--retry          # Retry failed repos
+--skip $repo_name  # Skip this repo"
+}
+
+warning_agent_error() {
+    local repo_name="$1"
+    local error="$2"
+    format_agent_sweep_warning \
+        "Agent reported error for $repo_name" \
+        "$error" \
+        "--retry          # Retry failed repos
+--verbose        # See detailed output"
+}
+
+# Validation failures
+error_validation_denylist() {
+    local repo_name="$1"
+    local file="$2"
+    format_agent_sweep_error \
+        "Commit plan validation failed for $repo_name" \
+        "File matches denylist: $file" \
+        "The agent proposed a file that violates security rules.
+This file will not be committed.
+Edit .ru/agent-sweep.conf to allow if needed."
+}
+
+error_validation_size() {
+    local repo_name="$1"
+    local file="$2"
+    local size="$3"
+    local limit="$4"
+    format_agent_sweep_error \
+        "Commit plan validation failed for $repo_name" \
+        "File exceeds size limit: $file (${size}MB > ${limit}MB)" \
+        "Use --max-file-mb=$size to increase limit
+Or exclude this file from the commit plan."
+}
+
+error_validation_secrets() {
+    local repo_name="$1"
+    local details="$2"
+    format_agent_sweep_error \
+        "Secrets detected in changes for $repo_name" \
+        "$details" \
+        "Remove secrets before committing.
+Use --secret-scan=off to disable (not recommended).
+Check: gitleaks detect --source=$repo_name"
+}
+
+# Rate limit
+warning_rate_limit() {
+    local wait_secs="$1"
+    format_agent_sweep_warning \
+        "API rate limit reached" \
+        "Backing off for $wait_secs seconds before retry..." \
+        "Progress will resume automatically.
+Press Ctrl+C to interrupt (state will be saved)."
+}
+
+# Resume/restart hints
+info_resume_available() {
+    echo "" >&2
+    printf '%b\n' "${BLUE}ℹ${RESET} Interrupted sweep can be resumed:" >&2
+    printf '%b\n' "    ru agent-sweep --resume" >&2
+    printf '%b\n' "  Or start fresh:" >&2
+    printf '%b\n' "    ru agent-sweep --restart" >&2
+    echo "" >&2
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP PROGRESS DISPLAY
+#
+# Real-time progress display for agent-sweep operations.
+# Supports interactive (TTY with spinners/bars) and non-interactive modes.
+#------------------------------------------------------------------------------
+
+# Global progress tracking state
+declare -g PROGRESS_TOTAL=0
+declare -g PROGRESS_CURRENT=0
+declare -g PROGRESS_SUCCEEDED=0
+declare -g PROGRESS_FAILED=0
+declare -g PROGRESS_SKIPPED=0
+declare -g PROGRESS_START_EPOCH=0
+declare -g PROGRESS_REPO_START_EPOCH=0
+declare -g PROGRESS_CURRENT_REPO=""
+declare -g PROGRESS_CURRENT_PHASE=""
+declare -g PROGRESS_IS_INTERACTIVE=false
+declare -g PROGRESS_PHASE_HISTORY=()
+
+# Phase names for display
+declare -gA PROGRESS_PHASE_NAMES=(
+    [1]="Understanding codebase"
+    [2]="Generating commit plan"
+    [3]="Release workflow (optional)"
+    [preflight]="Running preflight checks"
+    [spawn]="Starting agent session"
+    [wait]="Waiting for completion"
+    [validate]="Validating plan"
+    [apply]="Applying changes"
+)
+
+# Initialize progress tracking for agent-sweep.
+# Args: $1 = total repo count
+progress_init() {
+    local total="${1:-0}"
+
+    PROGRESS_TOTAL=$total
+    PROGRESS_CURRENT=0
+    PROGRESS_SUCCEEDED=0
+    PROGRESS_FAILED=0
+    PROGRESS_SKIPPED=0
+    PROGRESS_START_EPOCH=$(date +%s)
+    PROGRESS_CURRENT_REPO=""
+    PROGRESS_CURRENT_PHASE=""
+    PROGRESS_PHASE_HISTORY=()
+
+    # Detect interactive mode
+    if [[ -t 2 && "${QUIET:-false}" != "true" && "${AGENT_SWEEP_JSON_OUTPUT:-false}" != "true" ]]; then
+        PROGRESS_IS_INTERACTIVE=true
+    else
+        PROGRESS_IS_INTERACTIVE=false
+    fi
+
+    if [[ "$PROGRESS_IS_INTERACTIVE" == "true" ]]; then
+        _progress_show_header "$total"
+    else
+        log_info "Starting agent-sweep: $total repositories"
+    fi
+}
+
+# Show initial header (interactive mode)
+_progress_show_header() {
+    local total="$1"
+    echo "" >&2
+    if [[ "${GUM_AVAILABLE:-false}" == "true" ]]; then
+        gum style --border rounded --padding "0 2" --border-foreground "#89b4fa" \
+            "$(gum style --bold "Agent Sweep")" \
+            "Processing $total repositories" >&2
+    else
+        # Build content line with dynamic padding
+        local content="Processing $total repositories"
+        local box_width=38
+        local content_len=${#content}
+        local total_padding=$((box_width - content_len))
+        # Clamp to 0 if content exceeds box width (defensive)
+        [[ $total_padding -lt 0 ]] && total_padding=0
+        local left_pad=$((total_padding / 2))
+        local right_pad=$((total_padding - left_pad))
+        local left_spaces right_spaces
+        printf -v left_spaces '%*s' "$left_pad" ''
+        printf -v right_spaces '%*s' "$right_pad" ''
+
+        printf '%b\n' "${CYAN}╭──────────────────────────────────────╮${RESET}" >&2
+        printf '%b\n' "${CYAN}│${RESET}          ${BOLD}Agent Sweep${RESET}              ${CYAN}│${RESET}" >&2
+        printf '%b\n' "${CYAN}│${RESET}${left_spaces}${content}${right_spaces}${CYAN}│${RESET}" >&2
+        printf '%b\n' "${CYAN}╰──────────────────────────────────────╯${RESET}" >&2
+    fi
+    echo "" >&2
+}
+
+# Start processing a new repository.
+# Args: $1 = repo name/spec
+progress_start_repo() {
+    local repo_name="${1:-unknown}"
+
+    ((PROGRESS_CURRENT++))
+    # shellcheck disable=SC2034  # Tracking state for external introspection
+    PROGRESS_CURRENT_REPO="$repo_name"
+    PROGRESS_CURRENT_PHASE="preflight"
+    PROGRESS_REPO_START_EPOCH=$(date +%s)
+    PROGRESS_PHASE_HISTORY=()
+
+    SWEEP_CURRENT_REPO="$repo_name"
+
+    if [[ "$PROGRESS_IS_INTERACTIVE" == "true" ]]; then
+        _progress_show_repo_start "$repo_name"
+    else
+        log_step "[$PROGRESS_CURRENT/$PROGRESS_TOTAL] Processing: $repo_name"
+    fi
+}
+
+# Show repo start (interactive mode)
+_progress_show_repo_start() {
+    local repo_name="$1"
+
+    echo "" >&2
+    if [[ "${GUM_AVAILABLE:-false}" == "true" ]]; then
+        printf '%b\n' "$(gum style --foreground "#89b4fa" --bold "[$PROGRESS_CURRENT/$PROGRESS_TOTAL]") $repo_name" >&2
+    else
+        printf '%b\n' "${CYAN}[$PROGRESS_CURRENT/$PROGRESS_TOTAL]${RESET} ${BOLD}$repo_name${RESET}" >&2
+    fi
+
+    _progress_show_bar
+}
+
+# Update current phase.
+# Args: $1 = phase identifier (1, 2, 3, preflight, spawn, wait, validate, apply)
+progress_update_phase() {
+    local phase="${1:-}"
+    local phase_name="${PROGRESS_PHASE_NAMES[$phase]:-$phase}"
+
+    # Record previous phase in history
+    if [[ -n "$PROGRESS_CURRENT_PHASE" ]]; then
+        PROGRESS_PHASE_HISTORY+=("$PROGRESS_CURRENT_PHASE")
+    fi
+
+    PROGRESS_CURRENT_PHASE="$phase"
+    SWEEP_CURRENT_PHASE="$phase"
+
+    if [[ "$PROGRESS_IS_INTERACTIVE" == "true" ]]; then
+        _progress_show_phase "$phase_name"
+    else
+        log_verbose "  Phase: $phase_name"
+    fi
+}
+
+# Show phase update (interactive mode)
+_progress_show_phase() {
+    local phase_name="$1"
+
+    if [[ "${GUM_AVAILABLE:-false}" == "true" ]]; then
+        printf '%b\n' "  └─ $(gum style --foreground '#a6e3a1' "$phase_name") ⏳" >&2
+    else
+        printf '%b\n' "  └─ ${GREEN}$phase_name${RESET} ⏳" >&2
+    fi
+}
+
+# Complete current repository with status.
+# Args: $1 = status (success, failed, skipped)
+#       $2 = optional detail message
+progress_complete_repo() {
+    local status="${1:-success}"
+    local detail="${2:-}"
+    local duration=$(($(date +%s) - PROGRESS_REPO_START_EPOCH))
+    local duration_str
+    duration_str=$(format_duration "$duration")
+
+    case "$status" in
+        success) ((PROGRESS_SUCCEEDED++)) ;;
+        failed|error) ((PROGRESS_FAILED++)) ;;
+        skipped|preflight) ((PROGRESS_SKIPPED++)) ;;
+    esac
+
+    if [[ "$PROGRESS_IS_INTERACTIVE" == "true" ]]; then
+        _progress_show_repo_complete "$status" "$duration_str" "$detail"
+    else
+        case "$status" in
+            success) log_success "  Completed in $duration_str" ;;
+            failed|error) log_error "  Failed: ${detail:-unknown error}" ;;
+            skipped|preflight) log_warn "  Skipped: ${detail:-preflight check failed}" ;;
+        esac
+    fi
+}
+
+# Show repo completion (interactive mode)
+_progress_show_repo_complete() {
+    local status="$1"
+    local duration="$2"
+    local detail="$3"
+
+    local status_icon status_color
+    case "$status" in
+        success) status_icon="✓"; status_color="${GREEN}" ;;
+        failed|error) status_icon="✗"; status_color="${RED}" ;;
+        skipped|preflight) status_icon="⊘"; status_color="${YELLOW}" ;;
+        *) status_icon="?"; status_color="${DIM}" ;;
+    esac
+
+    printf '%b\n' "  └─ ${status_color}${status_icon}${RESET} Completed in $duration" >&2
+
+    if [[ -n "$detail" && "$status" != "success" ]]; then
+        printf '%b\n' "     ${DIM}$detail${RESET}" >&2
+    fi
+}
+
+# Render progress bar to stderr.
+_progress_show_bar() {
+    local pct=0
+    [[ $PROGRESS_TOTAL -gt 0 ]] && pct=$((PROGRESS_CURRENT * 100 / PROGRESS_TOTAL))
+
+    # Calculate elapsed time and estimate
+    local elapsed=$(($(date +%s) - PROGRESS_START_EPOCH))
+    local eta_str=""
+    if [[ $PROGRESS_CURRENT -gt 1 && $pct -gt 0 && $pct -lt 100 ]]; then
+        local per_repo=$((elapsed / (PROGRESS_CURRENT - 1)))
+        local remaining=$(( (PROGRESS_TOTAL - PROGRESS_CURRENT + 1) * per_repo ))
+        eta_str=" (~$(format_duration $remaining) remaining)"
+    fi
+
+    local bar_width=30
+    local filled=$((pct * bar_width / 100))
+    local empty=$((bar_width - filled))
+    local bar
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' "$empty" '' | tr ' ' '░')
+    printf '%b\n' "  ${DIM}$bar${RESET} $pct%%$eta_str" >&2
+}
+
+# Show final summary (called at end of sweep).
+# Uses existing print_agent_sweep_summary() for detailed output.
+progress_summary() {
+    local total_duration=$(($(date +%s) - PROGRESS_START_EPOCH))
+    local duration_str
+    duration_str=$(format_duration "$total_duration")
+
+    if [[ "$PROGRESS_IS_INTERACTIVE" != "true" ]]; then
+        local s="$PROGRESS_SUCCEEDED"
+        local f="$PROGRESS_FAILED"
+        local k="$PROGRESS_SKIPPED"
+
+        # In parallel mode, parent counters are not updated; derive from results file if available.
+        if (( s + f + k == 0 )) && [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
+            if command -v jq &>/dev/null; then
+                s=$(jq -r 'select(.type=="summary" and .status=="success") | .repo' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+                f=$(jq -r 'select(.type=="summary" and .status=="failed") | .repo' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+                k=$(jq -r 'select(.type=="summary" and .status=="skipped") | .repo' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+            else
+                s=$(grep -c '"type":"summary".*"status":"success"' "$RESULTS_FILE" 2>/dev/null || echo 0)
+                f=$(grep -c '"type":"summary".*"status":"failed"' "$RESULTS_FILE" 2>/dev/null || echo 0)
+                k=$(grep -c '"type":"summary".*"status":"skipped"' "$RESULTS_FILE" 2>/dev/null || echo 0)
+            fi
+        fi
+
+        log_info "Agent-sweep complete: $s succeeded, $f failed, $k skipped"
+        log_info "Total time: $duration_str"
+    fi
+
+    # Detailed summary handled by print_agent_sweep_summary()
 }
 
 #==============================================================================
@@ -513,7 +5398,7 @@ SYNC OPTIONS:
     --rebase             Use git pull --rebase
     --dry-run            Show what would happen without making changes
     --dir PATH           Override projects directory
-    --parallel N, -j N   Sync N repos concurrently (default: 1, sequential)
+    --parallel N, -j N   Sync N repos concurrently (default: 4)
     --resume             Resume an interrupted sync from where it left off
     --restart            Discard interrupted sync state and start fresh
     --timeout SECONDS    Network timeout for slow operations (default: 30)
@@ -526,12 +5411,12 @@ INIT OPTIONS:
     --example            Include example repositories in initial config
 
 ADD OPTIONS:
-    --private            Add to private.txt instead of repos.txt
+    --private            Add to private.txt instead of public.txt
     --from-cwd           Detect repo from current working directory
 
 LIST OPTIONS:
     --paths              Show local paths instead of URLs
-    --public             Show only repos from repos.txt
+    --public             Show only repos from public.txt
     --private            Show only repos from private.txt
 
 DOCTOR OPTIONS:
@@ -558,6 +5443,7 @@ REVIEW OPTIONS:
     --priority=LEVEL     Min priority: all, critical, high, normal, low
     --skip-days=N        Skip repos reviewed within N days (default: 7)
     --dry-run            Discovery only, don't start sessions
+    --status             Show review lock/checkpoint status and exit
     --resume             Resume interrupted review from checkpoint
     --push               Allow pushing changes (with --apply)
     --auto-answer=POLICY Auto-answer policy in non-interactive mode (auto|skip|fail)
@@ -576,8 +5462,9 @@ EXAMPLES:
     ru prune             Find orphan repos not in config
     ru doctor --review   Check system and review prerequisites
     ru prune --archive   Archive orphan repos
-    ru import repos.txt  Import repos from file (auto-detects visibility)
+    ru import my_repos.txt  Import repos from file (auto-detects visibility)
     ru review --dry-run  Discover issues/PRs without starting reviews
+    ru review --status   Show review lock/checkpoint status
     ru review            Start AI-assisted review of issues/PRs
     ru review --apply    Execute approved changes from plan
     ru review --basic    Answer queued review questions
@@ -585,7 +5472,7 @@ EXAMPLES:
 
 CONFIGURATION:
     Config:  ~/.config/ru/config
-    Repos:   ~/.config/ru/repos.d/repos.txt
+    Repos:   ~/.config/ru/repos.d/public.txt (and private.txt)
     Logs:    ~/.local/state/ru/logs/
 
 EXIT CODES:
@@ -598,6 +5485,139 @@ EXIT CODES:
 
 More info: https://github.com/Dicklesworthstone/repo_updater
 EOF
+}
+
+# Show stylish quick menu when ru is run with no arguments
+# Uses gum for beautiful output with ANSI fallback
+show_quick_menu() {
+    # Note: check_gum may not have been called yet, so check directly
+    local has_gum="false"
+    command -v gum &>/dev/null && has_gum="true"
+
+    if [[ "$has_gum" == "true" ]]; then
+        # ══════════════════════════════════════════════════════════════════════
+        # GUM-STYLED OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        printf '\n' >&2
+
+        # Header banner with double border
+        gum style \
+            --border double \
+            --border-foreground 212 \
+            --padding "0 2" \
+            --margin "0 0" \
+            --bold \
+            "🔄 ru v${VERSION}" \
+            "Repo Updater" >&2
+
+        printf '\n' >&2
+
+        # Commands section header
+        gum style --foreground 214 --bold "COMMANDS" >&2
+        printf '\n' >&2
+
+        # Core workflow commands
+        gum style --foreground 39 --bold "  Core Workflow" >&2
+        gum style "    $(gum style --foreground 82 'sync')           Clone missing repos and pull updates" >&2
+        gum style "    $(gum style --foreground 82 'status')         Show repository status (read-only)" >&2
+        gum style "    $(gum style --foreground 82 'review')         AI-assisted review of issues and PRs" >&2
+        printf '\n' >&2
+
+        # Repository management
+        gum style --foreground 39 --bold "  Repository Management" >&2
+        gum style "    $(gum style --foreground 82 'add') <repo>      Add a repository to your list" >&2
+        gum style "    $(gum style --foreground 82 'remove') <repo>   Remove a repository from your list" >&2
+        gum style "    $(gum style --foreground 82 'list')           Show configured repositories" >&2
+        gum style "    $(gum style --foreground 212 --bold 'import') <file>   $(gum style --foreground 212 'Import repos from file (auto-detects visibility)')" >&2
+        printf '\n' >&2
+
+        # Setup & maintenance
+        gum style --foreground 39 --bold "  Setup & Maintenance" >&2
+        gum style "    $(gum style --foreground 82 'init')           Initialize configuration directory" >&2
+        gum style "    $(gum style --foreground 82 'config')         Show or set configuration values" >&2
+        gum style "    $(gum style --foreground 82 'doctor')         Run system diagnostics" >&2
+        gum style "    $(gum style --foreground 82 'prune')          Find and manage orphan repositories" >&2
+        gum style "    $(gum style --foreground 82 'self-update')    Update ru to the latest version" >&2
+        printf '\n' >&2
+
+        # Quick examples
+        gum style --foreground 214 --bold "QUICK START" >&2
+        printf '\n' >&2
+        gum style --faint "  # First time setup" >&2
+        gum style --foreground 82 "  ru init" >&2
+        printf '\n' >&2
+        gum style --faint "  # Add and sync repos" >&2
+        gum style --foreground 82 "  ru add owner/repo" >&2
+        gum style --foreground 82 "  ru sync" >&2
+        printf '\n' >&2
+        gum style --faint "  # Import repos from a file" >&2
+        gum style --foreground 212 "  ru import my_repos.txt" >&2
+        printf '\n' >&2
+
+        # Footer
+        gum style --faint "  Run 'ru --help' for full documentation" >&2
+        gum style --faint "  https://github.com/Dicklesworthstone/repo_updater" >&2
+        printf '\n' >&2
+    else
+        # ══════════════════════════════════════════════════════════════════════
+        # ANSI FALLBACK OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        printf '\n' >&2
+
+        # Header banner with box drawing
+        printf '%b\n' "${BOLD}${MAGENTA}╔════════════════════════════════════════════╗${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}║${RESET}  ${BOLD}🔄 ru${RESET} v${VERSION}                              ${BOLD}${MAGENTA}║${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}║${RESET}  ${DIM}Repo Updater${RESET}                              ${BOLD}${MAGENTA}║${RESET}" >&2
+        printf '%b\n' "${BOLD}${MAGENTA}╚════════════════════════════════════════════╝${RESET}" >&2
+        printf '\n' >&2
+
+        # Commands section header
+        printf '%b\n' "${BOLD}${YELLOW}COMMANDS${RESET}" >&2
+        printf '\n' >&2
+
+        # Core workflow commands
+        printf '%b\n' "  ${BOLD}${CYAN}Core Workflow${RESET}" >&2
+        printf '%b\n' "    ${GREEN}sync${RESET}           Clone missing repos and pull updates" >&2
+        printf '%b\n' "    ${GREEN}status${RESET}         Show repository status (read-only)" >&2
+        printf '%b\n' "    ${GREEN}review${RESET}         AI-assisted review of issues and PRs" >&2
+        printf '\n' >&2
+
+        # Repository management
+        printf '%b\n' "  ${BOLD}${CYAN}Repository Management${RESET}" >&2
+        printf '%b\n' "    ${GREEN}add${RESET} <repo>      Add a repository to your list" >&2
+        printf '%b\n' "    ${GREEN}remove${RESET} <repo>   Remove a repository from your list" >&2
+        printf '%b\n' "    ${GREEN}list${RESET}           Show configured repositories" >&2
+        printf '%b\n' "    ${BOLD}${MAGENTA}import${RESET} <file>   ${MAGENTA}Import repos from file (auto-detects visibility)${RESET}" >&2
+        printf '\n' >&2
+
+        # Setup & maintenance
+        printf '%b\n' "  ${BOLD}${CYAN}Setup & Maintenance${RESET}" >&2
+        printf '%b\n' "    ${GREEN}init${RESET}           Initialize configuration directory" >&2
+        printf '%b\n' "    ${GREEN}config${RESET}         Show or set configuration values" >&2
+        printf '%b\n' "    ${GREEN}doctor${RESET}         Run system diagnostics" >&2
+        printf '%b\n' "    ${GREEN}prune${RESET}          Find and manage orphan repositories" >&2
+        printf '%b\n' "    ${GREEN}self-update${RESET}    Update ru to the latest version" >&2
+        printf '\n' >&2
+
+        # Quick examples
+        printf '%b\n' "${BOLD}${YELLOW}QUICK START${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# First time setup${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru init${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# Add and sync repos${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru add owner/repo${RESET}" >&2
+        printf '%b\n' "  ${GREEN}ru sync${RESET}" >&2
+        printf '\n' >&2
+        printf '%b\n' "  ${DIM}# Import repos from a file${RESET}" >&2
+        printf '%b\n' "  ${MAGENTA}ru import my_repos.txt${RESET}" >&2
+        printf '\n' >&2
+
+        # Footer
+        printf '%b\n' "  ${DIM}Run 'ru --help' for full documentation${RESET}" >&2
+        printf '%b\n' "  ${DIM}https://github.com/Dicklesworthstone/repo_updater${RESET}" >&2
+        printf '\n' >&2
+    fi
 }
 
 #==============================================================================
@@ -660,6 +5680,7 @@ get_config_value() {
 # Resolve all configuration values
 resolve_config() {
     PROJECTS_DIR=$(get_config_value "PROJECTS_DIR" "$DEFAULT_PROJECTS_DIR" "$PROJECTS_DIR")
+    PROJECTS_DIR=$(expand_tilde "$PROJECTS_DIR")
     LAYOUT=$(get_config_value "LAYOUT" "$DEFAULT_LAYOUT" "$LAYOUT")
     UPDATE_STRATEGY=$(get_config_value "UPDATE_STRATEGY" "$DEFAULT_UPDATE_STRATEGY" "$UPDATE_STRATEGY")
     AUTOSTASH=$(get_config_value "AUTOSTASH" "$DEFAULT_AUTOSTASH" "$AUTOSTASH")
@@ -756,11 +5777,11 @@ EOF
         log_verbose "Created config file: $config_file"
     fi
 
-    # Create repos.txt (simplified single file instead of public.txt/private.txt)
-    local repos_file="$repos_dir/repos.txt"
-    if [[ ! -f "$repos_file" ]]; then
-        cat > "$repos_file" << 'EOF'
-# Repository list for ru
+    # Create public.txt for public repositories
+    local public_file="$repos_dir/public.txt"
+    if [[ ! -f "$public_file" ]]; then
+        cat > "$public_file" << 'EOF'
+# Public repositories
 # Add one repository per line
 #
 # Supported formats:
@@ -775,7 +5796,7 @@ EOF
 #   koalaman/shellcheck
 EOF
         created_any="true"
-        log_verbose "Created repos file: $repos_file"
+        log_verbose "Created repos file: $public_file"
     fi
 
     # Create state directories
@@ -812,16 +5833,23 @@ gum_confirm() {
             return 1
         fi
     else
+        if ! can_prompt; then
+            [[ "$default" == "true" ]]
+            return $?
+        fi
+
         # ANSI fallback
         local yn
         if [[ "$default" == "true" ]]; then
-            read -rp "$prompt [Y/n] " yn
+            printf '%s ' "$prompt [Y/n]" >&2
+            IFS= read -r yn
             case "${yn,,}" in
                 n|no) return 1 ;;
                 *) return 0 ;;
             esac
         else
-            read -rp "$prompt [y/N] " yn
+            printf '%s ' "$prompt [y/N]" >&2
+            IFS= read -r yn
             case "${yn,,}" in
                 y|yes) return 0 ;;
                 *) return 1 ;;
@@ -957,15 +5985,53 @@ _is_safe_path_segment() {
     return 0
 }
 
+# Check that a candidate absolute path is safely under a base directory (lexical).
+# This is used to guard any rm -rf operations that use paths sourced from state files.
+# Notes:
+# - We intentionally do NOT resolve symlinks (rm -rf on a symlink removes the link, not the target).
+# - We reject paths containing dot segments to prevent traversal tricks.
+_is_path_under_base() {
+    local path="$1"
+    local base="$2"
+
+    [[ -n "$path" && -n "$base" ]] || return 1
+
+    # Require absolute paths (macOS/Linux support); refuse to operate on relative paths.
+    [[ "$path" == /* && "$base" == /* ]] || return 1
+
+    # Normalize trailing slashes
+    base="${base%/}"
+    path="${path%/}"
+
+    # Refuse empty/base root
+    [[ -n "$base" && "$base" != "/" ]] || return 1
+    [[ -n "$path" && "$path" != "/" ]] || return 1
+
+    # Refuse path traversal/dot segments
+    case "$path" in
+        *"/./"*|*"/../"*|*"/."|*"/..") return 1 ;;
+    esac
+    case "$base" in
+        *"/./"*|*"/../"*|*"/."|*"/..") return 1 ;;
+    esac
+
+    [[ "$path" == "$base" || "$path" == "$base/"* ]]
+}
+
 # Parse all GitHub URL formats and extract components
 # Supports: https://github.com/owner/repo, git@github.com:owner/repo.git,
 #           github.com/owner/repo, owner/repo (assumes github.com)
-# Uses nameref (-n) to return multiple values (requires Bash 4.3+)
+# Args: url host_var owner_var repo_var (variable names)
 parse_repo_url() {
     local url="$1"
-    local -n _host=$2
-    local -n _owner=$3
-    local -n _repo=$4
+    local host_var="$2"
+    local owner_var="$3"
+    local repo_var="$4"
+
+    # Use _out_ prefix to avoid shadowing caller's output variable names.
+    # Without this, if caller passes "host" as host_var, `local host=""` shadows
+    # it and `printf -v host` sets the local instead of caller's variable.
+    local _out_host="" _out_owner="" _out_repo=""
 
     # Normalize: strip .git suffix and trailing slashes
     url="${url%.git}"
@@ -975,43 +6041,46 @@ parse_repo_url() {
 
     # SSH scp-like format: git@host:owner/repo (repo must not contain /)
     if [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[1]}"
-        _owner="${BASH_REMATCH[2]}"
-        _repo="${BASH_REMATCH[3]}"
+        _out_host="${BASH_REMATCH[1]}"
+        _out_owner="${BASH_REMATCH[2]}"
+        _out_repo="${BASH_REMATCH[3]}"
         matched="true"
     # SSH URL format: ssh://git@host/owner/repo (optional user part)
     elif [[ "$url" =~ ^ssh://([^@/]+@)?([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[2]}"
-        _owner="${BASH_REMATCH[3]}"
-        _repo="${BASH_REMATCH[4]}"
+        _out_host="${BASH_REMATCH[2]}"
+        _out_owner="${BASH_REMATCH[3]}"
+        _out_repo="${BASH_REMATCH[4]}"
         matched="true"
     # HTTPS format: https://host/owner/repo (optional user@ for auth)
     elif [[ "$url" =~ ^https?://([^@/]+@)?([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[2]}"
-        _owner="${BASH_REMATCH[3]}"
-        _repo="${BASH_REMATCH[4]}"
+        _out_host="${BASH_REMATCH[2]}"
+        _out_owner="${BASH_REMATCH[3]}"
+        _out_repo="${BASH_REMATCH[4]}"
         matched="true"
     # Host/owner/repo format (no protocol): github.com/owner/repo
     elif [[ "$url" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        _host="${BASH_REMATCH[1]}"
-        _owner="${BASH_REMATCH[2]}"
-        _repo="${BASH_REMATCH[3]}"
+        _out_host="${BASH_REMATCH[1]}"
+        _out_owner="${BASH_REMATCH[2]}"
+        _out_repo="${BASH_REMATCH[3]}"
         matched="true"
     # Shorthand: owner/repo (assumes github.com)
     elif [[ "$url" =~ ^([^/]+)/([^/]+)$ ]]; then
-        _host="github.com"
-        _owner="${BASH_REMATCH[1]}"
-        _repo="${BASH_REMATCH[2]}"
+        _out_host="github.com"
+        _out_owner="${BASH_REMATCH[1]}"
+        _out_repo="${BASH_REMATCH[2]}"
         matched="true"
     fi
 
     # Validate parsed components for path safety
     if [[ "$matched" == "true" ]]; then
         # Strip optional :port from host (avoid filesystem-unfriendly ':' in full layout)
-        _host="${_host%%:*}"
-        if ! _is_safe_path_segment "$_owner" || ! _is_safe_path_segment "$_repo"; then
+        _out_host="${_out_host%%:*}"
+        if ! _is_safe_path_segment "$_out_owner" || ! _is_safe_path_segment "$_out_repo"; then
             return 1
         fi
+        _set_out_var "$host_var" "$_out_host" || return 1
+        _set_out_var "$owner_var" "$_out_owner" || return 1
+        _set_out_var "$repo_var" "$_out_repo" || return 1
         return 0
     fi
 
@@ -1150,61 +6219,68 @@ load_repo_list() {
 #   owner/repo as myname          -> url, empty branch, myname local_name
 #   owner/repo@develop as myname  -> url, develop branch, myname local_name
 #   owner/repo@feature/foo        -> url, feature/foo branch (branches can contain /)
-# Args: spec, url_var, branch_var, local_name_var (namerefs)
+# Args: spec url_var branch_var local_name_var (variable names)
 parse_repo_spec() {
     local spec="$1"
-    local -n _prs_url=$2
-    local -n _prs_branch=$3
-    local -n _prs_local_name=$4
+    local url_var="$2"
+    local branch_var="$3"
+    local local_name_var="$4"
+
+    # Use _out_ prefix to avoid shadowing caller's output variable names.
+    local _out_url="" _out_branch="" _out_local_name=""
 
     # Extract 'as <name>' if present (must be last)
     if [[ "$spec" =~ ^(.+)[[:space:]]+as[[:space:]]+([^[:space:]]+)$ ]]; then
         spec="${BASH_REMATCH[1]}"
         # Trim trailing whitespace from spec (greedy .+ may capture trailing spaces)
         spec="${spec%"${spec##*[![:space:]]}"}"
-        _prs_local_name="${BASH_REMATCH[2]}"
+        _out_local_name="${BASH_REMATCH[2]}"
     else
-        _prs_local_name=""
+        _out_local_name=""
     fi
 
     # Default: no branch
-    _prs_url="$spec"
-    _prs_branch=""
+    _out_url="$spec"
+    _out_branch=""
 
     # Extract '@branch' by splitting on the LAST '@' and only accepting it if the
     # left side is a valid repo URL. This avoids mis-parsing ssh://git@host/... forms
     # while still supporting branch names with / like feature/foo
     if [[ "$spec" == *"@"* ]]; then
-        local maybe_url maybe_branch host owner repo
+        local maybe_url maybe_branch _tmp_host _tmp_owner _tmp_repo
         maybe_url="${spec%@*}"
         maybe_branch="${spec##*@}"
         # Only accept as branch if: left side parses as URL, branch is non-empty and has no spaces
         if [[ -n "$maybe_url" && -n "$maybe_branch" && "$maybe_branch" != *[[:space:]]* ]]; then
-            if parse_repo_url "$maybe_url" host owner repo; then
-                _prs_url="$maybe_url"
-                _prs_branch="$maybe_branch"
+            if parse_repo_url "$maybe_url" _tmp_host _tmp_owner _tmp_repo; then
+                _out_url="$maybe_url"
+                _out_branch="$maybe_branch"
             fi
         fi
     fi
+
+    _set_out_var "$url_var" "$_out_url" || return 1
+    _set_out_var "$branch_var" "$_out_branch" || return 1
+    _set_out_var "$local_name_var" "$_out_local_name" || return 1
 }
 
 # Resolve a repo spec into validated parts and a local path
 # This is the central function for parsing and validating repo specifications.
-# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var (namerefs)
+# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var (variable names)
 # repo_id is canonical for reporting (host/owner/repo, or owner/repo for github.com)
 # Returns: 0 on success, 1 on invalid spec
 resolve_repo_spec() {
     local spec="$1"
     local projects_dir="$2"
     local layout="$3"
-    local -n _rrs_url=$4
-    local -n _rrs_branch=$5
-    local -n _rrs_custom=$6
-    local -n _rrs_path=$7
-    local -n _rrs_repo_id=$8
+    local url_var="$4"
+    local branch_var="$5"
+    local custom_var="$6"
+    local path_var="$7"
+    local repo_id_var="$8"
 
-    # Use unique prefixes to avoid shadowing caller's nameref targets and
-    # avoid conflicts with namerefs in parse_repo_spec and parse_repo_url
+    # Use unique prefixes to avoid shadowing caller variables and
+    # avoid conflicts with variables used in parse_repo_spec and parse_repo_url
     local spec_url spec_branch spec_custom spec_host spec_owner spec_repo
     parse_repo_spec "$spec" spec_url spec_branch spec_custom
 
@@ -1224,6 +6300,8 @@ resolve_repo_spec() {
     fi
 
     # Validate custom name if provided
+    # Use _rrs_ prefix to avoid shadowing caller's output variable names
+    local _rrs_path=""
     if [[ -n "$spec_custom" ]]; then
         _is_safe_path_segment "$spec_custom" || return 1
         _rrs_path="${projects_dir}/${spec_custom}"
@@ -1236,16 +6314,19 @@ resolve_repo_spec() {
         esac
     fi
 
-    _rrs_url="$spec_url"
-    _rrs_branch="$spec_branch"
-    _rrs_custom="$spec_custom"
-
     # Build canonical repo ID for display/reporting
+    local _rrs_repo_id=""
     if [[ "$spec_host" == "github.com" ]]; then
         _rrs_repo_id="${spec_owner}/${spec_repo}"
     else
         _rrs_repo_id="${spec_host}/${spec_owner}/${spec_repo}"
     fi
+
+    _set_out_var "$url_var" "$spec_url" || return 1
+    _set_out_var "$branch_var" "$spec_branch" || return 1
+    _set_out_var "$custom_var" "$spec_custom" || return 1
+    _set_out_var "$path_var" "$_rrs_path" || return 1
+    _set_out_var "$repo_id_var" "$_rrs_repo_id" || return 1
 
     return 0
 }
@@ -1327,8 +6408,86 @@ get_all_repos() {
 
     # Deduplicate and output
     if [[ -n "$all_repos" ]]; then
-        echo -n "$all_repos" | dedupe_repos
+        printf '%s' "$all_repos" | dedupe_repos
     fi
+}
+
+# Find the configured repo spec for a repo_id (preserves branch pins/custom names)
+# Args: repo_id (owner/repo or host/owner/repo)
+# Output: matching repo spec on stdout
+find_repo_spec_for_repo_id() {
+    local target_repo_id="$1"
+    [[ -z "$target_repo_id" ]] && return 1
+
+    local spec url branch custom_name path repo_id
+    while IFS= read -r spec; do
+        [[ -z "$spec" ]] && continue
+        if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name path repo_id; then
+            if [[ "$repo_id" == "$target_repo_id" ]]; then
+                printf '%s\n' "$spec"
+                return 0
+            fi
+        fi
+    done < <(get_all_repos)
+
+    return 1
+}
+
+# Attempt to detect latest release version without the GitHub API (avoids rate limits/proxies).
+# Returns:
+#   0 with version on stdout - success
+#   1 - no releases exist (redirect resolves to /releases)
+#   2 - request failed
+get_latest_release_from_redirect() {
+    local latest_url="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/latest"
+    local effective_url=""
+
+    if command -v curl &>/dev/null; then
+        if ! effective_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null); then
+            return 2
+        fi
+    elif command -v wget &>/dev/null; then
+        effective_url=$(
+            wget -qS --spider --max-redirect=0 "$latest_url" 2>&1 \
+                | awk '/^  Location: /{print $2}' \
+                | tail -1 \
+                | tr -d '\r'
+        )
+        if [[ -z "$effective_url" ]]; then
+            return 2
+        fi
+    else
+        return 2
+    fi
+
+    if [[ "$effective_url" != *"/tag/"* ]]; then
+        return 1
+    fi
+
+    local tag="${effective_url##*/tag/}"
+    tag="${tag%%\?*}"
+    local version="${tag#v}"
+    [[ -n "$version" ]] || return 2
+    printf '%s\n' "$version"
+}
+
+append_query_param() {
+    local url="$1"
+    local key="$2"
+    local value="$3"
+
+    local sep='?'
+    [[ "$url" == *\?* ]] && sep='&'
+    printf '%s%s%s=%s' "$url" "$sep" "$key" "$value"
+}
+
+cache_bust_url() {
+    local url="$1"
+    if [[ "${RU_CACHE_BUST:-1}" != "1" ]]; then
+        printf '%s' "$url"
+        return 0
+    fi
+    append_query_param "$url" "ru_cb" "${RU_CACHE_BUST_TOKEN:-$(date +%s)}"
 }
 
 #==============================================================================
@@ -1341,6 +6500,48 @@ is_git_repo() {
     local dir="$1"
     # Fast check for .git directory, then verify with plumbing
     [[ -d "$dir/.git" ]] || git -C "$dir" rev-parse --git-dir &>/dev/null
+}
+
+# Check if repo has uncommitted changes (staged, unstaged, or untracked)
+# Returns: 0 if dirty, 1 if clean or not a git repo
+repo_is_dirty() {
+    local repo_path="$1"
+    [[ -z "$repo_path" ]] && return 1
+    if ! is_git_repo "$repo_path"; then
+        return 1
+    fi
+
+    if ! git -C "$repo_path" diff --quiet -- 2>/dev/null; then
+        return 0
+    fi
+    if ! git -C "$repo_path" diff --cached --quiet -- 2>/dev/null; then
+        return 0
+    fi
+    if [[ -n "$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if repo has changes excluding .ru artifacts
+# Returns: 0 if dirty (excluding .ru), 1 if clean or not a git repo
+repo_is_dirty_excluding_ru() {
+    local repo_path="$1"
+    [[ -z "$repo_path" ]] && return 1
+    if ! is_git_repo "$repo_path"; then
+        return 1
+    fi
+
+    local changed
+    changed=$(git -C "$repo_path" diff --name-only 2>/dev/null | grep -vE '^\.(ru)(/|$)' || true)
+    [[ -n "$changed" ]] && return 0
+    changed=$(git -C "$repo_path" diff --cached --name-only 2>/dev/null | grep -vE '^\.(ru)(/|$)' || true)
+    [[ -n "$changed" ]] && return 0
+    changed=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null | grep -vE '^\.(ru)(/|$)' || true)
+    [[ -n "$changed" ]] && return 0
+
+    return 1
 }
 
 # Get repository status using git plumbing
@@ -1361,9 +6562,9 @@ get_repo_status() {
         git -C "$repo_path" fetch --quiet 2>/dev/null || true
     fi
 
-    # Check dirty status using porcelain (machine-readable)
+    # Check dirty status using plumbing (no status parsing)
     local dirty="false"
-    if [[ -n $(git -C "$repo_path" status --porcelain 2>/dev/null) ]]; then
+    if repo_is_dirty "$repo_path"; then
         dirty="true"
     fi
 
@@ -1378,11 +6579,12 @@ get_repo_status() {
     fi
 
     # Get ahead/behind counts using plumbing (deterministic, locale-independent)
-    local ahead=0 behind=0
+    local ahead=0 behind=0 output
     # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream tracking branch
     if ! output=$(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null); then
-        # If rev-list fails (e.g. unrelated histories), assume diverged
-        echo "STATUS=diverged AHEAD=? BEHIND=? DIRTY=$dirty BRANCH=$branch"
+        # If rev-list fails (e.g. unrelated histories), use -1 to indicate unknown
+        # (must be numeric for JSON output compatibility, ? would break printf %d)
+        echo "STATUS=diverged AHEAD=-1 BEHIND=-1 DIRTY=$dirty BRANCH=$branch"
         return 0
     fi
     read -r ahead behind <<< "$output"
@@ -1696,10 +6898,24 @@ load_sync_state() {
 # Args: status completed_array pending_array
 save_sync_state() {
     local status="$1"
-    shift
-    local -n completed_ref=$1
-    shift
-    local -n pending_ref=$1
+    local completed_name="$2"
+    local pending_name="$3"
+
+    _is_valid_var_name "$completed_name" || return 1
+    _is_valid_var_name "$pending_name" || return 1
+
+    # Use _arr_ prefix to avoid shadowing caller's variable names.
+    # If caller passes "completed" as completed_name, `local completed=()` would
+    # shadow it and eval would expand the empty local instead of caller's array.
+    # Note: We check array length first because "${arr[@]}" creates one empty
+    # element when arr is empty (the quotes preserve an empty expansion).
+    local -a _arr_completed=()
+    local -a _arr_pending=()
+    local _len
+    eval "_len=\${#${completed_name}[@]}"
+    [[ $_len -gt 0 ]] && eval "_arr_completed=(\"\${${completed_name}[@]}\")"
+    eval "_len=\${#${pending_name}[@]}"
+    [[ $_len -gt 0 ]] && eval "_arr_pending=(\"\${${pending_name}[@]}\")"
 
     local state_file
     state_file=$(get_sync_state_file)
@@ -1715,8 +6931,8 @@ save_sync_state() {
 
     # Build completed array JSON (handle empty array with set -u)
     local completed_json=""
-    if [[ ${#completed_ref[@]} -gt 0 ]]; then
-        for item in "${completed_ref[@]}"; do
+    if [[ ${#_arr_completed[@]} -gt 0 ]]; then
+        for item in "${_arr_completed[@]}"; do
             [[ -n "$completed_json" ]] && completed_json+=","
             completed_json+="\"$(json_escape "$item")\""
         done
@@ -1724,23 +6940,26 @@ save_sync_state() {
 
     # Build pending array JSON (handle empty array with set -u)
     local pending_json=""
-    if [[ ${#pending_ref[@]} -gt 0 ]]; then
-        for item in "${pending_ref[@]}"; do
+    if [[ ${#_arr_pending[@]} -gt 0 ]]; then
+        for item in "${_arr_pending[@]}"; do
             [[ -n "$pending_json" ]] && pending_json+=","
             pending_json+="\"$(json_escape "$item")\""
         done
     fi
 
-    cat > "$tmp_file" <<EOF
-{
-  "run_id": "$run_id",
-  "status": "$status",
-  "config_hash": "$config_hash",
-  "results_file": "${RESULTS_FILE:-}",
-  "completed": [$completed_json],
-  "pending": [$pending_json]
-}
-EOF
+    # Write JSON to temp file (uses hex escapes for braces to avoid breaking
+    # awk-based function extraction in test files that count brace depth)
+    local _ob=$'\x7b' _cb=$'\x7d'  # { and } as hex escapes
+    (
+        echo "${_ob}"
+        echo "  \"run_id\": \"$run_id\","
+        echo "  \"status\": \"$status\","
+        echo "  \"config_hash\": \"$config_hash\","
+        echo "  \"results_file\": \"${RESULTS_FILE:-}\","
+        echo "  \"completed\": [$completed_json],"
+        echo "  \"pending\": [$pending_json]"
+        echo "${_cb}"
+    ) > "$tmp_file"
 
     # Atomic rename
     mv "$tmp_file" "$state_file"
@@ -1849,6 +7068,11 @@ process_single_repo_worker() {
             echo "CONFLICT:diverged:$repo_label"
             return 0
         fi
+        if [[ "$status" == "no_upstream" ]]; then
+            write_result "$repo_label" "pull" "no_upstream" "0" "" "$local_path"
+            echo "CONFLICT:no_upstream:$repo_label"
+            return 0
+        fi
 
         if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
             echo "OK:updated:$repo_label"
@@ -1861,8 +7085,12 @@ process_single_repo_worker() {
 # Run parallel sync with worker pool
 # Args: pending_repos array ref, parallel count
 run_parallel_sync() {
-    local -n repos_ref=$1
+    local repos_name="$1"
     local parallel_count=$2
+
+    _is_valid_var_name "$repos_name" || return 1
+    local -a repos=()
+    eval "repos=(\"\${${repos_name}[@]-}\")"
 
     # Validate parallel count
     if [[ ! "$parallel_count" =~ ^[0-9]+$ ]] || [[ "$parallel_count" -lt 1 ]]; then
@@ -1870,7 +7098,7 @@ run_parallel_sync() {
         return 4
     fi
 
-    local total=${#repos_ref[@]}
+    local total=${#repos[@]}
     if [[ $total -eq 0 ]]; then
         return 0
     fi
@@ -1884,17 +7112,20 @@ run_parallel_sync() {
     echo "" >&2
 
     # Create temporary files for work queue and results
-    local work_queue results_file lock_file progress_file
+    local work_queue results_file lock_base progress_file
     work_queue=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
     results_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
-    lock_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    lock_base=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
     progress_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    local queue_lock_dir="${lock_base}.queue.lock"
+    local results_lock_dir="${lock_base}.results.lock"
+    local progress_lock_dir="${lock_base}.progress.lock"
 
     # Write repos to work queue
-    printf '%s\n' "${repos_ref[@]}" > "$work_queue"
+    printf '%s\n' "${repos[@]}" > "$work_queue"
 
     # Initialize progress counter
-    echo "0" > "$progress_file"
+    printf '0\n' > "$progress_file"
 
     # Launch workers
     local worker_pids=()
@@ -1903,15 +7134,17 @@ run_parallel_sync() {
             while true; do
                 # Atomically get next repo from queue
                 local repo_spec
-                {
-                    flock -x 200
+                if dir_lock_acquire "$queue_lock_dir" 60; then
                     repo_spec=$(head -1 "$work_queue" 2>/dev/null)
                     if [[ -n "$repo_spec" ]]; then
-                        # Remove from queue (portable sed)
+                        # Remove from queue (portable)
                         tail -n +2 "$work_queue" > "${work_queue}.tmp" 2>/dev/null
                         mv "${work_queue}.tmp" "$work_queue" 2>/dev/null
                     fi
-                } 200>"$lock_file"
+                    dir_lock_release "$queue_lock_dir"
+                else
+                    repo_spec=""
+                fi
 
                 # Exit if no more work
                 [[ -z "$repo_spec" ]] && break
@@ -1922,17 +7155,23 @@ run_parallel_sync() {
                     "$UPDATE_STRATEGY" "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES")
 
                 # Append result atomically
-                echo "$result" >> "$results_file"
+                if dir_lock_acquire "$results_lock_dir" 60; then
+                    printf '%s\n' "$result" >> "$results_file"
+                    dir_lock_release "$results_lock_dir"
+                else
+                    # Best-effort fallback: warn and write without lock
+                    printf '\n⚠ Warning: Could not acquire results lock, writing without lock\n' >&2
+                    printf '%s\n' "$result" >> "$results_file"
+                fi
 
                 # Update progress atomically
-                {
-                    flock -x 201
+                if dir_lock_acquire "$progress_lock_dir" 60; then
                     local current
                     current=$(cat "$progress_file")
                     echo $((current + 1)) > "$progress_file"
-                    # Print progress
-                    echo -ne "\r→ Progress: $((current + 1))/$total" >&2
-                } 201>"${lock_file}.progress"
+                    printf '\r→ Progress: %d/%d' "$((current + 1))" "$total" >&2
+                    dir_lock_release "$progress_lock_dir"
+                fi
             done
         ) &
         worker_pids+=($!)
@@ -1943,7 +7182,7 @@ run_parallel_sync() {
         wait "$pid" 2>/dev/null || true
     done
 
-    echo "" >&2  # New line after progress
+    printf '\n' >&2  # New line after progress
 
     # Parse results
     local cloned=0 updated=0 skipped=0 failed=0 conflicts=0
@@ -1962,8 +7201,9 @@ run_parallel_sync() {
         esac
     done < "$results_file"
 
-    # Cleanup temp files
-    rm -f "$work_queue" "$results_file" "$lock_file" "${lock_file}.progress" "$progress_file" 2>/dev/null
+    # Cleanup temp files and lock directories
+    rm -f "$work_queue" "${work_queue}.tmp" "$results_file" "$lock_base" "$progress_file" 2>/dev/null
+    rmdir "$queue_lock_dir" "$results_lock_dir" "$progress_lock_dir" 2>/dev/null || true
 
     # Return results via global variables (for summary)
     PARALLEL_CLONED=$cloned
@@ -1986,9 +7226,12 @@ cleanup() {
         return
     fi
 
-    # Remove temp files
+    # Remove temp files and lock directories
     if [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
         rm -f "$RESULTS_FILE"
+    fi
+    if [[ -n "${RESULTS_LOCK_DIR:-}" && -d "$RESULTS_LOCK_DIR" ]]; then
+        rmdir "$RESULTS_LOCK_DIR" 2>/dev/null || true
     fi
 }
 
@@ -2006,6 +7249,12 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
+                # Pass help to command-specific handlers if a command with its own help is set
+                if [[ "$COMMAND" == "dep-update" || "$COMMAND" == "ai-sync" ]]; then
+                    ARGS+=("$1")
+                    shift
+                    continue
+                fi
                 show_help
                 exit 0
                 ;;
@@ -2015,6 +7264,12 @@ parse_args() {
                 ;;
             --json)
                 JSON_OUTPUT="true"
+                # Also pass to subcommands that handle --json internally
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
+                    ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
+                fi
                 shift
                 ;;
             -q|--quiet)
@@ -2030,7 +7285,7 @@ parse_args() {
                 shift
                 ;;
             --dry-run)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" || "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
@@ -2072,7 +7327,7 @@ parse_args() {
                 shift
                 ;;
             --resume)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
@@ -2082,7 +7337,13 @@ parse_args() {
                 shift
                 ;;
             --restart)
-                RESTART="true"
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
+                    ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
+                else
+                    RESTART="true"
+                fi
                 shift
                 ;;
             --timeout)
@@ -2090,11 +7351,47 @@ parse_args() {
                     log_error "--timeout requires a value in seconds"
                     exit 4
                 fi
-                GIT_TIMEOUT="$2"
+                if [[ "$COMMAND" == "agent-sweep" || "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("--timeout=$2")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("--timeout=$2")
+                else
+                    GIT_TIMEOUT="$2"
+                fi
                 shift 2
                 ;;
+            --timeout=*)
+                if [[ "$COMMAND" == "agent-sweep" || "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
+                else
+                    GIT_TIMEOUT="${1#--timeout=}"
+                fi
+                shift
+                ;;
+            --repo=*|--manager=*|--include=*|--exclude=*|--test-cmd=*|--max-fix-attempts=*|--agent=*)
+                if [[ "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("$1")
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                shift
+                ;;
+            --major|--no-push|--no-untracked)
+                if [[ "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("$1")
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                shift
+                ;;
             --parallel)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     if [[ $# -lt 2 ]]; then
                         log_error "--parallel requires a number"
                         exit 4
@@ -2118,7 +7415,7 @@ parse_args() {
                 fi
                 ;;
             --parallel=*)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
@@ -2165,17 +7462,30 @@ parse_args() {
                 INIT_EXAMPLE="true"
                 shift
                 ;;
-            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review)
+            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep|ai-sync|dep-update)
                 COMMAND="$1"
                 shift
                 ;;
-            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd)
+            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd|--review)
                 # Subcommand-specific options - pass through to ARGS
                 ARGS+=("$1")
                 shift
                 ;;
-            --plan|--apply|--push|--analytics|--basic|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
+            --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" ]]; then
+                    ARGS+=("$1")
+                    shift
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_review_args+=("$1")
+                    shift
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                ;;
+            --max-file-mb=*)
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                     shift
                 elif [[ -z "$COMMAND" ]]; then
@@ -2227,7 +7537,7 @@ parse_args() {
     fi
 
     # Apply any pending args that appeared before the command
-    if [[ "$COMMAND" == "review" ]]; then
+    if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
         [[ ${#pending_review_args[@]} -gt 0 ]] && ARGS+=("${pending_review_args[@]}")
         [[ ${#pending_global_args[@]} -gt 0 ]] && ARGS+=("${pending_global_args[@]}")
     else
@@ -2242,6 +7552,9 @@ parse_args() {
                 case "$opt" in
                     --dry-run) DRY_RUN="true" ;;
                     --resume)  RESUME="true" ;;
+                    --restart) RESTART="true" ;;
+                    --json)    ;; # Already set JSON_OUTPUT at first pass
+                    --timeout=*) GIT_TIMEOUT="${opt#--timeout=}" ;;
                     --parallel=*) PARALLEL="${opt#--parallel=}" ;;
                     -j*) PARALLEL="${opt#-j}" ;;
                 esac
@@ -2289,6 +7602,25 @@ aggregate_results() {
     done < "$RESULTS_FILE"
 
     echo "CLONED=$cloned UPDATED=$updated CURRENT=$current SKIPPED=$skipped FAILED=$failed CONFLICTS=$conflicts SYSTEM_ERRORS=$system_errors"
+}
+
+# Load aggregate_results into global counters without eval.
+# Sets: CLONED UPDATED CURRENT SKIPPED FAILED CONFLICTS SYSTEM_ERRORS
+load_aggregate_results_globals() {
+    CLONED=0 UPDATED=0 CURRENT=0 SKIPPED=0 FAILED=0 CONFLICTS=0 SYSTEM_ERRORS=0
+
+    local kv key val
+    for kv in $(aggregate_results); do
+        key="${kv%%=*}"
+        val="${kv#*=}"
+        [[ "$val" =~ ^[0-9]+$ ]] || val=0
+
+        case "$key" in
+            CLONED|UPDATED|CURRENT|SKIPPED|FAILED|CONFLICTS|SYSTEM_ERRORS)
+                printf -v "$key" '%s' "$val"
+                ;;
+        esac
+    done
 }
 
 # Print a beautiful summary box with gum or ANSI fallback
@@ -2407,13 +7739,16 @@ print_conflict_help() {
                 printf '%b\n' "   Issue:  ${YELLOW}Dirty working tree${RESET} (uncommitted changes)" >&2
                 echo "" >&2
                 printf '%b\n' "   ${DIM}Resolution options:${RESET}" >&2
-                printf '%b\n' "     ${GREEN}a)${RESET} Stash and pull:" >&2
+                printf '%b\n' "     ${GREEN}a)${RESET} Use ru with --autostash (${GREEN}recommended${RESET}):" >&2
+                printf '%b\n' "        ${CYAN}ru sync --autostash${RESET}" >&2
+                echo "" >&2
+                printf '%b\n' "     ${GREEN}b)${RESET} Stash and pull manually:" >&2
                 printf '%b\n' "        ${CYAN}cd \"$path\" && git stash && git pull && git stash pop${RESET}" >&2
                 echo "" >&2
-                printf '%b\n' "     ${GREEN}b)${RESET} Commit your changes:" >&2
+                printf '%b\n' "     ${GREEN}c)${RESET} Commit your changes:" >&2
                 printf '%b\n' "        ${CYAN}cd \"$path\" && git add . && git commit -m \"WIP\"${RESET}" >&2
                 echo "" >&2
-                printf '%b\n' "     ${RED}c)${RESET} Discard local changes (${RED}DESTRUCTIVE${RESET}):" >&2
+                printf '%b\n' "     ${RED}d)${RESET} Discard local changes (${RED}DESTRUCTIVE${RESET}):" >&2
                 printf '%b\n' "        ${CYAN}cd \"$path\" && git checkout . && git clean -fd${RESET}" >&2
                 echo "" >&2
                 ;;
@@ -2631,7 +7966,7 @@ cmd_sync() {
         done
 
         # Aggregate results and compute proper exit code
-        eval "$(aggregate_results)"
+        load_aggregate_results_globals
         compute_exit_code "$FAILED" "$CONFLICTS" "$SYSTEM_ERRORS"
         exit $?
     fi
@@ -2649,7 +7984,7 @@ cmd_sync() {
         log_info "To add repos:"
         log_info "  ru add owner/repo              # Add to list"
         log_info "  ru sync owner/repo             # Sync directly (without adding)"
-        log_info "  echo 'owner/repo' >> $RU_CONFIG_DIR/repos.d/repos.txt  # Edit file directly"
+        log_info "  echo 'owner/repo' >> $RU_CONFIG_DIR/repos.d/public.txt  # Edit file directly"
         exit 0
     fi
 
@@ -2747,17 +8082,7 @@ cmd_sync() {
 
     # Check for parallel mode
     local parallel_count="${PARALLEL:-1}"
-
-    # Check for flock availability before entering parallel mode
-    if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
-        if ! command -v flock &>/dev/null; then
-            log_warn "Parallel sync requires 'flock' which is not installed"
-            log_warn "Falling back to sequential sync"
-            log_info "To enable parallel sync on macOS: brew install flock"
-            PARALLEL=""
-            parallel_count="1"
-        fi
-    fi
+    # Parallel mode uses portable directory locks (no external deps).
 
     if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
         # Parallel mode: use worker pool
@@ -2862,6 +8187,12 @@ cmd_sync() {
                 write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
                 continue
             fi
+            if [[ "$status" == "no_upstream" ]]; then
+                log_warn "No upstream: $repo_label"
+                ((conflicts++))
+                write_result "$repo_label" "pull" "no_upstream" "0" "" "$local_path"
+                continue
+            fi
 
             if do_pull "$local_path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
                 ((updated++))
@@ -2902,7 +8233,7 @@ cmd_sync() {
     duration=$((end_time - start_time))
 
     # Get aggregated counts from results file
-    eval "$(aggregate_results)"
+    load_aggregate_results_globals
 
     # Print summary using the new reporting functions
     print_summary "$CLONED" "$UPDATED" "$CURRENT" "$SKIPPED" "$CONFLICTS" "$FAILED" "$duration"
@@ -2927,21 +8258,20 @@ cmd_status() {
         exit 0
     fi
 
-    # Check for configured repos
-    local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
-    if [[ ! -f "$repos_file" ]] || [[ ! -s "$repos_file" ]] || ! grep -Eqv '^[[:space:]]*#|^[[:space:]]*$' "$repos_file" 2>/dev/null; then
-        log_info "No repositories configured."
-        log_info "Add repos with: ru add owner/repo"
-        exit 0
-    fi
-
-    # Load all repos from config
+    # Load all repos from config (reads from all *.txt files in repos.d/)
     local repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && repos+=("$line")
     done < <(get_all_repos)
 
     local total=${#repos[@]}
+
+    # Check for configured repos
+    if [[ "$total" -eq 0 ]]; then
+        log_info "No repositories configured."
+        log_info "Add repos with: ru add owner/repo"
+        exit 0
+    fi
 
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         # JSON output mode
@@ -2952,7 +8282,7 @@ cmd_status() {
             if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
                 continue
             fi
-            local status="missing" ahead=0 behind=0 dirty="false" branch_name=""
+            local status="missing" ahead=0 behind=0 dirty="false" mismatch="false" branch_name=""
             if [[ -d "$local_path" ]] && is_git_repo "$local_path"; then
                 local status_info
                 status_info=$(get_repo_status "$local_path" "$FETCH_REMOTES")
@@ -2961,6 +8291,10 @@ cmd_status() {
                 behind=$(echo "$status_info" | sed 's/.*BEHIND=\([^ ]*\).*/\1/')
                 dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
                 branch_name=$(echo "$status_info" | sed 's/.*BRANCH=\([^ ]*\).*/\1/')
+                # Check for remote URL mismatch
+                if check_remote_mismatch "$local_path" "$url"; then
+                    mismatch="true"
+                fi
             elif [[ -d "$local_path" ]]; then
                 status="not_git"
             fi
@@ -2970,8 +8304,8 @@ cmd_status() {
             local safe_path safe_branch
             safe_path=$(json_escape "$local_path")
             safe_branch=$(json_escape "$branch_name")
-            printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s}' \
-                "$repo_id" "$safe_path" "$status" "$safe_branch" "$ahead" "$behind" "$dirty"
+            printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s,"mismatch":%s}' \
+                "$repo_id" "$safe_path" "$status" "$safe_branch" "$ahead" "$behind" "$dirty" "$mismatch"
         done
         echo "]"
     else
@@ -2979,14 +8313,26 @@ cmd_status() {
         log_info "Repository Status ($total repos)"
         [[ "$FETCH_REMOTES" == "true" ]] && log_info "Fetching remotes for accurate status..."
         echo "" >&2
-        printf "%-30s %-12s %-15s %s\n" "Repository" "Status" "Branch" "Ahead/Behind" >&2
-        printf "%-30s %-12s %-15s %s\n" "------------------------------" "------------" "---------------" "------------" >&2
+
+        # First pass: compute max repo_id length for proper column width
+        local max_repo_len=10
+        for repo_spec in "${repos[@]}"; do
+            local url branch custom_name local_path repo_id
+            if resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                [[ ${#repo_id} -gt $max_repo_len ]] && max_repo_len=${#repo_id}
+            fi
+        done
+
+        # Print header with dynamic width (no truncation)
+        printf "%-${max_repo_len}s  %-12s %-15s %s\n" "Repository" "Status" "Branch" "Ahead/Behind" >&2
+        printf "%-${max_repo_len}s  %-12s %-15s %s\n" "$(printf '%*s' "$max_repo_len" '' | tr ' ' '-')" "------------" "---------------" "------------" >&2
+
         for repo_spec in "${repos[@]}"; do
             local url branch custom_name local_path repo_id
             if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
                 continue
             fi
-            local status="missing" ahead=0 behind=0 dirty="false" branch_name="" status_display
+            local status="missing" ahead=0 behind=0 dirty="false" mismatch="false" branch_name="" status_display
             if [[ -d "$local_path" ]] && is_git_repo "$local_path"; then
                 local status_info
                 status_info=$(get_repo_status "$local_path" "$FETCH_REMOTES")
@@ -2995,24 +8341,33 @@ cmd_status() {
                 behind=$(echo "$status_info" | sed 's/.*BEHIND=\([^ ]*\).*/\1/')
                 dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
                 branch_name=$(echo "$status_info" | sed 's/.*BRANCH=\([^ ]*\).*/\1/')
+                # Check for remote URL mismatch
+                if check_remote_mismatch "$local_path" "$url"; then
+                    mismatch="true"
+                fi
             elif [[ -d "$local_path" ]]; then
                 status="not_git"
             fi
-            case "$status" in
-                current)     status_display="${GREEN}current${RESET}" ;;
-                behind)      status_display="${YELLOW}behind${RESET}" ;;
-                ahead)       status_display="${CYAN}ahead${RESET}" ;;
-                diverged)    status_display="${RED}diverged${RESET}" ;;
-                missing)     status_display="${DIM}missing${RESET}" ;;
-                not_git)     status_display="${RED}not_git${RESET}" ;;
-                no_upstream) status_display="${YELLOW}no_upstrm${RESET}" ;;
-                *)           status_display="$status" ;;
-            esac
+            # If there's a mismatch, override status display
+            if [[ "$mismatch" == "true" ]]; then
+                status_display="${RED}mismatch${RESET}"
+            else
+                case "$status" in
+                    current)     status_display="${GREEN}current${RESET}" ;;
+                    behind)      status_display="${YELLOW}behind${RESET}" ;;
+                    ahead)       status_display="${CYAN}ahead${RESET}" ;;
+                    diverged)    status_display="${RED}diverged${RESET}" ;;
+                    missing)     status_display="${DIM}missing${RESET}" ;;
+                    not_git)     status_display="${RED}not_git${RESET}" ;;
+                    no_upstream) status_display="${YELLOW}no_upstrm${RESET}" ;;
+                    *)           status_display="$status" ;;
+                esac
+            fi
             [[ "$dirty" == "true" ]] && status_display="${status_display}${YELLOW}*${RESET}"
-            printf "%-30s %-12b %-15s %d/%d\n" "${repo_id:0:30}" "$status_display" "${branch_name:0:15}" "$ahead" "$behind" >&2
+            printf "%-${max_repo_len}s  %-12b %-15s %d/%d\n" "$repo_id" "$status_display" "$branch_name" "$ahead" "$behind" >&2
         done
         echo "" >&2
-        log_info "Legend: * = uncommitted changes"
+        log_info "Legend: * = uncommitted changes, mismatch = remote URL differs from config"
     fi
 }
 
@@ -3024,16 +8379,16 @@ cmd_init() {
 
     if [[ "$created" == "true" ]]; then
         log_success "Created configuration directory: $RU_CONFIG_DIR"
-        log_success "Created repos file: $RU_CONFIG_DIR/repos.d/repos.txt"
+        log_success "Created repos file: $RU_CONFIG_DIR/repos.d/public.txt"
         log_success "Created config file: $RU_CONFIG_DIR/config"
 
-        # Handle --example flag: copy example repos to repos.txt
+        # Handle --example flag: copy example repos to public.txt
         if [[ "$INIT_EXAMPLE" == "true" ]]; then
             local example_file="$SCRIPT_DIR/examples/public.txt"
-            local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
+            local public_file="$RU_CONFIG_DIR/repos.d/public.txt"
             if [[ -f "$example_file" ]]; then
-                # Overwrite the template repos.txt with example content
-                cp "$example_file" "$repos_file"
+                # Overwrite the template public.txt with example content
+                cp "$example_file" "$public_file"
                 log_success "Added example repos from $example_file"
             else
                 log_warn "Example file not found: $example_file"
@@ -3044,11 +8399,11 @@ cmd_init() {
         log_info "Next steps:"
         log_info "  1. Add repos:  ru add owner/repo"
         log_info "  2. Sync:       ru sync"
-        log_info "  3. Or edit:    $RU_CONFIG_DIR/repos.d/repos.txt"
+        log_info "  3. Or edit:    $RU_CONFIG_DIR/repos.d/public.txt"
     else
         log_info "Configuration already exists at: $RU_CONFIG_DIR"
         log_info "  Config:  $RU_CONFIG_DIR/config"
-        log_info "  Repos:   $RU_CONFIG_DIR/repos.d/repos.txt"
+        log_info "  Repos:   $RU_CONFIG_DIR/repos.d/public.txt"
     fi
 }
 
@@ -3103,12 +8458,12 @@ cmd_add() {
             echo "# Private repositories" > "$repos_file"
         fi
     else
-        repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
+        repos_file="$RU_CONFIG_DIR/repos.d/public.txt"
     fi
 
     for repo in "${repo_args[@]}"; do
         # Parse the repo spec to extract URL (ignoring branch/custom name for dupe check)
-        # shellcheck disable=SC2034  # spec_branch/spec_name set by nameref, intentionally unused
+        # shellcheck disable=SC2034  # spec_branch/spec_name set by parse_repo_spec, intentionally unused
         local spec_url spec_branch spec_name
         parse_repo_spec "$repo" spec_url spec_branch spec_name
 
@@ -3132,7 +8487,7 @@ cmd_add() {
             [[ -z "$line" ]] && continue
 
             # Parse the existing spec to get its URL
-            # shellcheck disable=SC2034  # existing_branch/existing_name set by nameref, intentionally unused
+            # shellcheck disable=SC2034  # existing_branch/existing_name set by parse_repo_spec, intentionally unused
             local existing_url existing_branch existing_name
             parse_repo_spec "$line" existing_url existing_branch existing_name
 
@@ -3160,7 +8515,7 @@ cmd_add() {
         # Also check the other repos file (public vs private)
         local other_file other_label
         if [[ "$use_private" == "true" ]]; then
-            other_file="$RU_CONFIG_DIR/repos.d/repos.txt"
+            other_file="$RU_CONFIG_DIR/repos.d/public.txt"
             other_label="public"
         else
             other_file="$RU_CONFIG_DIR/repos.d/private.txt"
@@ -3170,7 +8525,7 @@ cmd_add() {
         if [[ -f "$other_file" ]]; then
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
-                # shellcheck disable=SC2034  # existing_branch, existing_name set by nameref but only URL used
+                # shellcheck disable=SC2034  # existing_branch, existing_name set by parse_repo_spec but only URL used
                 local existing_url existing_branch existing_name
                 parse_repo_spec "$line" existing_url existing_branch existing_name
                 local existing_host existing_owner existing_repo
@@ -3257,12 +8612,34 @@ cmd_import() {
     local repos_dir="$RU_CONFIG_DIR/repos.d"
     mkdir -p "$repos_dir"
 
-    local public_file="$repos_dir/repos.txt"
+    local public_file="$repos_dir/public.txt"
     local private_file="$repos_dir/private.txt"
 
     # Initialize files if needed
     [[ ! -f "$public_file" ]] && touch "$public_file"
     [[ ! -f "$private_file" ]] && touch "$private_file"
+
+    # Load existing repos into associative array for fast deduplication
+    local -A existing_repos
+    for f in "$public_file" "$private_file"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            # Trim whitespace
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+
+            # shellcheck disable=SC2034 # Variables set by parse_repo_spec
+            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
+            parse_repo_spec "$line" ex_url ex_branch ex_name
+            if parse_repo_url "$ex_url" ex_host ex_owner ex_repo; then
+                # Store canonical ID: host/owner/repo
+                existing_repos["${ex_host}/${ex_owner}/${ex_repo}"]=1
+            fi
+        done < "$f"
+    done
 
     # Counters
     local imported_public=0
@@ -3280,6 +8657,8 @@ cmd_import() {
     for input_file in "${file_args[@]}"; do
         if [[ ! -f "$input_file" ]]; then
             log_error "File not found: $input_file"
+            ((skipped_error++))
+            error_repos+=("$input_file|file not found")
             continue
         fi
 
@@ -3297,21 +8676,29 @@ cmd_import() {
             ((total_lines++))
             ((file_line_count++))
 
+            # Parse the repo spec to get base URL and metadata
+            # shellcheck disable=SC2034 # Variables set by parse_repo_spec
+            local spec_url spec_branch spec_name
+            parse_repo_spec "$line" spec_url spec_branch spec_name
+
             # Parse the URL
             local host="" owner="" repo=""
-            if ! parse_repo_url "$line" host owner repo 2>/dev/null; then
+            if ! parse_repo_url "$spec_url" host owner repo 2>/dev/null; then
                 ((skipped_invalid++))
                 invalid_repos+=("$line")
                 continue
             fi
 
-            # Normalize to canonical form
-            local normalized
-            normalized=$(normalize_url "$line")
+            # Normalize to canonical form (preserve branch/custom name)
+            local normalized output_spec
+            normalized=$(normalize_url "$spec_url")
+            output_spec="$normalized"
+            [[ -n "$spec_branch" ]] && output_spec+="@$spec_branch"
+            [[ -n "$spec_name" ]] && output_spec+=" as $spec_name"
 
-            # Check for duplicates in both files
-            if grep -qxF "$normalized" "$public_file" 2>/dev/null || \
-               grep -qxF "$normalized" "$private_file" 2>/dev/null; then
+            # Check for duplicates using canonical ID
+            local canonical_id="${host}/${owner}/${repo}"
+            if [[ -n "${existing_repos[$canonical_id]:-}" ]]; then
                 ((skipped_duplicate++))
                 continue
             fi
@@ -3345,15 +8732,18 @@ cmd_import() {
             # Add to appropriate file
             if [[ "$is_private" == "true" ]]; then
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    printf '%s\n' "$normalized" >> "$private_file"
+                    printf '%s\n' "$output_spec" >> "$private_file"
                 fi
                 ((imported_private++))
             else
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    printf '%s\n' "$normalized" >> "$public_file"
+                    printf '%s\n' "$output_spec" >> "$public_file"
                 fi
                 ((imported_public++))
             fi
+
+            # Prevent duplicates within the same import run
+            existing_repos["$canonical_id"]=1
 
         done < "$input_file"
 
@@ -3448,9 +8838,13 @@ cmd_remove() {
     local removed=0 not_found=0
 
     for repo in "${ARGS[@]}"; do
-        # Normalize the repo URL for matching
+        # Normalize the repo URL for matching (accept @branch / "as name")
+        # shellcheck disable=SC2034  # spec_branch/spec_name set by parse_repo_spec, intentionally unused
+        local spec_url spec_branch spec_name
+        parse_repo_spec "$repo" spec_url spec_branch spec_name
+
         local host owner repo_name
-        if ! parse_repo_url "$repo" host owner repo_name; then
+        if ! parse_repo_url "$spec_url" host owner repo_name; then
             log_error "Invalid repo format: $repo"
             continue
         fi
@@ -3473,16 +8867,16 @@ cmd_remove() {
                 fi
 
                 # Parse the line to extract URL and compare owner/repo
-                # shellcheck disable=SC2034  # line_branch and line_custom_name are set by nameref but unused here
+                # shellcheck disable=SC2034  # line_branch and line_custom_name are set by parse_repo_spec but unused here
                 local line_url line_branch line_custom_name
                 parse_repo_spec "$line" line_url line_branch line_custom_name
 
-                # shellcheck disable=SC2034  # line_host is set by nameref but unused here
+                # shellcheck disable=SC2034  # line_host is set by parse_repo_url but unused here
                 local line_host line_owner line_repo
                 local should_remove="false"
                 if parse_repo_url "$line_url" line_host line_owner line_repo; then
-                    # Match if owner and repo name are exactly the same
-                    if [[ "$line_owner" == "$owner" && "$line_repo" == "$repo_name" ]]; then
+                    # Match if host, owner, and repo name are exactly the same
+                    if [[ "$line_host" == "$host" && "$line_owner" == "$owner" && "$line_repo" == "$repo_name" ]]; then
                         should_remove="true"
                     fi
                 fi
@@ -3544,12 +8938,12 @@ cmd_list() {
 
     local repos=()
     if [[ "$filter_public" == "true" ]]; then
-        # Only repos from repos.txt (public)
-        local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
-        if [[ -f "$repos_file" ]]; then
+        # Only repos from public.txt
+        local public_file="$RU_CONFIG_DIR/repos.d/public.txt"
+        if [[ -f "$public_file" ]]; then
             while IFS= read -r line; do
                 [[ -n "$line" ]] && repos+=("$line")
-            done < <(load_repo_list "$repos_file")
+            done < <(load_repo_list "$public_file")
         fi
     elif [[ "$filter_private" == "true" ]]; then
         # Only repos from private.txt
@@ -3668,11 +9062,22 @@ cmd_doctor() {
         printf '%b\n' "${DIM}[  ]${RESET} gum: not installed (optional, for prettier UI)" >&2
     fi
 
-    # Check flock (optional, enables parallel sync)
-    if command -v flock &>/dev/null; then
-        printf '%b\n' "${GREEN}[OK]${RESET} flock: available (enables parallel sync)" >&2
+    # Check ntm (optional, for ai-sync and dep-update)
+    if command -v ntm &>/dev/null; then
+        local ntm_version
+        ntm_version=$(ntm --version 2>/dev/null | head -1 || echo "unknown")
+        printf '%b\n' "${GREEN}[OK]${RESET} ntm: $ntm_version" >&2
     else
-        printf '%b\n' "${DIM}[  ]${RESET} flock: not installed (optional; enables parallel sync)" >&2
+        printf '%b\n' "${DIM}[  ]${RESET} ntm: not installed (optional, for ai-sync/dep-update)" >&2
+    fi
+
+    # Check claude-code (optional, for ai-sync and dep-update)
+    if command -v claude &>/dev/null; then
+        local claude_ver
+        claude_ver=$(claude --version 2>/dev/null | head -1 || echo "unknown")
+        printf '%b\n' "${GREEN}[OK]${RESET} claude-code: $claude_ver" >&2
+    else
+        printf '%b\n' "${DIM}[  ]${RESET} claude-code: not installed (optional, for ai-sync/dep-update)" >&2
     fi
 
     local run_review_checks="false"
@@ -3738,33 +9143,32 @@ cmd_doctor() {
             ((review_issues++))
         fi
 
-        if command -v flock &>/dev/null; then
-            printf '%b\n' "${GREEN}[OK]${RESET} flock: available" >&2
-        else
-            printf '%b\n' "${RED}[!!]${RESET} flock: not installed (required for review locking)" >&2
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                printf '%b\n' "${DIM}      Install: brew install flock${RESET}" >&2
-            else
-                printf '%b\n' "${DIM}      Install: sudo apt install util-linux OR sudo dnf install util-linux${RESET}" >&2
-            fi
-            ((review_issues++))
-        fi
+        local tmux_available="false"
+        local ntm_available="false"
+
         if command -v tmux &>/dev/null; then
             local tmux_version
             tmux_version=$(tmux -V 2>/dev/null | head -1 || echo "unknown")
             printf '%b\n' "${GREEN}[OK]${RESET} tmux: $tmux_version" >&2
+            tmux_available="true"
         else
             printf '%b\n' "${YELLOW}[??]${RESET} tmux: not installed (required for local driver)" >&2
         fi
 
         if command -v ntm &>/dev/null; then
-            if ntm --robot-status &>/dev/null; then
+            if ntm --help 2>&1 | grep -q "robot"; then
                 printf '%b\n' "${GREEN}[OK]${RESET} ntm: robot mode available" >&2
+                ntm_available="true"
             else
                 printf '%b\n' "${YELLOW}[??]${RESET} ntm: installed but robot mode unavailable" >&2
             fi
         else
             printf '%b\n' "${DIM}[  ]${RESET} ntm: not installed (optional)" >&2
+        fi
+
+        if [[ "$tmux_available" != "true" && "$ntm_available" != "true" ]]; then
+            printf '%b\n' "${RED}[!!]${RESET} review driver: no tmux or ntm available" >&2
+            ((review_issues++))
         fi
 
         if command -v gh &>/dev/null && gh auth status &>/dev/null; then
@@ -3829,66 +9233,19 @@ cmd_self_update() {
     local current_version="$VERSION"
     log_verbose "Current version: $current_version"
 
-    # Fetch latest release version from GitHub API
-    local api_url="$RU_GITHUB_API/repos/$RU_REPO_OWNER/$RU_REPO_NAME/releases/latest"
-    local response
-    if command -v curl &>/dev/null; then
-        response=$(curl -sS "$api_url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            exit 3
-        }
-    elif command -v wget &>/dev/null; then
-        response=$(wget -qO- "$api_url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            exit 3
-        }
-    else
-        log_error "Neither curl nor wget found"
+    # Detect latest release without GitHub API (avoids rate limits / proxy interference)
+    local latest_version=""
+    latest_version=$(get_latest_release_from_redirect)
+    local rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        if [[ "$rc" -eq 1 ]]; then
+            log_info "No releases found on GitHub"
+            log_info "You may be running a development version"
+            exit 0
+        fi
+        log_error "Failed to determine latest release version"
         exit 3
     fi
-
-    # Check for "Not Found" response (no releases exist)
-    if echo "$response" | grep -q '"message"[[:space:]]*:[[:space:]]*"Not Found"'; then
-        log_info "No releases found on GitHub"
-        log_info "You may be running a development version"
-        exit 0
-    fi
-
-    # Extract version from response (simple grep for portability)
-    local latest_version
-    latest_version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
-
-    if [[ -z "$latest_version" ]]; then
-        # Fallback: follow the github.com redirect for /releases/latest.
-        # This avoids API rate limits and works even when the API response changes.
-        local latest_url="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/latest"
-        local effective=""
-
-        if command -v curl &>/dev/null; then
-            effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null || true)
-        elif command -v wget &>/dev/null; then
-            effective=$(wget -qS --spider "$latest_url" 2>&1 | awk '/^  Location: / {print $2}' | tail -1 | tr -d '\r' || true)
-        fi
-
-        if [[ -n "$effective" && "$effective" == *"/tag/"* ]]; then
-            latest_version="${effective##*/tag/}"
-        fi
-    fi
-
-    if [[ -z "$latest_version" ]]; then
-        local api_msg
-        api_msg=$(echo "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
-        if [[ -n "$api_msg" ]]; then
-            log_error "Could not determine latest release version (GitHub API: $api_msg)"
-        else
-            log_error "Could not determine latest release version"
-        fi
-        log_verbose "Response: $response"
-        exit 3
-    fi
-
-    # Remove 'v' prefix if present
-    latest_version="${latest_version#v}"
     log_verbose "Latest version: $latest_version"
 
     # Compare versions
@@ -3918,13 +9275,16 @@ cmd_self_update() {
     # Create temp directory for download
     local temp_dir
     temp_dir=$(mktemp_dir) || { log_error "Failed to create temp directory"; exit 3; }
-    # Clean up on exit, but preserve global cleanup behavior
-    trap 'rm -rf "$temp_dir"; cleanup' EXIT
+    # Clean up on exit, but preserve global cleanup behavior.
+    # Expand temp_dir now so the EXIT trap doesn't lose the local variable.
+    # shellcheck disable=SC2064  # Intentional early expansion of temp_dir
+    trap "rm -rf -- \"$temp_dir\"; cleanup" EXIT
 
     # Download URLs
     local release_base="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/download/v$latest_version"
-    local script_url="$release_base/ru"
-    local checksum_url="$release_base/checksums.txt"
+    local script_url checksum_url
+    script_url=$(cache_bust_url "$release_base/ru")
+    checksum_url=$(cache_bust_url "$release_base/checksums.txt")
 
     # Download the new script
     log_step "Downloading v$latest_version..."
@@ -4071,7 +9431,7 @@ cmd_config() {
     echo "  PARALLEL=$PARALLEL" >&2
     echo "" >&2
     log_info "Config file: $RU_CONFIG_DIR/config"
-    log_info "Repos file:  $RU_CONFIG_DIR/repos.d/repos.txt"
+    log_info "Repos file:  $RU_CONFIG_DIR/repos.d/public.txt (and private.txt)"
 
     if [[ "$print_mode" == "true" && -f "$RU_CONFIG_DIR/config" ]]; then
         echo "" >&2
@@ -4201,6 +9561,14 @@ cmd_prune() {
     # Handle delete mode
     if [[ "$delete_mode" == "true" ]]; then
         if [[ "$NON_INTERACTIVE" != "true" ]]; then
+            # Avoid hanging in non-TTY contexts (pipes/CI). For unattended deletion,
+            # require explicit --non-interactive.
+            if [[ ! -t 0 ]]; then
+                log_error "Cannot prompt for prune deletion confirmation (stdin is not a TTY)"
+                log_info "Re-run with --non-interactive to proceed without prompts."
+                exit 3
+            fi
+
             log_warn "This will permanently delete ${#orphans[@]} repository(s)!"
             echo "" >&2
             for path in "${orphans[@]}"; do
@@ -4209,14 +9577,14 @@ cmd_prune() {
             echo "" >&2
 
             local confirm=""
-            if [[ "$GUM_AVAILABLE" == "true" ]]; then
+            if [[ "$GUM_AVAILABLE" == "true" && -t 1 ]]; then
                 if ! gum confirm "Delete these repositories?"; then
                     log_info "Aborted"
                     return 0
                 fi
             else
-                echo -n "Type 'delete' to confirm: " >&2
-                read -r confirm
+                printf "%s" "Type 'delete' to confirm: " >&2
+                IFS= read -r confirm
                 if [[ "$confirm" != "delete" ]]; then
                     log_info "Aborted"
                     return 0
@@ -4252,6 +9620,8 @@ cmd_prune() {
 check_review_prerequisites() {
     local has_errors=false
 
+    # Portable locking is built in; no external `flock` required.
+
     # Check for gh CLI
     if ! check_gh_installed; then
         log_error "GitHub CLI (gh) is required for review command"
@@ -4272,6 +9642,8 @@ check_review_prerequisites() {
         fi
         has_errors=true
     fi
+
+    # Portable locking is built in; no external `flock` required.
 
     # Check for Claude Code (claude command)
     if ! command -v claude &>/dev/null; then
@@ -4297,8 +9669,10 @@ get_review_lock_info_file() {
 # Check for and clean up stale locks from crashed processes
 # Returns 0 if lock was stale (and cleaned up), 1 if lock is valid or doesn't exist
 check_stale_lock() {
-    local info_file
+    local info_file lock_file lock_dir
     info_file=$(get_review_lock_info_file)
+    lock_file=$(get_review_lock_file)
+    lock_dir="${lock_file}.d"
 
     if [[ ! -f "$info_file" ]]; then
         return 1  # No info file, can't determine staleness
@@ -4312,6 +9686,7 @@ check_stale_lock() {
         # Corrupt info file, treat as stale
         log_warn "Found corrupt lock info file, cleaning up"
         rm -f "$info_file"
+        dir_lock_release "$lock_dir"
         return 0
     fi
 
@@ -4323,6 +9698,7 @@ check_stale_lock() {
         started_at=$(jq -r '.started_at // "unknown"' "$info_file" 2>/dev/null)
         log_warn "Found stale lock from dead process $lock_pid (run_id: $run_id, started: $started_at)"
         rm -f "$info_file"
+        dir_lock_release "$lock_dir"
         return 0  # Lock is stale
     fi
 
@@ -4330,21 +9706,19 @@ check_stale_lock() {
 }
 
 # Acquire review lock (prevents concurrent reviews)
-# Uses flock for atomic lock acquisition and JSON info file for metadata
+# Uses a portable directory lock + JSON info file for metadata
 acquire_review_lock() {
     local lock_file info_file
     lock_file=$(get_review_lock_file)
     info_file=$(get_review_lock_info_file)
     ensure_dir "$(dirname "$lock_file")"
+    local lock_dir="${lock_file}.d"
 
     # Check for stale locks first and clean up if needed
     check_stale_lock
 
-    # Open fd 9 for locking (survives subshell)
-    exec 9>"$lock_file"
-
     # Try non-blocking lock
-    if ! flock -n 9 2>/dev/null; then
+    if ! dir_lock_try_acquire "$lock_dir"; then
         # Lock held by another process - read info
         if [[ -f "$info_file" ]]; then
             local holder_run_id holder_started holder_pid holder_mode
@@ -4362,7 +9736,6 @@ acquire_review_lock() {
             log_error "Another review is running (no info available)"
         fi
         log_info "Use 'ru review --status' to check, or wait for completion"
-        exec 9>&-
         return 1
     fi
 
@@ -4370,14 +9743,8 @@ acquire_review_lock() {
     local run_id="${REVIEW_RUN_ID:-$$}"
     local mode="${REVIEW_MODE:-plan}"
 
-    cat > "$info_file" << EOF
-{
-  "run_id": "$run_id",
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "pid": $$,
-  "mode": "$mode"
-}
-EOF
+    printf '{"run_id":"%s","started_at":"%s","pid":%s,"mode":"%s"}\n' \
+        "$run_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$mode" > "$info_file"
 
     return 0
 }
@@ -4387,20 +9754,178 @@ release_review_lock() {
     local lock_file info_file
     lock_file=$(get_review_lock_file)
     info_file=$(get_review_lock_info_file)
+    local lock_dir="${lock_file}.d"
 
     # Remove info file
     rm -f "$info_file"
+    dir_lock_release "$lock_dir"
+}
 
-    # Release the flock (closing fd 9)
-    exec 9>&- 2>/dev/null || true
+#------------------------------------------------------------------------------
+# FILE DENYLIST ENFORCEMENT (Security Guardrails)
+#
+# Prevents committing sensitive or ephemeral files during agent-sweep,
+# regardless of agent output. Default patterns cover common secrets,
+# credentials, and build artifacts.
+#------------------------------------------------------------------------------
+
+# Default denylist patterns (can be extended via AGENT_SWEEP_DENYLIST_EXTRA)
+# Patterns support glob-style matching via bash's fnmatch
+declare -a AGENT_SWEEP_DENYLIST_PATTERNS=(
+    # Secrets and credentials
+    ".env"
+    ".env.*"
+    "*.pem"
+    "*.key"
+    "id_rsa"
+    "id_rsa.*"
+    "*.p12"
+    "*.pfx"
+    "credentials.json"
+    "secrets.json"
+    "*.secret"
+    "*.secrets"
+    ".netrc"
+    ".npmrc"            # May contain auth tokens
+    ".pypirc"           # May contain auth tokens
+
+    # Build artifacts and dependencies (large/ephemeral)
+    "node_modules"
+    "node_modules/*"
+    "__pycache__"
+    "__pycache__/*"
+    "*.pyc"
+    "*.pyo"
+    "dist"
+    "dist/*"
+    "build"
+    "build/*"
+    ".next"
+    ".next/*"
+    "target"            # Rust/Maven
+    "target/*"
+    "vendor"            # Go/PHP
+    "vendor/*"
+
+    # Logs and temporary files
+    "*.log"
+    "*.tmp"
+    "*.temp"
+    "*.swp"
+    "*.swo"
+    "*~"
+    ".DS_Store"
+    "Thumbs.db"
+
+    # IDE and editor files
+    ".idea"
+    ".idea/*"
+    ".vscode"
+    ".vscode/*"
+    "*.iml"
+)
+
+# Check if a file path matches any denylist pattern
+# Args: $1=file_path (relative path)
+# Returns: 0=denied (file should be blocked), 1=allowed
+# Note: Checks basename against exact matches and full path against glob patterns
+is_file_denied() {
+    local file_path="$1"
+    local basename pattern
+
+    # Normalize: remove leading ./ and trailing /
+    file_path="${file_path#./}"
+    file_path="${file_path%/}"
+
+    # Get the basename for simple comparisons
+    basename="${file_path##*/}"
+
+    # Also check for any extra patterns from environment
+    local -a all_patterns=("${AGENT_SWEEP_DENYLIST_PATTERNS[@]}")
+    if [[ ${#AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]} -gt 0 ]]; then
+        all_patterns+=("${AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]}")
+    fi
+    if [[ -n "${AGENT_SWEEP_DENYLIST_EXTRA:-}" ]]; then
+        # Split space-separated extra patterns
+        read -ra extra <<<"$AGENT_SWEEP_DENYLIST_EXTRA"
+        all_patterns+=("${extra[@]}")
+    fi
+
+    for pattern in "${all_patterns[@]}"; do
+        # Try matching against full path first (for directory patterns like "node_modules/*")
+        # shellcheck disable=SC2254  # Pattern is intentionally a glob
+        case "$file_path" in
+            $pattern) return 0 ;;  # Denied
+        esac
+
+        # Also match against just the basename (for patterns like ".env")
+        # shellcheck disable=SC2254
+        case "$basename" in
+            $pattern) return 0 ;;  # Denied
+        esac
+
+        # Special handling for directory matching (pattern without trailing /*)
+        # If pattern is "node_modules", match "node_modules/anything"
+        case "$pattern" in
+            */\*) ;;  # Already has /*, skip
+            *)
+                # Check if file is inside a denied directory (at any nesting level)
+                # This handles both "node_modules/pkg" and "frontend/node_modules/pkg"
+                # shellcheck disable=SC2254
+                case "$file_path" in
+                    $pattern/*) return 0 ;;       # Prefix match: node_modules/...
+                    */$pattern/*) return 0 ;;     # Nested match: .../node_modules/...
+                esac
+                ;;
+        esac
+    done
+
+    return 1  # Allowed
+}
+
+# Filter a list of files through the denylist
+# Args: file paths on stdin (one per line)
+# Output: allowed file paths to stdout, denied files logged to stderr
+# Returns: 0 if all allowed, 1 if any were denied
+filter_files_denylist() {
+    local file denied_count=0
+
+    while IFS= read -r file || [[ -n "$file" ]]; do
+        [[ -z "$file" ]] && continue
+        if is_file_denied "$file"; then
+            log_warn "Blocked by denylist: $file"
+            ((denied_count++))
+        else
+            printf '%s\n' "$file"
+        fi
+    done
+
+    [[ $denied_count -eq 0 ]]
+}
+
+# Get all denylist patterns as newline-separated list
+# Useful for displaying to users or for external tools
+get_denylist_patterns() {
+    printf '%s\n' "${AGENT_SWEEP_DENYLIST_PATTERNS[@]}"
+    if [[ ${#AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]} -gt 0 ]]; then
+        printf '%s\n' "${AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]}"
+    fi
+    if [[ -n "${AGENT_SWEEP_DENYLIST_EXTRA:-}" ]]; then
+        # shellcheck disable=SC2086  # Intentional word splitting for space-separated patterns
+        printf '%s\n' $AGENT_SWEEP_DENYLIST_EXTRA
+    fi
 }
 
 # Detect which review driver to use
 detect_review_driver() {
-    # Check if ntm is available and running
-    if command -v ntm &>/dev/null; then
-        # Try to query ntm status
-        if ntm list --robot 2>/dev/null | grep -q "session"; then
+    # Prefer ntm when robot mode is available and healthy
+    if declare -F ntm_check_available >/dev/null 2>&1; then
+        if ntm_check_available; then
+            echo "ntm"
+            return
+        fi
+    elif command -v ntm &>/dev/null; then
+        if ntm --robot-status &>/dev/null; then
             echo "ntm"
             return
         fi
@@ -4627,14 +10152,15 @@ local_driver_start_session() {
 }
 EOF
 
-    # Build claude command with stream-json output
-    # shellcheck disable=SC2016  # Single quotes intentional for tmux
-    local claude_cmd
-    claude_cmd='claude -p '"$(printf '%q' "$prompt")"' --output-format stream-json'
+    # Build claude command with stream-json output (shell-escaped args)
+    local -a claude_args=(claude -p "$prompt" --output-format stream-json)
+    local claude_cmd=""
+    printf -v claude_cmd '%q ' "${claude_args[@]}"
+    claude_cmd="${claude_cmd% }"
 
     # Create tmux session running claude
     if ! tmux new-session -d -s "$session_name" -c "$wt_path" \
-        "exec bash -c '$claude_cmd 2>&1 | tee \"$log_file\" > \"$event_pipe\"'"; then
+        "exec bash -c \"$claude_cmd 2>&1 | tee \\\"$log_file\\\" > \\\"$event_pipe\\\"\""; then
         log_error "Failed to create tmux session: $session_name"
         rm -f "$event_pipe"
         return 1
@@ -4757,19 +10283,24 @@ local_driver_interrupt_session() {
 # Parse a single stream-json event line
 # Args:
 #   $1 - JSON line to parse
-#   $2 - nameref for event_type output
-#   $3 - nameref for event_data output
+#   $2 - event_type output variable name
+#   $3 - event_data output variable name
 # Returns:
 #   0 if valid JSON, 1 if invalid
 parse_stream_json_event() {
     local line="$1"
-    local -n _pse_event_type=$2
-    local -n _pse_event_data=$3
+    local event_type_var="$2"
+    local event_data_var="$3"
+
+    # Use _pse_ prefix to avoid shadowing caller's output variable names
+    local _pse_event_type="" _pse_event_data=""
 
     # Validate JSON
     if ! echo "$line" | jq empty 2>/dev/null; then
         _pse_event_type="invalid"
         _pse_event_data="$line"
+        _set_out_var "$event_type_var" "$_pse_event_type" || return 1
+        _set_out_var "$event_data_var" "$_pse_event_data" || return 1
         return 1
     fi
 
@@ -4777,9 +10308,9 @@ parse_stream_json_event() {
 
     case "$_pse_event_type" in
         system)
-            local subtype
-            subtype=$(echo "$line" | jq -r '.subtype // ""')
-            if [[ "$subtype" == "init" ]]; then
+            local _pse_subtype
+            _pse_subtype=$(echo "$line" | jq -r '.subtype // ""')
+            if [[ "$_pse_subtype" == "init" ]]; then
                 _pse_event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
             else
                 _pse_event_data=$(echo "$line" | jq -c '.')
@@ -4799,6 +10330,8 @@ parse_stream_json_event() {
             ;;
     esac
 
+    _set_out_var "$event_type_var" "$_pse_event_type" || return 1
+    _set_out_var "$event_data_var" "$_pse_event_data" || return 1
     return 0
 }
 
@@ -5102,7 +10635,7 @@ extract_inline_options() {
     local output="$1"
 
     # Look for patterns like "a) ...", "1. ...", "- Option A"
-    echo "$output" | grep -E '^\s*[a-z]\)|^\s*[0-9]+\.|^\s*-\s+[A-Z]' | head -5
+    echo "$output" | grep -E '^[[:space:]]*[a-z]\)|^[[:space:]]*[0-9]+\.|^[[:space:]]*-[[:space:]]+[A-Z]' | head -5
 }
 
 # Detect wait reason and classify it
@@ -5203,6 +10736,1127 @@ format_wait_info() {
                 detected_at: (now | todate)
             }'
     fi
+}
+
+#------------------------------------------------------------------------------
+# SESSION MONITORING & COMPLETION DETECTION (bd-eycs)
+# Monitor active Claude Code sessions, detect states with hysteresis,
+# handle errors, stalls, and completion
+#------------------------------------------------------------------------------
+
+# Session state history for hysteresis (session_id -> comma-separated states)
+declare -gA SESSION_STATE_HISTORY=()
+
+# Stall counters per session for recovery escalation
+declare -gA SESSION_STALL_COUNTS=()
+
+# Error patterns that indicate session failure
+# shellcheck disable=SC2034  # Array used by session_has_error
+SESSION_ERROR_PATTERNS=(
+    "rate.limit"
+    "429"
+    "quota.exceeded"
+    "panic:"
+    "SIGSEGV"
+    "killed"
+    "unauthorized"
+    "invalid.*key"
+    "connection refused"
+    "timed out"
+    "context.*exceeded"
+    "token.*limit"
+)
+
+# Resolve the best available log file for a session
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Path to session log file (stdout)
+# Returns:
+#   0 if found, 1 otherwise
+get_session_log_path() {
+    local session_id="$1"
+
+    # Prefer worktree-local logs (local/ntm drivers)
+    local wt_path log_file
+    wt_path=$(get_worktree_for_session "$session_id" 2>/dev/null || true)
+    if [[ -n "$wt_path" ]]; then
+        log_file="$wt_path/.ru/session.log"
+        [[ -f "$log_file" ]] && { echo "$log_file"; return 0; }
+    fi
+
+    # Legacy fallback (if a pipe log is still used elsewhere)
+    log_file="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.pipe.log"
+    [[ -f "$log_file" ]] && { echo "$log_file"; return 0; }
+
+    return 1
+}
+
+# Calculate output velocity (characters per second) for a session
+# Args:
+#   $1 - Session ID
+#   $2 - Window in seconds (default: 5)
+# Outputs:
+#   Velocity as integer (chars/sec)
+calculate_output_velocity() {
+    local session_id="$1"
+    local window="${2:-5}"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local now file_size prev_size_file prev_size
+    now=$(date +%s)
+
+    # Store previous size for velocity calculation
+    prev_size_file="${RU_STATE_DIR:-/tmp}/pipes/${session_id}.prev_size"
+    ensure_dir "$(dirname "$prev_size_file")"
+
+    if [[ -f "$prev_size_file" ]]; then
+        prev_size=$(cat "$prev_size_file" 2>/dev/null || echo "0")
+    else
+        prev_size=0
+    fi
+
+    file_size=$(stat -c%s "$pipe_log" 2>/dev/null || stat -f%z "$pipe_log" 2>/dev/null || echo "0")
+
+    # Save current size for next call
+    echo "$file_size" > "$prev_size_file"
+
+    # Calculate chars added in the window
+    local chars_added=$((file_size - prev_size))
+    if [[ $chars_added -lt 0 ]]; then
+        chars_added=0
+    fi
+
+    # Velocity = chars / window (guard against division by zero)
+    if [[ $window -le 0 ]]; then
+        echo "0"
+        return 0
+    fi
+    local velocity=$((chars_added / window))
+    echo "$velocity"
+}
+
+# Get last output timestamp for a session
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Unix timestamp of last output
+get_last_output_time() {
+    local session_id="$1"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    # Get file modification time
+    local mtime
+    mtime=$(stat -c%Y "$pipe_log" 2>/dev/null || stat -f%m "$pipe_log" 2>/dev/null || echo "0")
+    echo "$mtime"
+}
+
+# Check if session output contains thinking indicators
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if thinking indicators present, 1 otherwise
+has_thinking_indicators() {
+    local session_id="$1"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
+        return 1
+    fi
+
+    # Check last 1000 chars for thinking patterns
+    if tail -c 1000 "$pipe_log" 2>/dev/null | grep -qE '(thinking|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\.{3,}|\.\.\.)'; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if session is at an input prompt (Claude waiting for input)
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if at prompt, 1 otherwise
+is_at_prompt() {
+    local session_id="$1"
+
+    # Use driver to get session state
+    local state_json
+    state_json=$(driver_get_session_state "$session_id" 2>/dev/null)
+
+    if [[ -z "$state_json" ]]; then
+        return 1
+    fi
+
+    # Check if state indicates waiting
+    local state
+    state=$(echo "$state_json" | jq -r '.state // "unknown"' 2>/dev/null)
+
+    case "$state" in
+        waiting|idle|prompt)
+            return 0
+            ;;
+    esac
+
+    # Also check log for prompt patterns
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
+        # Look for Claude Code prompt patterns in last 500 chars
+        if tail -c 500 "$pipe_log" 2>/dev/null | grep -qE '(^>|claude>|❯|➜|\$\s*$)'; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Check if session has received a result event (completion)
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if result event found, 1 otherwise
+session_has_result() {
+    local session_id="$1"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
+        return 1
+    fi
+
+    # Check for result event in stream-json output
+    if grep -q '"type":"result"' "$pipe_log" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if session has error patterns in output
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 if error found, 1 otherwise
+# Outputs:
+#   Error pattern to stderr if found
+session_has_error() {
+    local session_id="$1"
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+
+    if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
+        return 1
+    fi
+
+    local pattern
+    for pattern in "${SESSION_ERROR_PATTERNS[@]}"; do
+        if grep -qiE "$pattern" "$pipe_log" 2>/dev/null; then
+            echo "$pattern" >&2
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Detect raw session state without hysteresis
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   State string: generating|waiting|thinking|stalled|error|complete
+detect_session_state_raw() {
+    local session_id="$1"
+
+    # Check for completion first (highest priority)
+    if session_has_result "$session_id"; then
+        echo "complete"
+        return 0
+    fi
+
+    # Check for error patterns (high priority)
+    local error_pattern
+    if error_pattern=$(session_has_error "$session_id" 2>/dev/null); then
+        echo "error"
+        return 0
+    fi
+
+    # Consult driver state for waiting/complete/error when available
+    local state_json driver_state
+    state_json=$(driver_get_session_state "$session_id" 2>/dev/null || echo "")
+    if [[ -n "$state_json" ]]; then
+        if command -v jq &>/dev/null; then
+            driver_state=$(echo "$state_json" | jq -r '.state // empty' 2>/dev/null)
+        else
+            driver_state=$(echo "$state_json" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        case "$driver_state" in
+            error)
+                echo "error"
+                return 0
+                ;;
+            complete|dead)
+                echo "complete"
+                return 0
+                ;;
+            waiting|idle)
+                echo "waiting"
+                return 0
+                ;;
+            stalled)
+                echo "stalled"
+                return 0
+                ;;
+        esac
+
+        # If we have no log visibility, fall back to driver hints.
+        local log_path=""
+        log_path=$(get_session_log_path "$session_id" 2>/dev/null || true)
+        if [[ -z "$log_path" && -n "$driver_state" ]]; then
+            case "$driver_state" in
+                generating|thinking)
+                    echo "$driver_state"
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+
+    # Calculate output velocity
+    local velocity
+    velocity=$(calculate_output_velocity "$session_id" 5)
+
+    # Check for waiting state
+    if is_at_prompt "$session_id"; then
+        if [[ "$velocity" -lt 1 ]]; then
+            echo "waiting"
+            return 0
+        fi
+    fi
+
+    # Check for thinking indicators
+    if has_thinking_indicators "$session_id"; then
+        echo "thinking"
+        return 0
+    fi
+
+    # Check for stall (no output but not at prompt)
+    local last_output_time now
+    last_output_time=$(get_last_output_time "$session_id")
+    now=$(date +%s)
+    if [[ $((now - last_output_time)) -gt 30 ]]; then
+        echo "stalled"
+        return 0
+    fi
+
+    # Active generation
+    if [[ "$velocity" -gt 10 ]]; then
+        echo "generating"
+    else
+        echo "thinking"
+    fi
+}
+
+# Apply hysteresis to prevent state flapping
+# Args:
+#   $1 - Session ID
+#   $2 - New raw state
+#   $3 - Current confirmed state (optional, default: generating)
+#   $4 - Output variable name (optional, for avoiding subshell)
+# Outputs:
+#   Confirmed state after hysteresis (via stdout or named variable)
+apply_state_hysteresis() {
+    local session_id="$1"
+    local new_state="$2"
+    local current_state="${3:-generating}"
+    local out_var="${4:-}"
+
+    # Append to history (comma-separated string)
+    local history="${SESSION_STATE_HISTORY[$session_id]:-}"
+    history="${history:+$history,}$new_state"
+
+    # Keep last 5 samples using awk
+    history=$(echo "$history" | awk -F',' '{for(i=NF-4>1?NF-4:1;i<=NF;i++) printf "%s%s",$i,(i<NF?",":"")}')
+    SESSION_STATE_HISTORY["$session_id"]="$history"
+
+    # Determine required consecutive samples for each state
+    local required
+    case "$new_state" in
+        error|complete) required=1 ;;
+        generating|thinking) required=2 ;;
+        waiting) required=3 ;;
+        stalled) required=5 ;;
+        *) required=2 ;;
+    esac
+
+    # Count consecutive matching samples from end
+    local consecutive
+    consecutive=$(echo "$history" | awk -F',' -v state="$new_state" '
+        { c=0; for(i=NF;i>=1;i--) if($i==state) c++; else break; print c }
+    ')
+
+    local result
+    if [[ "$consecutive" -ge "$required" ]]; then
+        result="$new_state"
+    else
+        # Return current confirmed state
+        result="$current_state"
+    fi
+
+    # Output result via named variable or stdout
+    if [[ -n "$out_var" ]]; then
+        _set_out_var "$out_var" "$result"
+    else
+        echo "$result"
+    fi
+}
+
+# Handle a session that is waiting for input
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 on success
+handle_waiting_session() {
+    local session_id="$1"
+
+    # Get wait reason
+    local pipe_log
+    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+    local recent_output=""
+    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
+        recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
+    fi
+
+    local wait_info
+    wait_info=$(detect_wait_reason "$session_id" "" "$recent_output")
+
+    # Log the waiting state
+    log_verbose "Session $session_id waiting: $(echo "$wait_info" | jq -r '.reason // "unknown"')"
+
+    # Queue question if it's an ask_user_question
+    local reason
+    reason=$(echo "$wait_info" | jq -r '.reason // "unknown"')
+
+    if [[ "$reason" == "ask_user_question" ]]; then
+        # Extract and queue the question
+        local question_data
+        question_data=$(echo "$wait_info" | jq -c '.context // {}')
+        queue_question "$session_id" "$question_data" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+# Handle a stalled session with escalating recovery
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 on success
+handle_stalled_session() {
+    local session_id="$1"
+
+    local stall_count="${SESSION_STALL_COUNTS[$session_id]:-0}"
+    ((stall_count++))
+    SESSION_STALL_COUNTS["$session_id"]=$stall_count
+
+    log_warn "Session $session_id stalled (attempt $stall_count)"
+
+    if [[ $stall_count -le 2 ]]; then
+        # Soft restart: send Ctrl+C
+        driver_interrupt_session "$session_id" 2>/dev/null || true
+        sleep 5
+    elif [[ $stall_count -le 4 ]]; then
+        # Try /compact to reduce context
+        driver_send_to_session "$session_id" "/compact" 2>/dev/null || true
+        sleep 10
+    else
+        # Hard restart - stop and restart session
+        log_error "Session $session_id persistently stalled, stopping"
+        driver_stop_session "$session_id" 2>/dev/null || true
+        SESSION_STALL_COUNTS["$session_id"]=0
+
+        # Signal that session needs restart
+        return 1
+    fi
+
+    return 0
+}
+
+# Handle a session that encountered an error
+# Args:
+#   $1 - Session ID
+#   $2 - Error pattern (optional)
+# Returns:
+#   0 on success
+handle_session_error() {
+    local session_id="$1"
+    local error_pattern="${2:-unknown}"
+
+    log_error "Session $session_id error: $error_pattern"
+
+    # Check for rate limit errors specifically
+    if [[ "$error_pattern" =~ (429|rate.limit|quota) ]]; then
+        # Notify governor about rate limit
+        if declare -p GOVERNOR_STATE &>/dev/null 2>&1; then
+            governor_record_error 2>/dev/null || true
+        fi
+    fi
+
+    # Record session error outcome
+    record_session_outcome "$session_id" "error" "$error_pattern" 2>/dev/null || true
+
+    # Stop the errored session
+    driver_stop_session "$session_id" 2>/dev/null || true
+
+    return 0
+}
+
+# Handle a completed session
+# Args:
+#   $1 - Session ID
+# Returns:
+#   0 on success
+handle_session_complete() {
+    local session_id="$1"
+
+    # Get worktree path for this session
+    local wt_path
+    wt_path=$(get_worktree_for_session "$session_id" 2>/dev/null || echo "")
+
+    local outcome="unknown"
+    local items_count=0
+
+    if [[ -n "$wt_path" ]] && [[ -d "$wt_path" ]]; then
+        local plan_file="$wt_path/.ru/review-plan.json"
+
+        if [[ -f "$plan_file" ]]; then
+            if validate_review_plan "$plan_file" 2>/dev/null; then
+                items_count=$(jq '.items | length' "$plan_file" 2>/dev/null || echo "0")
+                log_info "Session $session_id completed: $items_count items reviewed"
+                outcome="success"
+            else
+                log_warn "Session $session_id produced invalid plan"
+                outcome="invalid_plan"
+            fi
+        else
+            log_warn "Session $session_id completed without plan artifact"
+            outcome="no_plan"
+        fi
+    else
+        log_warn "Session $session_id completed but worktree not found"
+        outcome="no_worktree"
+    fi
+
+    # Record outcome
+    record_session_outcome "$session_id" "$outcome" "$items_count" 2>/dev/null || true
+
+    # Clear stall counter
+    unset "SESSION_STALL_COUNTS[$session_id]"
+    unset "SESSION_STATE_HISTORY[$session_id]"
+
+    return 0
+}
+
+# Record session outcome (stub - integrates with checkpoint system)
+# Args:
+#   $1 - Session ID
+#   $2 - Outcome (success|error|invalid_plan|no_plan|no_worktree)
+#   $3 - Details (items count or error pattern)
+record_session_outcome() {
+    local session_id="$1"
+    local outcome="$2"
+    local details="${3:-}"
+
+    # Get repo ID from session mapping if available
+    local repo_id
+    repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "$session_id")
+
+    log_debug "Session $session_id ($repo_id) outcome: $outcome ($details)"
+
+    # If checkpoint system is available, record via that
+    if type -t record_repo_outcome &>/dev/null; then
+        record_repo_outcome "$repo_id" "$outcome" "0" "${details:-0}" "0" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+# Get repo ID for a session (stub - integrates with worktree mapping)
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Repo ID (owner/repo format) or empty if not found
+# Returns:
+#   0 if found, 1 if not found
+get_repo_for_session() {
+    local session_id="$1"
+
+    # Use review state to map session -> repo
+    local state_file
+    state_file=$(get_review_state_file 2>/dev/null || echo "")
+    if [[ -n "$state_file" && -f "$state_file" ]] && command -v jq &>/dev/null; then
+        local repo_id
+        repo_id=$(jq -r --arg sid "$session_id" \
+            '.repos | to_entries[] | select(.value.session_id == $sid) | .key' \
+            "$state_file" 2>/dev/null | head -1)
+        if [[ -n "$repo_id" ]]; then
+            echo "$repo_id"
+            return 0
+        fi
+    fi
+
+    # Not found - return empty
+    return 1
+}
+
+# Get worktree path for a session
+# Args:
+#   $1 - Session ID
+# Outputs:
+#   Worktree path
+get_worktree_for_session() {
+    local session_id="$1"
+
+    local repo_id
+    repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || true)
+    if [[ -n "$repo_id" ]]; then
+        local wt_path=""
+        if get_worktree_path "$repo_id" wt_path 2>/dev/null; then
+            if [[ -n "$wt_path" ]]; then
+                echo "$wt_path"
+                return 0
+            fi
+        fi
+    fi
+
+    echo ""
+}
+
+# Main session monitoring loop
+# Args:
+#   $1 - Lock file path (loop exits when removed)
+#   $2 - Poll interval in seconds (default: 2)
+# Returns:
+#   0 when lock removed, 1 on error
+monitor_sessions() {
+    local lock_file="$1"
+    local poll_interval="${2:-2}"
+
+    declare -A sessions=()  # session_id -> confirmed_state
+    declare -A repo_sessions=()  # repo_id -> session_id
+
+    log_verbose "Starting session monitor (poll=${poll_interval}s)"
+
+    while [[ -f "$lock_file" ]]; do
+        # Get list of active sessions
+        local session_list
+        session_list=$(driver_list_sessions 2>/dev/null || echo "")
+
+        # Process each active session
+        local session_id
+        while IFS= read -r session_id; do
+            [[ -z "$session_id" ]] && continue
+
+            local repo_id_for_session=""
+            repo_id_for_session=$(get_repo_for_session "$session_id" 2>/dev/null || true)
+            if [[ -n "$repo_id_for_session" && "$repo_id_for_session" != "$session_id" ]]; then
+                repo_sessions["$repo_id_for_session"]="$session_id"
+            fi
+
+            # Initialize if new session
+            if [[ -z "${sessions[$session_id]:-}" ]]; then
+                sessions["$session_id"]="generating"
+                log_debug "Monitoring new session: $session_id"
+            fi
+
+            # Detect raw state
+            local raw_state
+            raw_state=$(detect_session_state_raw "$session_id")
+
+            # Apply hysteresis
+            local confirmed_state
+            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "${sessions[$session_id]}")
+
+            log_debug "Session $session_id: raw=$raw_state confirmed=$confirmed_state"
+
+            # Handle state transitions
+            case "$confirmed_state" in
+                waiting)
+                    handle_waiting_session "$session_id"
+                    ;;
+                stalled)
+                    handle_stalled_session "$session_id"
+                    ;;
+                error)
+                    handle_session_error "$session_id"
+                    [[ -n "$repo_id_for_session" && "$repo_id_for_session" != "$session_id" ]] && unset "repo_sessions[$repo_id_for_session]"
+                    unset "sessions[$session_id]"
+                    ;;
+                complete)
+                    handle_session_complete "$session_id"
+                    [[ -n "$repo_id_for_session" && "$repo_id_for_session" != "$session_id" ]] && unset "repo_sessions[$repo_id_for_session]"
+                    unset "sessions[$session_id]"
+                    ;;
+            esac
+
+            sessions["$session_id"]="$confirmed_state"
+        done <<< "$session_list"
+
+        # Start new sessions if governor allows
+        if declare -f governor_update &>/dev/null; then
+            governor_update
+        fi
+
+        # Rebuild pending repos from state and start sessions
+        local -a pending_repos=()
+        local -A repo_items=()
+        if has_pending_repos 2>/dev/null && get_pending_repos_from_state pending_repos 2>/dev/null; then
+            local active_count="${#sessions[@]}"
+            if [[ ${#repo_sessions[@]} -gt $active_count ]]; then
+                active_count="${#repo_sessions[@]}"
+            fi
+            while can_start_new_session "$active_count" 2>/dev/null && [[ ${#pending_repos[@]} -gt 0 ]]; do
+                if start_next_queued_session repo_sessions pending_repos repo_items 2>/dev/null; then
+                    active_count=$((active_count + 1))
+                else
+                    break
+                fi
+            done
+        fi
+
+        sleep "$poll_interval"
+    done
+
+    log_verbose "Session monitor stopped (lock removed)"
+    return 0
+}
+
+# Check if there are pending repos to process (stub)
+# Returns:
+#   0 if pending repos exist, 1 otherwise
+has_pending_repos() {
+    # Check review state for pending repos
+    if [[ -n "${RU_STATE_DIR:-}" ]]; then
+        local state_file
+        state_file=$(get_review_state_file 2>/dev/null || echo "")
+        if [[ -f "$state_file" ]]; then
+            local pending
+            pending=$(jq '[.repos | to_entries[] | select(.value.status == "pending")] | length' "$state_file" 2>/dev/null || echo "0")
+            [[ "$pending" -gt 0 ]] && return 0
+        fi
+    fi
+    return 1
+}
+
+# Get pending repos from state file into an array
+# Args:
+#   $1 - Name of array variable to populate
+# Returns:
+#   0 on success, 1 if no state file or error
+get_pending_repos_from_state() {
+    local -n _out_arr=$1
+
+    _out_arr=()
+
+    if [[ -z "${RU_STATE_DIR:-}" ]]; then
+        return 1
+    fi
+
+    local state_file
+    state_file=$(get_review_state_file 2>/dev/null || echo "")
+    if [[ ! -f "$state_file" ]]; then
+        return 1
+    fi
+
+    local repo_list
+    repo_list=$(jq -r '.repos | to_entries[] | select(.value.status == "pending") | .key' "$state_file" 2>/dev/null || echo "")
+
+    local repo
+    while IFS= read -r repo; do
+        [[ -n "$repo" ]] && _out_arr+=("$repo")
+    done <<< "$repo_list"
+
+    return 0
+}
+
+# Start the next queued session from pending repos
+# Args:
+#   $1 - Reference to sessions associative array
+#   $2 - Reference to pending repos array
+#   $3 - Reference to repo_items associative array (repo_id -> newline-separated work items)
+# Returns:
+#   0 on success, 1 if no session started
+start_next_queued_session() {
+    if [[ -z "${1:-}" || -z "${2:-}" ]]; then
+        log_error "start_next_queued_session: missing arguments"
+        return 1
+    fi
+
+    local -n _sessions_ref="$1"
+    local -n _pending_ref="$2"
+    local items_ref_name="${3:-}"
+    local -A _empty_items=()
+    # If caller doesn't provide a repo_items map, use an empty map.
+    if [[ -n "$items_ref_name" ]]; then
+        local -n _repo_items_ref="$items_ref_name"
+    else
+        local -n _repo_items_ref="_empty_items"
+    fi
+
+    # Try to start the next viable repo; skip failures without stalling the queue.
+    while [[ ${#_pending_ref[@]} -gt 0 ]]; do
+        # Get next repo from pending list
+        local repo_id="${_pending_ref[0]}"
+        _pending_ref=("${_pending_ref[@]:1}")  # Remove first element
+
+        # Get worktree path for this repo
+        local wt_path=""
+        if ! get_worktree_path "$repo_id" wt_path 2>/dev/null || [[ -z "$wt_path" ]]; then
+            log_warn "No worktree found for $repo_id, marking error"
+            update_review_state ".repos[\"$repo_id\"].status = \"error\""
+            continue
+        fi
+
+        # Generate session ID
+        local session_id="ru-review-${REVIEW_RUN_ID:-$$}-${repo_id//\//-}"
+
+        # Build review prompt for this repo
+        # shellcheck disable=SC2190  # False positive: _repo_items_ref is a nameref to associative array
+        local items_blob="${_repo_items_ref[$repo_id]:-}"
+        local -a repo_items=()
+        if [[ -n "$items_blob" ]]; then
+            while IFS= read -r line; do
+                # shellcheck disable=SC2190  # False positive: repo_items is indexed array, not associative
+                [[ -n "$line" ]] && repo_items+=("$line")
+            done <<< "$items_blob"
+        fi
+
+        local items_json="[]"
+        if [[ ${#repo_items[@]} -gt 0 ]]; then
+            items_json=$(build_review_items_json "${repo_items[@]}")
+        fi
+
+        local prompt
+        prompt=$(generate_review_prompt "$repo_id" "$wt_path" "${REVIEW_RUN_ID:-unknown}" "$items_json")
+
+        # Load and start driver
+        if [[ -z "${REVIEW_DRIVER_LOADED:-}" ]]; then
+            if ! load_review_driver "${REVIEW_DRIVER:-local}"; then
+                log_error "Failed to load review driver for $repo_id"
+                update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                return 1
+            fi
+            REVIEW_DRIVER_LOADED=1
+        fi
+
+        # Start session via driver
+        if ! driver_start_session "$wt_path" "$session_id" "$prompt"; then
+            log_error "Failed to start session for $repo_id"
+            update_review_state ".repos[\"$repo_id\"].status = \"error\""
+            continue
+        fi
+
+        # Track session
+        _sessions_ref["$repo_id"]="$session_id"
+        update_review_state ".repos[\"$repo_id\"].status = \"in_progress\" | .repos[\"$repo_id\"].session_id = \"$session_id\""
+
+        log_info "Started session for $repo_id (${#_sessions_ref[@]} active)"
+        return 0
+    done
+
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# Cost Budget Management (bd-l05s)
+# Enforce limits on repos, runtime, and questions during review
+#------------------------------------------------------------------------------
+
+# Cost budget state (initialized in run_review_orchestration)
+declare -g COST_BUDGET_REPOS_PROCESSED=0
+declare -g COST_BUDGET_QUESTIONS_ASKED=0
+declare -g COST_BUDGET_START_TIME=0
+
+# Check if cost budget allows continuing
+# Uses REVIEW_MAX_REPOS, REVIEW_MAX_RUNTIME, REVIEW_MAX_QUESTIONS
+# Returns:
+#   0 if within budget, 1 if budget exceeded
+check_cost_budget() {
+    # Check repo limit
+    if [[ -n "${REVIEW_MAX_REPOS:-}" && "${REVIEW_MAX_REPOS:-0}" -gt 0 ]]; then
+        if [[ $COST_BUDGET_REPOS_PROCESSED -ge $REVIEW_MAX_REPOS ]]; then
+            log_warn "Cost budget: max repos ($REVIEW_MAX_REPOS) reached"
+            return 1
+        fi
+    fi
+
+    # Check runtime limit (in minutes)
+    if [[ -n "${REVIEW_MAX_RUNTIME:-}" && "${REVIEW_MAX_RUNTIME:-0}" -gt 0 ]]; then
+        local now elapsed_minutes
+        now=$(date +%s)
+        elapsed_minutes=$(( (now - COST_BUDGET_START_TIME) / 60 ))
+        if [[ $elapsed_minutes -ge $REVIEW_MAX_RUNTIME ]]; then
+            log_warn "Cost budget: max runtime (${REVIEW_MAX_RUNTIME}m) reached"
+            return 1
+        fi
+    fi
+
+    # Check questions limit
+    if [[ -n "${REVIEW_MAX_QUESTIONS:-}" && "${REVIEW_MAX_QUESTIONS:-0}" -gt 0 ]]; then
+        if [[ $COST_BUDGET_QUESTIONS_ASKED -ge $REVIEW_MAX_QUESTIONS ]]; then
+            log_warn "Cost budget: max questions ($REVIEW_MAX_QUESTIONS) reached"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Increment cost budget counters
+increment_repos_processed() {
+    ((COST_BUDGET_REPOS_PROCESSED++))
+}
+
+increment_questions_asked() {
+    ((COST_BUDGET_QUESTIONS_ASKED++))
+}
+
+#------------------------------------------------------------------------------
+# Pre-fetching Strategy (bd-l05s)
+# Warm caches for upcoming repos while reviewing current ones
+#------------------------------------------------------------------------------
+
+# Pre-fetch data for next N repos to minimize wait times
+# Args:
+#   $1 - Current index in repos array
+#   $2+ - Full repos array
+prefetch_next_repos() {
+    local current_index="$1"
+    shift
+    local -a repos=("$@")
+    local prefetch_count=2
+
+    local i
+    for ((i=1; i<=prefetch_count; i++)); do
+        local next_index=$((current_index + i))
+        if [[ $next_index -lt ${#repos[@]} ]]; then
+            local next_repo="${repos[next_index]}"
+
+            # Background prefetch
+            (
+                # Pre-fetch GitHub activity data (if function exists)
+                if declare -f get_repo_activity_cached &>/dev/null; then
+                    get_repo_activity_cached "$next_repo" >/dev/null 2>&1 || true
+                fi
+
+                # Warm git fetch
+                local local_path=""
+                local url branch custom_name repo_id
+                if resolve_repo_spec "$next_repo" "${PROJECTS_DIR:-}" "${LAYOUT:-flat}" \
+                        url branch custom_name local_path repo_id 2>/dev/null; then
+                    if [[ -d "$local_path" ]]; then
+                        git -C "$local_path" fetch --quiet 2>/dev/null || true
+                    fi
+                fi
+
+                log_debug "Pre-fetched data for $next_repo"
+            ) &
+        fi
+    done
+}
+
+#------------------------------------------------------------------------------
+# Main Review Orchestration Loop (bd-l05s)
+# Ties together worktrees, sessions, monitoring, and questions
+#------------------------------------------------------------------------------
+
+# Run the main orchestration loop for review sessions
+# Args:
+#   $1+ - Work items array (repo_id|type|number|...)
+# Returns:
+#   0 on success
+run_review_orchestration() {
+    local -a work_items=("$@")
+
+    # Initialize tracking
+    declare -A active_sessions=()  # repo_id -> session_id
+    declare -A session_states=()   # session_id -> confirmed_state
+    declare -A question_counted=()  # session_id -> 1 if question already counted
+    local -a pending_repos=()
+    local -a completed_repos=()
+    local poll_interval=2
+
+    # Extract unique repos from work items and group items per repo
+    declare -A seen_repos=()
+    declare -A repo_items=()
+    local item repo_id
+    for item in "${work_items[@]}"; do
+        IFS='|' read -r repo_id _ <<< "$item"
+        if [[ -n "$repo_id" && -z "${seen_repos[$repo_id]:-}" ]]; then
+            seen_repos["$repo_id"]=1
+            pending_repos+=("$repo_id")
+        fi
+        if [[ -n "$repo_id" ]]; then
+            if [[ -n "${repo_items[$repo_id]:-}" ]]; then
+                repo_items["$repo_id"]+=$'\n'"$item"
+            else
+                repo_items["$repo_id"]="$item"
+            fi
+        fi
+    done
+
+    # Initialize cost budget
+    COST_BUDGET_START_TIME=$(date +%s)
+    COST_BUDGET_REPOS_PROCESSED=0
+    COST_BUDGET_QUESTIONS_ASKED=0
+
+    # Initialize review state
+    init_review_state
+    for repo_id in "${pending_repos[@]}"; do
+        update_review_state ".repos[\"$repo_id\"] = {\"status\": \"pending\", \"started_at\": null}"
+    done
+
+    log_info "Starting orchestration for ${#pending_repos[@]} repos (driver: ${REVIEW_DRIVER:-local}, parallel: ${REVIEW_PARALLEL:-1})"
+
+    # Load driver
+    load_review_driver "${REVIEW_DRIVER:-local}" || return 3
+    REVIEW_DRIVER_LOADED=1
+
+    # Prepare worktrees for all repos
+    log_step "Preparing isolated worktrees..."
+    if ! prepare_review_worktrees "${work_items[@]}"; then
+        log_error "Failed to prepare worktrees"
+        return 1
+    fi
+
+    # Main orchestration loop
+    local lock_file="${RU_STATE_DIR:-/tmp}/review-${REVIEW_RUN_ID:-$$}.lock"
+    touch "$lock_file"
+
+    while [[ ${#pending_repos[@]} -gt 0 || ${#active_sessions[@]} -gt 0 ]]; do
+        # Refresh governor state to honor rate limits before starting sessions.
+        if declare -f governor_update &>/dev/null; then
+            governor_update
+        fi
+
+        # Check cost budget before starting new sessions
+        if ! check_cost_budget; then
+            log_warn "Cost budget exceeded, stopping new sessions"
+            pending_repos=()  # Don't start any more
+        fi
+
+        # Pre-fetch next repos while we have active sessions
+        # Note: Always pass 0 as index since pending_repos shrinks (first element removed)
+        # as repos are started, so we always want to prefetch from the front of the queue
+        if [[ ${#active_sessions[@]} -gt 0 && ${#pending_repos[@]} -gt 0 ]]; then
+            prefetch_next_repos 0 "${pending_repos[@]}"
+        fi
+
+        # Start new sessions if capacity allows
+        while can_start_new_session "${#active_sessions[@]}" && [[ ${#pending_repos[@]} -gt 0 ]]; do
+            if start_next_queued_session active_sessions pending_repos repo_items; then
+                increment_repos_processed
+            else
+                break
+            fi
+        done
+
+        # Monitor active sessions
+        for repo_id in "${!active_sessions[@]}"; do
+            local session_id="${active_sessions[$repo_id]}"
+            local raw_state confirmed_state prev_state
+
+            raw_state=$(detect_session_state_raw "$session_id" 2>/dev/null || echo "generating")
+            prev_state="${session_states[$session_id]:-generating}"
+            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "$prev_state")
+            session_states["$session_id"]="$confirmed_state"
+
+            # Clear question counter when leaving waiting state (allows counting new questions)
+            if [[ "$prev_state" == "waiting" && "$confirmed_state" != "waiting" ]]; then
+                unset "question_counted[$session_id]"
+            fi
+
+            log_debug "Session $session_id: state=$confirmed_state"
+
+            case "$confirmed_state" in
+                waiting)
+                    # Get session output for wait reason detection
+                    local pipe_log wait_info reason recent_output=""
+                    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+                    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
+                        recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
+                    fi
+                    wait_info=$(detect_wait_reason "$session_id" "" "$recent_output")
+                    reason=$(echo "$wait_info" | jq -r '.reason // "unknown"' 2>/dev/null)
+                    [[ -z "$reason" ]] && reason="unknown"
+                    if [[ "$reason" == "ask_user_question" || "$reason" == "agent_question_text" ]]; then
+                        # Only count question once (not every poll cycle)
+                        if [[ -z "${question_counted[$session_id]:-}" ]]; then
+                            increment_questions_asked
+                            question_counted["$session_id"]=1
+                        fi
+                        if ! check_cost_budget; then
+                            log_warn "Question budget reached, auto-skipping"
+                            driver_send_to_session "$session_id" "Skip this question and continue" 2>/dev/null || true
+                        else
+                            handle_waiting_session "$session_id"
+                        fi
+                    else
+                        handle_waiting_session "$session_id"
+                    fi
+                    ;;
+                complete)
+                    completed_repos+=("$repo_id")
+                    unset "active_sessions[$repo_id]"
+                    update_review_state ".repos[\"$repo_id\"].status = \"completed\""
+                    handle_session_complete "$session_id"
+                    log_info "Session completed for $repo_id"
+                    ;;
+                error)
+                    governor_record_error "session_error" "$session_id" 2>/dev/null || true
+                    handle_session_error "$session_id"
+                    unset "active_sessions[$repo_id]"
+                    update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                    ;;
+                stalled)
+                    handle_stalled_session "$session_id"
+                    ;;
+            esac
+        done
+
+        # Process question queue (TUI) if we have pending questions
+        if declare -f has_pending_questions &>/dev/null && has_pending_questions 2>/dev/null; then
+            if declare -f render_question_tui &>/dev/null; then
+                render_question_tui
+                if declare -f process_user_answers &>/dev/null; then
+                    process_user_answers
+                fi
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
+
+    rm -f "$lock_file"
+    log_success "Orchestration complete: ${#completed_repos[@]} repos processed"
+
+    # Update digest caches from completed worktrees
+    update_repo_digests_from_worktrees || true
+
+    return 0
 }
 
 #------------------------------------------------------------------------------
@@ -5315,6 +11969,19 @@ validate_agent_command() {
     cmd="${cmd#"${cmd%%[![:space:]]*}"}"
     cmd="${cmd%"${cmd##*[![:space:]]}"}"
 
+    # Reject newline-separated commands to prevent chaining via line breaks.
+    if [[ "$cmd" == *$'\n'* || "$cmd" == *$'\r'* ]]; then
+        # Pre-escape newlines for valid JSON (jq 1.8+ may not escape in output)
+        local escaped_cmd="${cmd//$'\n'/\\n}"
+        escaped_cmd="${escaped_cmd//$'\r'/\\r}"
+        jq -n \
+            --arg cmd "$escaped_cmd" \
+            --arg status "needs_approval" \
+            --arg reason "Command contains newline separators" \
+            '{command: $cmd, status: $status, reason: $reason}'
+        return 2
+    fi
+
     # Extract the base command (first token)
     local base_cmd="${cmd%%[[:space:]]*}"
     if [[ -z "$base_cmd" ]]; then
@@ -5323,6 +11990,19 @@ validate_agent_command() {
             --arg status "needs_approval" \
             --arg reason "Empty command" \
             '{command: $cmd, status: $status, reason: $reason}'
+        return 2
+    fi
+
+    # Security: Check for shell metacharacters that enable command chaining/injection
+    # These could bypass base_cmd checks by executing additional commands
+    # Characters: ; | & ` $( ) && || (newlines handled above)
+    if [[ "$cmd" =~ [\;\|\&\`] ]] || [[ "$cmd" =~ \$\( ]] || [[ "$cmd" =~ \&\& ]] || [[ "$cmd" =~ \|\| ]]; then
+        jq -n \
+            --arg cmd "$cmd" \
+            --arg base "$base_cmd" \
+            --arg status "needs_approval" \
+            --arg reason "Command contains shell metacharacters (;|&\`\$()) that could enable command chaining" \
+            '{command: $cmd, base_command: $base, status: $status, reason: $reason}'
         return 2
     fi
 
@@ -5513,16 +12193,320 @@ local_driver_session_alive() {
 # Uses ntm robot mode API for advanced session orchestration
 #------------------------------------------------------------------------------
 
-# Check if ntm is available and working
-ntm_is_available() {
+# Check if ntm is available and functional with distinct error codes.
+# Returns:
+#   0 - ntm available and functional
+#   1 - ntm not installed
+#   2 - ntm installed but robot mode not working
+# Usage in cmd_agent_sweep:
+#   ntm_check_available
+#   ntm_status=$?
+#   if [[ $ntm_status -eq 1 ]]; then log_error "Install ntm first"; return 3
+#   elif [[ $ntm_status -eq 2 ]]; then log_error "ntm robot mode broken"; return 3
+#   fi
+ntm_check_available() {
     if ! command -v ntm &>/dev/null; then
-        return 1
+        return 1  # Not installed
     fi
-    # Verify ntm responds to status query
+    # Verify robot mode works (fast, side-effect-free check)
     if ! ntm --robot-status &>/dev/null; then
-        return 1
+        return 2  # Installed but not functional
     fi
+    return 0  # Available and functional
+}
+
+# Backward-compatible wrapper: returns 0 if available, 1 otherwise
+ntm_is_available() {
+    ntm_check_available
+    [[ $? -eq 0 ]]
+}
+
+# Sanitize a string for use as tmux session name
+# Replaces non-alphanumeric chars with underscore, collapses multiple underscores
+sanitize_session_name() {
+    local name="${1:-}"
+    # Replace non-alphanumeric with underscore, collapse multiple underscores
+    name="${name//[^a-zA-Z0-9]/_}"
+    # Remove leading/trailing underscores and collapse multiples
+    echo "$name" | sed 's/__*/_/g; s/^_//; s/_$//'
+}
+
+# Spawn a Claude Code session for a repository via ntm robot mode.
+# Usage: ntm_spawn_session session_name workdir [timeout_seconds]
+# Returns: JSON response on stdout
+# Exit codes:
+#   0 - Session created successfully
+#   1 - Error (check error_code in JSON output)
+ntm_spawn_session() {
+    local session="${1:-}"
+    local workdir="${2:-}"
+    local timeout="${3:-60}"
+    local output
+
+    [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
+    [[ -z "$workdir" ]] && { echo '{"success":false,"error":"workdir required"}'; return 1; }
+    [[ ! -d "$workdir" ]] && { echo '{"success":false,"error":"workdir does not exist"}'; return 1; }
+
+    # Spawn with wait-for-ready using robot mode
+    if output=$(ntm --robot-spawn="$session" \
+        --spawn-cc=1 \
+        --spawn-wait \
+        --spawn-dir="$workdir" \
+        --ready-timeout="${timeout}s" 2>&1); then
+        echo "$output"
+        return 0
+    else
+        local exit_code=$?
+        # Output may contain JSON error details
+        if [[ -n "$output" ]]; then
+            echo "$output"
+        else
+            echo "{\"success\":false,\"error\":\"spawn failed\",\"exit_code\":$exit_code}"
+        fi
+        return $exit_code
+    fi
+}
+
+# Send a prompt to a Claude Code session, handling large prompts via chunking.
+# Usage: ntm_send_prompt session prompt
+# Returns: JSON response on stdout
+# Prompts >4KB are automatically chunked to avoid tmux SendKeys limits.
+ntm_send_prompt() {
+    local session="${1:-}"
+    local prompt="${2:-}"
+    local output
+
+    [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
+    [[ -z "$prompt" ]] && { echo '{"success":false,"error":"prompt required"}'; return 1; }
+
+    # Check prompt size - tmux has ~4KB practical limit per SendKeys call
+    if [[ ${#prompt} -gt 4000 ]]; then
+        log_warn "Prompt is ${#prompt} chars (>4KB), sending in chunks"
+        ntm_send_prompt_chunked "$session" "$prompt"
+        return $?
+    fi
+
+    if output=$(ntm --robot-send="$session" \
+        --msg="$prompt" \
+        --type=claude 2>&1); then
+        echo "$output"
+        return 0
+    else
+        local exit_code=$?
+        if [[ -n "$output" ]]; then
+            echo "$output"
+        else
+            echo "{\"success\":false,\"error\":\"send failed\",\"exit_code\":$exit_code}"
+        fi
+        return $exit_code
+    fi
+}
+
+# Send a large prompt in chunks to avoid tmux SendKeys limits.
+# Internal helper for ntm_send_prompt.
+ntm_send_prompt_chunked() {
+    local session="${1:-}"
+    local prompt="${2:-}"
+    local chunk_size=3500  # Leave buffer below 4KB limit
+    local offset=0
+    local length=${#prompt}
+
+    while [[ $offset -lt $length ]]; do
+        local chunk="${prompt:$offset:$chunk_size}"
+        if ! ntm --robot-send="$session" --msg="$chunk" --type=claude &>/dev/null; then
+            echo "{\"success\":false,\"error\":\"chunk send failed at offset $offset\"}"
+            return 1
+        fi
+        ((offset += chunk_size))
+        # Small delay between chunks to let terminal process
+        sleep 0.1
+    done
+
+    echo '{"success":true,"chunked":true}'
     return 0
+}
+
+# Wait for Claude Code agent to complete work and return to idle state.
+# Usage: ntm_wait_completion session [timeout_seconds]
+# Returns: JSON response on stdout
+# Exit codes:
+#   0 - Condition met (agent idle)
+#   1 - Timeout exceeded
+#   2 - Error (check error_code in JSON)
+#   3 - Agent error detected
+ntm_wait_completion() {
+    local session="${1:-}"
+    local timeout="${2:-300}"
+    local output exit_code
+
+    [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
+
+    output=$(ntm --robot-wait="$session" \
+        --condition=idle \
+        --wait-timeout="${timeout}s" \
+        --exit-on-error 2>&1)
+    exit_code=$?
+
+    if [[ -n "$output" ]]; then
+        echo "$output"
+    else
+        # Generate minimal JSON response if ntm didn't
+        if [[ $exit_code -eq 0 ]]; then
+            echo '{"success":true,"condition":"idle"}'
+        else
+            echo "{\"success\":false,\"error\":\"wait failed\",\"exit_code\":$exit_code}"
+        fi
+    fi
+    return $exit_code
+}
+
+# Kill an ntm session. Idempotent - safe to call on non-existent sessions.
+# Usage: ntm_kill_session session_name
+# Returns: always 0 (cleanup should never fail the main workflow)
+ntm_kill_session() {
+    local session="${1:-}"
+    [[ -z "$session" ]] && return 0
+    # -f flag prevents confirmation prompt
+    ntm kill "$session" -f 2>/dev/null || true
+    return 0
+}
+
+# Send Ctrl+C interrupt to agent panes in an ntm session.
+# Used to stop long-running agent work before sending new prompts.
+# Usage: ntm_interrupt_session session_name
+# Returns: 0 on success, 1 on failure
+ntm_interrupt_session() {
+    local session="${1:-}"
+    [[ -z "$session" ]] && return 1
+    ntm --robot-interrupt="$session" 2>/dev/null || return 1
+    return 0
+}
+
+# Cleanup all agent-sweep sessions owned by this process.
+# Respects AGENT_SWEEP_KEEP_SESSIONS for debugging.
+# Usage: cleanup_agent_sweep_sessions
+cleanup_agent_sweep_sessions() {
+    [[ "${AGENT_SWEEP_KEEP_SESSIONS:-false}" == "true" ]] && return 0
+
+    local sessions session
+    # Find sessions matching our naming pattern with our PID
+    sessions=$(ntm --robot-status 2>/dev/null | \
+        grep -oE '"name":"ru_sweep_[^"]*"' | cut -d'"' -f4) || true
+
+    # Disable glob expansion for safe iteration over session names
+    set -f
+    for session in $sessions; do
+        # Only kill sessions from this PID (pattern: ru_sweep_*_$$)
+        if [[ "$session" == *"_$$"* ]] || [[ "$session" == *"_$$_"* ]]; then
+            ntm_kill_session "$session"
+        fi
+    done
+    set +f
+}
+
+# Release agent-sweep instance lock (if held).
+# Uses AGENT_SWEEP_INSTANCE_LOCK_DIR/BASE set by cmd_agent_sweep.
+release_agent_sweep_instance_lock() {
+    local lock_dir="${AGENT_SWEEP_INSTANCE_LOCK_DIR:-}"
+    local lock_base="${AGENT_SWEEP_INSTANCE_LOCK_BASE:-}"
+
+    [[ -z "$lock_dir" ]] && return 0
+
+    if [[ -n "$lock_base" ]] && _is_path_under_base "$lock_dir" "$lock_base"; then
+        rm -f "$lock_dir/pid" 2>/dev/null || true
+        rmdir "$lock_dir" 2>/dev/null || true
+    else
+        log_warn "Refusing to release unsafe agent-sweep lock dir: $lock_dir"
+    fi
+}
+
+# Set up trap handlers for graceful agent-sweep shutdown.
+# Call early in cmd_agent_sweep() after initial setup.
+setup_agent_sweep_traps() {
+    trap 'agent_sweep_handle_interrupt' INT TERM
+    trap 'agent_sweep_handle_exit' EXIT
+}
+
+# Handle interrupt (Ctrl+C or TERM signal) during agent-sweep.
+# Saves state for resume and cleans up sessions.
+agent_sweep_handle_interrupt() {
+    echo "" >&2  # Newline after ^C
+    log_warn "Agent-sweep interrupted! Saving state for resume..."
+    save_agent_sweep_state "interrupted"
+    cleanup_agent_sweep_sessions
+    exit 5  # Exit code 5 = signal/interrupt
+}
+
+# Handle normal exit from agent-sweep.
+# Cleans up sessions unless --keep-sessions or --keep-sessions-on-fail.
+agent_sweep_handle_exit() {
+    local exit_code=$?
+
+    # On failure, optionally keep sessions for debugging
+    if [[ $exit_code -ne 0 ]] && [[ "${AGENT_SWEEP_KEEP_SESSIONS_ON_FAIL:-false}" == "true" ]]; then
+        log_info "Keeping sessions for debugging (--keep-sessions-on-fail)"
+        release_agent_sweep_instance_lock
+        return
+    fi
+
+    # On success, mark state as completed
+    if [[ $exit_code -eq 0 ]]; then
+        save_agent_sweep_state "completed"
+        cleanup_agent_sweep_state  # Clean up state file on success
+    fi
+
+    cleanup_agent_sweep_sessions
+    release_agent_sweep_instance_lock
+}
+
+# Map ntm error codes to ru exit codes.
+# Args: $1 = ntm error code string
+# Returns: ru exit code (0-5) on stdout
+#
+# ru exit codes:
+#   0 = success
+#   1 = partial failure (some repos failed)
+#   2 = complete failure (all operations failed)
+#   3 = system/environment error
+#   4 = bad arguments/usage
+#   5 = signal/interrupt
+map_ntm_error_to_exit_code() {
+    local ntm_error="${1:-}"
+
+    case "$ntm_error" in
+        # Retry-able conditions -> partial failure
+        TIMEOUT)             echo 1 ;;
+        RESOURCE_BUSY)       echo 1 ;;
+        RATE_LIMITED)        echo 1 ;;
+
+        # System/environment errors
+        SESSION_NOT_FOUND)   echo 3 ;;
+        PANE_NOT_FOUND)      echo 3 ;;
+        INTERNAL_ERROR)      echo 3 ;;
+        PERMISSION_DENIED)   echo 3 ;;
+        DEPENDENCY_MISSING)  echo 3 ;;
+
+        # Bad arguments/usage
+        INVALID_FLAG)        echo 4 ;;
+        INVALID_ARGS)        echo 4 ;;
+        NOT_IMPLEMENTED)     echo 4 ;;
+
+        # Default: partial failure (conservative)
+        *)                   echo 1 ;;
+    esac
+}
+
+# Get real-time activity state for an ntm session.
+# Usage: ntm_get_activity session_name
+# Output: JSON with agent states, velocity, health, rate_limited flag
+# Use to poll during wait for progress or detect rate limiting
+ntm_get_activity() {
+    local session="${1:-}"
+    [[ -z "$session" ]] && {
+        echo '{"success":false,"error":"session name required"}'
+        return 1
+    }
+    ntm --robot-activity="$session" 2>/dev/null
 }
 
 # ntm driver: Start a new Claude Code session
@@ -5821,6 +12805,7 @@ _enable_local_driver() {
     driver_stream_events() {
         local_driver_stream_events "$@"
     }
+    # shellcheck disable=SC2120  # Called with varying args via dispatch
     driver_list_sessions() {
         local_driver_list_sessions "$@"
     }
@@ -5899,12 +12884,20 @@ update_github_rate_limit() {
 # Scans recent logs for 429/rate limit patterns
 # Sets: GOVERNOR_STATE[model_in_backoff], GOVERNOR_STATE[model_backoff_until]
 check_model_rate_limit() {
-    local state_dir="$RU_STATE_DIR"
-    local log_dir
-    log_dir="$state_dir/logs/$(date +%Y-%m-%d)"
+    local state_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
+    local -a log_dirs=()
+    local today
+    today=$(date +%Y-%m-%d)
+    log_dirs+=("$state_dir/logs/$today")
 
-    if [[ ! -d "$log_dir" ]]; then
-        return 0
+    local yesterday=""
+    if yesterday=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null); then
+        :
+    elif yesterday=$(date -v -1d +%Y-%m-%d 2>/dev/null); then
+        :
+    fi
+    if [[ -n "$yesterday" && "$yesterday" != "$today" ]]; then
+        log_dirs+=("$state_dir/logs/$yesterday")
     fi
 
     # Look for 429 responses in recent log files (last 5 minutes)
@@ -5912,9 +12905,45 @@ check_model_rate_limit() {
     local now
     now=$(date +%s)
     local five_min_ago=$((now - 300))
+    local backoff_until="${GOVERNOR_STATE[model_backoff_until]:-0}"
+
+    # Clear expired backoff even if no logs are found.
+    if [[ "${GOVERNOR_STATE[model_in_backoff]}" == "true" ]]; then
+        [[ "$backoff_until" =~ ^[0-9]+$ ]] || backoff_until=0
+        if [[ "$now" -ge "$backoff_until" ]]; then
+            GOVERNOR_STATE[model_in_backoff]="false"
+            log_info "Model rate limit backoff expired, resuming normal operation"
+        fi
+    fi
+
+    local -a log_files=()
+    local log_dir
+    for log_dir in "${log_dirs[@]}"; do
+        if [[ -d "$log_dir" ]]; then
+            while IFS= read -r log_file; do
+                [[ -n "$log_file" ]] && log_files+=("$log_file")
+            done < <(find "$log_dir" -name "*.log" -type f 2>/dev/null)
+        fi
+    done
+
+    # Also scan review session logs in active worktrees (if available)
+    local run_id="${REVIEW_RUN_ID:-}"
+    if [[ -n "$run_id" ]]; then
+        local worktrees_dir="$state_dir/worktrees/$run_id"
+        if [[ -d "$worktrees_dir" ]]; then
+            while IFS= read -r log_file; do
+                [[ -n "$log_file" ]] && log_files+=("$log_file")
+            done < <(find "$worktrees_dir" -path "*/.ru/session.log" -type f 2>/dev/null)
+        fi
+    fi
+
+    if [[ ${#log_files[@]} -eq 0 ]]; then
+        return 0
+    fi
 
     # Find log files modified in last 5 minutes and grep for rate limit patterns
-    while IFS= read -r log_file; do
+    local log_file
+    for log_file in "${log_files[@]}"; do
         if [[ -f "$log_file" ]]; then
             local mtime
             mtime=$(stat -c %Y "$log_file" 2>/dev/null || stat -f %m "$log_file" 2>/dev/null || echo 0)
@@ -5924,21 +12953,13 @@ check_model_rate_limit() {
                 fi
             fi
         fi
-    done < <(find "$log_dir" -name "*.log" -type f 2>/dev/null)
+    done
 
     if [[ "$recent_429s" -gt 0 ]]; then
-        local backoff_until=$((now + 60))
+        backoff_until=$((now + 60))
         GOVERNOR_STATE[model_in_backoff]="true"
         GOVERNOR_STATE[model_backoff_until]="$backoff_until"
         log_warn "Model rate limit detected ($recent_429s hits), backing off until $(date -d "@$backoff_until" +%H:%M:%S 2>/dev/null || date -r "$backoff_until" +%H:%M:%S 2>/dev/null || echo 'soon')"
-    else
-        # Check if backoff period has expired
-        if [[ "${GOVERNOR_STATE[model_in_backoff]}" == "true" ]]; then
-            if [[ "$now" -ge "${GOVERNOR_STATE[model_backoff_until]}" ]]; then
-                GOVERNOR_STATE[model_in_backoff]="false"
-                log_info "Model rate limit backoff expired, resuming normal operation"
-            fi
-        fi
     fi
 }
 
@@ -6015,10 +13036,10 @@ adjust_parallelism() {
 }
 
 # Check if we can start a new session based on governor state
-# Args: current_active_sessions
+# Args: current_active_count (number of currently active sessions)
 # Returns: 0 if allowed, 1 if not
 can_start_new_session() {
-    local active_sessions="${1:-0}"
+    local active_count="${1:-0}"
 
     # Circuit breaker open = no new sessions
     if [[ "${GOVERNOR_STATE[circuit_breaker_open]}" == "true" ]]; then
@@ -6035,10 +13056,10 @@ can_start_new_session() {
     # Check effective parallelism
     local effective="${GOVERNOR_STATE[effective_parallelism]}"
     # Validate integers; default to conservative values if corrupted
-    [[ "$active_sessions" =~ ^[0-9]+$ ]] || active_sessions=0
+    [[ "$active_count" =~ ^[0-9]+$ ]] || active_count=0
     [[ "$effective" =~ ^[0-9]+$ ]] || effective=1
-    if [[ "$active_sessions" -ge "$effective" ]]; then
-        log_verbose "Cannot start session: at capacity ($active_sessions >= $effective)"
+    if [[ "$active_count" -ge "$effective" ]]; then
+        log_verbose "Cannot start session: at capacity ($active_count >= $effective)"
         return 1
     fi
 
@@ -6094,8 +13115,17 @@ start_rate_limit_governor() {
 # This is the RECOMMENDED approach as it updates GOVERNOR_STATE in the current process.
 # Updates rate limits and adjusts parallelism in one call.
 governor_update() {
-    update_github_rate_limit
-    check_model_rate_limit
+    local now
+    now=$(date +%s)
+    local last_update="${GOVERNOR_STATE[last_update]:-0}"
+    [[ "$last_update" =~ ^[0-9]+$ ]] || last_update=0
+
+    # Throttle expensive rate limit checks (default: every 30s).
+    if (( now - last_update >= 30 )); then
+        update_github_rate_limit
+        check_model_rate_limit
+        GOVERNOR_STATE[last_update]="$now"
+    fi
     adjust_parallelism
 }
 
@@ -6230,7 +13260,10 @@ write_questions_queue() {
 
     local payload
     payload=$(jq -n --argjson questions "$questions_json" '{version:1, questions:$questions}')
-    with_state_lock write_json_atomic "$questions_file" "$payload"
+    if ! with_state_lock write_json_atomic "$questions_file" "$payload"; then
+        log_warn "Failed to write questions queue"
+        return 1
+    fi
 }
 
 update_question_in_queue() {
@@ -6263,7 +13296,10 @@ update_question_in_queue() {
     fi
 
     updated=$(echo "$current" | jq --arg qid "$question_id" "$@" "$update_filter" 2>/dev/null) || return 1
-    with_state_lock write_json_atomic "$questions_file" "$updated"
+    if ! with_state_lock write_json_atomic "$questions_file" "$updated"; then
+        log_warn "Failed to update question in queue"
+        return 1
+    fi
 }
 
 mark_question_answered() {
@@ -6361,8 +13397,14 @@ dashboard_prompt_line() {
     local prompt="$1"
     local input=""
 
+    if ! can_prompt; then
+        echo ""
+        return 1
+    fi
+
     exit_alt_screen
-    read -r -p "$prompt" input
+    printf '%s' "$prompt" >&2
+    IFS= read -r input
     enter_alt_screen
     DASHBOARD_STATE[refresh_needed]="true"
     echo "$input"
@@ -6398,7 +13440,8 @@ dashboard_prompt_choice() {
         ((i++))
     done
     local choice=""
-    read -r -p "Choose [1-${#options[@]}]: " choice
+    printf 'Choose [1-%d]: ' "${#options[@]}" >&2
+    IFS= read -r choice
     enter_alt_screen
     DASHBOARD_STATE[refresh_needed]="true"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
@@ -6569,7 +13612,7 @@ dashboard_skip_all_questions() {
     ' 2>/dev/null || echo "")
 
     if [[ -n "$updated" ]]; then
-        with_state_lock write_json_atomic "$questions_file" "$updated"
+        with_state_lock write_json_atomic "$questions_file" "$updated" || return 1
     fi
 }
 
@@ -6612,6 +13655,237 @@ dashboard_apply_template() {
     [[ -z "$template_text" ]] && return 1
 
     driver_send_to_session "$session_id" "$template_text" || true
+}
+
+# Print wrapped text with a fixed indent
+print_wrapped_block() {
+    local indent="$1"
+    local width="$2"
+    local text="$3"
+
+    [[ -z "$text" ]] && return 0
+
+    while IFS= read -r line; do
+        printf '%s%s\n' "$indent" "$line"
+    done < <(wrap_text "$text" "$width")
+}
+
+# Show a patch summary for the worktree
+show_patch_summary() {
+    local wt_path="$1"
+    local cols="$2"
+    local plan_file="${3:-}"
+
+    local width=$((cols - 6))
+    [[ $width -lt 20 ]] && width=20
+
+    printf '\n  %sPATCH SUMMARY%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+
+    if [[ -z "$wt_path" || ! -d "$wt_path/.git" ]]; then
+        printf '  %sNo worktree available%s\n' "${DASH_DIM}" "${DASH_RESET}"
+        return 0
+    fi
+
+    local diffstat shortstat
+    diffstat=$(git -C "$wt_path" diff --stat --no-color 2>/dev/null || echo "")
+    shortstat=$(git -C "$wt_path" diff --shortstat --no-color 2>/dev/null || echo "")
+
+    if [[ -z "$diffstat" ]]; then
+        printf '  %sNo uncommitted changes%s\n' "${DASH_DIM}" "${DASH_RESET}"
+    else
+        printf '  Changed files:\n'
+        while IFS= read -r line; do
+            printf '    %s\n' "$(truncate_string "$line" "$width")"
+        done <<< "$(echo "$diffstat" | head -n 6)"
+
+        if [[ -n "$shortstat" ]]; then
+            printf '  Diff: %s\n' "$shortstat"
+        fi
+    fi
+
+    if [[ -n "$plan_file" && -f "$plan_file" ]] && command -v jq &>/dev/null; then
+        local tests_ran tests_ok gates_ok gates_warn tests_status
+        tests_ran=$(jq -r '.git.tests.ran // null' "$plan_file" 2>/dev/null)
+        tests_ok=$(jq -r '.git.tests.ok // null' "$plan_file" 2>/dev/null)
+        gates_ok=$(jq -r '.git.quality_gates_ok // null' "$plan_file" 2>/dev/null)
+        gates_warn=$(jq -r '.git.quality_gates_warning // null' "$plan_file" 2>/dev/null)
+
+        if [[ "$tests_ran" == "true" ]]; then
+            tests_status=$([[ "$tests_ok" == "true" ]] && echo "PASS" || echo "FAIL")
+        elif [[ "$tests_ran" == "false" ]]; then
+            tests_status="NOT RUN"
+        else
+            tests_status="UNKNOWN"
+        fi
+
+        printf '  Tests: %s\n' "$tests_status"
+        if [[ "$gates_ok" == "true" ]]; then
+            printf '  Quality gates: OK\n'
+        elif [[ "$gates_warn" == "true" ]]; then
+            printf '  Quality gates: WARNING\n'
+        elif [[ "$gates_ok" == "false" ]]; then
+            printf '  Quality gates: FAIL\n'
+        fi
+    fi
+}
+
+# View raw session output (tail of session log)
+view_session_output() {
+    local log_file="$1"
+
+    local cols rows term_size max_lines
+    term_size=$(get_terminal_size)
+    read -r cols rows <<< "$term_size"
+    max_lines=$((rows - 6))
+    [[ $max_lines -lt 5 ]] && max_lines=5
+
+    clear_screen
+    printf '%sSession Output%s\n\n' "${DASH_BOLD}" "${DASH_RESET}"
+
+    if [[ -z "$log_file" || ! -f "$log_file" ]]; then
+        printf '%sNo session log available.%s\n' "${DASH_DIM}" "${DASH_RESET}"
+    else
+        tail -n "$max_lines" "$log_file"
+    fi
+
+    printf '\nPress any key to return...\n'
+    read_keypress
+}
+
+# Drill-down view for a single question
+open_drilldown() {
+    local question_json="$1"
+
+    local repo_id session_id question_id prompt recommended
+    repo_id=$(echo "$question_json" | jq -r '.repo // "unknown"' 2>/dev/null)
+    session_id=$(question_get_session_id "$question_json")
+    question_id=$(question_get_id "$question_json")
+    prompt=$(question_get_prompt "$question_json")
+    recommended=$(question_get_recommended "$question_json")
+
+    local wt_path=""
+    if [[ -n "$repo_id" ]]; then
+        get_worktree_path "$repo_id" wt_path 2>/dev/null || wt_path=""
+    fi
+
+    local log_file=""
+    local plan_file=""
+    if [[ -n "$wt_path" ]]; then
+        log_file="$wt_path/.ru/session.log"
+        [[ -f "$log_file" ]] || log_file=""
+        plan_file="$wt_path/.ru/review-plan.json"
+        [[ -f "$plan_file" ]] || plan_file=""
+    fi
+
+    while true; do
+        local cols rows term_size width
+        term_size=$(get_terminal_size)
+        read -r cols rows <<< "$term_size"
+        width=$((cols - 4))
+        [[ $width -lt 20 ]] && width=20
+
+        local number item_type priority title context repo_url
+        number=$(echo "$question_json" | jq -r '.number // empty' 2>/dev/null)
+        item_type=$(echo "$question_json" | jq -r '.type // "issue"' 2>/dev/null)
+        priority=$(echo "$question_json" | jq -r '.priority // "NORMAL"' 2>/dev/null)
+        title=$(echo "$question_json" | jq -r '.title // .item_title // .context.title // empty' 2>/dev/null)
+        repo_url=$(echo "$question_json" | jq -r '.repo_url // .url // empty' 2>/dev/null)
+        context=$(echo "$question_json" | jq -r '
+            if .context == null then ""
+            elif (.context | type) == "string" then .context
+            else (.context | tostring)
+            end
+        ' 2>/dev/null)
+
+        clear_screen
+        printf '%s%s%s\n' "${DASH_BOLD}" " ${repo_id} - Session Detail [ESC]" "${DASH_RESET}"
+        draw_hline "$cols"
+
+        printf '  Repository: %s\n' "${repo_url:-$repo_id}"
+        printf '  Session ID: %s\n' "${session_id:-unknown}"
+        [[ -n "$wt_path" ]] && printf '  Worktree: %s\n' "$wt_path"
+        printf '  Priority: %s\n' "$priority"
+
+        if [[ -n "$number" || -n "$title" ]]; then
+            printf '\n  %s%s%s\n' "${DASH_BOLD}" "$(truncate_string "${item_type^^} #${number:-?}: ${title:-No title}" "$width")" "${DASH_RESET}"
+        fi
+
+        if [[ -n "$prompt" ]]; then
+            printf '\n  %sQUESTION%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$prompt"
+        fi
+
+        if [[ -n "$context" ]]; then
+            printf '\n  %sCONTEXT%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$context"
+        fi
+
+        local -a options=()
+        mapfile -t options < <(question_get_options_lines "$question_json")
+        if [[ ${#options[@]} -gt 0 ]]; then
+            printf '\n  %sOPTIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            [[ -n "${options[0]:-}" ]] && printf '  A: %s\n' "$(truncate_string "${options[0]}" "$width")"
+            [[ -n "${options[1]:-}" ]] && printf '  B: %s\n' "$(truncate_string "${options[1]}" "$width")"
+            if [[ ${#options[@]} -gt 2 ]]; then
+                printf '  C: %s\n' "$(truncate_string "${options[2]}" "$width")"
+            else
+                printf '  C: Skip\n'
+            fi
+        elif [[ -n "$recommended" ]]; then
+            printf '\n  %sRECOMMENDED%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            print_wrapped_block "  " "$width" "$recommended"
+            printf '  C: Skip\n'
+        else
+            printf '\n  %sACTIONS%s\n' "${DASH_BOLD}" "${DASH_RESET}"
+            printf '  C: Skip\n'
+        fi
+
+        local c_label="Skip"
+        if [[ -n "${options[2]:-}" ]]; then
+            c_label="Option 3"
+        fi
+
+        show_patch_summary "$wt_path" "$cols" "$plan_file"
+
+        printf '\n  [a] Quick fix  [b] Alt fix  [c] %s  [v] View session  [ESC] Back\n' "$c_label"
+
+        local key
+        key=$(read_keypress)
+        case "$key" in
+            $'\x1b'|q) return 0 ;;
+            a|b)
+                local answer=""
+                if [[ "$key" == "a" ]]; then
+                    answer="${options[0]:-}"
+                    [[ -z "$answer" ]] && answer="$recommended"
+                else
+                    answer="${options[1]:-}"
+                fi
+
+                if [[ -z "$answer" ]]; then
+                    continue
+                fi
+
+                [[ -n "$session_id" ]] && driver_send_to_session "$session_id" "$answer" || true
+                [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+                return 0
+                ;;
+            c)
+                if [[ -n "${options[2]:-}" ]]; then
+                    local answer="${options[2]}"
+                    [[ -n "$session_id" ]] && driver_send_to_session "$session_id" "$answer" || true
+                    [[ -n "$question_id" ]] && mark_question_answered "$question_id" "$answer" || true
+                else
+                    [[ -n "$question_id" ]] && mark_question_skipped "$question_id" || true
+                fi
+                return 0
+                ;;
+            v)
+                view_session_output "$log_file"
+                ;;
+            *) ;;
+        esac
+    done
 }
 
 # Enter alternate screen buffer
@@ -6673,6 +13947,21 @@ truncate_string() {
         echo "${str:0:$((max_width - 3))}..."
     else
         echo "$str"
+    fi
+}
+
+# Wrap text to a given width (preserves words when possible)
+wrap_text() {
+    local text="$1"
+    local width="$2"
+
+    [[ -z "$text" ]] && return 0
+    [[ -z "$width" || "$width" -le 0 ]] && { echo "$text"; return 0; }
+
+    if command -v fold &>/dev/null; then
+        echo "$text" | fold -s -w "$width"
+    else
+        echo "$text"
     fi
 }
 
@@ -6910,7 +14199,7 @@ render_sessions_panel() {
 # Args: $1=cols, $2=completed, $3=issues, $4=prs, $5=commits
 render_summary_panel() {
     local cols="$1"
-    local completed="$2"
+    local completed_count="$2"
     local issues="$3"
     local prs="$4"
     local commits="$5"
@@ -6921,7 +14210,7 @@ render_summary_panel() {
 
     printf '  %sSUMMARY%s\n' "${DASH_BOLD}" "${DASH_RESET}"
     printf '  Completed: %s%d%s | Issues: %d | PRs: %d | Commits: %d\n' \
-        "${DASH_GREEN}" "$completed" "${DASH_RESET}" "$issues" "$prs" "$commits"
+        "${DASH_GREEN}" "$completed_count" "${DASH_RESET}" "$issues" "$prs" "$commits"
 }
 
 # Render footer with keyboard shortcuts
@@ -6951,8 +14240,8 @@ render_dashboard() {
     read -r cols rows <<< "$term_size"
 
     # Parse stats with fallbacks
-    local completed issues prs commits progress_current progress_total
-    completed=$(echo "$stats_json" | jq -r '.completed // 0' 2>/dev/null) || completed=0
+    local completed_count issues prs commits progress_current progress_total
+    completed_count=$(echo "$stats_json" | jq -r '.completed // 0' 2>/dev/null) || completed_count=0
     issues=$(echo "$stats_json" | jq -r '.issues // 0' 2>/dev/null) || issues=0
     prs=$(echo "$stats_json" | jq -r '.prs // 0' 2>/dev/null) || prs=0
     commits=$(echo "$stats_json" | jq -r '.commits // 0' 2>/dev/null) || commits=0
@@ -6970,7 +14259,7 @@ render_dashboard() {
 
     render_questions_panel "$cols" "$questions_rows" "$questions_json"
     render_sessions_panel "$cols" "$sessions_json"
-    render_summary_panel "$cols" "$completed" "$issues" "$prs" "$commits"
+    render_summary_panel "$cols" "$completed_count" "$issues" "$prs" "$commits"
     render_footer "$cols"
 }
 
@@ -7143,8 +14432,14 @@ run_dashboard() {
                     ;;
                 drill:*)
                     local idx="${action#drill:}"
-                    # TODO: Open drill-down view (bd-7of4)
-                    log_verbose "Drill into question $idx"
+                    if [[ -n "$filtered_questions" ]]; then
+                        local question_json
+                        question_json=$(get_question_at_index "$filtered_questions" "$idx")
+                        if [[ -n "$question_json" ]]; then
+                            open_drilldown "$question_json"
+                            DASHBOARD_STATE[refresh_needed]="true"
+                        fi
+                    fi
                     ;;
                 skip:*)
                     local idx="${action#skip:}"
@@ -7277,9 +14572,15 @@ basic_mode_choose_answer() {
     local -a options=()
     mapfile -t options < <(question_get_options_lines "$question_json")
 
+    if ! can_prompt; then
+        echo ""
+        return 1
+    fi
+
     if [[ ${#options[@]} -eq 0 ]]; then
         local answer
-        read -r -p "Answer: " answer
+        printf 'Answer: ' >&2
+        IFS= read -r answer
         echo "$answer"
         return 0
     fi
@@ -7298,7 +14599,8 @@ basic_mode_choose_answer() {
         ((i++))
     done
     local choice=""
-    read -r -p "Choose [1-${#options[@]}]: " choice
+    printf 'Choose [1-%d]: ' "${#options[@]}" >&2
+    IFS= read -r choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
         echo "${options[$((choice - 1))]}"
         return 0
@@ -7358,315 +14660,6 @@ basic_mode_loop() {
     done
 }
 
-#------------------------------------------------------------------------------
-# REVIEW POLICY CONFIGURATION (bd-cutq)
-# Per-repo customization of review behavior via configuration files
-#------------------------------------------------------------------------------
-
-# Get path to review policies directory
-get_review_policy_dir() {
-    echo "${RU_CONFIG_DIR}/review-policies.d"
-}
-
-# Load policy for a specific repo, merging defaults with overrides
-# Args: $1 = repo_id (owner/repo format)
-# Outputs: Sourced policy variables to stdout as KEY=VALUE pairs
-load_policy_for_repo() {
-    local repo_id="$1"
-    local policy_dir
-    policy_dir=$(get_review_policy_dir)
-
-    # Initialize with hardcoded defaults
-    local -A policy=(
-        [REVIEW_TEST_CMD]=""
-        [REVIEW_TEST_TIMEOUT]="300"
-        [REVIEW_LINT_CMD]=""
-        [REVIEW_LINT_REQUIRED]="false"
-        [REVIEW_SECRET_SCAN]="true"
-        [REVIEW_SECRET_PATTERNS]=""
-        [REVIEW_ALLOW_PUSH]="true"
-        [REVIEW_REQUIRE_APPROVAL]="false"
-        [REVIEW_BASE_PRIORITY]="0"
-        [REVIEW_LABELS_BOOST]=""
-        [REVIEW_MAX_ITEMS]="20"
-        [REVIEW_SKIP_PRS]="false"
-        [REVIEW_DEEP_MODE]="false"
-    )
-
-    # 1. Load _default.conf if exists
-    local default_policy="${policy_dir}/_default.conf"
-    if [[ -f "$default_policy" ]]; then
-        # shellcheck disable=SC1090
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" == \#* ]] && continue
-            key=$(echo "$key" | xargs)  # Trim whitespace
-            value=$(echo "$value" | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-            [[ -n "$key" ]] && policy["$key"]="$value"
-        done < <(grep -E '^[[:space:]]*REVIEW_' "$default_policy" 2>/dev/null)
-    fi
-
-    # 2. Find and load repo-specific policy (exact match or glob)
-    local safe_repo_id="${repo_id//\//_}"  # owner/repo -> owner_repo
-    local repo_policy="${policy_dir}/${safe_repo_id}.conf"
-
-    if [[ -f "$repo_policy" ]]; then
-        # Exact match found
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" == \#* ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-            [[ -n "$key" ]] && policy["$key"]="$value"
-        done < <(grep -E '^[[:space:]]*REVIEW_' "$repo_policy" 2>/dev/null)
-    else
-        # Try glob patterns (e.g., myorg_*.conf)
-        local owner="${repo_id%%/*}"
-        local glob_pattern="${policy_dir}/${owner}_*.conf"
-        # shellcheck disable=SC2086
-        for glob_file in $glob_pattern; do
-            if [[ -f "$glob_file" && "$glob_file" != *"_*.conf" ]]; then
-                while IFS='=' read -r key value; do
-                    [[ -z "$key" || "$key" == \#* ]] && continue
-                    key=$(echo "$key" | xargs)
-                    value=$(echo "$value" | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-                    [[ -n "$key" ]] && policy["$key"]="$value"
-                done < <(grep -E '^[[:space:]]*REVIEW_' "$glob_file" 2>/dev/null)
-                break  # Use first matching glob
-            fi
-        done
-    fi
-
-    # Output as JSON for easy consumption
-    jq -n \
-        --arg test_cmd "${policy[REVIEW_TEST_CMD]}" \
-        --arg test_timeout "${policy[REVIEW_TEST_TIMEOUT]}" \
-        --arg lint_cmd "${policy[REVIEW_LINT_CMD]}" \
-        --arg lint_required "${policy[REVIEW_LINT_REQUIRED]}" \
-        --arg secret_scan "${policy[REVIEW_SECRET_SCAN]}" \
-        --arg secret_patterns "${policy[REVIEW_SECRET_PATTERNS]}" \
-        --arg allow_push "${policy[REVIEW_ALLOW_PUSH]}" \
-        --arg require_approval "${policy[REVIEW_REQUIRE_APPROVAL]}" \
-        --arg base_priority "${policy[REVIEW_BASE_PRIORITY]}" \
-        --arg labels_boost "${policy[REVIEW_LABELS_BOOST]}" \
-        --arg max_items "${policy[REVIEW_MAX_ITEMS]}" \
-        --arg skip_prs "${policy[REVIEW_SKIP_PRS]}" \
-        --arg deep_mode "${policy[REVIEW_DEEP_MODE]}" \
-        '{
-            test_cmd: $test_cmd,
-            test_timeout: ($test_timeout | tonumber),
-            lint_cmd: $lint_cmd,
-            lint_required: ($lint_required == "true"),
-            secret_scan: ($secret_scan == "true"),
-            secret_patterns: $secret_patterns,
-            allow_push: ($allow_push == "true"),
-            require_approval: ($require_approval == "true"),
-            base_priority: ($base_priority | tonumber),
-            labels_boost: $labels_boost,
-            max_items: ($max_items | tonumber),
-            skip_prs: ($skip_prs == "true"),
-            deep_mode: ($deep_mode == "true")
-        }'
-}
-
-# Apply priority boost from policy to a work item score
-# Args: $1 = repo_id, $2 = current_score, $3 = labels (comma-separated)
-# Outputs: New score
-apply_policy_priority_boost() {
-    local repo_id="$1"
-    local current_score="$2"
-    local labels="$3"
-
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-
-    # Get base priority boost
-    local base_boost
-    base_boost=$(echo "$policy" | jq -r '.base_priority // 0')
-    current_score=$((current_score + base_boost))
-
-    # Get label boosts (format: "label1:30,label2:20")
-    local labels_boost
-    labels_boost=$(echo "$policy" | jq -r '.labels_boost // ""')
-
-    if [[ -n "$labels_boost" && -n "$labels" ]]; then
-        # Parse label boosts
-        IFS=',' read -ra boost_pairs <<< "$labels_boost"
-        for pair in "${boost_pairs[@]}"; do
-            local label="${pair%%:*}"
-            local boost="${pair#*:}"
-            # Check if this label is in the item's labels
-            if [[ ",$labels," == *",$label,"* ]]; then
-                current_score=$((current_score + boost))
-            fi
-        done
-    fi
-
-    echo "$current_score"
-}
-
-# Validate a policy file for syntax and value errors
-# Args: $1 = path to policy file
-# Returns: 0 if valid, 1 if invalid (with error message to stderr)
-validate_policy_file() {
-    local file="$1"
-
-    if [[ ! -f "$file" ]]; then
-        log_error "Policy file not found: $file"
-        return 1
-    fi
-
-    # Check bash syntax (the file should be sourceable)
-    if ! bash -n "$file" 2>/dev/null; then
-        log_error "Syntax error in policy file: $file"
-        return 1
-    fi
-
-    # Check for valid variable assignments
-    local line_num=0
-    while IFS= read -r line; do
-        ((line_num++))
-        # Skip empty lines and comments
-        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-
-        # Check for REVIEW_ variable assignments
-        if [[ "$line" =~ ^[[:space:]]*REVIEW_ ]]; then
-            # Validate it's a proper assignment
-            if ! [[ "$line" =~ ^[[:space:]]*REVIEW_[A-Z_]+=.* ]]; then
-                log_error "Invalid assignment at line $line_num in $file: $line"
-                return 1
-            fi
-
-            # Extract key and value for validation
-            local key value
-            key=$(echo "$line" | sed 's/=.*//' | xargs)
-            value=$(echo "$line" | sed 's/^[^=]*=//' | xargs | sed 's/^["'"'"']//;s/["'"'"']$//')
-
-            # Validate numeric fields
-            case "$key" in
-                REVIEW_TEST_TIMEOUT|REVIEW_BASE_PRIORITY|REVIEW_MAX_ITEMS)
-                    if ! [[ "$value" =~ ^-?[0-9]+$ ]]; then
-                        log_error "$key must be numeric at line $line_num in $file"
-                        return 1
-                    fi
-                    ;;
-                REVIEW_LINT_REQUIRED|REVIEW_SECRET_SCAN|REVIEW_ALLOW_PUSH|REVIEW_REQUIRE_APPROVAL|REVIEW_SKIP_PRS|REVIEW_DEEP_MODE)
-                    if ! [[ "$value" =~ ^(true|false)$ ]]; then
-                        log_error "$key must be true or false at line $line_num in $file"
-                        return 1
-                    fi
-                    ;;
-            esac
-        fi
-    done < "$file"
-
-    return 0
-}
-
-# Initialize review policies directory with example configuration
-init_review_policies() {
-    local policy_dir
-    policy_dir=$(get_review_policy_dir)
-
-    if [[ ! -d "$policy_dir" ]]; then
-        mkdir -p "$policy_dir"
-        log_info "Created review policies directory: $policy_dir"
-    fi
-
-    # Create example default policy if no config exists
-    local default_policy="${policy_dir}/_default.conf"
-    local example_policy="${policy_dir}/_default.conf.example"
-
-    if [[ ! -f "$default_policy" && ! -f "$example_policy" ]]; then
-        cat > "$example_policy" << 'POLICY_EOF'
-# Default Review Policy (rename to _default.conf to activate)
-# These settings apply to all repos unless overridden by a repo-specific policy.
-#
-# To override for a specific repo, create a file named after the repo:
-#   owner_reponame.conf (e.g., myorg_backend.conf)
-#
-# For organization-wide settings, use glob patterns:
-#   myorg_*.conf (matches all repos in myorg)
-
-# Test Configuration
-# Auto-detect test command if empty (looks for Makefile, package.json, etc.)
-REVIEW_TEST_CMD=""
-REVIEW_TEST_TIMEOUT=300
-
-# Lint Configuration
-REVIEW_LINT_CMD=""
-REVIEW_LINT_REQUIRED=false
-
-# Secret Scanning
-# Scan for secrets before allowing push
-REVIEW_SECRET_SCAN=true
-# Additional patterns to detect (regex, pipe-separated)
-REVIEW_SECRET_PATTERNS=""
-
-# Push Policy
-# Allow pushing changes (false = never push for this repo)
-REVIEW_ALLOW_PUSH=true
-# Always ask before pushing (even with --apply)
-REVIEW_REQUIRE_APPROVAL=false
-
-# Priority Configuration
-# Base priority boost for all items from this repo
-REVIEW_BASE_PRIORITY=0
-# Label-based priority boosts (format: "label:boost,label:boost")
-# Example: "urgent:30,security:40,bug:20"
-REVIEW_LABELS_BOOST=""
-
-# Review Behavior
-# Maximum items to review per session
-REVIEW_MAX_ITEMS=20
-# Skip pull requests (only review issues)
-REVIEW_SKIP_PRS=false
-# Deep mode (comprehensive review, slower)
-REVIEW_DEEP_MODE=false
-# Non-interactive review behavior
-REVIEW_NON_INTERACTIVE=false
-# auto|skip|fail
-REVIEW_NON_INTERACTIVE_POLICY="auto"
-POLICY_EOF
-        log_info "Created example policy file: $example_policy"
-        log_info "Rename to _default.conf to activate default policies"
-    fi
-}
-
-# Get policy value for a repo
-# Args: $1 = repo_id, $2 = policy_key
-# Outputs: The value for that key
-get_policy_value() {
-    local repo_id="$1"
-    local key="$2"
-
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-    echo "$policy" | jq -r ".$key // empty"
-}
-
-# Check if a repo allows push based on policy
-# Args: $1 = repo_id
-# Returns: 0 if push allowed, 1 if not
-repo_allows_push() {
-    local repo_id="$1"
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-    local allow_push
-    allow_push=$(echo "$policy" | jq -r '.allow_push // true')
-    [[ "$allow_push" == "true" ]]
-}
-
-# Check if a repo requires approval before push
-# Args: $1 = repo_id
-# Returns: 0 if approval required, 1 if not
-repo_requires_approval() {
-    local repo_id="$1"
-    local policy
-    policy=$(load_policy_for_repo "$repo_id")
-    local require_approval
-    require_approval=$(echo "$policy" | jq -r '.require_approval // false')
-    [[ "$require_approval" == "true" ]]
-}
-
 # Parse review-specific arguments
 parse_review_args() {
     # Reset review-specific variables
@@ -7674,6 +14667,7 @@ parse_review_args() {
     REVIEW_DRIVER="auto"         # auto, ntm, or local
     REVIEW_PARALLEL=4            # concurrent sessions
     REVIEW_DRY_RUN="false"       # discovery only
+    REVIEW_STATUS="false"        # status only, no discovery/sessions
     REVIEW_ANALYTICS="false"     # show analytics dashboard
     REVIEW_BASIC_TUI="false"     # basic gum/ANSI TUI for questions
     # shellcheck disable=SC2034  # Used by later phases
@@ -7719,6 +14713,10 @@ parse_review_args() {
                 ;;
             -j[0-9]*)
                 REVIEW_PARALLEL="${arg#-j}"
+                if ! is_positive_int "$REVIEW_PARALLEL"; then
+                    log_error "Invalid -j value: $REVIEW_PARALLEL"
+                    exit 4
+                fi
                 ;;
             --repos=*)
                 REVIEW_REPOS_PATTERN="${arg#--repos=}"
@@ -7739,6 +14737,9 @@ parse_review_args() {
                 ;;
             --dry-run)
                 REVIEW_DRY_RUN="true"
+                ;;
+            --status)
+                REVIEW_STATUS="true"
                 ;;
             --resume)
                 # shellcheck disable=SC2034  # Used by later phases
@@ -7783,6 +14784,9 @@ parse_review_args() {
                     exit 4
                 fi
                 ;;
+            --json|--verbose|--quiet|-q|--non-interactive)
+                # Global options already processed by parse_args - ignore here
+                ;;
             -*)
                 log_error "Unknown review option: $arg"
                 exit 4
@@ -7804,7 +14808,7 @@ parse_review_args() {
 #------------------------------------------------------------------------------
 
 get_skipped_questions_log_file() {
-    printf '%s\n' "${RU_STATE_DIR}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
 }
 
 check_interactive_capability() {
@@ -7907,15 +14911,15 @@ summarize_non_interactive_questions() {
 
 #------------------------------------------------------------------------------
 # STATE PERSISTENCE FUNCTIONS
-# Atomic JSON operations with flock-based locking
+# Atomic JSON operations with portable locking
 #------------------------------------------------------------------------------
 
-# File descriptor for state lock (separate from review session lock)
-STATE_LOCK_FD=""
+STATE_LOCK_DIR=""
+STATE_LOCK_INFO_FILE=""
 
 # Get path to review state directory
 get_review_state_dir() {
-    printf '%s\n' "${RU_STATE_DIR}/review"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/review"
 }
 
 # Acquire exclusive lock on state files
@@ -7923,39 +14927,41 @@ get_review_state_dir() {
 acquire_state_lock() {
     local state_dir
     state_dir=$(get_review_state_dir)
-    if ! command -v flock &>/dev/null; then
-        log_error "flock is required for state locking"
-        return 1
-    fi
 
     if ! ensure_dir "$state_dir"; then
         log_error "Failed to create state directory: $state_dir"
         return 1
     fi
-    local lock_file="$state_dir/state.lock"
+    STATE_LOCK_DIR="$state_dir/state.lock.d"
+    STATE_LOCK_INFO_FILE="$state_dir/state.lock.info"
 
-    # Open fd for locking (avoid eval; quoting is sufficient)
-    if ! exec {STATE_LOCK_FD}>"$lock_file"; then
-        log_error "Failed to open state lock file: $lock_file"
-        return 1
+    # If a stale lock exists (crashed process), clean it up.
+    if [[ -d "$STATE_LOCK_DIR" && -f "$STATE_LOCK_INFO_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(jq -r '.pid // empty' "$STATE_LOCK_INFO_FILE" 2>/dev/null)
+        if [[ ! "$lock_pid" =~ ^[0-9]+$ ]]; then
+            rm -f "$STATE_LOCK_INFO_FILE" 2>/dev/null || true
+            dir_lock_release "$STATE_LOCK_DIR"
+        elif ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$STATE_LOCK_INFO_FILE" 2>/dev/null || true
+            dir_lock_release "$STATE_LOCK_DIR"
+        fi
     fi
- 
 
-    # Get exclusive lock (blocking)
-    if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
+    if ! dir_lock_acquire "$STATE_LOCK_DIR" 60; then
         log_error "Failed to acquire state lock"
         return 1
     fi
+
+    printf '{"pid":%s,"started_at":"%s"}\n' \
+        "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_LOCK_INFO_FILE"
     return 0
 }
 
 # Release state lock
 release_state_lock() {
-    if [[ -n "${STATE_LOCK_FD:-}" ]]; then
-        flock -u "$STATE_LOCK_FD" 2>/dev/null || true
-        exec {STATE_LOCK_FD}>&- 2>/dev/null || true
-        STATE_LOCK_FD=""
-    fi
+    rm -f "$STATE_LOCK_INFO_FILE" 2>/dev/null || true
+    dir_lock_release "$STATE_LOCK_DIR"
 }
 
 # Execute a function while holding the state lock
@@ -8045,7 +15051,10 @@ init_review_state() {
 
     if [[ ! -f "$state_file" ]]; then
         local initial_state='{"version":2,"repos":{},"items":{},"runs":{}}'
-        with_state_lock write_json_atomic "$state_file" "$initial_state"
+        if ! with_state_lock write_json_atomic "$state_file" "$initial_state"; then
+            log_warn "Failed to initialize review state"
+            return 1
+        fi
     fi
 }
 
@@ -8074,7 +15083,10 @@ update_review_state() {
             release_state_lock
             return 1
         fi
-        write_json_atomic "$state_file" "$updated"
+        if ! write_json_atomic "$state_file" "$updated"; then
+            release_state_lock
+            return 1
+        fi
     else
         # Without jq, we can't do complex updates
         log_warn "jq not available, state update skipped"
@@ -8222,7 +15234,10 @@ checkpoint_review_state() {
 EOF
 )
 
-    with_state_lock write_json_atomic "$checkpoint_file" "$checkpoint"
+    if ! with_state_lock write_json_atomic "$checkpoint_file" "$checkpoint"; then
+        log_warn "Failed to save review checkpoint"
+        return 1
+    fi
 }
 
 # Load checkpoint for resume
@@ -8266,20 +15281,36 @@ is_recently_reviewed() {
         return 1
     fi
 
-    # Calculate cutoff date
-    local cutoff
-    if date --version 2>/dev/null | grep -q GNU; then
-        cutoff=$(date -u -d "$skip_days days ago" +%Y-%m-%dT%H:%M:%SZ)
-    else
-        cutoff=$(date -u -v-${skip_days}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+    # Use epoch-based comparison for portability across date implementations
+    # (works with GNU coreutils, BSD date, and uutils coreutils)
+    local now_epoch cutoff_epoch last_review_epoch
+    now_epoch=$(date +%s 2>/dev/null)
+    if [[ -z "$now_epoch" ]]; then
+        return 1
     fi
+    cutoff_epoch=$((now_epoch - skip_days * 24 * 60 * 60))
 
-    if [[ -z "$cutoff" ]]; then
+    # Convert last_review ISO timestamp to epoch
+    # Try date -d (GNU/uutils) first, then date -j -f (BSD)
+    if last_review_epoch=$(date -d "$last_review" +%s 2>/dev/null); then
+        : # success
+    elif last_review_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_review" +%s 2>/dev/null); then
+        : # BSD success
+    else
+        # Fallback: lexicographic comparison with calculated cutoff timestamp
+        local cutoff
+        cutoff=$(date -u --date="@$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+        if [[ -z "$cutoff" ]]; then
+            return 1
+        fi
+        if [[ "$last_review" > "$cutoff" ]]; then
+            return 0
+        fi
         return 1
     fi
 
-    # Compare timestamps (lexicographic comparison works for ISO format)
-    if [[ "$last_review" > "$cutoff" ]]; then
+    # Compare epochs
+    if [[ "$last_review_epoch" -ge "$cutoff_epoch" ]]; then
         return 0  # Recently reviewed
     fi
 
@@ -8294,10 +15325,14 @@ cleanup_old_review_state() {
     state_dir=$(get_review_state_dir)
 
     # Clean old worktrees if they exist
-    local worktrees_dir="$RU_STATE_DIR/worktrees"
+    local worktrees_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
     if [[ -d "$worktrees_dir" ]]; then
-        find "$worktrees_dir" -maxdepth 1 -type d -mtime "+$max_age_days" \
-            -exec rm -rf {} \; 2>/dev/null || true
+        if _is_path_under_base "$worktrees_dir" "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"; then
+            find "$worktrees_dir" -mindepth 1 -maxdepth 1 -type d -mtime "+$max_age_days" \
+                -exec rm -rf {} \; 2>/dev/null || true
+        else
+            log_warn "Skipping worktree cleanup: unsafe path $worktrees_dir"
+        fi
     fi
 
     # Prune old runs from state file (requires jq)
@@ -8329,7 +15364,7 @@ cleanup_old_review_state() {
 
 # Get digest cache directory
 get_digest_cache_dir() {
-    printf '%s\n' "$RU_STATE_DIR/repo-digests"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/repo-digests"
 }
 
 # Load cached digest into a worktree and append delta since last review
@@ -8345,7 +15380,7 @@ prepare_repo_digest_for_worktree() {
     digest_file="$wt_path/.ru/repo-digest.md"
 
     if [[ ! -f "$digest_cache" ]]; then
-        log_verbose "No cached digest for $repo_id"
+        log_info "No cached digest for $repo_id - agent will create fresh"
         return 0
     fi
 
@@ -8354,14 +15389,15 @@ prepare_repo_digest_for_worktree() {
         return 1
     fi
 
+    local delta_appended="false"
     if [[ -f "$meta_cache" ]] && command -v jq &>/dev/null; then
         local last_commit current_commit
         last_commit=$(jq -r '.last_commit // empty' "$meta_cache" 2>/dev/null)
         current_commit=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null || echo "")
 
         if [[ -n "$last_commit" && -n "$current_commit" && "$last_commit" != "$current_commit" ]]; then
-            local changes files
-            changes=$(git -C "$wt_path" log --oneline "${last_commit}..${current_commit}" 2>/dev/null || true)
+            local changes files commit_count
+            changes=$(git -C "$wt_path" log --oneline "${last_commit}..${current_commit}" 2>/dev/null | head -20 || true)
             if [[ -n "$changes" ]]; then
                 files=$(git -C "$wt_path" diff --name-only "${last_commit}..${current_commit}" 2>/dev/null | head -20 || true)
                 {
@@ -8374,11 +15410,19 @@ prepare_repo_digest_for_worktree() {
                     printf '%s\n' '**Files Changed:**'
                     printf '%s\n' "$files"
                 } >> "$digest_file"
+                delta_appended="true"
             fi
+
+            commit_count=$(git -C "$wt_path" rev-list --count "${last_commit}..${current_commit}" 2>/dev/null || echo "")
+            [[ -n "$commit_count" ]] && log_debug "Digest delta: $commit_count commits since last review"
         fi
     fi
 
-    log_verbose "Loaded cached digest for $repo_id"
+    if [[ "$delta_appended" == "true" ]]; then
+        log_info "Loaded cached digest for $repo_id (with delta)"
+    else
+        log_info "Loaded cached digest for $repo_id (no changes)"
+    fi
     return 0
 }
 
@@ -8409,16 +15453,15 @@ update_digest_cache() {
     digest_size=$(wc -c < "$digest_file" 2>/dev/null || echo 0)
 
     local meta_file="$cache_dir/${repo_id//\//_}.meta.json"
-    cat > "$meta_file" <<EOF
-{
-  "last_commit": "$current_commit",
-  "last_update": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "run_id": "${REVIEW_RUN_ID:-unknown}",
-  "digest_size": $digest_size
-}
-EOF
+    printf '{\n  "repo": "%s",\n  "last_commit": "%s",\n  "last_review_at": "%s",\n  "digest_version": %s,\n  "digest_size": %s,\n  "run_id": "%s"\n}\n' \
+        "$repo_id" \
+        "$current_commit" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "1" \
+        "$digest_size" \
+        "${REVIEW_RUN_ID:-unknown}" > "$meta_file"
 
-    log_verbose "Updated digest cache for $repo_id"
+    log_info "Updated digest cache for $repo_id"
     return 0
 }
 
@@ -8494,7 +15537,7 @@ update_repo_digests_from_worktrees() {
     local repo_id wt_path
     while IFS= read -r repo_id; do
         [[ -z "$repo_id" ]] && continue
-        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
+        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""' "$mapping_file")
         [[ -n "$wt_path" ]] && update_digest_cache "$wt_path" "$repo_id"
     done < <(jq -r 'keys[]' "$mapping_file" 2>/dev/null)
 }
@@ -8656,7 +15699,10 @@ record_metrics_from_plan() {
             .[$e.key] = (.[$e.key] // 0) + $e.value))
         ' "$metrics_file" 2>/dev/null) || return 1
 
-    with_state_lock write_json_atomic "$metrics_file" "$updated"
+    if ! with_state_lock write_json_atomic "$metrics_file" "$updated"; then
+        log_warn "Failed to write metrics file"
+        return 1
+    fi
 }
 
 suggest_decision() {
@@ -8753,7 +15799,7 @@ cmd_review_analytics() {
 
 # Get the worktrees directory for current review run
 get_worktrees_dir() {
-    printf '%s\n' "${RU_STATE_DIR}/worktrees/${REVIEW_RUN_ID:-unknown}"
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/${REVIEW_RUN_ID:-unknown}"
 }
 
 # Check if a repository is clean (no uncommitted changes)
@@ -8767,10 +15813,7 @@ ensure_clean_or_fail() {
         return 1
     fi
 
-    local status
-    status=$(git -C "$repo_path" status --porcelain 2>/dev/null)
-
-    if [[ -n "$status" ]]; then
+    if repo_is_dirty "$repo_path"; then
         log_error "Repository has uncommitted changes: $repo_path"
         log_error "Please commit or stash changes before running review"
         return 1
@@ -8780,34 +15823,52 @@ ensure_clean_or_fail() {
 }
 
 # Record worktree mapping to JSON file
-# Args: repo_id, worktree_path, branch_name
+# Args: repo_id, worktree_path, branch_name, base_ref
 record_worktree_mapping() {
     local repo_id="$1"
     local wt_path="$2"
     local wt_branch="$3"
+    local base_ref="${4:-}"
 
     local worktrees_dir
     worktrees_dir=$(get_worktrees_dir)
     ensure_dir "$worktrees_dir"
 
     local mapping_file="$worktrees_dir/mapping.json"
-
-    # Initialize if doesn't exist
-    [[ ! -f "$mapping_file" ]] && echo '{}' > "$mapping_file"
+    local lock_dir="${mapping_file}.lock.d"
 
     # Add mapping atomically (requires jq)
     if command -v jq &>/dev/null; then
+        if ! dir_lock_acquire "$lock_dir" 30; then
+            log_error "Failed to acquire worktree mapping lock"
+            return 1
+        fi
+
+        # Initialize if doesn't exist
+        [[ ! -f "$mapping_file" ]] && echo '{}' > "$mapping_file"
+
         local tmp_file="${mapping_file}.tmp.$$"
+        [[ -z "$base_ref" ]] && base_ref="HEAD"
+
         if jq --arg repo "$repo_id" \
               --arg path "$wt_path" \
               --arg branch "$wt_branch" \
+              --arg base "$base_ref" \
               --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '.[$repo] = {"path": $path, "branch": $branch, "created_at": $created}' \
+              '.[$repo] = {"worktree_path": $path, "branch": $branch, "base_ref": $base, "created_at": $created}' \
               "$mapping_file" > "$tmp_file"; then
-            mv "$tmp_file" "$mapping_file"
+            if mv "$tmp_file" "$mapping_file"; then
+                dir_lock_release "$lock_dir"
+            else
+                log_error "Failed to write worktree mapping file: $mapping_file"
+                rm -f "$tmp_file"
+                dir_lock_release "$lock_dir"
+                return 1
+            fi
         else
             log_error "Failed to update worktree mapping for $repo_id"
             rm -f "$tmp_file"
+            dir_lock_release "$lock_dir"
             return 1
         fi
     else
@@ -8816,40 +15877,45 @@ record_worktree_mapping() {
 }
 
 # Get worktree path for a repo
-# Args: repo_id, nameref for path output
+# Args: repo_id, path output variable name
 # Returns: 0 if found, 1 if not found
 get_worktree_path() {
     local repo_id="$1"
-    local -n _wt_path_ref=$2
+    local path_var="$2"
 
     local worktrees_dir
     worktrees_dir=$(get_worktrees_dir)
     local mapping_file="$worktrees_dir/mapping.json"
 
     if [[ ! -f "$mapping_file" ]]; then
-        _wt_path_ref=""
+        _set_out_var "$path_var" "" || return 1
         return 1
     fi
 
     if command -v jq &>/dev/null; then
-        _wt_path_ref=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
-        [[ -n "$_wt_path_ref" ]] && return 0
+        # Use _gwp_ prefix to avoid shadowing caller's output variable name
+        local _gwp_path
+        _gwp_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""' "$mapping_file")
+        _set_out_var "$path_var" "$_gwp_path" || return 1
+        [[ -n "$_gwp_path" ]] && return 0
     fi
 
     return 1
 }
 
 # Get worktree mapping from work item info
-# Args: work_item (pipe-separated), nameref for repo_id, nameref for worktree_path
+# Args: work_item (pipe-separated), repo_id output variable name, worktree_path output variable name
 get_worktree_mapping() {
     local work_item="$1"
-    local -n _repo_id_ref=$2
-    local -n _wt_path_out=$3
+    local repo_id_var="$2"
+    local wt_path_var="$3"
 
     # Extract repo_id from work item (first field before |)
-    _repo_id_ref="${work_item%%|*}"
+    # Use _gwm_ prefix to avoid shadowing caller's output variable names.
+    local _gwm_repo_id="${work_item%%|*}"
+    _set_out_var "$repo_id_var" "$_gwm_repo_id" || return 1
 
-    get_worktree_path "$_repo_id_ref" _wt_path_out
+    get_worktree_path "$_gwm_repo_id" "$wt_path_var"
 }
 
 # Prepare worktrees for review
@@ -8874,22 +15940,33 @@ prepare_review_worktrees() {
     local failed=0
 
     for item in "${items[@]}"; do
-        local repo_id
-        repo_id="${item%%|*}"
+        local repo_spec
+        repo_spec="${item%%|*}"
 
-        # Skip if already processed
-        [[ -n "${seen_repos[$repo_id]:-}" ]] && continue
-        seen_repos["$repo_id"]=1
+        # Preserve branch pins/custom names from config when possible.
+        local config_spec=""
+        if declare -F find_repo_spec_for_repo_id >/dev/null; then
+            if config_spec=$(find_repo_spec_for_repo_id "$repo_spec" 2>/dev/null); then
+                repo_spec="$config_spec"
+            fi
+        fi
 
         # Resolve repo spec to get local path
         # shellcheck disable=SC2034  # resolved_repo_id used by resolve_repo_spec
         local url branch custom_name local_path resolved_repo_id
-        if ! resolve_repo_spec "$repo_id" "$PROJECTS_DIR" "$LAYOUT" \
+        if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
                 url branch custom_name local_path resolved_repo_id 2>/dev/null; then
-            log_warn "Could not resolve repo: $repo_id"
+            log_warn "Could not resolve repo: $repo_spec"
             ((failed++))
             continue
         fi
+
+        local repo_id="$resolved_repo_id"
+        [[ -z "$repo_id" ]] && repo_id="$repo_spec"
+
+        # Skip if already processed (dedupe by resolved repo id)
+        [[ -n "${seen_repos[$repo_id]:-}" ]] && continue
+        seen_repos["$repo_id"]=1
 
         # Check if repo exists locally
         if [[ ! -d "$local_path" ]]; then
@@ -8915,21 +15992,47 @@ prepare_review_worktrees() {
         local safe_repo_id="${repo_id//\//_}"
         local wt_path="$worktrees_dir/$safe_repo_id"
         local wt_branch="ru/review/${REVIEW_RUN_ID:-unknown}/${repo_id//\//-}"
+        log_debug "Creating worktree for $repo_id at $wt_path"
 
         # Fetch latest from remote (quiet, ignore failures)
         git -C "$local_path" fetch --quiet 2>/dev/null || true
 
         # Determine base reference (respect branch pins)
         local base_ref="${branch:-HEAD}"
+        local base_ref_create="$base_ref"
+        local is_pinned="false"
+        [[ -n "$branch" ]] && is_pinned="true"
+
+        if [[ "$is_pinned" == "true" ]]; then
+            # Ensure a local branch exists for apply/merge later (push requires a local branch).
+            if ! git -C "$local_path" rev-parse --verify "$base_ref" >/dev/null 2>&1; then
+                if git -C "$local_path" rev-parse --verify "origin/$base_ref" >/dev/null 2>&1; then
+                    if ! git -C "$local_path" branch --track "$base_ref" "origin/$base_ref" >/dev/null 2>&1; then
+                        log_error "Failed to create local tracking branch $base_ref for $repo_id"
+                        ((failed++))
+                        continue
+                    fi
+                fi
+            fi
+
+            # Prefer the local branch if available; otherwise fall back to remote ref.
+            if git -C "$local_path" rev-parse --verify "$base_ref" >/dev/null 2>&1; then
+                base_ref_create="$base_ref"
+            elif git -C "$local_path" rev-parse --verify "origin/$base_ref" >/dev/null 2>&1; then
+                base_ref_create="origin/$base_ref"
+            fi
+        fi
+
+        log_debug "Using base ref: $base_ref (pinned: $is_pinned)"
 
         # Check if worktree already exists
         if [[ -d "$wt_path" ]]; then
             log_warn "Worktree already exists, reusing: $wt_path"
         else
             # Create worktree with new branch
-            if ! git -C "$local_path" worktree add -b "$wt_branch" "$wt_path" "$base_ref" >/dev/null 2>&1; then
+            if ! git -C "$local_path" worktree add -b "$wt_branch" "$wt_path" "$base_ref_create" >/dev/null 2>&1; then
                 # Branch may already exist from previous run, try without -b
-                if ! git -C "$local_path" worktree add "$wt_path" "$base_ref" >/dev/null 2>&1; then
+                if ! git -C "$local_path" worktree add "$wt_path" "$base_ref_create" >/dev/null 2>&1; then
                     log_error "Failed to create worktree for $repo_id"
                     ((failed++))
                     continue
@@ -8944,7 +16047,7 @@ prepare_review_worktrees() {
         prepare_repo_digest_for_worktree "$repo_id" "$wt_path" || true
 
         # Record mapping for later phases
-        if ! record_worktree_mapping "$repo_id" "$wt_path" "$wt_branch"; then
+        if ! record_worktree_mapping "$repo_id" "$wt_path" "$wt_branch" "$base_ref"; then
             log_warn "Worktree created but mapping failed for $repo_id"
             # Continue anyway - worktree is usable, just not tracked
         fi
@@ -8969,7 +16072,14 @@ cleanup_review_worktrees() {
         return 1
     fi
 
-    local base="${RU_STATE_DIR}/worktrees/$run_id"
+    # Guard against traversal/malformed run ids (this affects filesystem deletion paths).
+    if ! _is_safe_path_segment "$run_id"; then
+        log_error "Unsafe review run ID: $run_id"
+        return 1
+    fi
+
+    local worktrees_root="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local base="${worktrees_root}/$run_id"
 
     [[ ! -d "$base" ]] && return 0
 
@@ -8982,10 +16092,16 @@ cleanup_review_worktrees() {
             [[ -z "$repo_id" ]] && continue
 
             local wt_path wt_branch
-            wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
+            wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""' "$mapping_file")
             wt_branch=$(jq -r --arg repo "$repo_id" '.[$repo].branch // ""' "$mapping_file")
 
             if [[ -d "$wt_path" ]]; then
+                # Safety: never delete paths outside the run directory, even if mapping.json is corrupt.
+                if ! _is_path_under_base "$wt_path" "$base"; then
+                    log_error "Refusing to remove worktree outside run dir: $wt_path"
+                    continue
+                fi
+
                 # Try to find main repo from worktree
                 local main_repo
                 main_repo=$(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's/\.git$//')
@@ -9017,7 +16133,12 @@ cleanup_review_worktrees() {
     fi
 
     # Remove the run directory
-    rm -rf "$base"
+    if _is_path_under_base "$base" "$worktrees_root"; then
+        rm -rf "$base"
+    else
+        log_error "Refusing to remove unsafe worktrees base: $base"
+        return 1
+    fi
 
     log_info "Cleanup: $removed worktrees removed"
     return 0
@@ -9028,7 +16149,7 @@ cleanup_review_worktrees() {
 # Output: JSON array of worktree info
 list_review_worktrees() {
     local run_id="${1:-${REVIEW_RUN_ID:-}}"
-    local base="${RU_STATE_DIR}/worktrees/$run_id"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/$run_id"
     local mapping_file="$base/mapping.json"
 
     if [[ -f "$mapping_file" ]]; then
@@ -9167,10 +16288,11 @@ days_since_timestamp() {
 # Returns: 0 if recently reviewed, 1 if not
 item_recently_reviewed() {
     local item_key="$1"
-    local state_file="$RU_STATE_DIR/review-state.json"
+    local state_file
+    state_file=$(get_review_state_file 2>/dev/null || echo "")
     local skip_days="${REVIEW_SKIP_DAYS:-7}"
 
-    [[ ! -f "$state_file" ]] && return 1
+    [[ -z "$state_file" || ! -f "$state_file" ]] && return 1
 
     local last_review
     last_review=$(jq -r --arg key "$item_key" '.items[$key].last_review // ""' "$state_file" 2>/dev/null)
@@ -9420,9 +16542,9 @@ discover_work_items() {
             log_verbose "Querying batch of $count repos"
             local response
             if response=$(gh_api_graphql_repo_batch "$chunk"); then
-                local items
-                items=$(parse_graphql_work_items "$response")
-                [[ -n "$items" ]] && all_work_items+="${items}"$'\n'
+                local parsed_items
+                parsed_items=$(parse_graphql_work_items "$response")
+                [[ -n "$parsed_items" ]] && all_work_items+="${parsed_items}"$'\n'
             else
                 log_warn "GraphQL batch query failed"
             fi
@@ -9436,9 +16558,9 @@ discover_work_items() {
         log_verbose "Querying final batch of $count repos"
         local response
         if response=$(gh_api_graphql_repo_batch "$chunk"); then
-            local items
-            items=$(parse_graphql_work_items "$response")
-            [[ -n "$items" ]] && all_work_items+="${items}"$'\n'
+            local parsed_items
+            parsed_items=$(parse_graphql_work_items "$response")
+            [[ -n "$parsed_items" ]] && all_work_items+="${parsed_items}"$'\n'
         else
             log_warn "GraphQL batch query failed"
         fi
@@ -9476,7 +16598,7 @@ format_priority_badge() {
     local use_color="${2:-true}"
 
     if [[ "$use_color" != "true" ]]; then
-        echo "[$level]"
+        printf '%s\n' "[$level]"
         return
     fi
 
@@ -9489,11 +16611,11 @@ format_priority_badge() {
     local BOLD="\033[1m"
 
     case "$level" in
-        CRITICAL) echo -e "${BOLD}${RED}[CRITICAL]${RESET}" ;;
-        HIGH)     echo -e "${ORANGE}[HIGH]${RESET}" ;;
-        NORMAL)   echo -e "${YELLOW}[NORMAL]${RESET}" ;;
-        LOW)      echo -e "${GRAY}[LOW]${RESET}" ;;
-        *)        echo "[$level]" ;;
+        CRITICAL) printf '%b\n' "${BOLD}${RED}[CRITICAL]${RESET}" ;;
+        HIGH)     printf '%b\n' "${ORANGE}[HIGH]${RESET}" ;;
+        NORMAL)   printf '%b\n' "${YELLOW}[NORMAL]${RESET}" ;;
+        LOW)      printf '%b\n' "${GRAY}[LOW]${RESET}" ;;
+        *)        printf '%s\n' "[$level]" ;;
     esac
 }
 
@@ -9503,7 +16625,11 @@ show_discovery_summary_ansi() {
     local total="$1" issues="$2" prs="$3"
     local critical="$4" high="$5" normal="$6" low="$7"
     local max_display="$8"
-    local -n _items_ansi=$9
+    local items_name="$9"
+
+    _is_valid_var_name "$items_name" || return 1
+    local -a items=()
+    eval "items=(\"\${${items_name}[@]-}\")"
 
     local BOLD="\033[1m"
     local RED="\033[31m"
@@ -9513,26 +16639,26 @@ show_discovery_summary_ansi() {
     local CYAN="\033[36m"
     local RESET="\033[0m"
 
-    echo "" >&2
-    echo -e "${BOLD}━━━ Discovery Summary ━━━${RESET}" >&2
-    echo "" >&2
-    echo -e "Total work items: ${BOLD}$total${RESET}" >&2
-    echo -e "  Issues: ${CYAN}$issues${RESET} | PRs: ${CYAN}$prs${RESET}" >&2
-    echo "" >&2
-    echo -e "${BOLD}By priority:${RESET}" >&2
-    [[ $critical -gt 0 ]] && echo -e "  ${RED}CRITICAL: $critical${RESET}" >&2
-    [[ $high -gt 0 ]] && echo -e "  ${ORANGE}HIGH: $high${RESET}" >&2
-    [[ $normal -gt 0 ]] && echo -e "  ${YELLOW}NORMAL: $normal${RESET}" >&2
-    [[ $low -gt 0 ]] && echo -e "  ${GRAY}LOW: $low${RESET}" >&2
-    echo "" >&2
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}━━━ Discovery Summary ━━━${RESET}" >&2
+    printf '\n' >&2
+    printf '%b\n' "Total work items: ${BOLD}$total${RESET}" >&2
+    printf '%b\n' "  Issues: ${CYAN}$issues${RESET} | PRs: ${CYAN}$prs${RESET}" >&2
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}By priority:${RESET}" >&2
+    [[ $critical -gt 0 ]] && printf '%b\n' "  ${RED}CRITICAL: $critical${RESET}" >&2
+    [[ $high -gt 0 ]] && printf '%b\n' "  ${ORANGE}HIGH: $high${RESET}" >&2
+    [[ $normal -gt 0 ]] && printf '%b\n' "  ${YELLOW}NORMAL: $normal${RESET}" >&2
+    [[ $low -gt 0 ]] && printf '%b\n' "  ${GRAY}LOW: $low${RESET}" >&2
+    printf '\n' >&2
 
-    if [[ ${#_items_ansi[@]} -gt 0 ]]; then
+    if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#_items_ansi[@]} ]] && display_count=${#_items_ansi[@]}
+        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
-        echo -e "${BOLD}Top $display_count items to review:${RESET}" >&2
+        printf '%b\n' "${BOLD}Top $display_count items to review:${RESET}" >&2
         local i=0
-        for item in "${_items_ansi[@]:0:$display_count}"; do
+        for item in "${items[@]:0:$display_count}"; do
             ((i++))
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
@@ -9547,9 +16673,9 @@ show_discovery_summary_ansi() {
             local short_title="${title:0:45}"
             [[ ${#title} -gt 45 ]] && short_title="${short_title}..."
 
-            echo -e "  $i. $badge ${CYAN}${repo_id}${RESET}#${number}: $short_title" >&2
+            printf '%b\n' "  $i. $badge ${CYAN}${repo_id}${RESET}#${number}: $short_title" >&2
         done
-        echo "" >&2
+        printf '\n' >&2
     fi
 }
 
@@ -9559,7 +16685,11 @@ show_discovery_summary_gum() {
     local total="$1" issues="$2" prs="$3"
     local critical="$4" high="$5" normal="$6" low="$7"
     local max_display="$8"
-    local -n _items_gum=$9
+    local items_name="$9"
+
+    _is_valid_var_name "$items_name" || return 1
+    local -a items=()
+    eval "items=(\"\${${items_name}[@]-}\")"
 
     # Header
     gum style --border rounded --padding "0 2" --border-foreground "#fab387" \
@@ -9576,15 +16706,15 @@ show_discovery_summary_gum() {
     [[ $high -gt 0 ]] && gum style --foreground "#fab387" "  HIGH: $high" >&2
     [[ $normal -gt 0 ]] && gum style --foreground "#f9e2af" "  NORMAL: $normal" >&2
     [[ $low -gt 0 ]] && gum style --foreground "#6c7086" "  LOW: $low" >&2
-    echo "" >&2
+    printf '\n' >&2
 
-    if [[ ${#_items_gum[@]} -gt 0 ]]; then
+    if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#_items_gum[@]} ]] && display_count=${#_items_gum[@]}
+        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
         gum style --bold "Top $display_count items to review:" >&2
         local i=0
-        for item in "${_items_gum[@]:0:$display_count}"; do
+        for item in "${items[@]:0:$display_count}"; do
             ((i++))
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
@@ -9602,11 +16732,11 @@ show_discovery_summary_gum() {
             local short_title="${title:0:45}"
             [[ ${#title} -gt 45 ]] && short_title="${short_title}..."
 
-            echo -n "  $i. " >&2
+            printf '  %d. ' "$i" >&2
             gum style --foreground "$badge_color" --inline "[$level]" >&2
-            echo " ${repo_id}#${number}: $short_title" >&2
+            printf ' %s#%s: %s\n' "$repo_id" "$number" "$short_title" >&2
         done
-        echo "" >&2
+        printf '\n' >&2
     fi
 }
 
@@ -9616,16 +16746,20 @@ show_discovery_summary_json() {
     local total="$1" issues="$2" prs="$3"
     local critical="$4" high="$5" normal="$6" low="$7"
     local max_display="$8"
-    local -n _items_json=$9
+    local items_name="$9"
+
+    _is_valid_var_name "$items_name" || return 1
+    local -a items=()
+    eval "items=(\"\${${items_name}[@]-}\")"
 
     local items_json="[]"
 
-    if [[ ${#_items_json[@]} -gt 0 ]]; then
+    if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#_items_json[@]} ]] && display_count=${#_items_json[@]}
+        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
 
         local item_list=""
-        for item in "${_items_json[@]:0:$display_count}"; do
+        for item in "${items[@]:0:$display_count}"; do
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
             local score level
@@ -9973,6 +17107,159 @@ finalize_review_exit() {
 }
 
 #------------------------------------------------------------------------------
+# cmd_review_status: Report review lock + checkpoint status (read-only)
+#
+# Outputs:
+#   - Human summary to stderr (default)
+#   - JSON to stdout when --json is set
+#
+# Returns:
+#   0 always (best-effort)
+#------------------------------------------------------------------------------
+cmd_review_status() {
+    local lock_file info_file checkpoint_file state_file
+    lock_file=$(get_review_lock_file)
+    info_file=$(get_review_lock_info_file)
+    checkpoint_file=$(get_checkpoint_file)
+    state_file=$(get_review_state_file)
+
+    ensure_dir "$(dirname "$lock_file")"
+
+    local lock_supported="true"
+    local lock_held="unknown"
+    local lock_dir="${lock_file}.d"
+    if [[ -d "$lock_dir" ]]; then
+        lock_held="true"
+    else
+        lock_held="false"
+    fi
+
+    local lock_held_json="null"
+    if [[ "$lock_held" == "true" || "$lock_held" == "false" ]]; then
+        lock_held_json="$lock_held"
+    fi
+
+    local info_exists="false"
+    local info_run_id="" info_started_at="" info_pid="" info_mode=""
+    local pid_alive="unknown"
+
+    if [[ -f "$info_file" ]]; then
+        info_exists="true"
+        if command -v jq &>/dev/null; then
+            info_run_id=$(jq -r '.run_id // ""' "$info_file" 2>/dev/null || echo "")
+            info_started_at=$(jq -r '.started_at // ""' "$info_file" 2>/dev/null || echo "")
+            info_pid=$(jq -r '.pid // ""' "$info_file" 2>/dev/null || echo "")
+            info_mode=$(jq -r '.mode // ""' "$info_file" 2>/dev/null || echo "")
+        fi
+        if [[ "$info_pid" =~ ^[0-9]+$ ]]; then
+            if kill -0 "$info_pid" 2>/dev/null; then
+                pid_alive="true"
+            else
+                pid_alive="false"
+            fi
+        fi
+    fi
+
+    local pid_alive_json="null"
+    if [[ "$pid_alive" == "true" || "$pid_alive" == "false" ]]; then
+        pid_alive_json="$pid_alive"
+    fi
+
+    local checkpoint_exists="false"
+    local checkpoint_run_id="" checkpoint_mode="" checkpoint_hash=""
+    local checkpoint_total="" checkpoint_completed="" checkpoint_pending="" checkpoint_questions=""
+    if [[ -f "$checkpoint_file" ]]; then
+        checkpoint_exists="true"
+        if command -v jq &>/dev/null; then
+            checkpoint_run_id=$(jq -r '.run_id // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_mode=$(jq -r '.mode // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_hash=$(jq -r '.config_hash // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_total=$(jq -r '.repos_total // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_completed=$(jq -r '.repos_completed // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_pending=$(jq -r '.repos_pending // ""' "$checkpoint_file" 2>/dev/null || echo "")
+            checkpoint_questions=$(jq -r '.questions_pending // ""' "$checkpoint_file" 2>/dev/null || echo "")
+        fi
+    fi
+
+    local checkpoint_total_json="null"
+    local checkpoint_completed_json="null"
+    local checkpoint_pending_json="null"
+    local checkpoint_questions_json="null"
+    [[ "$checkpoint_total" =~ ^[0-9]+$ ]] && checkpoint_total_json="$checkpoint_total"
+    [[ "$checkpoint_completed" =~ ^[0-9]+$ ]] && checkpoint_completed_json="$checkpoint_completed"
+    [[ "$checkpoint_pending" =~ ^[0-9]+$ ]] && checkpoint_pending_json="$checkpoint_pending"
+    [[ "$checkpoint_questions" =~ ^[0-9]+$ ]] && checkpoint_questions_json="$checkpoint_questions"
+
+    local state_exists="false"
+    [[ -f "$state_file" ]] && state_exists="true"
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local ts
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        printf '{'
+        printf '"command":"review","mode":"status","timestamp":"%s",' "$ts"
+        printf '"lock":{"supported":%s,"held":%s,"info_file_exists":%s,' \
+            "$lock_supported" "$lock_held_json" "$info_exists"
+        printf '"info":{"run_id":"%s","started_at":"%s","pid":"%s","pid_alive":%s,"mode":"%s"}},' \
+            "$(json_escape "$info_run_id")" "$(json_escape "$info_started_at")" "$(json_escape "$info_pid")" "$pid_alive_json" "$(json_escape "$info_mode")"
+        printf '"checkpoint":{"exists":%s,"run_id":"%s","mode":"%s","config_hash":"%s","repos_total":%s,"repos_completed":%s,"repos_pending":%s,"questions_pending":%s},' \
+            "$checkpoint_exists" "$(json_escape "$checkpoint_run_id")" "$(json_escape "$checkpoint_mode")" "$(json_escape "$checkpoint_hash")" \
+            "$checkpoint_total_json" "$checkpoint_completed_json" "$checkpoint_pending_json" "$checkpoint_questions_json"
+        printf '"state":{"exists":%s}}' "$state_exists"
+        printf '\n'
+        return 0
+    fi
+
+    log_step "Review status"
+
+    case "$lock_held" in
+        true) log_info "Review lock: held" ;;
+        false) log_info "Review lock: free" ;;
+        *) log_info "Review lock: unknown" ;;
+    esac
+
+    if [[ "$info_exists" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            [[ -n "$info_run_id" ]] && log_info "  Run ID:  $info_run_id"
+            [[ -n "$info_started_at" ]] && log_info "  Started: $info_started_at"
+            [[ -n "$info_pid" ]] && log_info "  PID:     $info_pid (alive: $pid_alive)"
+            [[ -n "$info_mode" ]] && log_info "  Mode:    $info_mode"
+        else
+            log_info "Lock info (raw):"
+            sed 's/^/  /' "$info_file" >&2 || true
+        fi
+    else
+        log_info "Lock info: none"
+    fi
+
+    if [[ "$checkpoint_exists" == "true" ]]; then
+        if command -v jq &>/dev/null; then
+            log_info "Checkpoint: present"
+            [[ -n "$checkpoint_run_id" ]] && log_info "  Run ID:           $checkpoint_run_id"
+            [[ -n "$checkpoint_mode" ]] && log_info "  Mode:             $checkpoint_mode"
+            [[ -n "$checkpoint_hash" ]] && log_info "  Config hash:       $checkpoint_hash"
+            [[ "$checkpoint_total_json" != "null" ]] && log_info "  Repos total:       $checkpoint_total_json"
+            [[ "$checkpoint_completed_json" != "null" ]] && log_info "  Repos completed:   $checkpoint_completed_json"
+            [[ "$checkpoint_pending_json" != "null" ]] && log_info "  Repos pending:     $checkpoint_pending_json"
+            [[ "$checkpoint_questions_json" != "null" ]] && log_info "  Questions pending: $checkpoint_questions_json"
+        else
+            log_info "Checkpoint present (jq not installed)"
+        fi
+    else
+        log_info "Checkpoint: none"
+    fi
+
+    if [[ "$state_exists" == "true" ]]; then
+        log_info "Review state: present"
+    else
+        log_info "Review state: none"
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
 # cmd_review: Review GitHub issues and PRs using Claude Code
 #------------------------------------------------------------------------------
 cmd_review() {
@@ -9981,6 +17268,11 @@ cmd_review() {
 
     # Parse review-specific arguments
     parse_review_args
+
+    if [[ "$REVIEW_STATUS" == "true" ]]; then
+        cmd_review_status
+        return $?
+    fi
 
     if [[ "$REVIEW_ANALYTICS" == "true" ]]; then
         cmd_review_analytics
@@ -10077,8 +17369,11 @@ cmd_review() {
                 fi
             done < <(get_all_repos)
         else
+            # Use IFS+read to safely split without glob expansion
+            local -a tokens
+            IFS=' ' read -ra tokens <<< "$REVIEW_INVALIDATE_CACHE"
             local token
-            for token in $REVIEW_INVALIDATE_CACHE; do
+            for token in "${tokens[@]}"; do
                 invalidate_repos+=("$token")
             done
         fi
@@ -10118,15 +17413,20 @@ cmd_review() {
         finalize_review_exit "$apply_code"
     fi
 
-    # Auto-detect driver if needed
-    if [[ "$REVIEW_DRIVER" == "auto" ]]; then
-        REVIEW_DRIVER=$(detect_review_driver)
-        log_verbose "Auto-detected driver: $REVIEW_DRIVER"
-    fi
+    # Dry-run discovery should not require a session driver (tmux/ntm).
+    if [[ "$REVIEW_DRY_RUN" != "true" ]]; then
+        # Auto-detect driver if needed
+        if [[ "$REVIEW_DRIVER" == "auto" ]]; then
+            REVIEW_DRIVER=$(detect_review_driver)
+            log_verbose "Auto-detected driver: $REVIEW_DRIVER"
+        fi
 
-    if [[ "$REVIEW_DRIVER" == "none" ]]; then
-        log_error "No review driver available. Install tmux or ntm."
-        exit 3
+        if [[ "$REVIEW_DRIVER" == "none" ]]; then
+            log_error "No review driver available. Install tmux or ntm."
+            exit 3
+        fi
+    else
+        [[ "$REVIEW_DRIVER" == "auto" ]] && REVIEW_DRIVER="none"
     fi
 
     # Discovery phase
@@ -10183,35 +17483,34 @@ cmd_review() {
     pending_repos_list="${pending_repos_list%" "}"
     checkpoint_review_state "" "$pending_repos_list"
 
-    # TODO: Orchestration phases (implemented in later beads)
-    # - Prepare worktrees
-    # - Start Claude Code sessions
-    # - Monitor and aggregate questions
-    # - Apply approved changes
-
-    log_warn "Review orchestration not yet implemented"
+    # Run main orchestration loop (bd-l05s)
     log_info "Run ID: $run_id"
     log_info "Driver: $REVIEW_DRIVER"
     log_info "Mode: $REVIEW_MODE"
     log_info "Parallel: $REVIEW_PARALLEL"
 
-    if [[ "$REVIEW_MODE" == "apply" ]]; then
-        log_info "Apply mode: would execute approved plans"
-        if [[ "$REVIEW_PUSH" == "true" ]]; then
-            log_info "Push enabled: would push approved changes"
-        fi
+    local orchestration_code=0
+    if ! run_review_orchestration "${work_items[@]}"; then
+        orchestration_code=$?
+        log_error "Orchestration failed with code $orchestration_code"
     fi
 
+    # Handle non-interactive mode questions summary
     if [[ "$REVIEW_NON_INTERACTIVE" == "true" ]]; then
         summarize_non_interactive_questions
     fi
 
-    update_repo_digests_from_worktrees || true
-    clear_review_checkpoint
-    if [[ "$JSON_OUTPUT" == "true" ]]; then
-        build_review_completion_json "$run_id" "$REVIEW_MODE" "$review_start_epoch" "0" "${work_items[@]}"
+    # Clear checkpoint on success
+    if [[ "$orchestration_code" -eq 0 ]]; then
+        clear_review_checkpoint
     fi
-    return 0
+
+    # Build completion JSON if requested
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        build_review_completion_json "$run_id" "$REVIEW_MODE" "$review_start_epoch" "$orchestration_code" "${work_items[@]}"
+    fi
+
+    finalize_review_exit "$orchestration_code"
 }
 
 #------------------------------------------------------------------------------
@@ -10246,7 +17545,7 @@ resolve_review_apply_run_id() {
         return 0
     fi
 
-    local base="${RU_STATE_DIR}/worktrees"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
     if [[ ! -d "$base" ]]; then
         log_error "No review worktrees directory found: $base"
         return 1
@@ -10322,7 +17621,7 @@ cmd_review_apply() {
         [[ -n "$repo_id" ]] || continue
 
         local wt_path
-        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file" 2>/dev/null || echo "")
+        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""' "$mapping_file" 2>/dev/null || echo "")
         if [[ -z "$wt_path" || ! -d "$wt_path" ]]; then
             log_error "Missing or invalid worktree path for $repo_id (mapping.json)"
             codes+=("2")
@@ -10450,14 +17749,7 @@ verify_push_safe() {
     fi
 
     if [[ -n "$wt_path" && -d "$wt_path" ]]; then
-        local wt_status
-        wt_status=$(git -C "$wt_path" status --porcelain 2>/dev/null || true)
-        # Ignore ru-managed artifacts stored under .ru/
-        if [[ -n "$wt_status" ]]; then
-            wt_status=$(echo "$wt_status" | grep -vE '^\?\? \.ru(/|$)' 2>/dev/null || true)
-        fi
-
-        if [[ -n "$wt_status" ]]; then
+        if repo_is_dirty_excluding_ru "$wt_path"; then
             log_error "Worktree has uncommitted changes for $repo_id (refusing to push)"
             return 1
         fi
@@ -10556,7 +17848,7 @@ push_worktree_changes() {
         return 1
     fi
 
-    if [[ -n "$(git -C "$main_repo" status --porcelain 2>/dev/null)" ]]; then
+    if repo_is_dirty "$main_repo"; then
         log_error "Main repo has uncommitted changes: $main_repo"
         return 1
     fi
@@ -10590,8 +17882,9 @@ push_worktree_changes() {
         return 1
     fi
 
-    if ! git -C "$main_repo" push 2>/dev/null; then
-        log_error "Push failed for $repo_id"
+    local push_output
+    if ! push_output=$(git -C "$main_repo" push 2>&1); then
+        log_error "Push failed for $repo_id: $push_output"
         git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
         [[ -n "$original_branch" ]] && git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
         return 1
@@ -10932,9 +18225,15 @@ generate_review_prompt() {
   # NOTE: Avoid unquoted heredocs here so any backticks/$() inside $work_items_json
   # cannot trigger command substitution during prompt generation.
   printf '%s\n' \
-    "POLICY: We don't allow PRs or outside contributions. Feel free to submit issues and PRs to illustrate fixes, but they will not be merged directly. The agent reviews and independently decides whether and how to address submissions. Bug reports are welcome." \
+    "We don't allow PRs or outside contributions to this project as a matter of policy; here is the policy disclosed to users:" \
     "" \
-    'TASK: Review the following work items using `gh` READ operations only:'
+    "> *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other \"stakeholders,\" which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via \`gh\` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity." \
+    "" \
+    'But I want you to now use the `gh` utility to review all open issues and PRs and to independently read and review each of these carefully; without trusting or relying on any of the user reports being correct, or their suggested/proposed changes or "fixes" being correct, I want you to do your own totally separate and independent verification and validation. You can use the stuff from users as possible inspiration, but everything has to come from your own mind and/or official documentation and the actual code and empirical, independent evidence. Note that MANY of these are likely out of date because I made tons of fixes and changes already; it'\''s important to look at the dates and subsequent commits. Use ultrathink. After you have reviewed things carefully and taken actions in response (including implementing possible fixes or new features), you can respond on my behalf using `gh`.' \
+    "" \
+    'Just a reminder: we do NOT accept ANY PRs. You can look at them to see if they contain good ideas but even then you must check with me first before integrating even ideas because they could take the project into another direction I don'\''t like or introduce scope creep. Use ultrathink.' \
+    "" \
+    "WORK ITEMS TO REVIEW:"
 
   printf '%s\n' "$work_items_json"
 
@@ -11521,11 +18820,29 @@ run_test_gate() {
 
     log_verbose "Running tests: $test_cmd"
 
-    # Run tests with timeout
-    if output=$(cd "$project_dir" && timeout "$timeout" bash -c "$test_cmd" 2>&1); then
-        exit_code=0
+    # Run tests with timeout (portable: use gtimeout on macOS if available)
+    local timeout_cmd="timeout"
+    if ! command -v timeout &>/dev/null; then
+        if command -v gtimeout &>/dev/null; then
+            timeout_cmd="gtimeout"
+        else
+            timeout_cmd=""
+            log_verbose "No timeout command available; running tests without timeout"
+        fi
+    fi
+
+    if [[ -n "$timeout_cmd" ]]; then
+        if output=$(cd "$project_dir" && "$timeout_cmd" "$timeout" bash -c "$test_cmd" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     else
-        exit_code=$?
+        if output=$(cd "$project_dir" && bash -c "$test_cmd" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     fi
 
     local end_time duration
@@ -11534,7 +18851,7 @@ run_test_gate() {
 
     # Summarize output (last 10 lines or key metrics)
     local output_summary
-    output_summary=$(echo "$output" | tail -10 | tr '\n' ' ' | cut -c1-200)
+    output_summary=$(printf '%s\n' "$output" | tail -10 | tr '\n' ' ' | cut -c1-200)
 
     jq -n \
         --argjson ran true \
@@ -11592,7 +18909,7 @@ run_lint_gate() {
     fi
 
     local output_summary
-    output_summary=$(echo "$output" | head -20 | tr '\n' ' ' | cut -c1-300)
+    output_summary=$(printf '%s\n' "$output" | head -20 | tr '\n' ' ' | cut -c1-300)
 
     jq -n \
         --argjson ran true \
@@ -11612,7 +18929,12 @@ run_lint_gate() {
 }
 
 #------------------------------------------------------------------------------
-# run_secret_scan: Scan for secrets in project changes
+# run_secret_scan: Scan for secrets in project changes (bd-0ghe)
+#
+# Uses layered fallback approach:
+#   1. gitleaks (if installed) - comprehensive scanner
+#   2. detect-secrets (if installed) - alternative scanner
+#   3. heuristic regex patterns (fallback) - best effort
 #
 # Args:
 #   $1 - Project directory path
@@ -11629,10 +18951,12 @@ run_secret_scan() {
     local scope="${2:-all}"
     local findings=()
     local exit_code=0
+    local scanner_ran=false
 
-    # Use gitleaks if available
+    # Layer 1: Use gitleaks if available
     if command -v gitleaks &>/dev/null; then
         log_verbose "Scanning for secrets with gitleaks"
+        scanner_ran=true
         local gl_output
         if ! gl_output=$(gitleaks detect --source "$project_dir" --no-git 2>&1); then
             exit_code=1
@@ -11641,30 +18965,80 @@ run_secret_scan() {
             gl_summary=$(echo "$gl_output" | head -3 | tr '\n' ' ')
             findings+=("gitleaks: ${gl_summary:-detected potential secrets}")
         fi
-    else
-        # Regex fallback
+    # Layer 2: Use detect-secrets if available (requires jq to parse output)
+    elif command -v detect-secrets &>/dev/null && command -v jq &>/dev/null; then
+        log_verbose "Scanning for secrets with detect-secrets"
+        local ds_output ds_count
+        if ds_output=$(detect-secrets scan "$project_dir" 2>/dev/null); then
+            ds_count=$(echo "$ds_output" | jq '.results | length' 2>/dev/null || echo "")
+            if [[ "$ds_count" =~ ^[0-9]+$ ]]; then
+                scanner_ran=true
+                if [[ "$ds_count" -gt 0 ]]; then
+                    exit_code=1
+                    findings+=("detect-secrets: found $ds_count potential secrets")
+                fi
+            fi
+        fi
+        # If detect-secrets failed or produced invalid output, scanner_ran stays false
+        if [[ "$scanner_ran" != "true" ]]; then
+            log_verbose "detect-secrets scan failed, falling back to regex patterns"
+        fi
+    fi
+
+    # Layer 3: Regex fallback - used when no external scanner succeeded
+    if [[ "$scanner_ran" != "true" ]]; then
+        # Log why detect-secrets was skipped if it's installed but jq is missing
+        if command -v detect-secrets &>/dev/null && ! command -v jq &>/dev/null; then
+            log_verbose "Skipping detect-secrets (requires jq to parse output)"
+        fi
+        # Layer 3: Regex fallback with comprehensive patterns
         log_verbose "Scanning for secrets with regex patterns"
         local patterns=(
-            'password\s*[:=]'
-            'api.?key\s*[:=]'
-            'secret\s*[:=]'
-            'token\s*[:=]'
-            'AWS_ACCESS_KEY'
+            # Private keys
+            '-----BEGIN.*PRIVATE KEY-----'
+            '-----BEGIN RSA PRIVATE KEY-----'
+            '-----BEGIN EC PRIVATE KEY-----'
+            '-----BEGIN OPENSSH PRIVATE KEY-----'
+            # AWS (exact format)
+            'AKIA[0-9A-Z]{16}'
+            'ASIA[0-9A-Z]{16}'
             'AWS_SECRET_ACCESS_KEY'
-            'PRIVATE_KEY'
-            'BEGIN RSA PRIVATE KEY'
-            'BEGIN OPENSSH PRIVATE KEY'
+            'AWS_ACCESS_KEY'
+            # GitHub tokens
+            'ghp_[a-zA-Z0-9]{36}'
+            'gho_[a-zA-Z0-9]{36}'
+            'ghs_[a-zA-Z0-9]{36}'
+            # Slack
+            'xox[baprs]-[0-9a-zA-Z-]{10,}'
+            # OpenAI/Anthropic
+            'sk-[a-zA-Z0-9]{48}'
+            'sk-ant-[a-zA-Z0-9-]{40,}'
+            # Google
+            'AIza[0-9A-Za-z_-]{35}'
+            # Stripe
+            'sk_live_[0-9a-zA-Z]{24}'
+            # Generic patterns
+            'password[[:space:]]*[:=]'
+            'api.?key[[:space:]]*[:=]'
+            'secret[[:space:]]*[:=]'
+            'token[[:space:]]*[:=]'
         )
 
         local diff_output
         if [[ "$scope" == "staged" ]]; then
-            diff_output=$(git -C "$project_dir" diff --cached 2>/dev/null || true)
+            diff_output=$(git -C "$project_dir" diff --no-color --cached 2>/dev/null || true)
         else
-            diff_output=$(git -C "$project_dir" diff HEAD~1..HEAD 2>/dev/null || true)
+            if git -C "$project_dir" rev-parse --verify HEAD >/dev/null 2>&1; then
+                diff_output=$(git -C "$project_dir" diff --no-color HEAD 2>/dev/null || true)
+            else
+                diff_output=$(git -C "$project_dir" diff --no-color 2>/dev/null || true)
+            fi
         fi
 
         for pattern in "${patterns[@]}"; do
-            if echo "$diff_output" | grep -qiE "$pattern"; then
+            # Use -e to explicitly pass pattern (handles patterns starting with -)
+            # Use case-insensitive matching to catch PASSWORD=, Password=, etc.
+            if echo "$diff_output" | grep -qiE -e "$pattern"; then
                 exit_code=2  # Warning
                 findings+=("Potential secret pattern: $pattern")
             fi
@@ -11673,22 +19047,54 @@ run_secret_scan() {
 
     local findings_json="[]"
     if [[ ${#findings[@]} -gt 0 ]]; then
-        findings_json=$(printf '%s\n' "${findings[@]}" | jq -R . | jq -s .)
+        if command -v jq &>/dev/null; then
+            findings_json=$(printf '%s\n' "${findings[@]}" | jq -R . | jq -s . 2>/dev/null || echo '[]')
+        else
+            local first=true item
+            findings_json="["
+            for item in "${findings[@]}"; do
+                $first || findings_json+=","
+                findings_json+="\"$(json_escape "$item")\""
+                first=false
+            done
+            findings_json+="]"
+        fi
     fi
 
-    jq -n \
-        --argjson ran true \
-        --argjson ok "$([ $exit_code -eq 0 ] && echo true || echo false)" \
-        --argjson warning "$([ $exit_code -eq 2 ] && echo true || echo false)" \
-        --argjson findings "$findings_json" \
-        --arg tool "$(command -v gitleaks &>/dev/null && echo gitleaks || echo regex)" \
-        '{
-            ran: $ran,
-            ok: $ok,
-            warning: $warning,
-            tool: $tool,
-            findings: $findings
-        }'
+    # Determine which tool was actually used based on scanner_ran flag
+    local tool_used="heuristic"
+    if [[ "$scanner_ran" == "true" ]]; then
+        # If scanner_ran is true, an external tool succeeded
+        if command -v gitleaks &>/dev/null; then
+            tool_used="gitleaks"
+        else
+            tool_used="detect-secrets"
+        fi
+    fi
+
+    local ok_json="false"
+    local warning_json="false"
+    [[ $exit_code -eq 0 ]] && ok_json="true"
+    [[ $exit_code -eq 2 ]] && warning_json="true"
+
+    if command -v jq &>/dev/null; then
+        jq -n \
+            --argjson ran true \
+            --argjson ok "$ok_json" \
+            --argjson warning "$warning_json" \
+            --argjson findings "$findings_json" \
+            --arg tool "$tool_used" \
+            '{
+                ran: $ran,
+                ok: $ok,
+                warning: $warning,
+                tool: $tool,
+                findings: $findings
+            }'
+    else
+        printf '{"ran":true,"ok":%s,"warning":%s,"tool":"%s","findings":%s}\n' \
+            "$ok_json" "$warning_json" "$(json_escape "$tool_used")" "$findings_json"
+    fi
 
     return $exit_code
 }
@@ -11894,12 +19300,12 @@ record_gh_action_log() {
 
 parse_gh_action_target() {
     local target="$1"
-    local -n _type_ref=$2
-    local -n _number_ref=$3
+    local type_var="$2"
+    local number_var="$3"
 
     if [[ "$target" =~ ^(issue|pr)#[0-9]+$ ]]; then
-        _type_ref="${target%%#*}"
-        _number_ref="${target##*#}"
+        _set_out_var "$type_var" "${target%%#*}" || return 1
+        _set_out_var "$number_var" "${target##*#}" || return 1
         return 0
     fi
 
@@ -12140,10 +19546,1195 @@ execute_gh_actions() {
 }
 
 #==============================================================================
+# SECTION 13.9: AGENT SWEEP PREFLIGHT CHECKS
+#==============================================================================
+
+# Repository preflight check for agent-sweep
+# Validates that a repository is in a safe state before invoking an agent.
+# Sets PREFLIGHT_SKIP_REASON on failure with machine-readable reason.
+# Args: $1 = repo_path (absolute path to git repository)
+# Returns: 0 if repo passes all checks, 1 if any check fails
+# Outputs: PREFLIGHT_SKIP_REASON global variable (used by callers)
+# shellcheck disable=SC2034  # PREFLIGHT_SKIP_REASON is read by callers
+repo_preflight_check() {
+    local repo_path="$1"
+    PREFLIGHT_SKIP_REASON=""
+
+    # Check 0: Path exists?
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        PREFLIGHT_SKIP_REASON="repo_path_not_found"
+        return 1
+    fi
+
+    # Check 1: Is it a git repo?
+    if ! git -C "$repo_path" rev-parse --is-inside-work-tree &>/dev/null; then
+        PREFLIGHT_SKIP_REASON="not_a_git_repo"
+        return 1
+    fi
+
+    # Check 2: Git email configured?
+    if [[ -z "$(git -C "$repo_path" config user.email 2>/dev/null)" ]]; then
+        PREFLIGHT_SKIP_REASON="git_email_not_configured"
+        return 1
+    fi
+
+    # Check 3: Git name configured?
+    if [[ -z "$(git -C "$repo_path" config user.name 2>/dev/null)" ]]; then
+        PREFLIGHT_SKIP_REASON="git_name_not_configured"
+        return 1
+    fi
+
+    # Check 4: Shallow clone? (some operations may fail)
+    if [[ -f "$repo_path/.git/shallow" ]]; then
+        PREFLIGHT_SKIP_REASON="shallow_clone"
+        return 1
+    fi
+
+    # Check 5: Dirty submodules?
+    if git -C "$repo_path" submodule status 2>/dev/null | grep -q '^+'; then
+        PREFLIGHT_SKIP_REASON="dirty_submodules"
+        return 1
+    fi
+
+    # Check 6: Rebase in progress?
+    if [[ -d "$repo_path/.git/rebase-apply" ]] || [[ -d "$repo_path/.git/rebase-merge" ]]; then
+        PREFLIGHT_SKIP_REASON="rebase_in_progress"
+        return 1
+    fi
+
+    # Check 7: Merge in progress?
+    if [[ -f "$repo_path/.git/MERGE_HEAD" ]]; then
+        PREFLIGHT_SKIP_REASON="merge_in_progress"
+        return 1
+    fi
+
+    # Check 8: Cherry-pick in progress?
+    if [[ -f "$repo_path/.git/CHERRY_PICK_HEAD" ]]; then
+        PREFLIGHT_SKIP_REASON="cherry_pick_in_progress"
+        return 1
+    fi
+
+    # Check 9: Detached HEAD?
+    local branch
+    branch=$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null)
+    if [[ -z "$branch" ]]; then
+        PREFLIGHT_SKIP_REASON="detached_HEAD"
+        return 1
+    fi
+
+    # Check 10: Has upstream? (only required if push strategy is not "none")
+    local upstream
+    upstream=$(git -C "$repo_path" rev-parse --abbrev-ref "@{u}" 2>/dev/null)
+    if [[ -z "$upstream" ]] && [[ "${AGENT_SWEEP_PUSH_STRATEGY:-push}" != "none" ]]; then
+        PREFLIGHT_SKIP_REASON="no_upstream_branch"
+        return 1
+    fi
+
+    # Check 11: Diverged from upstream?
+    if [[ -n "$upstream" ]]; then
+        local ahead behind
+        # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream tracking branch
+        read -r ahead behind < <(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null)
+        if [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]]; then
+            PREFLIGHT_SKIP_REASON="diverged_from_upstream"
+            return 1
+        fi
+    fi
+
+    # Check 12: Unmerged paths (merge conflicts)?
+    if git -C "$repo_path" ls-files --unmerged 2>/dev/null | grep -q .; then
+        PREFLIGHT_SKIP_REASON="unmerged_paths"
+        return 1
+    fi
+
+    # Check 13: git diff --check clean? (whitespace errors, conflict markers)
+    if ! git -C "$repo_path" diff --check &>/dev/null; then
+        PREFLIGHT_SKIP_REASON="diff_check_failed"
+        return 1
+    fi
+
+    # Check 14: Too many untracked files?
+    local untracked_count
+    untracked_count=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null | wc -l)
+    if [[ "$untracked_count" -gt "${AGENT_SWEEP_MAX_UNTRACKED:-1000}" ]]; then
+        PREFLIGHT_SKIP_REASON="too_many_untracked_files"
+        return 1
+    fi
+
+    return 0
+}
+
+# Get human-readable explanation for a preflight skip reason
+# Args: $1 = skip_reason (from PREFLIGHT_SKIP_REASON)
+# Outputs: Human-readable message to stdout
+preflight_skip_reason_message() {
+    local reason="$1"
+    case "$reason" in
+        repo_path_not_found)        echo "Repository path not found" ;;
+        not_a_git_repo)             echo "Not a git repository" ;;
+        git_email_not_configured)   echo "Git user.email is not configured" ;;
+        git_name_not_configured)    echo "Git user.name is not configured" ;;
+        shallow_clone)              echo "Repository is a shallow clone" ;;
+        dirty_submodules)           echo "Submodules have uncommitted changes" ;;
+        rebase_in_progress)         echo "A rebase is in progress" ;;
+        merge_in_progress)          echo "A merge is in progress" ;;
+        cherry_pick_in_progress)    echo "A cherry-pick is in progress" ;;
+        detached_HEAD)              echo "HEAD is detached (not on a branch)" ;;
+        no_upstream_branch)         echo "No upstream tracking branch configured" ;;
+        diverged_from_upstream)     echo "Branch has diverged from upstream" ;;
+        unmerged_paths)             echo "Unmerged paths exist (merge conflicts)" ;;
+        diff_check_failed)          echo "Diff check failed (whitespace or conflict markers)" ;;
+        too_many_untracked_files)   echo "Too many untracked files" ;;
+        *)                          echo "Unknown preflight issue: $reason" ;;
+    esac
+}
+
+# Get suggested user action for a preflight skip reason
+# Args: $1 = skip_reason (from PREFLIGHT_SKIP_REASON)
+# Outputs: Suggested remediation command to stdout
+preflight_skip_reason_action() {
+    local reason="$1"
+    case "$reason" in
+        repo_path_not_found)        echo "Ensure the repo exists or run: ru sync" ;;
+        not_a_git_repo)             echo "Verify the directory is a git repository" ;;
+        git_email_not_configured)   echo "Run: git config user.email \"you@example.com\"" ;;
+        git_name_not_configured)    echo "Run: git config user.name \"Your Name\"" ;;
+        shallow_clone)              echo "Run: git fetch --unshallow" ;;
+        dirty_submodules)           echo "Commit or discard submodule changes" ;;
+        rebase_in_progress)         echo "Complete or abort the rebase: git rebase --continue OR git rebase --abort" ;;
+        merge_in_progress)          echo "Complete or abort the merge: git merge --continue OR git merge --abort" ;;
+        cherry_pick_in_progress)    echo "Complete or abort: git cherry-pick --continue OR git cherry-pick --abort" ;;
+        detached_HEAD)              echo "Switch to a branch: git checkout <branch>" ;;
+        no_upstream_branch)         echo "Set upstream: git branch --set-upstream-to=origin/<branch>" ;;
+        diverged_from_upstream)     echo "Pull and rebase: git pull --rebase" ;;
+        unmerged_paths)             echo "Resolve conflicts and run: git add <files>" ;;
+        diff_check_failed)          echo "Fix whitespace issues or conflict markers in working tree" ;;
+        too_many_untracked_files)   echo "Review .gitignore or clean untracked files: git clean -n" ;;
+        *)                          echo "Investigate and fix the issue" ;;
+    esac
+}
+
+# Run preflight checks on all repos upfront before spawning agents.
+# Shows all problems at once for better UX (fail fast).
+#
+# Args: $1 = name of array variable containing repo specs (modified in place)
+#
+# Returns:
+#   0 - At least one repo passed preflight
+#   1 - All repos failed preflight (or empty input)
+#
+# Side effects:
+#   - Modifies the input array to contain only repos that passed
+#   - Writes preflight results to ${AGENT_SWEEP_STATE_DIR}/preflight_results.ndjson
+#   - Sets PREFLIGHT_PASSED_COUNT and PREFLIGHT_FAILED_COUNT
+#
+# Usage:
+#   local repos=(repo1 repo2 repo3)
+#   run_parallel_preflight repos
+#   # repos now contains only repos that passed preflight
+run_parallel_preflight() {
+    # shellcheck disable=SC2178  # repos_ref is a nameref to caller's array
+    local -n repos_ref=$1
+    local -a passed_repos=()
+    local -a failed_repos=()
+    local preflight_results_file="${AGENT_SWEEP_STATE_DIR}/preflight_results.ndjson"
+
+    local total_count=${#repos_ref[@]}
+    [[ $total_count -eq 0 ]] && return 1
+
+    log_info "Running preflight checks on $total_count repositories..."
+
+    # Initialize results file with header
+    printf '{"type":"header","timestamp":"%s","total_repos":%d}\n' \
+        "$(date -Iseconds)" "$total_count" > "$preflight_results_file"
+
+    # Run preflight for each repo
+    local repo_spec repo_path repo_name
+    for repo_spec in "${repos_ref[@]}"; do
+        repo_path=$(repo_spec_to_path "$repo_spec")
+        repo_name=$(get_repo_name "$repo_spec")
+
+        if repo_preflight_check "$repo_path"; then
+            passed_repos+=("$repo_spec")
+            printf '{"repo":"%s","path":"%s","status":"passed"}\n' \
+                "$(json_escape "$repo_name")" "$(json_escape "$repo_path")" >> "$preflight_results_file"
+            log_verbose "Preflight passed: $repo_name"
+        else
+            failed_repos+=("$repo_spec")
+            local reason="${PREFLIGHT_SKIP_REASON:-unknown}"
+            local message
+            message=$(preflight_skip_reason_message "$reason")
+            printf '{"repo":"%s","path":"%s","status":"failed","reason":"%s","message":"%s"}\n' \
+                "$(json_escape "$repo_name")" "$(json_escape "$repo_path")" \
+                "$(json_escape "$reason")" "$(json_escape "$message")" >> "$preflight_results_file"
+            log_warn "Preflight failed: $repo_name - $message"
+        fi
+    done
+
+    # Write summary to results file
+    printf '{"type":"summary","passed":%d,"failed":%d}\n' \
+        "${#passed_repos[@]}" "${#failed_repos[@]}" >> "$preflight_results_file"
+
+    # Export counts for summary display (read by callers)
+    # shellcheck disable=SC2034  # These are exported for callers to read
+    PREFLIGHT_PASSED_COUNT=${#passed_repos[@]}
+    # shellcheck disable=SC2034
+    PREFLIGHT_FAILED_COUNT=${#failed_repos[@]}
+
+    # Log summary
+    if [[ ${#failed_repos[@]} -gt 0 ]]; then
+        log_info "Preflight complete: ${#passed_repos[@]} passed, ${#failed_repos[@]} skipped"
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_info "Skipped repos:"
+            for repo_spec in "${failed_repos[@]}"; do
+                local name action
+                name=$(get_repo_name "$repo_spec")
+                # Re-run preflight to get the reason (cached in PREFLIGHT_SKIP_REASON)
+                repo_preflight_check "$(repo_spec_to_path "$repo_spec")" 2>/dev/null || true
+                action=$(preflight_skip_reason_action "${PREFLIGHT_SKIP_REASON:-unknown}")
+                log_info "  - $name: $action"
+            done
+        fi
+    else
+        log_info "Preflight complete: all ${#passed_repos[@]} repositories passed"
+    fi
+
+    # Return passed repos via the reference
+    repos_ref=("${passed_repos[@]}")
+
+    # Return failure if all repos failed
+    [[ ${#passed_repos[@]} -gt 0 ]]
+}
+
+#==============================================================================
+# SECTION 13.10: AGENT SWEEP COMMAND
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# cmd_agent_sweep: Main entry point for agent-sweep command
+#
+# Orchestrates AI coding agents to process repositories with uncommitted changes.
+# Uses ntm (Named Tmux Manager) to spawn and manage agent sessions.
+#
+# Returns:
+#   0 - All repos processed successfully
+#   1 - Some repos failed
+#   2 - Conflicts or quality gate failures
+#   3 - System/dependency error (ntm, tmux missing)
+#   4 - Invalid arguments
+#   5 - Interrupted (use --resume to continue)
+#------------------------------------------------------------------------------
+cmd_agent_sweep() {
+    # Default configuration
+    local with_release=false
+    local parallel=1
+    local repos_filter=""
+    local dry_run=false
+    local resume=false
+    local restart=false
+    local keep_sessions=false
+    local keep_sessions_on_fail=false
+    local attach_on_fail=false
+    local execution_mode="agent"
+    local secret_scan_mode="warn"
+    local json_output=false
+    local max_file_mb_override=""
+    local phase1_timeout="${AGENT_SWEEP_PHASE1_TIMEOUT:-300}"
+    local phase2_timeout="${AGENT_SWEEP_PHASE2_TIMEOUT:-600}"
+    local phase3_timeout="${AGENT_SWEEP_PHASE3_TIMEOUT:-300}"
+
+    # Parse agent-sweep specific arguments
+    local arg
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --with-release) with_release=true ;;
+            -j[0-9]*) parallel="${arg#-j}" ;;
+            --parallel=*) parallel="${arg#--parallel=}" ;;
+            --repos=*) repos_filter="${arg#--repos=}" ;;
+            --dry-run) dry_run=true ;;
+            --resume) resume=true ;;
+            --restart) restart=true ;;
+            --keep-sessions) keep_sessions=true ;;
+            --keep-sessions-on-fail) keep_sessions_on_fail=true ;;
+            --attach-on-fail) attach_on_fail=true ;;
+            --execution-mode=*) execution_mode="${arg#--execution-mode=}" ;;
+            --secret-scan=*) secret_scan_mode="${arg#--secret-scan=}" ;;
+            --max-file-mb=*) max_file_mb_override="${arg#--max-file-mb=}" ;;
+            --phase1-timeout=*) phase1_timeout="${arg#--phase1-timeout=}" ;;
+            --phase2-timeout=*) phase2_timeout="${arg#--phase2-timeout=}" ;;
+            --phase3-timeout=*) phase3_timeout="${arg#--phase3-timeout=}" ;;
+            --json) json_output=true ;;
+            --verbose|-v) VERBOSE=true; LOG_LEVEL=1 ;;
+            --debug|-d) DEBUG=true; VERBOSE=true; LOG_LEVEL=2 ;;
+        esac
+    done
+
+    # Validate parallel count
+    if ! [[ "$parallel" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "Invalid parallel count: $parallel (must be positive integer)"
+        return 4
+    fi
+
+    # Validate execution mode
+    case "$execution_mode" in
+        plan|apply|agent) ;;
+        *) log_error "Invalid execution mode: $execution_mode"; return 4 ;;
+    esac
+
+    # Validate secret scan mode
+    case "$secret_scan_mode" in
+        none|warn|block) ;;
+        *) log_error "Invalid secret-scan mode: $secret_scan_mode"; return 4 ;;
+    esac
+
+    # Validate max file size override
+    if [[ -n "$max_file_mb_override" ]]; then
+        if ! agent_sweep_is_positive_int "$max_file_mb_override"; then
+            log_error "Invalid --max-file-mb: $max_file_mb_override (must be positive integer)"
+            return 4
+        fi
+        AGENT_SWEEP_MAX_FILE_MB_OVERRIDE="$max_file_mb_override"
+    fi
+
+    # Resume and restart are mutually exclusive
+    if [[ "$resume" == true && "$restart" == true ]]; then
+        log_error "Cannot use --resume and --restart together"
+        return 4
+    fi
+
+    # Ensure state directory exists
+    local state_dir="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}"
+    ensure_dir "$state_dir"
+
+    # Concurrent instance lock
+    local lock_dir="$state_dir/instance.lock"
+
+    # Helper to release lock - only called within cmd_agent_sweep where state_dir is in scope
+    # Note: The EXIT trap uses inline expansion instead of this function to avoid scope issues
+    release_lock() {
+        rm -f "$state_dir/instance.lock/pid" 2>/dev/null
+        rmdir "$state_dir/instance.lock" 2>/dev/null || true
+    }
+
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        local existing_pid
+        existing_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "unknown")
+        log_error "Another agent-sweep is already running (PID: $existing_pid)"
+        log_error "If stale, remove: $lock_dir"
+        return 1
+    fi
+    echo $$ > "$lock_dir/pid"
+    AGENT_SWEEP_INSTANCE_LOCK_DIR="$lock_dir"
+    AGENT_SWEEP_INSTANCE_LOCK_BASE="$state_dir"
+    # Use double quotes to expand lock_dir at trap definition time (not execution time)
+    # shellcheck disable=SC2064
+    trap "rm -f '$lock_dir/pid' 2>/dev/null; rmdir '$lock_dir' 2>/dev/null || true" EXIT
+    log_debug "Acquired instance lock: $lock_dir (PID: $$)"
+
+    # Check ntm availability
+    log_verbose "Checking ntm availability..."
+    if ! ntm_check_available; then
+        log_error "ntm (Named Tmux Manager) is not available"
+        release_lock
+        return 3
+    fi
+
+    # Check tmux availability
+    if ! command -v tmux &>/dev/null; then
+        log_error "tmux is required for agent-sweep"
+        release_lock
+        return 3
+    fi
+    log_debug "ntm and tmux availability confirmed"
+
+    # Load all configured repos
+    log_verbose "Loading configured repositories..."
+    local -a repos=()
+    load_all_repos repos
+    log_debug "Loaded ${#repos[@]} configured repositories"
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        log_error "No repositories configured. Run 'ru add' to add repositories."
+        release_lock
+        return 4
+    fi
+
+    # Filter to repos with uncommitted changes
+    log_verbose "Filtering for repositories with uncommitted changes..."
+    local -a dirty_repos=()
+    local repo_spec repo_path
+    for repo_spec in "${repos[@]}"; do
+        repo_path=$(repo_spec_to_path "$repo_spec")
+        if [[ -d "$repo_path" ]] && has_uncommitted_changes "$repo_path"; then
+            if [[ -z "$repos_filter" ]] || [[ "$repo_spec" == *"$repos_filter"* ]]; then
+                dirty_repos+=("$repo_spec")
+                log_debug "Found dirty repo: $(get_repo_name "$repo_spec")"
+            fi
+        fi
+    done
+    log_verbose "Found ${#dirty_repos[@]} repositories with uncommitted changes"
+
+    # Handle empty case
+    if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+        if [[ "$json_output" == true ]]; then
+            jq -n '{status:"success",message:"No repositories with uncommitted changes",repos_processed:0}'
+        else
+            log_success "No repositories with uncommitted changes found."
+        fi
+        release_lock
+        return 0
+    fi
+
+    # Dry run mode
+    if [[ "$dry_run" == true ]]; then
+        if [[ "$json_output" == true ]]; then
+            printf '%s\n' "${dirty_repos[@]}" | jq -R . | jq -s '{mode:"dry-run",repos:.}'
+        else
+            log_info "Dry run: ${#dirty_repos[@]} repositories with uncommitted changes:"
+            for repo_spec in "${dirty_repos[@]}"; do
+                log_info "  - $(get_repo_name "$repo_spec")"
+            done
+        fi
+        release_lock
+        return 0
+    fi
+
+    # Setup results tracking
+    setup_agent_sweep_results
+
+    # Handle resume/restart
+    if [[ "$resume" == true ]] && load_agent_sweep_state; then
+        log_info "Resuming previous agent-sweep run..."
+        local -a remaining=()
+        for repo_spec in "${dirty_repos[@]}"; do
+            local is_done=false
+            # Check if repo is in completed list (handle empty array safely)
+            if [[ ${#COMPLETED_REPOS[@]} -gt 0 ]]; then
+                for c in "${COMPLETED_REPOS[@]}"; do
+                    [[ "$c" == "$repo_spec" ]] && is_done=true && break
+                done
+            fi
+            [[ "$is_done" != true ]] && remaining+=("$repo_spec")
+        done
+        dirty_repos=("${remaining[@]}")
+        log_info "Resuming with ${#dirty_repos[@]} remaining repositories"
+    elif [[ "$restart" == true ]]; then
+        log_info "Restarting agent-sweep (clearing previous state)..."
+        cleanup_agent_sweep_state
+    fi
+
+    # If resuming, honor prior --with-release unless explicitly overridden
+    if [[ "$resume" == true && "${SWEEP_WITH_RELEASE:-false}" == "true" ]]; then
+        with_release="true"
+    fi
+    SWEEP_WITH_RELEASE="$with_release"
+
+    if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+        log_success "All repositories already processed."
+        release_lock
+        return 0
+    fi
+
+    # Run preflight checks
+    log_step "Running preflight checks..."
+    if ! run_parallel_preflight dirty_repos; then
+        if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+            log_error "All repositories failed preflight checks"
+            release_lock
+            return 2
+        fi
+    fi
+
+    # Setup trap handlers
+    setup_agent_sweep_traps
+
+    # Export configuration
+    export AGENT_SWEEP_WITH_RELEASE="$with_release"
+    export AGENT_SWEEP_EXECUTION_MODE="$execution_mode"
+    export AGENT_SWEEP_SECRET_SCAN="$secret_scan_mode"
+    export AGENT_SWEEP_PHASE1_TIMEOUT="$phase1_timeout"
+    export AGENT_SWEEP_PHASE2_TIMEOUT="$phase2_timeout"
+    export AGENT_SWEEP_PHASE3_TIMEOUT="$phase3_timeout"
+    export AGENT_SWEEP_JSON_OUTPUT="$json_output"
+    export AGENT_SWEEP_MAX_FILE_MB_OVERRIDE="${AGENT_SWEEP_MAX_FILE_MB_OVERRIDE:-}"
+    export AGENT_SWEEP_KEEP_SESSIONS="$keep_sessions"
+    export AGENT_SWEEP_KEEP_SESSIONS_ON_FAIL="$keep_sessions_on_fail"
+
+    # Process repositories
+    local sweep_exit=0
+    log_step "Processing ${#dirty_repos[@]} repositories..."
+
+    if [[ $parallel -gt 1 ]]; then
+        log_info "Running $parallel agents in parallel"
+        run_parallel_agent_sweep dirty_repos "$parallel" || sweep_exit=$?
+    else
+        run_sequential_agent_sweep dirty_repos || sweep_exit=$?
+    fi
+
+    # Print summary
+    print_agent_sweep_summary
+
+    # Handle attach-on-fail
+    if [[ "$attach_on_fail" == true && $sweep_exit -ne 0 ]]; then
+        local failed_session
+        failed_session=$(get_first_failed_session)
+        [[ -n "$failed_session" ]] && tmux attach-session -t "$failed_session" 2>/dev/null || true
+    fi
+
+    # Cleanup
+    if [[ "$keep_sessions" != true ]]; then
+        if [[ "$keep_sessions_on_fail" != true || $sweep_exit -eq 0 ]]; then
+            cleanup_agent_sweep_sessions
+        fi
+    fi
+
+    release_lock
+    return $sweep_exit
+}
+
+# Helper functions for agent-sweep (stubs for dependent beads)
+run_sequential_agent_sweep() {
+    # shellcheck disable=SC2178
+    local -n repos_ref=$1
+    local any_failed=false
+    local rn total=${#repos_ref[@]}
+
+    # Initialize progress display
+    progress_init "$total"
+    log_debug "Starting sequential sweep of $total repositories"
+
+    for repo_spec in "${repos_ref[@]}"; do
+        rn=$(get_repo_name "$repo_spec")
+
+        # Start repo in progress display
+        progress_start_repo "$rn"
+        log_verbose "Starting workflow for $rn"
+
+        local repo_start repo_duration
+        repo_start=$(date +%s)
+        if run_single_agent_workflow "$repo_spec"; then
+            repo_duration=$(( $(date +%s) - repo_start ))
+            record_repo_result "$repo_spec" "success" "" "$repo_duration"
+            progress_complete_repo "success"
+            log_debug "Workflow succeeded for $rn"
+        else
+            local exit_code=$?
+            repo_duration=$(( $(date +%s) - repo_start ))
+            if [[ $exit_code -eq 2 ]]; then
+                record_repo_result "$repo_spec" "skipped" "skipped" "$repo_duration"
+                progress_complete_repo "skipped" "skipped"
+                log_debug "Workflow skipped for $rn"
+            else
+                record_repo_result "$repo_spec" "failed" "exit code $exit_code" "$repo_duration"
+                progress_complete_repo "failed" "exit code $exit_code"
+                log_debug "Workflow failed for $rn (exit code: $exit_code)"
+                any_failed=true
+            fi
+        fi
+    done
+
+    # Show summary
+    progress_summary
+    log_debug "Sequential sweep complete: any_failed=$any_failed"
+    [[ "$any_failed" != true ]]
+}
+
+run_parallel_agent_sweep() {
+    # shellcheck disable=SC2178
+    local -n repos_ref=$1
+    local max_parallel="${2:-4}"
+    local total=${#repos_ref[@]}
+
+    # For small batches, just use sequential mode
+    # Pass $1 (original array name) to avoid circular nameref
+    if [[ $total -le 1 ]] || [[ "$max_parallel" -le 1 ]]; then
+        run_sequential_agent_sweep "$1"
+        return $?
+    fi
+
+    log_info "Starting parallel sweep: $total repos, max $max_parallel workers"
+    progress_init "$total"
+
+    # Create work queue and lock directory
+    local work_queue lock_dir
+    work_queue=$(mktemp_file) || { log_error "Failed to create work queue"; return 3; }
+    lock_dir="${AGENT_SWEEP_STATE_DIR:-/tmp}/locks_$$"
+    if ! mkdir -p "$lock_dir"; then
+        log_error "Failed to create lock directory: $lock_dir"
+        rm -f "$work_queue" 2>/dev/null || true
+        return 3
+    fi
+
+    # Populate work queue
+    printf '%s\n' "${repos_ref[@]}" > "$work_queue"
+
+    # Track worker PIDs and results
+    local -a worker_pids=()
+    local any_failed=false
+
+    # Spawn workers
+    local i
+    for ((i=0; i<max_parallel && i<total; i++)); do
+        (
+            local worker_id=$i
+            local worker_failed=false
+            log_debug "Worker $worker_id starting"
+
+            while true; do
+                # Check global backoff before claiming work
+                agent_sweep_backoff_wait_if_needed || true
+
+                # Atomic dequeue: acquire lock, read first line, remove it
+                local repo_spec=""
+                if dir_lock_acquire "${lock_dir}/queue.lock" 30 2>/dev/null; then
+                    if [[ -s "$work_queue" ]]; then
+                        repo_spec=$(head -n1 "$work_queue" 2>/dev/null || true)
+                        if [[ -n "$repo_spec" ]]; then
+                            tail -n +2 "$work_queue" > "${work_queue}.tmp" 2>/dev/null || true
+                            mv "${work_queue}.tmp" "$work_queue" 2>/dev/null || true
+                        fi
+                    fi
+                    dir_lock_release "${lock_dir}/queue.lock" 2>/dev/null || true
+                fi
+
+                # No more work
+                [[ -z "$repo_spec" ]] && break
+
+                # Process this repo
+                local rn
+                rn=$(get_repo_name "$repo_spec")
+                progress_start_repo "$rn"
+                log_debug "Worker $worker_id processing $rn"
+
+                local repo_start repo_duration
+                repo_start=$(date +%s)
+                if run_single_agent_workflow "$repo_spec"; then
+                    repo_duration=$(( $(date +%s) - repo_start ))
+                    record_repo_result "$repo_spec" "success" "" "$repo_duration"
+                    progress_complete_repo "success"
+                else
+                    local exit_code=$?
+                    repo_duration=$(( $(date +%s) - repo_start ))
+                    if [[ $exit_code -eq 2 ]]; then
+                        record_repo_result "$repo_spec" "skipped" "skipped" "$repo_duration"
+                        progress_complete_repo "skipped" "skipped"
+                    else
+                        record_repo_result "$repo_spec" "failed" "exit code $exit_code" "$repo_duration"
+                        progress_complete_repo "failed" "exit code $exit_code"
+                        worker_failed=true
+                    fi
+                fi
+            done
+
+            log_debug "Worker $worker_id finished"
+            [[ "$worker_failed" != true ]]
+        ) &
+        worker_pids+=($!)
+    done
+
+    # Wait for all workers
+    local pid
+    for pid in "${worker_pids[@]}"; do
+        if ! wait "$pid"; then
+            any_failed=true
+        fi
+    done
+
+    # Cleanup
+    rm -f "$work_queue" "${work_queue}.tmp"
+    rm -rf "$lock_dir"
+
+    # Show summary
+    progress_summary
+
+    [[ "$any_failed" != true ]]
+}
+
+run_single_agent_workflow() {
+    local repo_spec="$1"
+    local rn rp start_time exec_mode with_release
+    rn=$(get_repo_name "$repo_spec")
+    rp=$(repo_spec_to_path "$repo_spec")
+    start_time=$(date +%s)
+    exec_mode="${AGENT_SWEEP_EXECUTION_MODE:-agent}"
+    with_release="${AGENT_SWEEP_WITH_RELEASE:-false}"
+    SWEEP_LAST_SESSION_NAME=""
+
+    log_debug "run_single_agent_workflow: repo=$rn path=$rp"
+
+    if [[ -z "$rp" || ! -d "$rp" ]]; then
+        log_error "Repo path not found: $rp"
+        write_result "$rn" "preflight" "failed" 0 "repo path not found" "$rp"
+        return 1
+    fi
+
+    if ! load_repo_agent_config "$rp"; then
+        log_error "Failed to load agent-sweep config for $rn"
+        write_result "$rn" "config" "failed" 0 "config load failed" "$rp"
+        return 1
+    fi
+    log_debug "Config loaded: AGENT_SWEEP_ENABLED=$AGENT_SWEEP_ENABLED"
+
+    if [[ "$AGENT_SWEEP_ENABLED" != "true" ]]; then
+        log_verbose "Skipping $rn (disabled in config)"
+        write_result "$rn" "preflight" "skipped" 0 "disabled" "$rp"
+        return 2
+    fi
+
+    progress_update_phase "preflight"
+    if ! repo_preflight_check "$rp"; then
+        local reason="${PREFLIGHT_SKIP_REASON:-unknown}"
+        local message
+        message=$(preflight_skip_reason_message "$reason")
+        log_warn "Preflight failed for $rn: $message"
+        write_result "$rn" "preflight" "skipped" 0 "$reason" "$rp"
+        return 2
+    fi
+
+    local artifact_dir=""
+    artifact_dir=$(setup_repo_artifact_dir "$rp" 2>/dev/null || true)
+    if [[ -n "$artifact_dir" ]]; then
+        capture_git_state "$rp" "${artifact_dir}/git_before.txt" || true
+    fi
+
+    # Optional pre-hook
+    if [[ -n "$AGENT_SWEEP_PRE_HOOK" ]]; then
+        local pre_output pre_exit
+        if pre_output=$( (cd "$rp" && eval "$AGENT_SWEEP_PRE_HOOK") 2>&1); then
+            pre_exit=0
+        else
+            pre_exit=$?
+        fi
+        [[ -n "$artifact_dir" ]] && printf '%s\n' "$pre_output" > "${artifact_dir}/pre_hook.log"
+        if [[ $pre_exit -ne 0 ]]; then
+            log_error "Pre-hook failed for $rn (exit $pre_exit): $pre_output"
+            write_result "$rn" "pre_hook" "failed" 0 "pre-hook failed" "$rp"
+            capture_final_artifacts "$rp" ""
+            return 1
+        fi
+    fi
+
+    # Backup ref before any changes
+    git -C "$rp" update-ref -m "agent-sweep backup before run ${RUN_ID:-unknown}" \
+        "refs/agent-sweep/pre-run-${RUN_ID:-unknown}" HEAD 2>/dev/null || true
+
+    # Session cleanup helper (honor keep-sessions flags)
+    _maybe_kill_session() {
+        local session_name="$1"
+        local failed="${2:-false}"
+        [[ -z "$session_name" ]] && return 0
+        if [[ "${AGENT_SWEEP_KEEP_SESSIONS:-false}" == "true" ]]; then
+            return 0
+        fi
+        if [[ "$failed" == "true" && "${AGENT_SWEEP_KEEP_SESSIONS_ON_FAIL:-false}" == "true" ]]; then
+            return 0
+        fi
+        ntm_kill_session "$session_name"
+    }
+
+    # Spawn session
+    progress_update_phase "spawn"
+    local session_name
+    session_name="ru_sweep_$(sanitize_session_name "$rn")_$$"
+    local spawn_result spawn_exit
+    if spawn_result=$(ntm_spawn_session "$session_name" "$rp"); then
+        spawn_exit=0
+    else
+        spawn_exit=$?
+    fi
+    [[ -n "$artifact_dir" ]] && capture_spawn_response "$rp" "$spawn_result" || true
+    if [[ $spawn_exit -ne 0 ]]; then
+        log_error "Session spawn failed for $rn: $spawn_result"
+        write_result "$rn" "spawn" "failed" 0 "session spawn failed" "$rp"
+        capture_final_artifacts "$rp" "$session_name"
+        _maybe_kill_session "$session_name" "true"
+        return 1
+    fi
+    SWEEP_LAST_SESSION_NAME="$session_name"
+    write_result "$rn" "spawn" "ok" 0 "" "$rp"
+
+    local pane_output=""
+    local phase_start phase_duration
+
+    # Phase 1: Understanding
+    if ! should_skip_phase "phase1" && ! should_skip_phase "understanding"; then
+        progress_update_phase 1
+        local phase1_prompt
+        phase1_prompt=$(get_effective_phase_prompt 1 "$rp")
+        if [[ -n "$AGENT_SWEEP_EXTRA_CONTEXT" ]]; then
+            phase1_prompt+=$'\n\nAdditional context:\n'"$AGENT_SWEEP_EXTRA_CONTEXT"
+        fi
+
+        phase_start=$(date +%s)
+        log_activity_snapshot "$rp" "phase1" "start"
+        if ! ntm_send_prompt "$session_name" "$phase1_prompt" >/dev/null 2>&1; then
+            log_error "Failed to send Phase 1 prompt for $rn"
+            write_result "$rn" "phase1" "failed" 0 "send prompt failed" "$rp"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        progress_update_phase "wait"
+        if ! ntm_wait_completion "$session_name" "${AGENT_SWEEP_PHASE1_TIMEOUT:-300}" >/dev/null 2>&1; then
+            phase_duration=$(( $(date +%s) - phase_start ))
+            log_error "Phase 1 timed out for $rn"
+            write_result "$rn" "phase1" "timeout" "$phase_duration" "" "$rp"
+            log_activity_snapshot "$rp" "phase1" "timeout"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        phase_duration=$(( $(date +%s) - phase_start ))
+        pane_output=$(capture_pane_output "$session_name" 10000 2>/dev/null || true)
+        local understanding_json=""
+        if understanding_json=$(extract_plan_json "$pane_output" "UNDERSTANDING"); then
+            [[ -n "$artifact_dir" ]] && printf '%s\n' "$understanding_json" > "${artifact_dir}/understanding.json"
+            write_result "$rn" "phase1" "ok" "$phase_duration" "" "$rp"
+        else
+            log_warn "Phase 1 understanding JSON not found for $rn"
+            write_result "$rn" "phase1" "warning" "$phase_duration" "missing understanding json" "$rp"
+        fi
+        log_activity_snapshot "$rp" "phase1" "complete"
+    else
+        log_verbose "Skipping Phase 1 for $rn"
+        write_result "$rn" "phase1" "skipped" 0 "" "$rp"
+    fi
+
+    # Phase 2: Commit plan
+    if should_skip_phase "phase2" || should_skip_phase "commit"; then
+        log_verbose "Skipping Phase 2 for $rn"
+        write_result "$rn" "phase2" "skipped" 0 "" "$rp"
+    else
+        progress_update_phase 2
+        local phase2_prompt
+        phase2_prompt=$(get_effective_phase_prompt 2 "$rp")
+        if [[ -n "$AGENT_SWEEP_EXTRA_CONTEXT" ]]; then
+            phase2_prompt+=$'\n\nAdditional context:\n'"$AGENT_SWEEP_EXTRA_CONTEXT"
+        fi
+
+        phase_start=$(date +%s)
+        log_activity_snapshot "$rp" "phase2" "start"
+        if ! ntm_send_prompt "$session_name" "$phase2_prompt" >/dev/null 2>&1; then
+            log_error "Failed to send Phase 2 prompt for $rn"
+            write_result "$rn" "phase2" "failed" 0 "send prompt failed" "$rp"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        progress_update_phase "wait"
+        if ! ntm_wait_completion "$session_name" "${AGENT_SWEEP_PHASE2_TIMEOUT:-600}" >/dev/null 2>&1; then
+            phase_duration=$(( $(date +%s) - phase_start ))
+            log_error "Phase 2 timed out for $rn"
+            write_result "$rn" "phase2" "timeout" "$phase_duration" "" "$rp"
+            log_activity_snapshot "$rp" "phase2" "timeout"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        phase_duration=$(( $(date +%s) - phase_start ))
+        pane_output=$(capture_pane_output "$session_name" 10000 2>/dev/null || true)
+        local commit_plan=""
+        if ! commit_plan=$(extract_plan_json "$pane_output" "COMMIT_PLAN"); then
+            log_error "Commit plan JSON not found for $rn"
+            write_result "$rn" "phase2" "failed" "$phase_duration" "missing commit plan json" "$rp"
+            log_activity_snapshot "$rp" "phase2" "failed"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        [[ -n "$artifact_dir" ]] && capture_plan_json "$rp" "commit" "$commit_plan" || true
+        write_result "$rn" "phase2" "ok" "$phase_duration" "" "$rp"
+
+        progress_update_phase "validate"
+        if [[ "$exec_mode" == "plan" ]]; then
+            if ! validate_commit_plan "$commit_plan" "$rp"; then
+                log_error "Commit plan validation failed for $rn: ${VALIDATION_ERROR:-unknown}"
+                write_result "$rn" "validation" "failed" 0 "${VALIDATION_ERROR:-validation failed}" "$rp"
+                log_activity_snapshot "$rp" "phase2" "validation_failed"
+                capture_final_artifacts "$rp" "$session_name"
+                _maybe_kill_session "$session_name" "true"
+                return 1
+            fi
+            write_result "$rn" "validation" "ok" 0 "" "$rp"
+            log_info "Plan mode enabled; skipping commit execution for $rn"
+        else
+            progress_update_phase "apply"
+            if ! execute_commit_plan "$commit_plan" "$rp"; then
+                log_error "Commit execution failed for $rn"
+                write_result "$rn" "execution" "failed" 0 "commit execution failed" "$rp"
+                log_activity_snapshot "$rp" "phase2" "execution_failed"
+                capture_final_artifacts "$rp" "$session_name"
+                _maybe_kill_session "$session_name" "true"
+                return 1
+            fi
+            write_result "$rn" "execution" "ok" 0 "" "$rp"
+        fi
+        log_activity_snapshot "$rp" "phase2" "complete"
+    fi
+
+    # Phase 3: Release (optional)
+    local release_strategy
+    release_strategy=$(get_release_strategy "$rp")
+    if [[ "$with_release" == true && "$release_strategy" != "never" ]] && \
+       ! should_skip_phase "phase3" && ! should_skip_phase "release"; then
+        progress_update_phase 3
+        local phase3_prompt
+        phase3_prompt=$(get_effective_phase_prompt 3 "$rp")
+        if [[ -n "$AGENT_SWEEP_EXTRA_CONTEXT" ]]; then
+            phase3_prompt+=$'\n\nAdditional context:\n'"$AGENT_SWEEP_EXTRA_CONTEXT"
+        fi
+
+        phase_start=$(date +%s)
+        log_activity_snapshot "$rp" "phase3" "start"
+        if ! ntm_send_prompt "$session_name" "$phase3_prompt" >/dev/null 2>&1; then
+            log_error "Failed to send Phase 3 prompt for $rn"
+            write_result "$rn" "phase3" "failed" 0 "send prompt failed" "$rp"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        progress_update_phase "wait"
+        if ! ntm_wait_completion "$session_name" "${AGENT_SWEEP_PHASE3_TIMEOUT:-300}" >/dev/null 2>&1; then
+            phase_duration=$(( $(date +%s) - phase_start ))
+            log_error "Phase 3 timed out for $rn"
+            write_result "$rn" "phase3" "timeout" "$phase_duration" "" "$rp"
+            log_activity_snapshot "$rp" "phase3" "timeout"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        phase_duration=$(( $(date +%s) - phase_start ))
+        pane_output=$(capture_pane_output "$session_name" 10000 2>/dev/null || true)
+        local release_plan=""
+        if ! release_plan=$(extract_plan_json "$pane_output" "RELEASE_PLAN"); then
+            log_error "Release plan JSON not found for $rn"
+            write_result "$rn" "phase3" "failed" "$phase_duration" "missing release plan json" "$rp"
+            log_activity_snapshot "$rp" "phase3" "failed"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+
+        [[ -n "$artifact_dir" ]] && capture_plan_json "$rp" "release" "$release_plan" || true
+        write_result "$rn" "phase3" "ok" "$phase_duration" "" "$rp"
+
+        if [[ "$exec_mode" == "plan" ]]; then
+            if ! validate_release_plan "$release_plan" "$rp"; then
+                log_error "Release plan validation failed for $rn: ${VALIDATION_ERROR:-unknown}"
+                write_result "$rn" "release" "failed" 0 "${VALIDATION_ERROR:-validation failed}" "$rp"
+                log_activity_snapshot "$rp" "phase3" "validation_failed"
+                capture_final_artifacts "$rp" "$session_name"
+                _maybe_kill_session "$session_name" "true"
+                return 1
+            fi
+            write_result "$rn" "release" "skipped" 0 "plan mode" "$rp"
+        else
+            if ! execute_release_plan "$release_plan" "$rp"; then
+                log_error "Release execution failed for $rn"
+                write_result "$rn" "release" "failed" 0 "release execution failed" "$rp"
+                log_activity_snapshot "$rp" "phase3" "execution_failed"
+                capture_final_artifacts "$rp" "$session_name"
+                _maybe_kill_session "$session_name" "true"
+                return 1
+            fi
+            write_result "$rn" "release" "ok" 0 "" "$rp"
+        fi
+        log_activity_snapshot "$rp" "phase3" "complete"
+    else
+        log_verbose "Skipping Phase 3 for $rn"
+        write_result "$rn" "phase3" "skipped" 0 "" "$rp"
+    fi
+
+    # Optional post-hook
+    if [[ -n "$AGENT_SWEEP_POST_HOOK" ]]; then
+        local post_output post_exit
+        if post_output=$( (cd "$rp" && eval "$AGENT_SWEEP_POST_HOOK") 2>&1); then
+            post_exit=0
+        else
+            post_exit=$?
+        fi
+        [[ -n "$artifact_dir" ]] && printf '%s\n' "$post_output" > "${artifact_dir}/post_hook.log"
+        if [[ $post_exit -ne 0 ]]; then
+            log_error "Post-hook failed for $rn (exit $post_exit): $post_output"
+            write_result "$rn" "post_hook" "failed" 0 "post-hook failed" "$rp"
+            capture_final_artifacts "$rp" "$session_name"
+            _maybe_kill_session "$session_name" "true"
+            return 1
+        fi
+    fi
+
+    capture_final_artifacts "$rp" "$session_name"
+    _maybe_kill_session "$session_name"
+
+    local duration=$(( $(date +%s) - start_time ))
+    write_result "$rn" "agent-sweep" "success" "$duration" "" "$rp"
+    return 0
+}
+
+get_first_failed_session() {
+    local sf="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/results.ndjson"
+    if [[ ! -f "$sf" ]]; then
+        return 0
+    fi
+    if command -v jq &>/dev/null; then
+        jq -r 'select(.type=="summary" and .status=="failed") | .session // empty' "$sf" 2>/dev/null | head -1
+    else
+        grep '"type":"summary"' "$sf" | grep '"status":"failed"' | head -1 | sed -nE 's/.*"session":"([^"]*)".*/\1/p'
+    fi
+}
+
+record_repo_result() {
+    local repo_spec="$1"
+    local st="$2"
+    local detail="${3:-}"
+    local duration="${4:-0}"
+    local sf="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/results.ndjson"
+    local completed_file="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/completed_repos.txt"
+    local ts line
+
+    [[ -z "$repo_spec" ]] && return 1
+
+    # Ensure duration is numeric
+    local duration_num="${duration:-0}"
+    [[ "$duration_num" =~ ^[0-9]+$ ]] || duration_num=0
+
+    ts=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local safe_repo safe_detail safe_session
+    safe_repo=$(json_escape "$repo_spec")
+    safe_detail=$(json_escape "$detail")
+    safe_session=$(json_escape "${SWEEP_LAST_SESSION_NAME:-}")
+
+    printf -v line '{"type":"summary","repo":"%s","status":"%s","detail":"%s","duration":%s,"session":"%s","timestamp":"%s"}\n' \
+        "$safe_repo" "$st" "$safe_detail" "$duration_num" "$safe_session" "$ts"
+
+    # Use results lock if available (parallel safety)
+    if [[ -n "${RESULTS_LOCK_DIR:-}" ]] && dir_lock_acquire "$RESULTS_LOCK_DIR" 10 2>/dev/null; then
+        printf '%s' "$line" >> "$sf"
+        case "$st" in
+            success|failed|skipped)
+                echo "$repo_spec" >> "$completed_file"
+                ;;
+        esac
+        dir_lock_release "$RESULTS_LOCK_DIR" 2>/dev/null || true
+    else
+        printf '%s' "$line" >> "$sf"
+        case "$st" in
+            success|failed|skipped)
+                echo "$repo_spec" >> "$completed_file"
+                ;;
+        esac
+    fi
+
+    case "$st" in
+        success|failed|skipped)
+            mark_repo_completed "$repo_spec" "$st" || true
+            ;;
+    esac
+
+    SWEEP_LAST_SESSION_NAME=""
+}
+
+print_agent_sweep_summary() {
+    local sf="${AGENT_SWEEP_STATE_DIR:-$RU_STATE_DIR/agent-sweep}/results.ndjson"
+    [[ ! -f "$sf" ]] && return
+
+    # Calculate duration
+    local end_time duration_seconds duration_str
+    end_time=$(date +%s)
+    duration_seconds=$((end_time - ${RUN_START_TIME:-$end_time}))
+    duration_str=$(format_duration "$duration_seconds")
+
+    # Count results
+    local s=0 f=0 k=0
+    if command -v jq &>/dev/null; then
+        while IFS= read -r l; do
+            local entry_type status
+            entry_type=$(echo "$l" | jq -r '.type // empty' 2>/dev/null)
+            [[ "$entry_type" != "summary" ]] && continue
+            status=$(echo "$l" | jq -r '.status // empty' 2>/dev/null)
+            case "$status" in
+                success) ((s++)) ;; failed) ((f++)) ;; skipped) ((k++)) ;;
+            esac
+        done < "$sf"
+    else
+        s=$(grep -c '"type":"summary".*"status":"success"' "$sf" 2>/dev/null || echo 0)
+        f=$(grep -c '"type":"summary".*"status":"failed"' "$sf" 2>/dev/null || echo 0)
+        local error_count
+        error_count=$(grep -c '"type":"summary".*"status":"error"' "$sf" 2>/dev/null || echo 0)
+        f=$((f + error_count))
+        k=$(grep -c '"type":"summary".*"status":"skipped"' "$sf" 2>/dev/null || echo 0)
+    fi
+    local t=$((s + f + k))
+
+    if [[ "${AGENT_SWEEP_JSON_OUTPUT:-false}" == "true" ]]; then
+        # JSON output with full details
+        local timestamp repos_json
+        timestamp=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+        if command -v jq &>/dev/null; then
+            repos_json=$(jq -s \
+                '[.[] | select(.type=="summary") | {name:.repo,status:.status,duration:(.duration // 0),error:(.detail // ""),session:(.session // "")}]' \
+                "$sf" 2>/dev/null || echo '[]')
+            jq -n --arg ts "$timestamp" --arg rid "${RUN_ID:-unknown}" \
+                --argjson dur "$duration_seconds" \
+                --argjson t "$t" --argjson s "$s" --argjson f "$f" --argjson k "$k" \
+                --argjson repos "$repos_json" \
+                --arg art "${RUN_ARTIFACTS_DIR:-}" \
+                '{timestamp:$ts,run_id:$rid,duration_seconds:$dur,summary:{total:$t,succeeded:$s,failed:$f,skipped:$k},artifacts_dir:$art,repos:$repos}'
+        else
+            repos_json="[]"
+            printf '{"timestamp":"%s","run_id":"%s","duration_seconds":%s,"summary":{"total":%s,"succeeded":%s,"failed":%s,"skipped":%s},"artifacts_dir":"%s","repos":%s}' \
+                "$timestamp" "$(json_escape "${RUN_ID:-unknown}")" "$duration_seconds" "$t" "$s" "$f" "$k" \
+                "$(json_escape "${RUN_ARTIFACTS_DIR:-}")" "$repos_json"
+        fi
+    else
+        # Human-readable box output (63 chars wide)
+        {
+            echo ""
+            echo "╭─────────────────────────────────────────────────────────────╮"
+            echo "│                   Agent Sweep Complete                       │"
+            echo "│                                                             │"
+            printf "│  Processed: %-48s │\n" "$t repos"
+            printf "│  Succeeded: %-48s │\n" "$s"
+            printf "│  Failed:    %-48s │\n" "$f"
+            printf "│  Skipped:   %-48s │\n" "$k"
+            printf "│  Total time: %-47s │\n" "$duration_str"
+            echo "╰─────────────────────────────────────────────────────────────╯"
+        } >&2
+
+        # Show failed repos if any
+        if (( f > 0 )); then
+            echo >&2 ""
+            echo >&2 "Failed repos:"
+            jq -r 'select(.type=="summary" and .status == "failed") | "  • \(.repo): \(.detail // "unknown")"' "$sf" 2>/dev/null | head -10 >&2
+        fi
+
+        # Show artifacts location
+        if [[ -n "${RUN_ARTIFACTS_DIR:-}" && -d "$RUN_ARTIFACTS_DIR" ]]; then
+            echo >&2 ""
+            echo >&2 "Artifacts: $RUN_ARTIFACTS_DIR"
+        fi
+    fi
+}
+
+#==============================================================================
 # SECTION 14: MAIN DISPATCH
 #==============================================================================
 
 main() {
+    # Show quick menu if run with no arguments
+    if [[ $# -eq 0 ]]; then
+        show_quick_menu
+        exit 0
+    fi
+
     # Initialize
     ARGS=()
     parse_args "$@"
@@ -12152,7 +20743,7 @@ main() {
 
     # Create results file for this run
     RESULTS_FILE=$(mktemp_file) || { log_error "Failed to create temp file"; exit 3; }
-    RESULTS_LOCK_FILE="${RESULTS_FILE}.lock"
+    RESULTS_LOCK_DIR="${RESULTS_FILE}.lock.d"
 
     # Dispatch to command
     case "$COMMAND" in
@@ -12168,6 +20759,9 @@ main() {
         prune)      cmd_prune ;;
         import)     cmd_import ;;
         review)     cmd_review ;;
+        agent-sweep) cmd_agent_sweep ;;
+        ai-sync)    cmd_ai_sync ;;
+        dep-update) cmd_dep_update ;;
         *)
             log_error "Unknown command: $COMMAND"
             show_help

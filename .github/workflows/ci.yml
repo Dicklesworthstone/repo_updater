@@ -93,6 +93,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+
       - name: Run installer
         run: |
           chmod +x install.sh
@@ -106,10 +112,21 @@ jobs:
           echo "✓ ru is installed and executable"
 
       - name: Check version output
-        run: /tmp/ru-test/ru --version
+        run: |
+          # Use brew bash on macOS since ru requires bash >= 4.3
+          if [[ "$(uname)" == "Darwin" ]]; then
+            "$(brew --prefix)/bin/bash" /tmp/ru-test/ru --version
+          else
+            /tmp/ru-test/ru --version
+          fi
 
       - name: Check help output
-        run: /tmp/ru-test/ru --help | head -20
+        run: |
+          if [[ "$(uname)" == "Darwin" ]]; then
+            "$(brew --prefix)/bin/bash" /tmp/ru-test/ru --help | head -20
+          else
+            /tmp/ru-test/ru --help | head -20
+          fi
 
   version-check:
     name: Version Consistency

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Mock tmux for tests. Behavior controlled by NTM_MOCK_SCENARIO.
+
+set -uo pipefail
+
+scenario="${NTM_MOCK_SCENARIO:-ok}"
+state_file="${NTM_MOCK_STATE_FILE:-/tmp/ntm_mock_state}"
+
+load_session() {
+    if [[ -f "$state_file" ]]; then
+        head -n 1 "$state_file"
+    else
+        echo "test"
+    fi
+}
+
+emit_ok_output() {
+    cat <<'EOF'
+I have read the AGENTS.md and README.md files carefully.
+
+RU_UNDERSTANDING_JSON_BEGIN
+{"summary":"Test repo for agent-sweep","conventions":["Bash 4.0+"],"risks":[],"notes":[]}
+RU_UNDERSTANDING_JSON_END
+
+Based on my analysis, here is the commit plan:
+
+RU_COMMIT_PLAN_JSON_BEGIN
+{
+  "commits": [
+    {"files": ["modified.txt"], "message": "fix: update test file\n\nUpdated the test file content."}
+  ],
+  "push": false,
+  "excluded_files": [],
+  "assumptions": [],
+  "risks": []
+}
+RU_COMMIT_PLAN_JSON_END
+EOF
+}
+
+emit_release_output() {
+    cat <<'EOF'
+I have read the AGENTS.md and README.md files carefully.
+
+RU_UNDERSTANDING_JSON_BEGIN
+{"summary":"Test repo for agent-sweep","conventions":["Bash 4.0+"],"risks":[],"notes":[]}
+RU_UNDERSTANDING_JSON_END
+
+Based on my analysis, here is the commit plan:
+
+RU_COMMIT_PLAN_JSON_BEGIN
+{
+  "commits": [
+    {"files": ["modified.txt"], "message": "fix: update test file\n\nUpdated the test file content."}
+  ],
+  "push": false,
+  "excluded_files": [],
+  "assumptions": [],
+  "risks": []
+}
+RU_COMMIT_PLAN_JSON_END
+
+RU_RELEASE_PLAN_JSON_BEGIN
+{
+  "version": "1.1.0",
+  "tag": "v1.1.0",
+  "changelog_entry": "## v1.1.0\n\n- Fixed test file",
+  "version_files": [{"path": "VERSION", "old": "1.0.0", "new": "1.1.0"}],
+  "checks": ["tests"]
+}
+RU_RELEASE_PLAN_JSON_END
+EOF
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    capture-pane)
+        case "$scenario" in
+            ok)
+                emit_ok_output
+                ;;
+            ok_with_release)
+                emit_release_output
+                ;;
+            invalid_json)
+                cat <<'EOF'
+RU_COMMIT_PLAN_JSON_BEGIN
+{not valid json
+RU_COMMIT_PLAN_JSON_END
+EOF
+                ;;
+            no_markers)
+                echo "Agent did not produce expected markers"
+                ;;
+            *)
+                emit_ok_output
+                ;;
+        esac
+        ;;
+    list-panes)
+        format=""
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == "-F" ]]; then
+                shift
+                format="${1:-}"
+            fi
+            shift || true
+        done
+        case "$format" in
+            *pane_pid*) echo "12345" ;;
+            *pane_id*) echo "0.1" ;;
+            *) echo "0.1" ;;
+        esac
+        ;;
+    list-sessions)
+        session="$(load_session)"
+        echo "$session"
+        ;;
+    has-session)
+        exit 0
+        ;;
+    send-keys)
+        exit 0
+        ;;
+    kill-session)
+        exit 0
+        ;;
+    new-session)
+        exit 0
+        ;;
+    *)
+        echo "mock tmux: unhandled args: $*" >&2
+        exit 2
+        ;;
+esac

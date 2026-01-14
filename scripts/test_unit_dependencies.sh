@@ -437,4 +437,4 @@ run_test test_ensure_dependencies_default_requires_auth
 
 # Print results
 print_results
-exit $?
+exit "$(get_exit_code)"

@@ -66,6 +66,17 @@ validate_agent_command() {
     local cmd
     cmd=$(echo "$raw_cmd" | xargs)
 
+    # Reject newline-separated commands to prevent chaining via line breaks.
+    if [[ "$raw_cmd" == *$'\n'* || "$raw_cmd" == *$'\r'* ]]; then
+        # Pre-escape newlines for valid JSON (jq 1.8+ may not escape in output)
+        local escaped_cmd="${raw_cmd//$'\n'/\\n}"
+        escaped_cmd="${escaped_cmd//$'\r'/\\r}"
+        jq -n --arg cmd "$escaped_cmd" --arg status "needs_approval" \
+            --arg reason "Command contains newline separators" \
+            '{command: $cmd, status: $status, reason: $reason}'
+        return 2
+    fi
+
     # Extract the base command (first word)
     local base_cmd="${cmd%% *}"
 
@@ -459,6 +470,21 @@ test_unknown_command() {
     log_test_pass "$test_name"
 }
 
+test_multiline_command_needs_approval() {
+    local test_name="validate_agent_command: newline separators need approval"
+    log_test_start "$test_name"
+
+    local result exit_code status
+    result=$(validate_agent_command $'git status\nrm -rf /')
+    exit_code=$?
+
+    assert_equals "2" "$exit_code" "Exit code should be 2 (needs approval)"
+    status=$(echo "$result" | jq -r '.status')
+    assert_equals "needs_approval" "$status" "Status should be 'needs_approval'"
+
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Tests: Helper Functions
 #==============================================================================
@@ -547,6 +573,7 @@ run_all_tests() {
 
     # Unknown command tests
     run_test test_unknown_command
+    run_test test_multiline_command_needs_approval
 
     # Helper function tests
     run_test test_is_command_safe_git
@@ -555,7 +582,7 @@ run_all_tests() {
     run_test test_is_command_blocked_ls
 
     print_results
-    return $TF_TESTS_FAILED
+    return "$(get_exit_code)"
 }
 
 run_all_tests

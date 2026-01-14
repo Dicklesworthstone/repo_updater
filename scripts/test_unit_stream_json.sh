@@ -30,6 +30,8 @@ log_verbose() { :; }
 # Stream-JSON Parsing Functions (from ru script)
 #==============================================================================
 
+# Use namerefs to avoid variable shadowing when caller passes "event_type"
+# as output variable name (ru uses _set_out_var with prefixed locals instead)
 parse_stream_json_event() {
     local line="$1"
     local -n _pse_event_type=$2
@@ -422,7 +424,7 @@ run_all_tests() {
     run_test test_get_tool_uses_ask_user
 
     print_results
-    return $TF_TESTS_FAILED
+    return "$(get_exit_code)"
 }
 
 run_all_tests

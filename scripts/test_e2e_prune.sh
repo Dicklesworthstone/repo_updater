@@ -361,7 +361,7 @@ test_prune_respects_custom_names() {
     setup_initialized_env
 
     # Add repo with custom name
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "owner/long-repository-name as shortname" >> "$repos_file"
 
     # Create directory with custom name
@@ -484,4 +484,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

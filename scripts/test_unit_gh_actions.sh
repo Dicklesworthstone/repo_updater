@@ -12,6 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$SCRIPT_DIR/test_framework.sh"
 
+# Helper functions required by parse_gh_action_target
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_var"
 source_ru_function "ensure_dir"
 source_ru_function "get_review_state_dir"
 source_ru_function "get_gh_actions_log_file"
@@ -251,10 +254,354 @@ create_valid_plan_with_actions() {
 EOF
 }
 
+#==============================================================================
+# Tests: parse_gh_action_target
+#==============================================================================
+
+test_parse_gh_action_target_issue() {
+    local test_name="parse_gh_action_target: parses issue#N"
+    log_test_start "$test_name"
+
+    local target_type="" number=""
+    if parse_gh_action_target "issue#42" target_type number; then
+        assert_equals "issue" "$target_type" "Type should be 'issue'"
+        assert_equals "42" "$number" "Number should be 42"
+    else
+        fail "Should successfully parse issue#42"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_parse_gh_action_target_pr() {
+    local test_name="parse_gh_action_target: parses pr#N"
+    log_test_start "$test_name"
+
+    local target_type="" number=""
+    if parse_gh_action_target "pr#7" target_type number; then
+        assert_equals "pr" "$target_type" "Type should be 'pr'"
+        assert_equals "7" "$number" "Number should be 7"
+    else
+        fail "Should successfully parse pr#7"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_parse_gh_action_target_large_number() {
+    local test_name="parse_gh_action_target: handles large numbers"
+    log_test_start "$test_name"
+
+    local target_type="" number=""
+    if parse_gh_action_target "issue#12345" target_type number; then
+        assert_equals "12345" "$number" "Should handle large numbers"
+    else
+        fail "Should handle large issue numbers"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_parse_gh_action_target_invalid_format() {
+    local test_name="parse_gh_action_target: rejects invalid format"
+    log_test_start "$test_name"
+
+    local target_type="" number=""
+    if parse_gh_action_target "invalid" target_type number; then
+        fail "Should reject invalid format"
+    else
+        pass "Invalid format correctly rejected"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_parse_gh_action_target_invalid_type() {
+    local test_name="parse_gh_action_target: rejects invalid type"
+    log_test_start "$test_name"
+
+    local target_type="" number=""
+    if parse_gh_action_target "bug#42" target_type number; then
+        fail "Should reject invalid type (bug)"
+    else
+        pass "Invalid type correctly rejected"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_parse_gh_action_target_non_numeric() {
+    local test_name="parse_gh_action_target: rejects non-numeric"
+    log_test_start "$test_name"
+
+    local target_type="" number=""
+    if parse_gh_action_target "issue#abc" target_type number; then
+        fail "Should reject non-numeric"
+    else
+        pass "Non-numeric correctly rejected"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: record_gh_action_log
+#==============================================================================
+
+test_record_gh_action_log_creates_file() {
+    local test_name="record_gh_action_log: creates log file"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    record_gh_action_log "owner/repo" '{"op":"comment"}' "ok" "Success"
+
+    local log_file
+    log_file=$(get_gh_actions_log_file)
+    assert_file_exists "$log_file" "Log file should be created"
+
+    log_test_pass "$test_name"
+}
+
+test_record_gh_action_log_jsonl_format() {
+    local test_name="record_gh_action_log: writes valid JSONL"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    record_gh_action_log "owner/repo" '{"op":"comment"}' "ok" "Done"
+
+    local log_file
+    log_file=$(get_gh_actions_log_file)
+
+    local parsed
+    parsed=$(jq -r '.repo' "$log_file" 2>/dev/null)
+    assert_equals "owner/repo" "$parsed" "Should be valid JSONL with repo field"
+
+    log_test_pass "$test_name"
+}
+
+test_record_gh_action_log_appends() {
+    local test_name="record_gh_action_log: appends to existing file"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    record_gh_action_log "repo1" '{"op":"comment"}' "ok" ""
+    record_gh_action_log "repo2" '{"op":"close"}' "failed" "Error"
+
+    local log_file
+    log_file=$(get_gh_actions_log_file)
+
+    local line_count
+    line_count=$(wc -l < "$log_file" | tr -d ' ')
+    assert_equals "2" "$line_count" "Should have 2 lines"
+
+    log_test_pass "$test_name"
+}
+
+test_record_gh_action_log_has_timestamp() {
+    local test_name="record_gh_action_log: includes timestamp"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    record_gh_action_log "owner/repo" '{"op":"label"}' "ok" ""
+
+    local log_file
+    log_file=$(get_gh_actions_log_file)
+
+    local ts
+    ts=$(jq -r '.ts' "$log_file")
+    if [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]; then
+        pass "Timestamp has ISO8601 format"
+    else
+        fail "Timestamp format invalid: $ts"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: gh_action_already_executed
+#==============================================================================
+
+test_gh_action_already_executed_no_log() {
+    local test_name="gh_action_already_executed: returns false when no log"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+    mkdir -p "$RU_STATE_DIR/review"
+
+    if gh_action_already_executed "owner/repo" '{"op":"comment"}'; then
+        fail "Should return false when no log file"
+    else
+        pass "Correctly returns false when no log file"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_gh_action_already_executed_not_found() {
+    local test_name="gh_action_already_executed: returns false for new action"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    record_gh_action_log "owner/repo" '{"op":"close"}' "ok" ""
+
+    if gh_action_already_executed "owner/repo" '{"op":"comment"}'; then
+        fail "Should return false for action not in log"
+    else
+        pass "Correctly returns false for new action"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_gh_action_already_executed_found() {
+    local test_name="gh_action_already_executed: returns true for executed action"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    local action='{"op":"comment","target":"issue#42"}'
+    record_gh_action_log "owner/repo" "$action" "ok" ""
+
+    if gh_action_already_executed "owner/repo" "$action"; then
+        pass "Correctly found executed action"
+    else
+        fail "Should find previously executed action"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_gh_action_already_executed_different_repo() {
+    local test_name="gh_action_already_executed: distinguishes repos"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    local action='{"op":"comment"}'
+    record_gh_action_log "owner/repo1" "$action" "ok" ""
+
+    if gh_action_already_executed "owner/repo2" "$action"; then
+        fail "Should not find action from different repo"
+    else
+        pass "Correctly distinguishes repos"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_gh_action_already_executed_ignores_failed() {
+    local test_name="gh_action_already_executed: ignores failed status"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+
+    local action='{"op":"comment"}'
+    record_gh_action_log "owner/repo" "$action" "failed" "Error"
+
+    if gh_action_already_executed "owner/repo" "$action"; then
+        fail "Should not consider failed actions as duplicates"
+    else
+        pass "Correctly ignores failed actions"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: canonicalize_gh_action
+#==============================================================================
+
+test_canonicalize_gh_action_sorts_keys() {
+    local test_name="canonicalize_gh_action: sorts JSON keys"
+    log_test_start "$test_name"
+
+    local input='{"target":"issue#42","op":"comment","body":"test"}'
+    local expected='{"body":"test","op":"comment","target":"issue#42"}'
+
+    local result
+    result=$(canonicalize_gh_action "$input")
+    assert_equals "$expected" "$result" "Keys should be sorted"
+
+    log_test_pass "$test_name"
+}
+
+test_canonicalize_gh_action_compact() {
+    local test_name="canonicalize_gh_action: returns compact JSON"
+    log_test_start "$test_name"
+
+    local input='{
+        "op": "close",
+        "target": "pr#7"
+    }'
+
+    local result
+    result=$(canonicalize_gh_action "$input")
+
+    local line_count
+    line_count=$(echo "$result" | wc -l | tr -d ' ')
+    assert_equals "1" "$line_count" "Output should be single line"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Run All Tests
+#==============================================================================
+
+# execute_gh_actions tests
 run_test test_execute_gh_actions_happy_path_and_idempotent
 run_test test_execute_gh_actions_continues_on_failure
 run_test test_execute_gh_actions_runs_commands
 run_test test_execute_gh_actions_handles_errors
 
+# parse_gh_action_target tests
+run_test test_parse_gh_action_target_issue
+run_test test_parse_gh_action_target_pr
+run_test test_parse_gh_action_target_large_number
+run_test test_parse_gh_action_target_invalid_format
+run_test test_parse_gh_action_target_invalid_type
+run_test test_parse_gh_action_target_non_numeric
+
+# record_gh_action_log tests
+run_test test_record_gh_action_log_creates_file
+run_test test_record_gh_action_log_jsonl_format
+run_test test_record_gh_action_log_appends
+run_test test_record_gh_action_log_has_timestamp
+
+# gh_action_already_executed tests
+run_test test_gh_action_already_executed_no_log
+run_test test_gh_action_already_executed_not_found
+run_test test_gh_action_already_executed_found
+run_test test_gh_action_already_executed_different_repo
+run_test test_gh_action_already_executed_ignores_failed
+
+# canonicalize_gh_action tests
+run_test test_canonicalize_gh_action_sorts_keys
+run_test test_canonicalize_gh_action_compact
+
 print_results
-exit $?
+exit "$(get_exit_code)"

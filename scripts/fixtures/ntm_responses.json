@@ -1,0 +1,55 @@
+{
+  "spawn_success": {
+    "success": true,
+    "session": "ru_sweep_test_12345",
+    "agents": [{"pane": "0.1", "type": "claude", "ready": true}]
+  },
+  "spawn_resource_busy": {
+    "success": false,
+    "error_code": "RESOURCE_BUSY",
+    "error": "session already exists"
+  },
+  "spawn_dependency_missing": {
+    "success": false,
+    "error_code": "DEPENDENCY_MISSING",
+    "error": "tmux not installed"
+  },
+  "wait_success": {
+    "success": true,
+    "condition": "idle",
+    "waited_seconds": 45.2
+  },
+  "wait_timeout": {
+    "success": false,
+    "error_code": "TIMEOUT",
+    "error": "Timeout waiting for condition"
+  },
+  "wait_agent_error": {
+    "success": false,
+    "error_code": "AGENT_ERROR",
+    "error": "Agent crashed or rate limited"
+  },
+  "activity_generating": {
+    "success": true,
+    "session": "test",
+    "state": "GENERATING",
+    "velocity": 150.5
+  },
+  "activity_idle": {
+    "success": true,
+    "session": "test",
+    "state": "WAITING",
+    "velocity": 0.0
+  },
+  "send_success": {
+    "success": true,
+    "delivered_to": 1,
+    "chunks": 1
+  },
+  "pane_output_with_commit_plan": {
+    "content": "Analyzing repository...\n\nRU_COMMIT_PLAN_JSON_BEGIN\n{\"commits\":[{\"files\":[\"src/main.py\"],\"message\":\"fix: resolve null pointer\"}],\"push\":true,\"excluded_files\":[],\"assumptions\":[],\"risks\":[]}\nRU_COMMIT_PLAN_JSON_END\n\nPlan generated."
+  },
+  "pane_output_with_release_plan": {
+    "content": "RU_RELEASE_PLAN_JSON_BEGIN\n{\"version\":\"1.2.0\",\"tag\":\"v1.2.0\",\"changelog_entry\":\"## v1.2.0\\n\\n### Fixed\\n- Bug fix\",\"version_files\":[{\"path\":\"VERSION\",\"old\":\"1.1.0\",\"new\":\"1.2.0\"}],\"checks\":[\"tests\"]}\nRU_RELEASE_PLAN_JSON_END"
+  }
+}

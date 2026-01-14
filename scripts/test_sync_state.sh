@@ -66,6 +66,7 @@ extract_function() {
     ' "$file"
 }
 
+source <(extract_function "_is_valid_var_name" "$PROJECT_DIR/ru")
 source <(extract_function "json_escape" "$PROJECT_DIR/ru")
 source <(extract_function "get_sync_state_file" "$PROJECT_DIR/ru")
 source <(extract_function "load_sync_state" "$PROJECT_DIR/ru")
@@ -710,4 +711,4 @@ run_test test_is_repo_completed_last_item
 
 # Print results
 print_results
-exit $?
+exit "$(get_exit_code)"

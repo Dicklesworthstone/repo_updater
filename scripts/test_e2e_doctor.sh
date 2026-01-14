@@ -243,7 +243,7 @@ test_doctor_no_repos_configured() {
     setup_initialized_env
 
     # Clear repos file
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "# Empty" > "$repos_file"
 
     local stderr_output
@@ -406,4 +406,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

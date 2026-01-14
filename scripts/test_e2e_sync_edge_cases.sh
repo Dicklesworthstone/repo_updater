@@ -198,13 +198,13 @@ add_local_commit() {
 # Add repo to ru config
 add_repo_to_config() {
     local repo_spec="$1"
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "$repo_spec" >> "$repos_file"
 }
 
 # Clear repos from config
 clear_repos_config() {
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "# Test repos" > "$repos_file"
 }
 
@@ -678,7 +678,7 @@ test_interrupted_sync_exits_code_5() {
     "$RU_SCRIPT" init >/dev/null 2>&1 || true
 
     # Add a fake repo to the config (so sync has something to process)
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "testowner/testrepo" >> "$repos_file"
 
     # Set PROJECTS_DIR env to our test dir
@@ -731,7 +731,7 @@ test_restart_clears_state() {
     "$RU_SCRIPT" init >/dev/null 2>&1 || true
 
     # Add a fake repo to the config (so sync has something to process)
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "testowner/testrepo" >> "$repos_file"
     export RU_PROJECTS_DIR="$TEST_PROJECTS_DIR"
 
@@ -780,7 +780,7 @@ test_resume_option_recognized() {
     "$RU_SCRIPT" init >/dev/null 2>&1 || true
 
     # Add a fake repo to the config (so sync has something to process)
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "testowner/testrepo" >> "$repos_file"
     export RU_PROJECTS_DIR="$TEST_PROJECTS_DIR"
 
@@ -880,4 +880,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

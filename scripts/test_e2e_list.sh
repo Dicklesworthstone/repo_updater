@@ -161,7 +161,7 @@ test_list_empty_repos_file() {
     setup_initialized_env
 
     # Clear the repos file
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "# Empty repos file" > "$repos_file"
 
     local stderr_output
@@ -278,7 +278,7 @@ test_list_with_branch_spec() {
     echo -e "${BLUE}Test:${RESET} ru list handles branch specs (owner/repo@branch)"
     setup_initialized_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "owner/repo@develop" >> "$repos_file"
 
     local stdout_output
@@ -293,7 +293,7 @@ test_list_with_custom_name() {
     echo -e "${BLUE}Test:${RESET} ru list handles custom names (owner/repo as name)"
     setup_initialized_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "owner/long-repository-name as shortname" >> "$repos_file"
 
     local stdout_output
@@ -309,7 +309,7 @@ test_list_paths_with_custom_name() {
     setup_initialized_env
     export RU_LAYOUT="flat"
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     echo "owner/long-repository-name as shortname" >> "$repos_file"
 
     local stdout_output
@@ -343,7 +343,7 @@ test_list_mixed_url_formats() {
     echo -e "${BLUE}Test:${RESET} ru list handles mixed URL formats"
     setup_initialized_env
 
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat >> "$repos_file" <<'EOF'
 owner1/repo1
 https://github.com/owner2/repo2
@@ -486,4 +486,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

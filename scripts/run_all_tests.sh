@@ -6,7 +6,9 @@
 #   ./scripts/run_all_tests.sh              # Run all tests with human-readable output
 #   ./scripts/run_all_tests.sh --tap        # Run with TAP output for CI
 #   ./scripts/run_all_tests.sh --parallel   # Run tests in parallel (faster)
+#   ./scripts/run_all_tests.sh -j 4         # Run with 4 parallel jobs
 #   ./scripts/run_all_tests.sh --list       # List test files without running
+#   ./scripts/run_all_tests.sh --coverage   # Show coverage report after tests
 #   ./scripts/run_all_tests.sh test_e2e_*   # Run only matching test files
 #
 # Features:
@@ -36,7 +38,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAP_MODE="false"
 PARALLEL_MODE="false"
 LIST_ONLY="false"
+COVERAGE_MODE="false"
 FILTER_PATTERN=""
+MAX_JOBS=""  # Empty means unlimited (all CPUs)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,12 +49,30 @@ while [[ $# -gt 0 ]]; do
             export TF_TAP_MODE="true"
             shift
             ;;
-        --parallel|-j)
+        --parallel)
             PARALLEL_MODE="true"
+            shift
+            ;;
+        -j|--jobs)
+            PARALLEL_MODE="true"
+            if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+                MAX_JOBS="$2"
+                shift
+            fi
+            shift
+            ;;
+        -j[0-9]*)
+            # Handle -j4 style (no space)
+            PARALLEL_MODE="true"
+            MAX_JOBS="${1#-j}"
             shift
             ;;
         --list)
             LIST_ONLY="true"
+            shift
+            ;;
+        --coverage)
+            COVERAGE_MODE="true"
             shift
             ;;
         --help|-h)
@@ -131,7 +153,8 @@ discover_tests() {
         done < <(find "$SCRIPT_DIR" -maxdepth 1 -name 'test_*.sh' -type f -print0 | sort -z)
     fi
 
-    printf '%s\n' "${tests[@]}"
+    # Only print if there are tests (empty array would output just newline)
+    [[ ${#tests[@]} -gt 0 ]] && printf '%s\n' "${tests[@]}"
 }
 
 #==============================================================================
@@ -283,25 +306,68 @@ main() {
     local test_num=0
 
     if [[ "$PARALLEL_MODE" == "true" ]]; then
-        # Parallel execution using background jobs
+        # Parallel execution with job limiting and proper cleanup
         local pids=()
         local tmpdir
         tmpdir=$(mktemp -d)
+        local running_jobs=0
+        local max_jobs="${MAX_JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
+        # Cleanup trap for interrupt handling
+        # shellcheck disable=SC2317  # Function is invoked via trap
+        cleanup_parallel() {
+            echo ""
+            echo "${YELLOW}Interrupted - cleaning up...${RESET}" >&2
+            # Kill all background jobs
+            for pid in "${pids[@]}"; do
+                kill "$pid" 2>/dev/null || true
+            done
+            rm -rf "$tmpdir"
+            exit 130
+        }
+        trap cleanup_parallel INT TERM
+
+        if [[ "$TAP_MODE" != "true" ]]; then
+            echo "Running in parallel with up to $max_jobs jobs..."
+            echo ""
+        fi
+
+        # Launch jobs with throttling
         for test_file in "${tests[@]}"; do
             ((test_num++))
             local result_file="$tmpdir/result_$test_num"
+
+            # Wait if we've hit the job limit
+            # Note: wait -n requires Bash 4.3+; use polling fallback for 4.0-4.2
+            while [[ $running_jobs -ge $max_jobs ]]; do
+                if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+                    wait -n 2>/dev/null || true
+                else
+                    # Fallback: brief sleep then recount (less efficient but compatible)
+                    sleep 0.1
+                fi
+                running_jobs=$(jobs -r | wc -l)
+            done
+
             (
                 run_single_test "$test_file" > "$result_file"
             ) &
             pids+=($!)
+            ((running_jobs++))
         done
 
-        # Wait for all jobs and collect results
-        test_num=0
+        # Wait for all remaining jobs
         for pid in "${pids[@]}"; do
-            ((test_num++))
             wait "$pid" 2>/dev/null || true
+        done
+
+        # Reset trap
+        trap - INT TERM
+
+        # Collect results in order
+        test_num=0
+        for test_file in "${tests[@]}"; do
+            ((test_num++))
             local result_file="$tmpdir/result_$test_num"
             if [[ -f "$result_file" ]]; then
                 local result
@@ -313,6 +379,12 @@ main() {
                 else
                     ((total_failed++))
                 fi
+            else
+                # Result file missing - report as failure
+                local test_name
+                test_name=$(basename "$test_file" .sh)
+                print_test_result "$test_num" "1" "0" "$test_name" "No result file (test may have crashed)"
+                ((total_failed++))
             fi
         done
 
@@ -338,6 +410,11 @@ main() {
     local total_time=$((total_end_time - total_start_time))
 
     print_summary "${#tests[@]}" "$total_passed" "$total_failed" "$total_time"
+
+    # Show coverage report if requested
+    if [[ "$COVERAGE_MODE" == "true" && -x "$SCRIPT_DIR/test_coverage.sh" ]]; then
+        "$SCRIPT_DIR/test_coverage.sh"
+    fi
 
     # Exit with failure if any tests failed
     if [[ "$total_failed" -gt 0 ]]; then

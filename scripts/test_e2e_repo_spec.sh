@@ -47,6 +47,9 @@ setup_test_env() {
     export HOME="$TEMP_DIR/home"
     mkdir -p "$HOME"
 
+    # Force sequential mode for predictable output
+    export RU_PARALLEL=1
+
     # Create a projects directory
     export PROJECTS_DIR="$TEMP_DIR/projects"
     mkdir -p "$PROJECTS_DIR"
@@ -144,7 +147,7 @@ test_basic_repo_spec() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with basic specs
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 owner/repo
 charmbracelet/gum
@@ -179,7 +182,7 @@ test_branch_pinning() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with branch specs
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 owner/repo@develop
 charmbracelet/gum@main
@@ -213,7 +216,7 @@ test_custom_names() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with custom name specs
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 owner/repo as my-custom-name
 charmbracelet/gum as glamorous-scripts
@@ -249,7 +252,7 @@ test_combined_spec() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with combined specs
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 owner/repo@develop as dev-repo
 charmbracelet/gum@main as gum-stable
@@ -284,7 +287,7 @@ test_deduplication() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with duplicate paths
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 # These should dedupe to one entry (same local path)
 owner/repo
@@ -333,7 +336,7 @@ test_mixed_specs() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with mixed specs
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 # Basic
 simple/repo
@@ -383,7 +386,7 @@ test_edge_cases() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with edge cases
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 # Repo with hyphen in name
 my-org/my-repo
@@ -434,7 +437,7 @@ test_layout_with_specs() {
     "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a simple repos file
-    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/repos.txt"
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
     cat > "$repos_file" << 'EOF'
 owner/repo
 owner/another as custom-name
@@ -496,4 +499,4 @@ echo "============================================"
 echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
 echo "============================================"
 
-exit $TESTS_FAILED
+[[ $TESTS_FAILED -eq 0 ]]

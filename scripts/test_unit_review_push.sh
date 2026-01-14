@@ -33,7 +33,7 @@ source_ru_function "record_review_push"
 source_ru_function "push_worktree_changes"
 
 # Required global used by acquire_state_lock/release_state_lock (normally set in ru)
-STATE_LOCK_FD=201
+export STATE_LOCK_FD=201
 
 # Mock logging used by the functions under test
 log_step() { :; }
@@ -88,7 +88,7 @@ test_verify_push_safe_rejects_unanswered_questions() {
 }
 EOF
 
-    assert_fails 'verify_push_safe "owner/repo" "$plan_file"' "should refuse push with unanswered questions"
+    assert_fails "should refuse push with unanswered questions" verify_push_safe "owner/repo" "$plan_file"
     log_test_pass "$test_name"
 }
 
@@ -166,4 +166,4 @@ run_test test_verify_push_safe_rejects_unanswered_questions
 run_test test_push_worktree_changes_ff_only_and_records_state
 
 print_results
-exit $?
+exit "$(get_exit_code)"

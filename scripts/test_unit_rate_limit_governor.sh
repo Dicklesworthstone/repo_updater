@@ -93,7 +93,7 @@ test_get_target_parallelism_override() {
     local test_name="get_target_parallelism: respects REVIEW_PARALLEL"
     log_test_start "$test_name"
 
-    REVIEW_PARALLEL=8
+    export REVIEW_PARALLEL=8
     local result
     result=$(get_target_parallelism)
 
@@ -286,6 +286,11 @@ test_governor_update_syncs_state() {
     GOVERNOR_STATE[github_remaining]=800
     GOVERNOR_STATE[model_in_backoff]="false"
 
+    # Save original functions before mocking (they're global in bash!)
+    local _orig_update_github_rate_limit _orig_check_model_rate_limit
+    _orig_update_github_rate_limit=$(declare -f update_github_rate_limit)
+    _orig_check_model_rate_limit=$(declare -f check_model_rate_limit)
+
     # Mock update_github_rate_limit to not actually call API
     update_github_rate_limit() { :; }
     check_model_rate_limit() { :; }
@@ -295,6 +300,325 @@ test_governor_update_syncs_state() {
 
     # With github_remaining=800, effective should be halved (4/2=2)
     assert_equals "2" "${GOVERNOR_STATE[effective_parallelism]}" "governor_update adjusts parallelism"
+
+    # Restore original functions
+    eval "$_orig_update_github_rate_limit"
+    eval "$_orig_check_model_rate_limit"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: update_github_rate_limit (bd-0l0g)
+#==============================================================================
+
+# Source the actual function for testing
+source_ru_function "update_github_rate_limit"
+
+# Mock retry_with_backoff to return immediately
+# Call format: retry_with_backoff --capture=stdout 3 1 -- gh api rate_limit
+# Args: $1=--capture=stdout $2=retries $3=delay $4=-- $5+=command
+retry_with_backoff() {
+    shift  # --capture=stdout (one arg, not two)
+    shift  # retries (3)
+    shift  # delay (1)
+    shift  # --
+    "$@"   # command: gh api rate_limit
+}
+
+test_update_github_rate_limit_parses_response() {
+    local test_name="update_github_rate_limit: parses API response"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    # Create mock gh in mock_bin
+    local mock_bin="$test_env/mock_bin"
+    mkdir -p "$mock_bin"
+    local old_path="$PATH"
+    export PATH="$mock_bin:$PATH"
+
+    cat > "$mock_bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+if [[ "$1" == "api" && "$2" == "rate_limit" ]]; then
+    cat <<'JSON'
+{
+  "resources": {
+    "core": {
+      "limit": 5000,
+      "remaining": 3500,
+      "reset": 1704067200
+    }
+  }
+}
+JSON
+    exit 0
+fi
+exit 1
+MOCK_GH
+    chmod +x "$mock_bin/gh"
+
+    update_github_rate_limit
+
+    PATH="$old_path"
+
+    assert_equals "3500" "${GOVERNOR_STATE[github_remaining]}" "remaining parsed"
+    assert_equals "1704067200" "${GOVERNOR_STATE[github_reset]}" "reset parsed"
+
+    log_test_pass "$test_name"
+}
+
+test_update_github_rate_limit_handles_low_remaining() {
+    local test_name="update_github_rate_limit: detects low remaining"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    local mock_bin="$test_env/mock_bin"
+    mkdir -p "$mock_bin"
+    local old_path="$PATH"
+    export PATH="$mock_bin:$PATH"
+
+    cat > "$mock_bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+if [[ "$1" == "api" && "$2" == "rate_limit" ]]; then
+    cat <<'JSON'
+{
+  "resources": {
+    "core": {
+      "limit": 5000,
+      "remaining": 200,
+      "reset": 1704067200
+    }
+  }
+}
+JSON
+    exit 0
+fi
+exit 1
+MOCK_GH
+    chmod +x "$mock_bin/gh"
+
+    update_github_rate_limit
+
+    PATH="$old_path"
+
+    assert_equals "200" "${GOVERNOR_STATE[github_remaining]}" "low remaining detected"
+
+    log_test_pass "$test_name"
+}
+
+test_update_github_rate_limit_handles_no_gh() {
+    local test_name="update_github_rate_limit: handles missing gh"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    # Create empty bin dir BEFORE changing PATH (so mkdir command works)
+    mkdir -p "$test_env/empty_bin"
+
+    # Set PATH to only include empty_bin so gh isn't found.
+    # (command -v is a bash builtin, doesn't need anything in PATH)
+    local old_path="$PATH"
+    export PATH="$test_env/empty_bin"
+
+    # Should not error, just return
+    update_github_rate_limit
+    local rc=$?
+
+    PATH="$old_path"
+
+    assert_equals "0" "$rc" "returns 0 when gh missing"
+    # State should be unchanged (default 5000)
+    assert_equals "5000" "${GOVERNOR_STATE[github_remaining]}" "state unchanged"
+
+    log_test_pass "$test_name"
+}
+
+test_update_github_rate_limit_handles_api_failure() {
+    local test_name="update_github_rate_limit: handles API failure"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    local mock_bin="$test_env/mock_bin"
+    mkdir -p "$mock_bin"
+    local old_path="$PATH"
+    export PATH="$mock_bin:$PATH"
+
+    cat > "$mock_bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+echo "API error" >&2
+exit 1
+MOCK_GH
+    chmod +x "$mock_bin/gh"
+
+    update_github_rate_limit
+    local rc=$?
+
+    PATH="$old_path"
+
+    assert_equals "0" "$rc" "returns 0 on API failure"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: check_model_rate_limit (bd-0l0g)
+#==============================================================================
+
+source_ru_function "check_model_rate_limit"
+
+test_check_model_rate_limit_detects_429_in_logs() {
+    local test_name="check_model_rate_limit: detects 429 in recent logs"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_STATE_DIR="$test_env/state/ru"
+    local log_dir
+    log_dir="$RU_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    mkdir -p "$log_dir"
+
+    # Create a log file with 429 pattern
+    echo "Error: 429 Too Many Requests" > "$log_dir/session.log"
+    touch "$log_dir/session.log"  # Ensure recent mtime
+
+    check_model_rate_limit
+
+    assert_equals "true" "${GOVERNOR_STATE[model_in_backoff]}" "backoff enabled"
+    assert_not_equals "0" "${GOVERNOR_STATE[model_backoff_until]}" "backoff_until set"
+
+    log_test_pass "$test_name"
+}
+
+test_check_model_rate_limit_detects_rate_limit_pattern() {
+    local test_name="check_model_rate_limit: detects 'rate limit' pattern"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_STATE_DIR="$test_env/state/ru"
+    local log_dir
+    log_dir="$RU_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    mkdir -p "$log_dir"
+
+    echo "API rate limit exceeded" > "$log_dir/session.log"
+    touch "$log_dir/session.log"
+
+    check_model_rate_limit
+
+    assert_equals "true" "${GOVERNOR_STATE[model_in_backoff]}" "backoff enabled"
+
+    log_test_pass "$test_name"
+}
+
+test_check_model_rate_limit_detects_overloaded() {
+    local test_name="check_model_rate_limit: detects 'overloaded' pattern"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_STATE_DIR="$test_env/state/ru"
+    local log_dir
+    log_dir="$RU_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    mkdir -p "$log_dir"
+
+    echo "Service overloaded, please retry" > "$log_dir/session.log"
+    touch "$log_dir/session.log"
+
+    check_model_rate_limit
+
+    assert_equals "true" "${GOVERNOR_STATE[model_in_backoff]}" "backoff enabled"
+
+    log_test_pass "$test_name"
+}
+
+test_check_model_rate_limit_ignores_old_logs() {
+    local test_name="check_model_rate_limit: ignores logs older than 5 minutes"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_STATE_DIR="$test_env/state/ru"
+    local log_dir
+    log_dir="$RU_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    mkdir -p "$log_dir"
+
+    echo "Error: 429 Too Many Requests" > "$log_dir/old_session.log"
+    # Make it 10 minutes old
+    touch -d "10 minutes ago" "$log_dir/old_session.log" 2>/dev/null || \
+    touch -t "$(date -v-10M +%Y%m%d%H%M 2>/dev/null || date -d '10 minutes ago' +%Y%m%d%H%M)" "$log_dir/old_session.log" 2>/dev/null || true
+
+    check_model_rate_limit
+
+    # Should not trigger backoff from old logs
+    assert_equals "false" "${GOVERNOR_STATE[model_in_backoff]}" "backoff not enabled"
+
+    log_test_pass "$test_name"
+}
+
+test_check_model_rate_limit_clears_expired_backoff() {
+    local test_name="check_model_rate_limit: clears expired backoff"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_STATE_DIR="$test_env/state/ru"
+    local log_dir
+    log_dir="$RU_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    mkdir -p "$log_dir"
+    # Create a benign log file (no 429 errors) so the function has something to scan
+    echo "Normal operation log" > "$log_dir/clean.log"
+
+    # Set backoff that has expired
+    local now
+    now=$(date +%s)
+    GOVERNOR_STATE[model_in_backoff]="true"
+    GOVERNOR_STATE[model_backoff_until]=$((now - 60))  # Expired 60 seconds ago
+
+    # No recent 429s in logs (empty log dir)
+
+    check_model_rate_limit
+
+    assert_equals "false" "${GOVERNOR_STATE[model_in_backoff]}" "backoff cleared"
+
+    log_test_pass "$test_name"
+}
+
+test_check_model_rate_limit_no_log_dir() {
+    local test_name="check_model_rate_limit: handles missing log directory"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_STATE_DIR="$test_env/nonexistent"
+
+    check_model_rate_limit
+    local rc=$?
+
+    assert_equals "0" "$rc" "returns 0 when log dir missing"
+    assert_equals "false" "${GOVERNOR_STATE[model_in_backoff]}" "backoff not enabled"
 
     log_test_pass "$test_name"
 }
@@ -314,5 +638,19 @@ run_test test_circuit_breaker_triggers
 run_test test_get_governor_status_json
 run_test test_governor_update_syncs_state
 
+# update_github_rate_limit tests (bd-0l0g)
+run_test test_update_github_rate_limit_parses_response
+run_test test_update_github_rate_limit_handles_low_remaining
+run_test test_update_github_rate_limit_handles_no_gh
+run_test test_update_github_rate_limit_handles_api_failure
+
+# check_model_rate_limit tests (bd-0l0g)
+run_test test_check_model_rate_limit_detects_429_in_logs
+run_test test_check_model_rate_limit_detects_rate_limit_pattern
+run_test test_check_model_rate_limit_detects_overloaded
+run_test test_check_model_rate_limit_ignores_old_logs
+run_test test_check_model_rate_limit_clears_expired_backoff
+run_test test_check_model_rate_limit_no_log_dir
+
 print_results
-exit $?
+exit "$(get_exit_code)"

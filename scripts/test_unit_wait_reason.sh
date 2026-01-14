@@ -104,7 +104,7 @@ extract_question_from_text() {
 
 extract_inline_options() {
     local output="$1"
-    echo "$output" | grep -E '^\s*[a-z]\)|^\s*[0-9]+\.|^\s*-\s+[A-Z]' | head -5
+    echo "$output" | grep -E '^[[:space:]]*[a-z]\)|^[[:space:]]*[0-9]+\.|^[[:space:]]*-[[:space:]]+[A-Z]' | head -5
 }
 
 detect_text_question() {
@@ -584,7 +584,7 @@ run_all_tests() {
     run_test test_detect_wait_reason_priority
 
     print_results
-    return $TF_TESTS_FAILED
+    return "$(get_exit_code)"
 }
 
 run_all_tests

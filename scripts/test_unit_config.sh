@@ -24,6 +24,9 @@ source_ru_function "get_config_value"
 source_ru_function "set_config_value"
 source_ru_function "ensure_config_exists"
 source_ru_function "log_verbose"
+source_ru_function "is_valid_config_key"
+source_ru_function "expand_tilde"
+source_ru_function "resolve_config"
 
 # Set XDG defaults for sourcing (we override in tests anyway)
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/ru-test-config}"
@@ -40,6 +43,7 @@ RU_LOG_DIR="$RU_STATE_DIR/logs"
 # Initialize other global variables that functions depend on
 VERBOSE="false"
 GUM_AVAILABLE="false"
+LOG_LEVEL=0
 
 #==============================================================================
 # Tests: get_config_value
@@ -453,7 +457,7 @@ test_ensure_config_exists_creates_config_file() {
 }
 
 test_ensure_config_exists_creates_repos_file() {
-    local test_name="ensure_config_exists: Creates repos.txt template"
+    local test_name="ensure_config_exists: Creates public.txt template"
     log_test_start "$test_name"
     local test_env
     test_env=$(create_temp_dir)
@@ -469,9 +473,9 @@ test_ensure_config_exists_creates_repos_file() {
 
     ensure_config_exists >/dev/null 2>&1
 
-    # repos.txt should exist
-    local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
-    assert_file_exists "$repos_file" "repos.txt should be created"
+    # public.txt should exist
+    local repos_file="$RU_CONFIG_DIR/repos.d/public.txt"
+    assert_file_exists "$repos_file" "public.txt should be created"
 
     # Should contain format examples
     assert_file_contains "$repos_file" "owner/repo" "Should have format examples"
@@ -535,6 +539,378 @@ test_ensure_config_exists_creates_state_dirs() {
 }
 
 #==============================================================================
+# Tests: is_valid_config_key
+#==============================================================================
+
+test_is_valid_config_key_valid_simple() {
+    local test_name="is_valid_config_key: Valid simple key"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "PROJECTS_DIR"; then
+        log_test_pass "$test_name"
+    else
+        fail_test "PROJECTS_DIR should be a valid config key"
+    fi
+}
+
+test_is_valid_config_key_valid_with_numbers() {
+    local test_name="is_valid_config_key: Valid key with numbers"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "LOG_LEVEL_2"; then
+        log_test_pass "$test_name"
+    else
+        fail_test "LOG_LEVEL_2 should be a valid config key"
+    fi
+}
+
+test_is_valid_config_key_valid_with_underscores() {
+    local test_name="is_valid_config_key: Valid key with underscores"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "UPDATE_STRATEGY"; then
+        log_test_pass "$test_name"
+    else
+        fail_test "UPDATE_STRATEGY should be a valid config key"
+    fi
+}
+
+test_is_valid_config_key_single_letter() {
+    local test_name="is_valid_config_key: Valid single letter key"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "X"; then
+        log_test_pass "$test_name"
+    else
+        fail_test "X should be a valid config key"
+    fi
+}
+
+test_is_valid_config_key_invalid_lowercase() {
+    local test_name="is_valid_config_key: Invalid lowercase key"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "projects_dir"; then
+        fail_test "Lowercase projects_dir should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+test_is_valid_config_key_invalid_mixed_case() {
+    local test_name="is_valid_config_key: Invalid mixed case key"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "ProjectsDir"; then
+        fail_test "Mixed case ProjectsDir should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+test_is_valid_config_key_invalid_starts_with_number() {
+    local test_name="is_valid_config_key: Invalid key starting with number"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "2PROJECTS"; then
+        fail_test "Key starting with number should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+test_is_valid_config_key_invalid_starts_with_underscore() {
+    local test_name="is_valid_config_key: Invalid key starting with underscore"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "_PRIVATE"; then
+        fail_test "Key starting with underscore should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+test_is_valid_config_key_invalid_with_hyphen() {
+    local test_name="is_valid_config_key: Invalid key with hyphen"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "PROJECTS-DIR"; then
+        fail_test "Key with hyphen should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+test_is_valid_config_key_invalid_empty() {
+    local test_name="is_valid_config_key: Invalid empty key"
+    log_test_start "$test_name"
+
+    if is_valid_config_key ""; then
+        fail_test "Empty string should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+test_is_valid_config_key_invalid_with_space() {
+    local test_name="is_valid_config_key: Invalid key with space"
+    log_test_start "$test_name"
+
+    if is_valid_config_key "PROJECTS DIR"; then
+        fail_test "Key with space should be invalid"
+    else
+        log_test_pass "$test_name"
+    fi
+}
+
+#==============================================================================
+# Tests: resolve_config
+#==============================================================================
+
+test_resolve_config_uses_defaults() {
+    local test_name="resolve_config: Uses defaults when nothing set"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create empty config (no settings)
+    echo "# empty config" > "$RU_CONFIG_DIR/config"
+
+    # Set defaults
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # Clear any existing values
+    unset RU_PROJECTS_DIR RU_LAYOUT RU_UPDATE_STRATEGY RU_AUTOSTASH RU_PARALLEL 2>/dev/null || true
+    PROJECTS_DIR=""
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    # Run resolve_config
+    resolve_config
+
+    assert_equals "/default/projects" "$PROJECTS_DIR" "PROJECTS_DIR should use default"
+    assert_equals "flat" "$LAYOUT" "LAYOUT should use default"
+    assert_equals "ff-only" "$UPDATE_STRATEGY" "UPDATE_STRATEGY should use default"
+    assert_equals "true" "$AUTOSTASH" "AUTOSTASH should use default"
+    assert_equals "4" "$PARALLEL" "PARALLEL should use default"
+
+    log_test_pass "$test_name"
+}
+
+test_resolve_config_uses_config_file() {
+    local test_name="resolve_config: Uses config file values"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config with custom values
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+PROJECTS_DIR=/custom/projects
+LAYOUT=owner-repo
+UPDATE_STRATEGY=rebase
+AUTOSTASH=false
+PARALLEL=8
+EOF
+
+    # Set defaults (should be overridden)
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # Clear env vars and current values
+    unset RU_PROJECTS_DIR RU_LAYOUT RU_UPDATE_STRATEGY RU_AUTOSTASH RU_PARALLEL 2>/dev/null || true
+    PROJECTS_DIR=""
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    resolve_config
+
+    assert_equals "/custom/projects" "$PROJECTS_DIR" "PROJECTS_DIR should use config file"
+    assert_equals "owner-repo" "$LAYOUT" "LAYOUT should use config file"
+    assert_equals "rebase" "$UPDATE_STRATEGY" "UPDATE_STRATEGY should use config file"
+    assert_equals "false" "$AUTOSTASH" "AUTOSTASH should use config file"
+    assert_equals "8" "$PARALLEL" "PARALLEL should use config file"
+
+    log_test_pass "$test_name"
+}
+
+test_resolve_config_expands_tilde() {
+    local test_name="resolve_config: Expands tilde in PROJECTS_DIR"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    local old_home="$HOME"
+    HOME="$test_env/home"
+    mkdir -p "$HOME"
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+PROJECTS_DIR=~/repos
+EOF
+
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    unset RU_PROJECTS_DIR RU_LAYOUT RU_UPDATE_STRATEGY RU_AUTOSTASH RU_PARALLEL 2>/dev/null || true
+    PROJECTS_DIR=""
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    resolve_config
+
+    assert_equals "$HOME/repos" "$PROJECTS_DIR" "PROJECTS_DIR should expand tilde"
+
+    HOME="$old_home"
+    log_test_pass "$test_name"
+}
+
+test_resolve_config_uses_env_vars() {
+    local test_name="resolve_config: Environment variables override config file"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config with values
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+PROJECTS_DIR=/file/projects
+LAYOUT=flat
+EOF
+
+    # Set defaults
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # Set env vars (should override file)
+    export RU_PROJECTS_DIR="/env/projects"
+    export RU_LAYOUT="full"
+
+    # Clear current values
+    PROJECTS_DIR=""
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    resolve_config
+
+    assert_equals "/env/projects" "$PROJECTS_DIR" "PROJECTS_DIR should use env var"
+    assert_equals "full" "$LAYOUT" "LAYOUT should use env var"
+
+    unset RU_PROJECTS_DIR RU_LAYOUT
+    log_test_pass "$test_name"
+}
+
+test_resolve_config_uses_cli_args() {
+    local test_name="resolve_config: CLI args take highest priority"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config with values
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+PROJECTS_DIR=/file/projects
+LAYOUT=flat
+EOF
+
+    # Set defaults
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # Set env vars
+    export RU_PROJECTS_DIR="/env/projects"
+
+    # Set CLI args (these are passed as current values before resolve_config)
+    PROJECTS_DIR="/cli/projects"
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    resolve_config
+
+    assert_equals "/cli/projects" "$PROJECTS_DIR" "PROJECTS_DIR should use CLI arg"
+
+    unset RU_PROJECTS_DIR
+    log_test_pass "$test_name"
+}
+
+test_resolve_config_partial_config() {
+    local test_name="resolve_config: Handles partial config gracefully"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    export RU_CONFIG_DIR="$test_env/config/ru"
+    mkdir -p "$RU_CONFIG_DIR"
+
+    # Create config with only some values
+    cat > "$RU_CONFIG_DIR/config" << 'EOF'
+PROJECTS_DIR=/partial/projects
+EOF
+
+    # Set defaults
+    export DEFAULT_PROJECTS_DIR="/default/projects"
+    export DEFAULT_LAYOUT="flat"
+    export DEFAULT_UPDATE_STRATEGY="ff-only"
+    export DEFAULT_AUTOSTASH="true"
+    export DEFAULT_PARALLEL="4"
+
+    # Clear everything
+    unset RU_PROJECTS_DIR RU_LAYOUT RU_UPDATE_STRATEGY RU_AUTOSTASH RU_PARALLEL 2>/dev/null || true
+    PROJECTS_DIR=""
+    LAYOUT=""
+    UPDATE_STRATEGY=""
+    AUTOSTASH=""
+    PARALLEL=""
+
+    resolve_config
+
+    assert_equals "/partial/projects" "$PROJECTS_DIR" "PROJECTS_DIR should use config file"
+    assert_equals "flat" "$LAYOUT" "LAYOUT should use default"
+    assert_equals "ff-only" "$UPDATE_STRATEGY" "UPDATE_STRATEGY should use default"
+    assert_equals "true" "$AUTOSTASH" "AUTOSTASH should use default"
+    assert_equals "4" "$PARALLEL" "PARALLEL should use default"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
 # Run All Tests
 #==============================================================================
 
@@ -563,5 +939,26 @@ run_test test_ensure_config_exists_creates_repos_file
 run_test test_ensure_config_exists_idempotent
 run_test test_ensure_config_exists_creates_state_dirs
 
+# is_valid_config_key tests
+run_test test_is_valid_config_key_valid_simple
+run_test test_is_valid_config_key_valid_with_numbers
+run_test test_is_valid_config_key_valid_with_underscores
+run_test test_is_valid_config_key_single_letter
+run_test test_is_valid_config_key_invalid_lowercase
+run_test test_is_valid_config_key_invalid_mixed_case
+run_test test_is_valid_config_key_invalid_starts_with_number
+run_test test_is_valid_config_key_invalid_starts_with_underscore
+run_test test_is_valid_config_key_invalid_with_hyphen
+run_test test_is_valid_config_key_invalid_empty
+run_test test_is_valid_config_key_invalid_with_space
+
+# resolve_config tests
+run_test test_resolve_config_uses_defaults
+run_test test_resolve_config_uses_config_file
+run_test test_resolve_config_expands_tilde
+run_test test_resolve_config_uses_env_vars
+run_test test_resolve_config_uses_cli_args
+run_test test_resolve_config_partial_config
+
 print_results
-exit $?
+exit "$(get_exit_code)"
