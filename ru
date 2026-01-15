@@ -12342,10 +12342,13 @@ ntm_wait_completion() {
 
     [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
 
+    # Use --transition to ensure we wait for a full processing cycle:
+    # agent must leave WAITING (start processing) and return to WAITING (finish)
     output=$(ntm --robot-wait="$session" \
         --condition=idle \
         --wait-timeout="${timeout}s" \
-        --exit-on-error 2>&1)
+        --exit-on-error \
+        --transition 2>&1)
     exit_code=$?
 
     if [[ -n "$output" ]]; then
