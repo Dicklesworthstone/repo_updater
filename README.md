@@ -320,7 +320,26 @@ Keep your projects directory clean:
 
 ### Installation
 
-**One-liner (recommended):**
+#### Recommended: Homebrew (macOS/Linux)
+
+```bash
+brew install dicklesworthstone/tap/ru
+```
+
+This method provides:
+- Automatic updates via `brew upgrade`
+- Dependency management
+- Easy uninstall via `brew uninstall`
+
+#### Windows: Scoop
+
+```powershell
+scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
+scoop install dicklesworthstone/ru
+```
+
+#### Alternative: Install Script
+
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 ```

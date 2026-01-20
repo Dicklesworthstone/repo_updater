@@ -837,9 +837,15 @@ main() {
             log_info "  ru init          Initialize configuration"
             log_info "  ru add owner/repo  Add a repository"
             log_info "  ru sync          Sync all repositories"
+            printf '\n' >&2
+            log_info "Tip: You can also install via Homebrew:"
+            log_info "  brew install dicklesworthstone/tap/ru"
         else
             log_info "Get started with:"
             log_info "  $installed_path --help"
+            printf '\n' >&2
+            log_info "Tip: You can also install via Homebrew:"
+            log_info "  brew install dicklesworthstone/tap/ru"
         fi
 
         printf '\n' >&2
