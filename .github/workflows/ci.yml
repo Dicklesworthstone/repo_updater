@@ -85,7 +85,24 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install bash
-          echo "$(brew --prefix bash)/bin" >> $GITHUB_PATH
+          BASH_5="$(brew --prefix bash 2>/dev/null)/bin/bash"
+          if [[ ! -x "$BASH_5" ]]; then
+            BREW_PREFIX="$(brew --prefix)"
+            if [[ -x "$BREW_PREFIX/opt/bash/bin/bash" ]]; then
+              BASH_5="$BREW_PREFIX/opt/bash/bin/bash"
+            else
+              CELLAR="$(brew --cellar bash)"
+              BASH_5="$(ls -1 "$CELLAR"/*/bin/bash 2>/dev/null | tail -1)"
+            fi
+          fi
+
+          if [[ -x "$BASH_5" ]]; then
+            echo "BASH_5=$BASH_5" >> $GITHUB_ENV
+            echo "$(dirname "$BASH_5")" >> $GITHUB_PATH
+          else
+            echo "::error::Unable to locate Homebrew bash"
+            exit 1
+          fi
 
       - name: Show bash version
         run: bash --version | head -1
@@ -138,7 +155,24 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install bash
-          echo "$(brew --prefix bash)/bin" >> $GITHUB_PATH
+          BASH_5="$(brew --prefix bash 2>/dev/null)/bin/bash"
+          if [[ ! -x "$BASH_5" ]]; then
+            BREW_PREFIX="$(brew --prefix)"
+            if [[ -x "$BREW_PREFIX/opt/bash/bin/bash" ]]; then
+              BASH_5="$BREW_PREFIX/opt/bash/bin/bash"
+            else
+              CELLAR="$(brew --cellar bash)"
+              BASH_5="$(ls -1 "$CELLAR"/*/bin/bash 2>/dev/null | tail -1)"
+            fi
+          fi
+
+          if [[ -x "$BASH_5" ]]; then
+            echo "BASH_5=$BASH_5" >> $GITHUB_ENV
+            echo "$(dirname "$BASH_5")" >> $GITHUB_PATH
+          else
+            echo "::error::Unable to locate Homebrew bash"
+            exit 1
+          fi
 
       - name: Run installer
         run: |
@@ -156,7 +190,7 @@ jobs:
         run: |
           # Use brew bash on macOS since ru requires bash >= 4.3
           if [[ "$(uname)" == "Darwin" ]]; then
-            "$(brew --prefix bash)/bin/bash" /tmp/ru-test/ru --version
+            "$BASH_5" /tmp/ru-test/ru --version
           else
             /tmp/ru-test/ru --version
           fi
@@ -164,7 +198,7 @@ jobs:
       - name: Check help output
         run: |
           if [[ "$(uname)" == "Darwin" ]]; then
-            "$(brew --prefix bash)/bin/bash" /tmp/ru-test/ru --help | head -20
+            "$BASH_5" /tmp/ru-test/ru --help | head -20
           else
             /tmp/ru-test/ru --help | head -20
           fi
