@@ -88,11 +88,11 @@ jobs:
           # Link bash to ensure it's available in PATH (may already be linked)
           brew link --overwrite bash 2>/dev/null || true
 
-          # Find the bash 5 binary
-          BASH_5="$(brew --prefix)/bin/bash"
+          # Find the bash 5 binary - use formula prefix which is architecture-aware
+          BASH_5="$(brew --prefix bash)/bin/bash"
           if [[ ! -x "$BASH_5" ]]; then
-            # Fallback to formula-specific prefix
-            BASH_5="$(brew --prefix bash)/bin/bash"
+            # Fallback to Homebrew prefix
+            BASH_5="$(brew --prefix)/bin/bash"
           fi
           if [[ ! -x "$BASH_5" ]]; then
             # Last resort: search in Cellar
@@ -104,6 +104,7 @@ jobs:
             echo "Found bash at: $BASH_5"
             "$BASH_5" --version | head -1
             echo "BASH_5=$BASH_5" >> $GITHUB_ENV
+            # Prepend to PATH so it takes precedence
             echo "$(dirname "$BASH_5")" >> $GITHUB_PATH
           else
             echo "::error::Unable to locate Homebrew bash"
@@ -111,21 +112,32 @@ jobs:
           fi
 
       - name: Show bash version
+        if: runner.os == 'macOS'
         run: |
           echo "PATH: $PATH"
-          which bash
-          bash --version | head -1
+          echo "BASH_5: $BASH_5"
+          "$BASH_5" --version | head -1
 
       - name: Create test output directory
         run: mkdir -p test-results
 
       - name: Run all tests (TAP format)
         id: tap_tests
-        run: ./scripts/run_all_tests.sh --tap 2>&1 | tee test-results/tests.tap
+        run: |
+          if [[ "$(uname)" == "Darwin" ]]; then
+            "$BASH_5" ./scripts/run_all_tests.sh --tap 2>&1 | tee test-results/tests.tap
+          else
+            ./scripts/run_all_tests.sh --tap 2>&1 | tee test-results/tests.tap
+          fi
 
       - name: Run all tests (human-readable)
         if: failure() || success()
-        run: ./scripts/run_all_tests.sh 2>&1 | tee test-results/tests.log
+        run: |
+          if [[ "$(uname)" == "Darwin" ]]; then
+            "$BASH_5" ./scripts/run_all_tests.sh 2>&1 | tee test-results/tests.log
+          else
+            ./scripts/run_all_tests.sh 2>&1 | tee test-results/tests.log
+          fi
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -167,11 +179,11 @@ jobs:
           # Link bash to ensure it's available in PATH (may already be linked)
           brew link --overwrite bash 2>/dev/null || true
 
-          # Find the bash 5 binary
-          BASH_5="$(brew --prefix)/bin/bash"
+          # Find the bash 5 binary - use formula prefix which is architecture-aware
+          BASH_5="$(brew --prefix bash)/bin/bash"
           if [[ ! -x "$BASH_5" ]]; then
-            # Fallback to formula-specific prefix
-            BASH_5="$(brew --prefix bash)/bin/bash"
+            # Fallback to Homebrew prefix
+            BASH_5="$(brew --prefix)/bin/bash"
           fi
           if [[ ! -x "$BASH_5" ]]; then
             # Last resort: search in Cellar
@@ -183,6 +195,7 @@ jobs:
             echo "Found bash at: $BASH_5"
             "$BASH_5" --version | head -1
             echo "BASH_5=$BASH_5" >> $GITHUB_ENV
+            # Prepend to PATH so it takes precedence
             echo "$(dirname "$BASH_5")" >> $GITHUB_PATH
           else
             echo "::error::Unable to locate Homebrew bash"
