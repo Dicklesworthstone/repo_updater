@@ -45,6 +45,21 @@ brew install dicklesworthstone/tap/ru
 
 ---
 
+## 🤖 Agent Quickstart (JSON/TOON)
+
+**Use structured output in agent contexts.** stdout = data, stderr = diagnostics, exit 0 = success.
+
+```bash
+# Sync all repos (machine-readable)
+ru sync --format json
+
+# Preview without changes
+ru sync --dry-run --format json
+
+# Status only (no fetch)
+ru status --no-fetch --format json
+```
+
 ## 🤖 Ready-made Blurb for AI Agents
 
 > [!IMPORTANT]
