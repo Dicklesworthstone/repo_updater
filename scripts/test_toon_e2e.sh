@@ -44,10 +44,12 @@ done
 log ""
 
 # Phase 2: Format Flag Tests
+# NOTE: Using 'list' instead of 'status' because status scans all repos (~100+)
+# and takes too long. 'list' is fast and demonstrates TOON format correctly.
 log "--- Phase 2: Format Flag Tests ---"
 
-log_info "Test 2.1: ru --format json status"
-if json_output=$(ru --format json status 2>/dev/null); then
+log_info "Test 2.1: ru --format json list"
+if json_output=$(ru --format json list 2>/dev/null); then
     if echo "$json_output" | jq . >/dev/null 2>&1; then
         record_pass "--format json produces valid JSON"
         json_bytes=$(echo -n "$json_output" | wc -c)
@@ -56,13 +58,13 @@ if json_output=$(ru --format json status 2>/dev/null); then
         record_fail "--format json invalid"
     fi
 else
-    record_skip "ru --format json status error"
+    record_skip "ru --format json list error"
 fi
 
-log_info "Test 2.2: ru --format toon status"
-if toon_output=$(ru --format toon status 2>/dev/null); then
+log_info "Test 2.2: ru --format toon list"
+if toon_output=$(ru --format toon list 2>/dev/null); then
     # TOON tabular format for arrays starts with [N]{header}:
-    # e.g., [112]{repo,path,status,...}:
+    # e.g., [112]{repo,path,url}:
     if [[ -n "$toon_output" && "$toon_output" =~ ^\[([0-9]+)\]\{ ]]; then
         record_pass "--format toon produces TOON tabular format"
         toon_bytes=$(echo -n "$toon_output" | wc -c)
@@ -81,7 +83,7 @@ if toon_output=$(ru --format toon status 2>/dev/null); then
         fi
     fi
 else
-    record_skip "ru --format toon status error"
+    record_skip "ru --format toon list error"
 fi
 log ""
 
@@ -116,7 +118,7 @@ log "--- Phase 4: Environment Variables ---"
 unset RU_OUTPUT_FORMAT TOON_DEFAULT_FORMAT
 
 export RU_OUTPUT_FORMAT=toon
-if env_out=$(ru status 2>/dev/null); then
+if env_out=$(ru list 2>/dev/null); then
     if [[ -n "$env_out" ]]; then
         record_pass "RU_OUTPUT_FORMAT=toon accepted"
     else
@@ -128,7 +130,7 @@ fi
 unset RU_OUTPUT_FORMAT
 
 export TOON_DEFAULT_FORMAT=toon
-if env_out=$(ru status 2>/dev/null); then
+if env_out=$(ru list 2>/dev/null); then
     if [[ -n "$env_out" ]]; then
         record_pass "TOON_DEFAULT_FORMAT=toon accepted"
     else
@@ -139,7 +141,7 @@ else
 fi
 
 # Test CLI override
-if override=$(ru --format json status 2>/dev/null) && echo "$override" | jq . >/dev/null 2>&1; then
+if override=$(ru --format json list 2>/dev/null) && echo "$override" | jq . >/dev/null 2>&1; then
     record_pass "CLI --format json overrides env"
 else
     record_skip "CLI override test"
@@ -170,8 +172,8 @@ log ""
 # Phase 6: Multiple Commands
 log "--- Phase 6: Multiple Commands ---"
 
+# Note: 'status' omitted because it scans all repos and is too slow for CI
 COMMANDS=(
-    "status"
     "list"
 )
 
