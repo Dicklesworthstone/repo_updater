@@ -16878,7 +16878,7 @@ show_discovery_summary_gum() {
             [[ ${#title} -gt 45 ]] && short_title="${short_title}..."
 
             printf '  %d. ' "$i" >&2
-            gum style --foreground "$badge_color" --inline "[$level]" >&2
+            printf '%s' "$(gum style --foreground "$badge_color" "[$level]")" >&2
             printf ' %s#%s: %s\n' "$repo_id" "$number" "$short_title" >&2
         done
         printf '\n' >&2
