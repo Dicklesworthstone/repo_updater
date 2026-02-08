@@ -15347,8 +15347,8 @@ checkpoint_review_state() {
     # Convert space-separated to JSON arrays
     local completed_json pending_json
     if command -v jq &>/dev/null; then
-        completed_json=$(echo "$completed_repos" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s . 2>/dev/null || echo '[]')
-        pending_json=$(echo "$pending_repos" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s . 2>/dev/null || echo '[]')
+        completed_json=$(echo "$completed_repos" | tr ' ' '\n' | { grep -v '^$' || true; } | jq -R . | jq -s . 2>/dev/null || echo '[]')
+        pending_json=$(echo "$pending_repos" | tr ' ' '\n' | { grep -v '^$' || true; } | jq -R . | jq -s . 2>/dev/null || echo '[]')
     else
         # Simple fallback without jq
         completed_json="[]"
@@ -16773,8 +16773,8 @@ show_discovery_summary_ansi() {
     local items_name="$9"
 
     _is_valid_var_name "$items_name" || return 1
-    local -a items=()
-    eval "items=(\"\${${items_name}[@]-}\")"
+    local -a _ds_items=()
+    eval "_ds_items=(\"\${${items_name}[@]-}\")"
 
     local BOLD="\033[1m"
     local RED="\033[31m"
@@ -16797,13 +16797,13 @@ show_discovery_summary_ansi() {
     [[ $low -gt 0 ]] && printf '%b\n' "  ${GRAY}LOW: $low${RESET}" >&2
     printf '\n' >&2
 
-    if [[ ${#items[@]} -gt 0 ]]; then
+    if [[ ${#_ds_items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
+        [[ $display_count -gt ${#_ds_items[@]} ]] && display_count=${#_ds_items[@]}
 
         printf '%b\n' "${BOLD}Top $display_count items to review:${RESET}" >&2
         local i=0
-        for item in "${items[@]:0:$display_count}"; do
+        for item in "${_ds_items[@]:0:$display_count}"; do
             ((i++))
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
@@ -16833,8 +16833,8 @@ show_discovery_summary_gum() {
     local items_name="$9"
 
     _is_valid_var_name "$items_name" || return 1
-    local -a items=()
-    eval "items=(\"\${${items_name}[@]-}\")"
+    local -a _ds_items=()
+    eval "_ds_items=(\"\${${items_name}[@]-}\")"
 
     # Header
     gum style --border rounded --padding "0 2" --border-foreground "#fab387" \
@@ -16853,13 +16853,13 @@ show_discovery_summary_gum() {
     [[ $low -gt 0 ]] && gum style --foreground "#6c7086" "  LOW: $low" >&2
     printf '\n' >&2
 
-    if [[ ${#items[@]} -gt 0 ]]; then
+    if [[ ${#_ds_items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
+        [[ $display_count -gt ${#_ds_items[@]} ]] && display_count=${#_ds_items[@]}
 
         gum style --bold "Top $display_count items to review:" >&2
         local i=0
-        for item in "${items[@]:0:$display_count}"; do
+        for item in "${_ds_items[@]:0:$display_count}"; do
             ((i++))
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
@@ -16878,7 +16878,7 @@ show_discovery_summary_gum() {
             [[ ${#title} -gt 45 ]] && short_title="${short_title}..."
 
             printf '  %d. ' "$i" >&2
-            gum style --foreground "$badge_color" --inline "[$level]" >&2
+            printf '%s' "$(gum style --foreground "$badge_color" "[$level]")" >&2
             printf ' %s#%s: %s\n' "$repo_id" "$number" "$short_title" >&2
         done
         printf '\n' >&2
@@ -16894,17 +16894,17 @@ show_discovery_summary_json() {
     local items_name="$9"
 
     _is_valid_var_name "$items_name" || return 1
-    local -a items=()
-    eval "items=(\"\${${items_name}[@]-}\")"
+    local -a _ds_items=()
+    eval "_ds_items=(\"\${${items_name}[@]-}\")"
 
     local items_json="[]"
 
-    if [[ ${#items[@]} -gt 0 ]]; then
+    if [[ ${#_ds_items[@]} -gt 0 ]]; then
         local display_count=$max_display
-        [[ $display_count -gt ${#items[@]} ]] && display_count=${#items[@]}
+        [[ $display_count -gt ${#_ds_items[@]} ]] && display_count=${#_ds_items[@]}
 
         local item_list=""
-        for item in "${items[@]:0:$display_count}"; do
+        for item in "${_ds_items[@]:0:$display_count}"; do
             IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
 
             local score level
