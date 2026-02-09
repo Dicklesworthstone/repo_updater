@@ -193,6 +193,7 @@ ru sync
   - [Per-Repository Configuration](#per-repository-configuration)
   - [State Management](#state-management)
   - [Troubleshooting Agent Sweep](#troubleshooting-agent-sweep)
+- [AI Sync](#-ai-sync)
 - [Dependency Updates](#-dependency-updates)
   - [Supported Package Managers](#supported-package-managers)
   - [Update Workflow](#update-workflow)
@@ -487,6 +488,7 @@ ru [command] [options]
 | `prune` | Find and manage orphan repositories |
 | `review` | AI-assisted code review orchestration |
 | `agent-sweep` | Orchestrate AI agents across dirty repos |
+| `ai-sync` | Auto-commit dirty repos using AI agents (via ntm) |
 | `dep-update` | AI-powered dependency updates across repos |
 | `import` | Import repos from GitHub stars or org |
 
@@ -2328,6 +2330,39 @@ git rebase origin/main  # Or merge
 | `3` | System error (ntm, tmux missing) |
 | `4` | Invalid arguments |
 | `5` | Interrupted (use `--resume`) |
+
+---
+
+## 🤖 AI Sync
+
+The `ai-sync` subcommand automatically commits uncommitted changes across repositories using AI agents. It scans for dirty repos, launches an AI agent per repo (via ntm), and the agent reads project context, reviews changes, creates logical commits, and pushes.
+
+### Prerequisites
+
+- **ntm** (Named Tmux Manager) - for session orchestration
+- **claude-code**, **codex**, or **gemini** CLI - for AI agent execution
+
+### Usage
+
+```bash
+ru ai-sync                        # Process all dirty repos
+ru ai-sync --dry-run              # Show what would be processed
+ru ai-sync --include=my-project   # Only process matching repos
+ru ai-sync --exclude=test-*       # Skip matching repos
+ru ai-sync --timeout=1200         # Allow 20 minutes per repo
+ru ai-sync --no-push              # Commit but don't push
+ru ai-sync --agent=codex          # Use a different AI agent
+ru ai-sync --no-untracked         # Ignore untracked files
+```
+
+### How It Works
+
+1. Scans all configured repos for uncommitted changes
+2. For each dirty repo, launches an AI agent session via ntm
+3. The agent reads `AGENTS.md` and `README.md` to understand the project
+4. Reviews all changes and groups them into logical commits
+5. Creates detailed commit messages explaining the changes
+6. Pushes to the remote (unless `--no-push` is specified)
 
 ---
 
