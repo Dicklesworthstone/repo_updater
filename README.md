@@ -58,6 +58,14 @@ ru sync --dry-run --format json
 
 # Status only (no fetch)
 ru status --no-fetch --format json
+
+# Machine-readable CLI documentation
+ru robot-docs                   # All topics as JSON
+ru robot-docs commands          # Command/flag reference
+ru robot-docs quickstart        # Getting started guide
+ru robot-docs examples          # Usage examples
+ru robot-docs exit-codes        # Exit code reference
+ru robot-docs formats           # Output format details
 ```
 
 ## 🤖 Ready-made Blurb for AI Agents
@@ -491,6 +499,7 @@ ru [command] [options]
 | `ai-sync` | Auto-commit dirty repos using AI agents (via ntm) |
 | `dep-update` | AI-powered dependency updates across repos |
 | `import` | Import repos from GitHub stars or org |
+| `robot-docs` | Machine-readable CLI documentation (JSON) |
 
 ### Global Options
 

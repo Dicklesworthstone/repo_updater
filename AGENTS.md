@@ -106,6 +106,7 @@ rm -rf "$TEMP_DIR"  # cleanup
 | `doctor` | System diagnostics | (none) |
 | `self-update` | Update ru | `--check` (check only, don't update) |
 | `config` | Show/set configuration | `--print`, `--set KEY=VALUE` |
+| `robot-docs` | Machine-readable CLI docs (JSON) | `<topic>`: quickstart, commands, examples, exit-codes, formats, all |
 
 ---
 
