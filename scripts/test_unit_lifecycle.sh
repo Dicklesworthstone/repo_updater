@@ -813,6 +813,10 @@ test_release_strategy_default_no_workflow() {
     log_test_start "get_release_strategy: defaults to never without workflow"
     setup_lifecycle_test
 
+    # Re-source to get clean copy (guards against prior test overrides)
+    source_ru_function "get_release_strategy"
+    source_ru_function "has_release_workflow"
+
     local repo_dir
     repo_dir=$(create_real_git_repo "strategy-default" 1)
 
@@ -826,6 +830,9 @@ test_release_strategy_default_no_workflow() {
 test_release_strategy_per_repo_config() {
     log_test_start "get_release_strategy: reads per-repo config"
     setup_lifecycle_test
+
+    source_ru_function "get_release_strategy"
+    source_ru_function "has_release_workflow"
 
     local repo_dir
     repo_dir=$(create_real_git_repo "strategy-repo" 1)
@@ -845,6 +852,9 @@ test_release_strategy_with_workflow() {
     log_test_start "get_release_strategy: auto when workflow exists"
     setup_lifecycle_test
 
+    source_ru_function "get_release_strategy"
+    source_ru_function "has_release_workflow"
+
     local repo_dir
     repo_dir=$(create_real_git_repo "strategy-workflow" 1)
 
@@ -862,6 +872,9 @@ test_release_strategy_with_workflow() {
 test_release_strategy_invalid_repo() {
     log_test_start "get_release_strategy: returns never for invalid repo"
     setup_lifecycle_test
+
+    source_ru_function "get_release_strategy"
+    source_ru_function "has_release_workflow"
 
     local strategy
     strategy=$(get_release_strategy "")
