@@ -881,6 +881,8 @@ test_quality_gates_all_pass() {
     log_test_start "run_quality_gates: all gates pass"
     setup_lifecycle_test
 
+    # Re-source to get a clean copy (guards against prior test side effects)
+    source_ru_function "run_quality_gates"
     get_review_state_dir() { echo "$RU_STATE_DIR/review"; }
     get_review_policy_dir() { echo "$RU_CONFIG_DIR/review-policies"; }
 
@@ -904,19 +906,16 @@ test_quality_gates_all_pass() {
     local plan_file="$TEST_DIR/plan.json"
     create_test_plan_file "$plan_file" '{"repo":"owner/repo"}'
 
-    local result stderr_file="$TEST_DIR/qg_stderr.log"
-    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>"$stderr_file")
+    local result
+    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>/dev/null)
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "All gates pass should return 0"
+    assert_not_empty "$result" "run_quality_gates should produce output"
 
-    if [[ -n "$result" ]]; then
-        local overall_ok
-        overall_ok=$(echo "$result" | jq -r '.overall_ok' 2>/dev/null)
-        assert_equals "true" "$overall_ok" "overall_ok should be true"
-    else
-        fail "run_quality_gates should produce JSON output"
-    fi
+    local overall_ok
+    overall_ok=$(echo "$result" | jq -r '.overall_ok' 2>/dev/null)
+    assert_equals "true" "$overall_ok" "overall_ok should be true"
 
     log_test_pass "run_quality_gates: all gates pass"
 }
@@ -925,6 +924,7 @@ test_quality_gates_lint_failure() {
     log_test_start "run_quality_gates: lint failure"
     setup_lifecycle_test
 
+    source_ru_function "run_quality_gates"
     get_review_state_dir() { echo "$RU_STATE_DIR/review"; }
     get_review_policy_dir() { echo "$RU_CONFIG_DIR/review-policies"; }
 
@@ -947,19 +947,16 @@ test_quality_gates_lint_failure() {
     local plan_file="$TEST_DIR/plan.json"
     create_test_plan_file "$plan_file" '{"repo":"owner/repo"}'
 
-    local result stderr_file="$TEST_DIR/qg_stderr.log"
-    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>"$stderr_file")
+    local result
+    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>/dev/null)
     local exit_code=$?
 
     assert_equals "1" "$exit_code" "Lint failure should return 1"
+    assert_not_empty "$result" "run_quality_gates should produce output"
 
-    if [[ -n "$result" ]]; then
-        local overall_ok
-        overall_ok=$(echo "$result" | jq -r '.overall_ok' 2>/dev/null)
-        assert_equals "false" "$overall_ok" "overall_ok should be false on lint failure"
-    else
-        fail "run_quality_gates should produce JSON output"
-    fi
+    local overall_ok
+    overall_ok=$(echo "$result" | jq -r '.overall_ok' 2>/dev/null)
+    assert_equals "false" "$overall_ok" "overall_ok should be false on lint failure"
 
     log_test_pass "run_quality_gates: lint failure"
 }
@@ -968,6 +965,7 @@ test_quality_gates_secret_warning() {
     log_test_start "run_quality_gates: secret warning"
     setup_lifecycle_test
 
+    source_ru_function "run_quality_gates"
     get_review_state_dir() { echo "$RU_STATE_DIR/review"; }
     get_review_policy_dir() { echo "$RU_CONFIG_DIR/review-policies"; }
 
@@ -990,19 +988,16 @@ test_quality_gates_secret_warning() {
     local plan_file="$TEST_DIR/plan.json"
     create_test_plan_file "$plan_file" '{"repo":"owner/repo"}'
 
-    local result stderr_file="$TEST_DIR/qg_stderr.log"
-    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>"$stderr_file")
+    local result
+    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>/dev/null)
     local exit_code=$?
 
     assert_equals "2" "$exit_code" "Secret warning should return 2"
+    assert_not_empty "$result" "run_quality_gates should produce output"
 
-    if [[ -n "$result" ]]; then
-        local has_warning
-        has_warning=$(echo "$result" | jq -r '.has_warning' 2>/dev/null)
-        assert_equals "true" "$has_warning" "has_warning should be true"
-    else
-        fail "run_quality_gates should produce JSON output"
-    fi
+    local has_warning
+    has_warning=$(echo "$result" | jq -r '.has_warning' 2>/dev/null)
+    assert_equals "true" "$has_warning" "has_warning should be true"
 
     log_test_pass "run_quality_gates: secret warning"
 }
