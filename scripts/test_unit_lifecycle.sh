@@ -404,7 +404,7 @@ test_release_plan_tag_only_strategy() {
         fi
 
         # Verify no gh calls were made (no GitHub release)
-        if [[ ${#MOCK_GH_CALLS[@]} -eq 0 ]]; then
+        if [[ "$(gh_mock_call_count)" -eq 0 ]]; then
             pass "No gh commands executed (tag-only)"
         else
             fail "Should not call gh in tag-only mode"
@@ -556,15 +556,7 @@ test_gh_actions_merge_blocked() {
     fi
 
     # Verify no gh merge call was made
-    local found_merge=false
-    for call in "${MOCK_GH_CALLS[@]}"; do
-        if [[ "$call" == *"merge"* ]]; then
-            found_merge=true
-            break
-        fi
-    done
-
-    if [[ "$found_merge" == "false" ]]; then
+    if ! gh_mock_called_with "merge"; then
         pass "No gh merge command was executed"
     else
         fail "Should not execute gh merge"
@@ -890,6 +882,7 @@ test_quality_gates_all_pass() {
     setup_lifecycle_test
 
     get_review_state_dir() { echo "$RU_STATE_DIR/review"; }
+    get_review_policy_dir() { echo "$RU_CONFIG_DIR/review-policies"; }
 
     # Mock the gate functions
     load_policy_for_repo() {
@@ -911,15 +904,19 @@ test_quality_gates_all_pass() {
     local plan_file="$TEST_DIR/plan.json"
     create_test_plan_file "$plan_file" '{"repo":"owner/repo"}'
 
-    local result
-    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>/dev/null)
+    local result stderr_file="$TEST_DIR/qg_stderr.log"
+    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>"$stderr_file")
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "All gates pass should return 0"
 
-    local overall_ok
-    overall_ok=$(echo "$result" | jq -r '.overall_ok')
-    assert_equals "true" "$overall_ok" "overall_ok should be true"
+    if [[ -n "$result" ]]; then
+        local overall_ok
+        overall_ok=$(echo "$result" | jq -r '.overall_ok' 2>/dev/null)
+        assert_equals "true" "$overall_ok" "overall_ok should be true"
+    else
+        fail "run_quality_gates should produce JSON output"
+    fi
 
     log_test_pass "run_quality_gates: all gates pass"
 }
@@ -929,6 +926,7 @@ test_quality_gates_lint_failure() {
     setup_lifecycle_test
 
     get_review_state_dir() { echo "$RU_STATE_DIR/review"; }
+    get_review_policy_dir() { echo "$RU_CONFIG_DIR/review-policies"; }
 
     load_policy_for_repo() {
         echo '{"test_command":"","lint_command":"eslint ."}'
@@ -949,15 +947,19 @@ test_quality_gates_lint_failure() {
     local plan_file="$TEST_DIR/plan.json"
     create_test_plan_file "$plan_file" '{"repo":"owner/repo"}'
 
-    local result
-    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>/dev/null)
+    local result stderr_file="$TEST_DIR/qg_stderr.log"
+    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>"$stderr_file")
     local exit_code=$?
 
     assert_equals "1" "$exit_code" "Lint failure should return 1"
 
-    local overall_ok
-    overall_ok=$(echo "$result" | jq -r '.overall_ok')
-    assert_equals "false" "$overall_ok" "overall_ok should be false on lint failure"
+    if [[ -n "$result" ]]; then
+        local overall_ok
+        overall_ok=$(echo "$result" | jq -r '.overall_ok' 2>/dev/null)
+        assert_equals "false" "$overall_ok" "overall_ok should be false on lint failure"
+    else
+        fail "run_quality_gates should produce JSON output"
+    fi
 
     log_test_pass "run_quality_gates: lint failure"
 }
@@ -967,6 +969,7 @@ test_quality_gates_secret_warning() {
     setup_lifecycle_test
 
     get_review_state_dir() { echo "$RU_STATE_DIR/review"; }
+    get_review_policy_dir() { echo "$RU_CONFIG_DIR/review-policies"; }
 
     load_policy_for_repo() {
         echo '{"test_command":"","lint_command":""}'
@@ -987,15 +990,19 @@ test_quality_gates_secret_warning() {
     local plan_file="$TEST_DIR/plan.json"
     create_test_plan_file "$plan_file" '{"repo":"owner/repo"}'
 
-    local result
-    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>/dev/null)
+    local result stderr_file="$TEST_DIR/qg_stderr.log"
+    result=$(run_quality_gates "$TEST_DIR/repo" "$plan_file" 2>"$stderr_file")
     local exit_code=$?
 
     assert_equals "2" "$exit_code" "Secret warning should return 2"
 
-    local has_warning
-    has_warning=$(echo "$result" | jq -r '.has_warning')
-    assert_equals "true" "$has_warning" "has_warning should be true"
+    if [[ -n "$result" ]]; then
+        local has_warning
+        has_warning=$(echo "$result" | jq -r '.has_warning' 2>/dev/null)
+        assert_equals "true" "$has_warning" "has_warning should be true"
+    else
+        fail "run_quality_gates should produce JSON output"
+    fi
 
     log_test_pass "run_quality_gates: secret warning"
 }
@@ -1170,14 +1177,7 @@ test_execute_gh_action_comment_issue() {
         fail "Comment on issue should succeed"
     fi
 
-    local found=false
-    for call in "${MOCK_GH_CALLS[@]}"; do
-        if [[ "$call" == *"issue comment"* && "$call" == *"42"* ]]; then
-            found=true
-            break
-        fi
-    done
-    if [[ "$found" == "true" ]]; then
+    if gh_mock_called_with "issue comment.*42"; then
         pass "Called gh issue comment 42"
     else
         fail "Should call gh issue comment 42"
@@ -1197,14 +1197,7 @@ test_execute_gh_action_comment_pr() {
         fail "Comment on PR should succeed"
     fi
 
-    local found=false
-    for call in "${MOCK_GH_CALLS[@]}"; do
-        if [[ "$call" == *"pr comment"* && "$call" == *"7"* ]]; then
-            found=true
-            break
-        fi
-    done
-    if [[ "$found" == "true" ]]; then
+    if gh_mock_called_with "pr comment.*7"; then
         pass "Called gh pr comment 7"
     else
         fail "Should call gh pr comment 7"
@@ -1240,14 +1233,7 @@ test_execute_gh_action_close_issue() {
         fail "Close issue should succeed"
     fi
 
-    local found=false
-    for call in "${MOCK_GH_CALLS[@]}"; do
-        if [[ "$call" == *"issue close"* && "$call" == *"10"* ]]; then
-            found=true
-            break
-        fi
-    done
-    if [[ "$found" == "true" ]]; then
+    if gh_mock_called_with "issue close.*10"; then
         pass "Called gh issue close 10"
     else
         fail "Should call gh issue close"
@@ -1267,14 +1253,7 @@ test_execute_gh_action_close_pr_with_comment() {
         fail "Close PR with comment should succeed"
     fi
 
-    local found=false
-    for call in "${MOCK_GH_CALLS[@]}"; do
-        if [[ "$call" == *"pr close"* && "$call" == *"25"* && "$call" == *"comment"* ]]; then
-            found=true
-            break
-        fi
-    done
-    if [[ "$found" == "true" ]]; then
+    if gh_mock_called_with "pr close.*25.*--comment"; then
         pass "Called gh pr close with --comment"
     else
         fail "Should call gh pr close with --comment"
@@ -1294,14 +1273,7 @@ test_execute_gh_action_label() {
         fail "Add labels should succeed"
     fi
 
-    local found=false
-    for call in "${MOCK_GH_CALLS[@]}"; do
-        if [[ "$call" == *"issue edit"* && "$call" == *"5"* && "$call" == *"add-label"* && "$call" == *"bug,urgent"* ]]; then
-            found=true
-            break
-        fi
-    done
-    if [[ "$found" == "true" ]]; then
+    if gh_mock_called_with "issue edit.*5.*--add-label.*bug,urgent"; then
         pass "Called gh issue edit with correct labels"
     else
         fail "Should call gh issue edit --add-label bug,urgent"
