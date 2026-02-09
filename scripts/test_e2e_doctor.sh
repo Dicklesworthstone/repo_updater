@@ -19,100 +19,25 @@
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
 # shellcheck disable=SC2317  # Functions are called dynamically
+# shellcheck disable=SC1091  # Sourced files checked separately
 set -uo pipefail
 
+#==============================================================================
+# Source E2E Test Framework
+#==============================================================================
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RU_SCRIPT="$PROJECT_DIR/ru"
+# shellcheck source=test_e2e_framework.sh
+source "$SCRIPT_DIR/test_e2e_framework.sh"
 
 #==============================================================================
-# Test Framework
+# Helpers
 #==============================================================================
-
-TESTS_PASSED=0
-TESTS_FAILED=0
-TEMP_DIR=""
-
-# Colors (disabled if stdout is not a terminal)
-if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    BLUE='\033[0;34m'
-    RESET='\033[0m'
-else
-    RED='' GREEN='' YELLOW='' BLUE='' RESET=''
-fi
-
-setup_test_env() {
-    TEMP_DIR=$(mktemp -d)
-    export XDG_CONFIG_HOME="$TEMP_DIR/config"
-    export XDG_STATE_HOME="$TEMP_DIR/state"
-    export XDG_CACHE_HOME="$TEMP_DIR/cache"
-    export HOME="$TEMP_DIR/home"
-    export RU_PROJECTS_DIR="$TEMP_DIR/projects"
-    mkdir -p "$HOME"
-}
 
 setup_initialized_env() {
-    setup_test_env
+    e2e_setup
     mkdir -p "$RU_PROJECTS_DIR"
-    # Initialize config
-    "$RU_SCRIPT" init >/dev/null 2>&1
-}
-
-cleanup_test_env() {
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-    fi
-    unset RU_PROJECTS_DIR
-}
-
-pass() {
-    echo -e "${GREEN}PASS${RESET}: $1"
-    ((TESTS_PASSED++))
-}
-
-fail() {
-    echo -e "${RED}FAIL${RESET}: $1"
-    ((TESTS_FAILED++))
-}
-
-#==============================================================================
-# Assertion Helpers
-#==============================================================================
-
-assert_exit_code() {
-    local expected="$1"
-    local actual="$2"
-    local msg="$3"
-    if [[ "$expected" -eq "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (expected exit code $expected, got $actual)"
-    fi
-}
-
-assert_stderr_contains() {
-    local output="$1"
-    local pattern="$2"
-    local msg="$3"
-    if printf '%s\n' "$output" | grep -q "$pattern"; then
-        pass "$msg"
-    else
-        fail "$msg (pattern '$pattern' not found in stderr)"
-    fi
-}
-
-assert_stderr_not_contains() {
-    local output="$1"
-    local pattern="$2"
-    local msg="$3"
-    if ! printf '%s\n' "$output" | grep -q "$pattern"; then
-        pass "$msg"
-    else
-        fail "$msg (pattern '$pattern' should not be in stderr)"
-    fi
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
 }
 
 #==============================================================================
@@ -120,103 +45,100 @@ assert_stderr_not_contains() {
 #==============================================================================
 
 test_doctor_runs_successfully() {
-    echo -e "${BLUE}Test:${RESET} ru doctor runs and produces output"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
     local exit_code=$?
 
     # Doctor may exit 0 or 3 depending on gh auth status
-    # We just verify it runs and produces expected output format
     if [[ "$exit_code" -eq 0 || "$exit_code" -eq 3 ]]; then
         pass "Exits with valid code ($exit_code)"
     else
         fail "Unexpected exit code $exit_code (expected 0 or 3)"
     fi
-    assert_stderr_contains "$stderr_output" "System Check" "Shows System Check header"
+    assert_contains "$stderr_output" "System Check" "Shows System Check header"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_checks_git() {
-    echo -e "${BLUE}Test:${RESET} ru doctor checks git installation"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    # Git should be installed in our test environment
-    assert_stderr_contains "$stderr_output" "git:" "Checks git"
-    assert_stderr_contains "$stderr_output" "\[OK\].*git:" "Git check passes"
+    assert_contains "$stderr_output" "git:" "Checks git"
+    if printf '%s\n' "$stderr_output" | grep -q "\[OK\].*git:"; then
+        pass "Git check passes"
+    else
+        fail "Git check passes"
+    fi
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_checks_gh() {
-    echo -e "${BLUE}Test:${RESET} ru doctor checks gh CLI"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    # Check that gh CLI is mentioned (may or may not be installed)
-    assert_stderr_contains "$stderr_output" "gh:" "Checks gh CLI"
+    assert_contains "$stderr_output" "gh:" "Checks gh CLI"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_checks_config() {
-    echo -e "${BLUE}Test:${RESET} ru doctor checks config directory"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "Config:" "Checks config directory"
-    assert_stderr_contains "$stderr_output" "\[OK\].*Config:" "Config check passes when initialized"
+    assert_contains "$stderr_output" "Config:" "Checks config directory"
+    if printf '%s\n' "$stderr_output" | grep -q "\[OK\].*Config:"; then
+        pass "Config check passes when initialized"
+    else
+        fail "Config check passes when initialized"
+    fi
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_checks_repos() {
-    echo -e "${BLUE}Test:${RESET} ru doctor checks configured repos"
     setup_initialized_env
 
-    "$RU_SCRIPT" add owner/repo1 owner/repo2 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo1 owner/repo2 >/dev/null 2>&1
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "Repos:" "Checks repos"
-    assert_stderr_contains "$stderr_output" "2 configured" "Shows correct repo count"
+    assert_contains "$stderr_output" "Repos:" "Checks repos"
+    assert_contains "$stderr_output" "2 configured" "Shows correct repo count"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_checks_projects_dir() {
-    echo -e "${BLUE}Test:${RESET} ru doctor checks projects directory"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "Projects:" "Checks projects directory"
+    assert_contains "$stderr_output" "Projects:" "Checks projects directory"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_checks_gum() {
-    echo -e "${BLUE}Test:${RESET} ru doctor checks gum (optional)"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    # Gum check should appear (may be installed or not)
-    assert_stderr_contains "$stderr_output" "gum:" "Checks gum"
+    assert_contains "$stderr_output" "gum:" "Checks gum"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -224,22 +146,21 @@ test_doctor_checks_gum() {
 #==============================================================================
 
 test_doctor_uninitialized_config() {
-    echo -e "${BLUE}Test:${RESET} ru doctor detects uninitialized config"
-    setup_test_env
+    e2e_setup
     mkdir -p "$RU_PROJECTS_DIR"
-    # Don't initialize config
+    # Remove pre-created config to simulate uninitialized state
+    rm -rf "$XDG_CONFIG_HOME/ru"
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "not initialized" "Detects uninitialized config"
-    assert_stderr_contains "$stderr_output" "ru init" "Suggests ru init"
+    assert_contains "$stderr_output" "not initialized" "Detects uninitialized config"
+    assert_contains "$stderr_output" "ru init" "Suggests ru init"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_no_repos_configured() {
-    echo -e "${BLUE}Test:${RESET} ru doctor detects no repos configured"
     setup_initialized_env
 
     # Clear repos file
@@ -247,11 +168,11 @@ test_doctor_no_repos_configured() {
     echo "# Empty" > "$repos_file"
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "none configured" "Detects no repos configured"
+    assert_contains "$stderr_output" "none configured" "Detects no repos configured"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -259,30 +180,28 @@ test_doctor_no_repos_configured() {
 #==============================================================================
 
 test_doctor_projects_dir_missing() {
-    echo -e "${BLUE}Test:${RESET} ru doctor handles missing projects directory"
     setup_initialized_env
 
     # Remove projects directory
     rmdir "$RU_PROJECTS_DIR" 2>/dev/null || true
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "will be created" "Notes projects dir will be created"
+    assert_contains "$stderr_output" "will be created" "Notes projects dir will be created"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_projects_dir_writable() {
-    echo -e "${BLUE}Test:${RESET} ru doctor verifies projects directory is writable"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    assert_stderr_contains "$stderr_output" "writable" "Checks writability"
+    assert_contains "$stderr_output" "writable" "Checks writability"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -290,27 +209,24 @@ test_doctor_projects_dir_writable() {
 #==============================================================================
 
 test_doctor_exit_codes() {
-    echo -e "${BLUE}Test:${RESET} ru doctor uses correct exit codes"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
     local exit_code=$?
 
     # Exit code 0 means all checks passed, 3 means issues found
     if [[ "$exit_code" -eq 0 ]]; then
-        # Should show success message
-        assert_stderr_contains "$stderr_output" "All checks passed" "Shows success message when exit 0"
+        assert_contains "$stderr_output" "All checks passed" "Shows success message when exit 0"
     elif [[ "$exit_code" -eq 3 ]]; then
-        # Should show issues count
-        assert_stderr_contains "$stderr_output" "issue" "Shows issue count when exit 3"
+        assert_contains "$stderr_output" "issue" "Shows issue count when exit 3"
     else
         fail "Unexpected exit code $exit_code"
     fi
 
     pass "Exit code matches output message"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -318,12 +234,11 @@ test_doctor_exit_codes() {
 #==============================================================================
 
 test_doctor_output_to_stderr() {
-    echo -e "${BLUE}Test:${RESET} ru doctor outputs to stderr (not stdout)"
     setup_initialized_env
 
     local stdout_output stderr_output
-    stdout_output=$("$RU_SCRIPT" doctor 2>/dev/null)
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1 >/dev/null)
+    stdout_output=$("$E2E_RU_SCRIPT" doctor 2>/dev/null)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1 >/dev/null)
 
     # Stdout should be empty or minimal
     if [[ -z "$stdout_output" ]]; then
@@ -333,77 +248,43 @@ test_doctor_output_to_stderr() {
     fi
 
     # Stderr should have content
-    if [[ -n "$stderr_output" ]]; then
-        pass "Stderr has diagnostic output"
-    else
-        fail "Stderr should have diagnostic output"
-    fi
+    assert_not_empty "$stderr_output" "Stderr has diagnostic output"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_doctor_uses_status_indicators() {
-    echo -e "${BLUE}Test:${RESET} ru doctor uses status indicators ([OK], [??], [!!])"
     setup_initialized_env
 
     local stderr_output
-    stderr_output=$("$RU_SCRIPT" doctor 2>&1)
+    stderr_output=$("$E2E_RU_SCRIPT" doctor 2>&1)
 
-    # Should have at least one [OK] indicator
-    assert_stderr_contains "$stderr_output" "\[OK\]" "Uses [OK] indicator"
+    if printf '%s\n' "$stderr_output" | grep -q "\[OK\]"; then
+        pass "Uses [OK] indicator"
+    else
+        fail "Uses [OK] indicator"
+    fi
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
 # Run Tests
 #==============================================================================
 
-echo "============================================"
-echo "E2E Tests: ru doctor workflow"
-echo "============================================"
-echo ""
+run_test test_doctor_runs_successfully
+run_test test_doctor_checks_git
+run_test test_doctor_checks_gh
+run_test test_doctor_checks_config
+run_test test_doctor_checks_repos
+run_test test_doctor_checks_projects_dir
+run_test test_doctor_checks_gum
+run_test test_doctor_uninitialized_config
+run_test test_doctor_no_repos_configured
+run_test test_doctor_projects_dir_missing
+run_test test_doctor_projects_dir_writable
+run_test test_doctor_exit_codes
+run_test test_doctor_output_to_stderr
+run_test test_doctor_uses_status_indicators
 
-# Basic functionality
-test_doctor_runs_successfully
-echo ""
-test_doctor_checks_git
-echo ""
-test_doctor_checks_gh
-echo ""
-test_doctor_checks_config
-echo ""
-test_doctor_checks_repos
-echo ""
-test_doctor_checks_projects_dir
-echo ""
-test_doctor_checks_gum
-echo ""
-
-# Config states
-test_doctor_uninitialized_config
-echo ""
-test_doctor_no_repos_configured
-echo ""
-
-# Projects directory states
-test_doctor_projects_dir_missing
-echo ""
-test_doctor_projects_dir_writable
-echo ""
-
-# Exit codes
-test_doctor_exit_codes
-echo ""
-
-# Output format
-test_doctor_output_to_stderr
-echo ""
-test_doctor_uses_status_indicators
-echo ""
-
-echo "============================================"
-echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
-echo "============================================"
-
-[[ $TESTS_FAILED -eq 0 ]]
+print_results
