@@ -92,9 +92,10 @@ test_no_upstream_skips() {
 
     # Create a repo without upstream remote
     local bare="$E2E_TEMP_DIR/remotes/nofork.git"
-    git init --bare "$bare" --quiet
+    git init --bare --initial-branch=main "$bare" --quiet
     local clone="$RU_PROJECTS_DIR/nofork"
     git clone "$bare" "$clone" --quiet 2>/dev/null
+    git -C "$clone" checkout -b main --quiet 2>/dev/null || true
     echo "data" > "$clone/file.txt"
     git -C "$clone" add file.txt
     git -C "$clone" commit -m "init" --quiet
@@ -278,7 +279,7 @@ test_json_output() {
     output=$("$E2E_RU_SCRIPT" fork-status --json 2>/dev/null) || exit_code=$?
 
     assert_equals "0" "$exit_code" "fork-status --json exits 0"
-    assert_contains "$output" '"command":"fork-status"' "JSON has correct command field"
+    assert_contains "$output" '"command": "fork-status"' "JSON has correct command field"
     assert_contains "$output" '"repo":"test_owner/jsonrepo"' "JSON has repo field"
     assert_contains "$output" '"behind"' "JSON has behind field"
 
@@ -291,9 +292,10 @@ test_verbose_no_upstream() {
 
     # Create repo without upstream
     local bare="$E2E_TEMP_DIR/remotes/plain.git"
-    git init --bare "$bare" --quiet
+    git init --bare --initial-branch=main "$bare" --quiet
     local clone="$RU_PROJECTS_DIR/plain"
     git clone "$bare" "$clone" --quiet 2>/dev/null
+    git -C "$clone" checkout -b main --quiet 2>/dev/null || true
     echo "data" > "$clone/file.txt"
     git -C "$clone" add file.txt
     git -C "$clone" commit -m "init" --quiet

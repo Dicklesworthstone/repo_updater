@@ -55,13 +55,12 @@ init_fork_config() {
 add_upstream_commit() {
     local upstream_dir="$1"
     local msg="$2"
-    local tmp_clone="$E2E_TEMP_DIR/tmp_upstream_$$"
+    local tmp_clone="$E2E_TEMP_DIR/tmp_upstream_${RANDOM}"
     git clone "$upstream_dir" "$tmp_clone" --quiet 2>/dev/null
     echo "$msg" >> "$tmp_clone/README.md"
     git -C "$tmp_clone" add README.md
     git -C "$tmp_clone" commit -m "$msg" --quiet
     git -C "$tmp_clone" push origin main --quiet 2>/dev/null
-    rm -rf "$tmp_clone"
 }
 
 add_local_commit() {

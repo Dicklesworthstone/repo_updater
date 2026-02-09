@@ -25,14 +25,14 @@ setup_fork_env() {
     ORIGIN_DIR="$E2E_TEMP_DIR/remotes/${repo_name}_origin.git"
     LOCAL_DIR="$RU_PROJECTS_DIR/${repo_name}"
 
-    git init --bare "$UPSTREAM_DIR" --quiet
-    local tmp_clone="$E2E_TEMP_DIR/tmp_clone_$$"
+    git init --bare --initial-branch=main "$UPSTREAM_DIR" --quiet
+    local tmp_clone="$E2E_TEMP_DIR/tmp_clone_${repo_name}"
     git clone "$UPSTREAM_DIR" "$tmp_clone" --quiet 2>/dev/null
+    git -C "$tmp_clone" checkout -b main --quiet 2>/dev/null || true
     echo "initial" > "$tmp_clone/README.md"
     git -C "$tmp_clone" add README.md
     git -C "$tmp_clone" commit -m "Initial commit" --quiet
     git -C "$tmp_clone" push origin main --quiet 2>/dev/null
-    rm -rf "$tmp_clone"
 
     git clone --bare "$UPSTREAM_DIR" "$ORIGIN_DIR" --quiet 2>/dev/null
 
