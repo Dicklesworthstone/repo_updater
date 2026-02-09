@@ -13,94 +13,16 @@
 # Note: This script uses PATH-based mocks to avoid live GitHub API calls.
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
+# shellcheck disable=SC1091  # Sourced files checked separately
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RU_SCRIPT="$PROJECT_DIR/ru"
+# shellcheck source=test_e2e_framework.sh
+source "$SCRIPT_DIR/test_e2e_framework.sh"
 
 #==============================================================================
-# Test Framework
+# Test-Specific Assertion Helpers
 #==============================================================================
-
-TESTS_PASSED=0
-TESTS_FAILED=0
-TEMP_DIR=""
-ORIGINAL_PATH="$PATH"
-
-if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    RESET='\033[0m'
-else
-    RED='' GREEN='' YELLOW='' RESET=''
-fi
-
-setup_test_env() {
-    TEMP_DIR=$(mktemp -d)
-
-    export XDG_CONFIG_HOME="$TEMP_DIR/config"
-    export XDG_STATE_HOME="$TEMP_DIR/state"
-    export XDG_CACHE_HOME="$TEMP_DIR/cache"
-    export HOME="$TEMP_DIR/home"
-    export RU_PROJECTS_DIR="$TEMP_DIR/projects"
-
-    mkdir -p "$HOME" "$RU_PROJECTS_DIR"
-
-    mkdir -p "$TEMP_DIR/mock_bin"
-    export PATH="$TEMP_DIR/mock_bin:$ORIGINAL_PATH"
-}
-
-cleanup_test_env() {
-    PATH="$ORIGINAL_PATH"
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-    fi
-    unset RU_PROJECTS_DIR
-}
-
-pass() {
-    echo -e "${GREEN}PASS${RESET}: $1"
-    ((TESTS_PASSED++))
-}
-
-fail() {
-    echo -e "${RED}FAIL${RESET}: $1"
-    ((TESTS_FAILED++))
-}
-
-skip() {
-    echo -e "${YELLOW}SKIP${RESET}: $1"
-}
-
-#==============================================================================
-# Assertion Helpers
-#==============================================================================
-
-assert_exit_code() {
-    local expected="$1"
-    local actual="$2"
-    local msg="$3"
-
-    if [[ "$expected" -eq "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (expected exit code $expected, got $actual)"
-    fi
-}
-
-assert_file_contains() {
-    local path="$1"
-    local pattern="$2"
-    local msg="$3"
-
-    if [[ -f "$path" ]] && grep -q "$pattern" "$path"; then
-        pass "$msg"
-    else
-        fail "$msg (pattern '$pattern' not found in $path)"
-    fi
-}
 
 assert_jq_filter() {
     local json_file="$1"
@@ -109,17 +31,13 @@ assert_jq_filter() {
     local msg="$4"
 
     if ! command -v jq &>/dev/null; then
-        skip "$msg (jq not installed)"
+        skip_test "$msg (jq not installed)"
         return 0
     fi
 
     local actual
     actual=$(jq -r "$filter" "$json_file" 2>/dev/null || echo "__JQ_ERROR__")
-    if [[ "$actual" == "$expected" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (expected '$expected', got '$actual')"
-    fi
+    assert_equals "$expected" "$actual" "$msg"
 }
 
 assert_jq_number() {
@@ -129,24 +47,20 @@ assert_jq_number() {
     local msg="$4"
 
     if ! command -v jq &>/dev/null; then
-        skip "$msg (jq not installed)"
+        skip_test "$msg (jq not installed)"
         return 0
     fi
 
     local actual
     actual=$(jq -r "$filter" "$json_file" 2>/dev/null || echo "__JQ_ERROR__")
-    if [[ "$actual" == "$expected" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (expected $expected, got $actual)"
-    fi
+    assert_equals "$expected" "$actual" "$msg"
 }
 
 #==============================================================================
 # Mock Helpers
 #==============================================================================
 
-create_mock_gh() {
+create_review_mock_gh() {
     local auth_exit_code="$1"
     local graphql_json="$2"
 
@@ -155,7 +69,7 @@ create_mock_gh() {
     local bash_path
     bash_path=$(type -P bash)
 
-    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+    cat > "$E2E_MOCK_BIN/gh" <<EOF
 #!${bash_path}
 set -uo pipefail
 
@@ -177,10 +91,10 @@ echo "mock gh: unexpected args: \$*" >&2
 exit 2
 EOF
 
-    chmod +x "$TEMP_DIR/mock_bin/gh"
+    chmod +x "$E2E_MOCK_BIN/gh"
 }
 
-graphql_response_with_items() {
+graphql_review_response_with_items() {
     cat <<'JSON'
 {
   "data": {
@@ -218,7 +132,7 @@ graphql_response_with_items() {
 JSON
 }
 
-graphql_response_empty() {
+graphql_review_response_empty() {
     cat <<'JSON'
 {
   "data": {
@@ -236,35 +150,8 @@ JSON
 }
 
 setup_review_env_with_repo() {
-    "$RU_SCRIPT" init >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo >/dev/null 2>&1
-}
-
-_make_minimal_path_bin_without_drivers() {
-    local out_dir="$1"
-
-    mkdir -p "$out_dir"
-
-    # Essential commands needed by ru script during initialization and operation
-    # dirname/basename/pwd: Script directory detection (line 124)
-    # rm: State file cleanup
-    # printf: Output formatting
-    # ln: Various symlink operations
-    # kill/sleep/rmdir: portable directory-locking (stale lock detection + release)
-    local -a cmds=(
-        awk basename cat cut date dirname grep head jq kill ln mkdir mktemp rmdir sleep
-        printf pwd rm sed sort tr uniq wc
-    )
-
-    local cmd
-    for cmd in "${cmds[@]}"; do
-        local bin
-        # Use 'type -P' to get the actual binary path, ignoring aliases/functions
-        # 'command -v' can return alias strings like "alias cat=batcat"
-        bin=$(type -P "$cmd" 2>/dev/null || echo "")
-        [[ -n "$bin" ]] || continue
-        ln -s "$bin" "$out_dir/$cmd" 2>/dev/null || true
-    done
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo >/dev/null 2>&1
 }
 
 #==============================================================================
@@ -272,18 +159,17 @@ _make_minimal_path_bin_without_drivers() {
 #==============================================================================
 
 test_review_dry_run_json_outputs_items() {
-    echo "Test: ru --json review --dry-run emits discovery JSON (items present)"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_with_items)"
+    create_review_mock_gh 0 "$(graphql_review_response_with_items)"
     setup_review_env_with_repo
 
-    local out_json="$TEMP_DIR/out.json"
-    local err_txt="$TEMP_DIR/err.txt"
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
+    local out_json="$E2E_TEMP_DIR/out.json"
+    local err_txt="$E2E_TEMP_DIR/err.txt"
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --dry-run exits 0"
+    assert_equals "0" "$exit_code" "review --dry-run exits 0"
     assert_jq_filter "$out_json" '.mode' "discovery" "JSON mode is discovery"
     assert_jq_filter "$out_json" '.command' "review" "JSON command is review"
     assert_jq_number "$out_json" '.summary.items_found' "2" "summary.items_found == 2"
@@ -291,107 +177,102 @@ test_review_dry_run_json_outputs_items() {
     assert_jq_number "$out_json" '.summary.by_type.prs' "1" "summary.by_type.prs == 1"
     assert_file_contains "$err_txt" "Dry run complete" "stderr reports dry run completion"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_dry_run_json_outputs_empty() {
-    echo "Test: ru --json review --dry-run emits discovery JSON (no items)"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_empty)"
+    create_review_mock_gh 0 "$(graphql_review_response_empty)"
     setup_review_env_with_repo
 
-    local out_json="$TEMP_DIR/out.json"
-    local err_txt="$TEMP_DIR/err.txt"
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
+    local out_json="$E2E_TEMP_DIR/out.json"
+    local err_txt="$E2E_TEMP_DIR/err.txt"
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --dry-run exits 0 (no items)"
+    assert_equals "0" "$exit_code" "review --dry-run exits 0 (no items)"
     assert_jq_number "$out_json" '.summary.items_found' "0" "summary.items_found == 0"
     assert_file_contains "$err_txt" "No work items need review" "stderr reports no work items"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_prereq_gh_auth_failure_exit_code_3() {
-    echo "Test: ru review fails with exit code 3 when gh auth check fails"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 1 "$(graphql_response_with_items)"
+    create_review_mock_gh 1 "$(graphql_review_response_with_items)"
     setup_review_env_with_repo
 
-    local err_txt="$TEMP_DIR/err.txt"
-    "$RU_SCRIPT" review --dry-run --mode=local --non-interactive >/dev/null 2>"$err_txt"
+    local err_txt="$E2E_TEMP_DIR/err.txt"
+    "$E2E_RU_SCRIPT" review --dry-run --mode=local --non-interactive >/dev/null 2>"$err_txt"
     local exit_code=$?
 
-    assert_exit_code 3 "$exit_code" "review fails with exit code 3 on gh auth failure"
+    assert_equals "3" "$exit_code" "review fails with exit code 3 on gh auth failure"
     assert_file_contains "$err_txt" "not authenticated" "stderr explains gh auth required"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_dry_run_succeeds_without_tmux_or_ntm() {
-    echo "Test: ru review --dry-run succeeds without tmux/ntm drivers"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_with_items)"
+    create_review_mock_gh 0 "$(graphql_review_response_with_items)"
 
     # Create minimal repo list without using `ru init/add` (keeps PATH needs small).
     mkdir -p "$XDG_CONFIG_HOME/ru/repos.d"
     printf '%s\n' "owner/repo" > "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
 
-    local minimal_bin="$TEMP_DIR/minimal_bin"
-    _make_minimal_path_bin_without_drivers "$minimal_bin"
+    local minimal_bin="$E2E_TEMP_DIR/minimal_bin"
+    e2e_make_minimal_path_bin "$minimal_bin"
 
     local saved_path="$PATH"
     local bash_bin
     bash_bin=$(command -v bash 2>/dev/null || echo "")
     if [[ -z "$bash_bin" ]]; then
         fail "bash not found in PATH"
-        cleanup_test_env
+        e2e_cleanup
         return
     fi
 
     # Ensure review driver commands are not visible.
-    export PATH="$TEMP_DIR/mock_bin:$minimal_bin"
+    export PATH="$E2E_MOCK_BIN:$minimal_bin"
 
-    local out_json="$TEMP_DIR/out.json"
-    local err_txt="$TEMP_DIR/err.txt"
-    "$bash_bin" "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
+    local out_json="$E2E_TEMP_DIR/out.json"
+    local err_txt="$E2E_TEMP_DIR/err.txt"
+    "$bash_bin" "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>"$err_txt"
     local exit_code=$?
 
     PATH="$saved_path"
 
-    assert_exit_code 0 "$exit_code" "review --dry-run exits 0 without drivers"
+    assert_equals "0" "$exit_code" "review --dry-run exits 0 without drivers"
     assert_jq_filter "$out_json" '.mode' "discovery" "JSON mode is discovery"
     assert_file_contains "$err_txt" "Dry run complete" "stderr reports dry run completion"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_status_reports_free_when_no_lock() {
-    echo "Test: ru review --status reports lock free when no lock is held"
-    setup_test_env
+    e2e_setup
 
     # Avoid prerequisite failures from other parts of review.
-    create_mock_gh 0 "$(graphql_response_empty)"
+    create_review_mock_gh 0 "$(graphql_review_response_empty)"
     setup_review_env_with_repo
 
-    local err_txt="$TEMP_DIR/err.txt"
-    "$RU_SCRIPT" review --status --mode=local --non-interactive >/dev/null 2>"$err_txt"
+    local err_txt="$E2E_TEMP_DIR/err.txt"
+    "$E2E_RU_SCRIPT" review --status --mode=local --non-interactive >/dev/null 2>"$err_txt"
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --status exits 0"
+    assert_equals "0" "$exit_code" "review --status exits 0"
     assert_file_contains "$err_txt" "Review lock: free" "stderr reports lock free"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_status_json_includes_lock_and_checkpoint() {
-    echo "Test: ru --json review --status includes lock + checkpoint fields"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_empty)"
+    create_review_mock_gh 0 "$(graphql_review_response_empty)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -429,18 +310,18 @@ EOF
 }
 EOF
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "--json review --status exits 0"
+    assert_equals "0" "$exit_code" "--json review --status exits 0"
     assert_jq_filter "$out_json" '.mode' "status" "JSON mode is status"
     assert_jq_filter "$out_json" '.command' "review" "JSON command is review"
     assert_jq_filter "$out_json" '.lock.held' "true" "lock.held == true"
     assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
     assert_jq_number "$out_json" '.checkpoint.repos_pending' "1" "checkpoint.repos_pending == 1"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #------------------------------------------------------------------------------
@@ -448,10 +329,9 @@ EOF
 #------------------------------------------------------------------------------
 
 test_review_initializes_clean_state() {
-    echo "Test: ru review --dry-run creates clean state directory structure"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_with_items)"
+    create_review_mock_gh 0 "$(graphql_review_response_with_items)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -459,17 +339,17 @@ test_review_initializes_clean_state() {
     # Verify no state exists initially
     if [[ -d "$state_dir/review" ]]; then
         fail "review dir exists before running review"
-        cleanup_test_env
+        e2e_cleanup
         return
     else
         pass "review dir does not exist initially"
     fi
 
     # Run review --dry-run (discovery phase only)
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >/dev/null 2>&1
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --dry-run exits 0"
+    assert_equals "0" "$exit_code" "review --dry-run exits 0"
 
     # State directory should exist after discovery
     if [[ -d "$state_dir" ]]; then
@@ -478,18 +358,17 @@ test_review_initializes_clean_state() {
         fail "state directory not created"
     fi
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_discovers_multiple_repos() {
-    echo "Test: ru review --dry-run discovers items from multiple repos"
-    setup_test_env
+    e2e_setup
 
     # Create mock gh that returns items for multiple repos
     local bash_path
     bash_path=$(type -P bash)
 
-    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+    cat > "$E2E_MOCK_BIN/gh" <<EOF
 #!${bash_path}
 set -uo pipefail
 
@@ -549,24 +428,24 @@ fi
 
 exit 2
 EOF
-    chmod +x "$TEMP_DIR/mock_bin/gh"
+    chmod +x "$E2E_MOCK_BIN/gh"
 
     # Add multiple repos
-    "$RU_SCRIPT" init >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo1 >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo2 >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo3 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo1 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo2 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo3 >/dev/null 2>&1
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "multi-repo review --dry-run exits 0"
+    assert_equals "0" "$exit_code" "multi-repo review --dry-run exits 0"
     assert_jq_number "$out_json" '.summary.items_found' "4" "summary.items_found == 4 (across 3 repos)"
     assert_jq_number "$out_json" '.summary.by_type.issues' "3" "summary.by_type.issues == 3"
     assert_jq_number "$out_json" '.summary.by_type.prs' "1" "summary.by_type.prs == 1"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #------------------------------------------------------------------------------
@@ -574,10 +453,9 @@ EOF
 #------------------------------------------------------------------------------
 
 test_review_resumes_from_checkpoint() {
-    echo "Test: ru review --resume detects existing checkpoint"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_with_items)"
+    create_review_mock_gh 0 "$(graphql_review_response_with_items)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -600,24 +478,23 @@ test_review_resumes_from_checkpoint() {
 }
 EOF
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --status with checkpoint exits 0"
+    assert_equals "0" "$exit_code" "review --status with checkpoint exits 0"
     assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
     assert_jq_filter "$out_json" '.checkpoint.run_id' "resume-test-123" "checkpoint has correct run_id"
     assert_jq_number "$out_json" '.checkpoint.repos_completed' "1" "checkpoint.repos_completed == 1"
     assert_jq_number "$out_json" '.checkpoint.repos_pending' "2" "checkpoint.repos_pending == 2"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_status_reports_stale_checkpoint() {
-    echo "Test: ru review --status reports when checkpoint is stale (config hash mismatch)"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_with_items)"
+    create_review_mock_gh 0 "$(graphql_review_response_with_items)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -641,15 +518,15 @@ test_review_status_reports_stale_checkpoint() {
 }
 EOF
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --status exits 0"
+    assert_equals "0" "$exit_code" "review --status exits 0"
     assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
     assert_jq_filter "$out_json" '.checkpoint.config_hash' "stale_hash_should_not_match" "checkpoint has stale hash"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #------------------------------------------------------------------------------
@@ -657,10 +534,9 @@ EOF
 #------------------------------------------------------------------------------
 
 test_review_status_detects_orphaned_lock() {
-    echo "Test: ru review --status detects orphaned lock with dead PID"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_empty)"
+    create_review_mock_gh 0 "$(graphql_review_response_empty)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -680,23 +556,22 @@ test_review_status_detects_orphaned_lock() {
 }
 EOF
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --status exits 0"
+    assert_equals "0" "$exit_code" "review --status exits 0"
     assert_jq_filter "$out_json" '.lock.held' "true" "lock.held == true (orphaned)"
     assert_jq_filter "$out_json" '.lock.info.pid' "999999999" "lock info has dead PID"
     assert_jq_filter "$out_json" '.lock.info.pid_alive' "false" "PID detected as dead"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_cleanup_releases_lock() {
-    echo "Test: Cleanup releases lock directory properly"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_empty)"
+    create_review_mock_gh 0 "$(graphql_review_response_empty)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -710,7 +585,7 @@ test_review_cleanup_releases_lock() {
         pass "lock directory exists before cleanup"
     else
         fail "lock directory not created"
-        cleanup_test_env
+        e2e_cleanup
         return
     fi
 
@@ -724,12 +599,12 @@ test_review_cleanup_releases_lock() {
     fi
 
     # Verify status shows lock free
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
 
     assert_jq_filter "$out_json" '.lock.held' "false" "lock.held == false after cleanup"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #------------------------------------------------------------------------------
@@ -737,10 +612,9 @@ test_review_cleanup_releases_lock() {
 #------------------------------------------------------------------------------
 
 test_review_state_file_operations() {
-    echo "Test: Review state file read/write operations"
-    setup_test_env
+    e2e_setup
 
-    create_mock_gh 0 "$(graphql_response_with_items)"
+    create_review_mock_gh 0 "$(graphql_review_response_with_items)"
     setup_review_env_with_repo
 
     local state_dir="$XDG_STATE_HOME/ru"
@@ -764,24 +638,23 @@ test_review_state_file_operations() {
 EOF
 
     # Run discovery - should respect skip-days from state
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --skip-days=30 >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --skip-days=30 >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --dry-run with state file exits 0"
+    assert_equals "0" "$exit_code" "review --dry-run with state file exits 0"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_discovery_respects_priority_filter() {
-    echo "Test: ru review --dry-run respects --priority filter"
-    setup_test_env
+    e2e_setup
 
     # Create mock gh with items having different labels
     local bash_path
     bash_path=$(type -P bash)
 
-    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+    cat > "$E2E_MOCK_BIN/gh" <<EOF
 #!${bash_path}
 set -uo pipefail
 
@@ -818,30 +691,29 @@ fi
 
 exit 2
 EOF
-    chmod +x "$TEMP_DIR/mock_bin/gh"
+    chmod +x "$E2E_MOCK_BIN/gh"
 
-    "$RU_SCRIPT" init >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo >/dev/null 2>&1
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --priority=high >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --priority=high >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --dry-run with priority filter exits 0"
+    assert_equals "0" "$exit_code" "review --dry-run with priority filter exits 0"
     # Note: Exact filtering depends on implementation, but test should pass
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 test_review_respects_max_repos_limit() {
-    echo "Test: ru review --dry-run respects --max-repos limit"
-    setup_test_env
+    e2e_setup
 
     # Create mock gh with items for multiple repos
     local bash_path
     bash_path=$(type -P bash)
 
-    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+    cat > "$E2E_MOCK_BIN/gh" <<EOF
 #!${bash_path}
 set -uo pipefail
 
@@ -888,18 +760,18 @@ fi
 
 exit 2
 EOF
-    chmod +x "$TEMP_DIR/mock_bin/gh"
+    chmod +x "$E2E_MOCK_BIN/gh"
 
-    "$RU_SCRIPT" init >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo1 >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo2 >/dev/null 2>&1
-    "$RU_SCRIPT" add owner/repo3 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo1 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo2 >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/repo3 >/dev/null 2>&1
 
-    local out_json="$TEMP_DIR/out.json"
-    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --max-repos=2 >"$out_json" 2>/dev/null
+    local out_json="$E2E_TEMP_DIR/out.json"
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --max-repos=2 >"$out_json" 2>/dev/null
     local exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "review --dry-run with --max-repos exits 0"
+    assert_equals "0" "$exit_code" "review --dry-run with --max-repos exits 0"
 
     # Verify repos_queued respects the limit
     local repos_count
@@ -910,47 +782,39 @@ EOF
         fail "repos_queued exceeds --max-repos=2 limit (got $repos_count)"
     fi
 
-    cleanup_test_env
+    e2e_cleanup
 }
-
 
 #==============================================================================
 # Run Tests
 #==============================================================================
 
+log_suite_start "E2E Tests: ru review (discovery/dry-run)"
+
 # Original tests
-test_review_dry_run_json_outputs_items
-test_review_dry_run_json_outputs_empty
-test_review_prereq_gh_auth_failure_exit_code_3
-test_review_dry_run_succeeds_without_tmux_or_ntm
-test_review_status_reports_free_when_no_lock
-test_review_status_json_includes_lock_and_checkpoint
+run_test test_review_dry_run_json_outputs_items
+run_test test_review_dry_run_json_outputs_empty
+run_test test_review_prereq_gh_auth_failure_exit_code_3
+run_test test_review_dry_run_succeeds_without_tmux_or_ntm
+run_test test_review_status_reports_free_when_no_lock
+run_test test_review_status_json_includes_lock_and_checkpoint
 
 # Review Initialization Tests (bd-0ujx)
-test_review_initializes_clean_state
-test_review_discovers_multiple_repos
+run_test test_review_initializes_clean_state
+run_test test_review_discovers_multiple_repos
 
 # Review State/Checkpoint Tests (bd-0ujx)
-test_review_resumes_from_checkpoint
-test_review_status_reports_stale_checkpoint
+run_test test_review_resumes_from_checkpoint
+run_test test_review_status_reports_stale_checkpoint
 
 # Review Abort/Cleanup Tests (bd-0ujx)
-test_review_status_detects_orphaned_lock
-test_review_cleanup_releases_lock
+run_test test_review_status_detects_orphaned_lock
+run_test test_review_cleanup_releases_lock
 
 # Review Metrics/Completion Tests (bd-0ujx)
-test_review_state_file_operations
-test_review_discovery_respects_priority_filter
-test_review_respects_max_repos_limit
+run_test test_review_state_file_operations
+run_test test_review_discovery_respects_priority_filter
+run_test test_review_respects_max_repos_limit
 
-echo ""
-echo "=============================================="
-echo "Review E2E Test Summary"
-echo "=============================================="
-echo -e "  ${GREEN}Passed:${RESET} $TESTS_PASSED"
-echo -e "  ${RED}Failed:${RESET} $TESTS_FAILED"
-
-if [[ "$TESTS_FAILED" -eq 0 ]]; then
-    exit 0
-fi
-exit 1
+print_results
+exit "$(get_exit_code)"

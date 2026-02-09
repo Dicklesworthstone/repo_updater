@@ -13,138 +13,22 @@
 #   - Deduplication by path
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
-# shellcheck disable=SC1090  # Dynamic sourcing is intentional
+# shellcheck disable=SC1091  # Dynamic sourcing is intentional
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RU_SCRIPT="$PROJECT_DIR/ru"
-
-#==============================================================================
-# Test Framework
-#==============================================================================
-
-TESTS_PASSED=0
-TESTS_FAILED=0
-TEMP_DIR=""
-
-# Colors (disabled if stdout is not a terminal)
-if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    RESET='\033[0m'
-else
-    RED='' GREEN='' YELLOW='' RESET=''
-fi
-
-setup_test_env() {
-    TEMP_DIR=$(mktemp -d)
-    # Override XDG directories to isolate tests
-    export XDG_CONFIG_HOME="$TEMP_DIR/config"
-    export XDG_STATE_HOME="$TEMP_DIR/state"
-    export XDG_CACHE_HOME="$TEMP_DIR/cache"
-    export HOME="$TEMP_DIR/home"
-    mkdir -p "$HOME"
-
-    # Force sequential mode for predictable output
-    export RU_PARALLEL=1
-
-    # Create a projects directory
-    export PROJECTS_DIR="$TEMP_DIR/projects"
-    mkdir -p "$PROJECTS_DIR"
-}
-
-cleanup_test_env() {
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-    fi
-}
-
-pass() {
-    echo -e "${GREEN}PASS${RESET}: $1"
-    ((TESTS_PASSED++))
-}
-
-fail() {
-    echo -e "${RED}FAIL${RESET}: $1"
-    ((TESTS_FAILED++))
-}
-
-skip() {
-    echo -e "${YELLOW}SKIP${RESET}: $1"
-}
-
-#==============================================================================
-# Assertion Helpers
-#==============================================================================
-
-assert_equals() {
-    local expected="$1"
-    local actual="$2"
-    local msg="$3"
-    if [[ "$expected" == "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (expected: '$expected', got: '$actual')"
-    fi
-}
-
-assert_contains() {
-    local haystack="$1"
-    local needle="$2"
-    local msg="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then
-        pass "$msg"
-    else
-        fail "$msg (string '$needle' not found in output)"
-    fi
-}
-
-assert_not_contains() {
-    local haystack="$1"
-    local needle="$2"
-    local msg="$3"
-    if [[ "$haystack" != *"$needle"* ]]; then
-        pass "$msg"
-    else
-        fail "$msg (string '$needle' should not be in output)"
-    fi
-}
-
-assert_file_exists() {
-    local path="$1"
-    local msg="$2"
-    if [[ -f "$path" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (file not found: $path)"
-    fi
-}
-
-assert_dir_exists() {
-    local path="$1"
-    local msg="$2"
-    if [[ -d "$path" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (directory not found: $path)"
-    fi
-}
+# shellcheck source=test_e2e_framework.sh
+source "$SCRIPT_DIR/test_e2e_framework.sh"
 
 #==============================================================================
 # Test: Basic repo spec parsing
 #==============================================================================
 
 test_basic_repo_spec() {
-    echo ""
-    echo "=== Test: Basic repo spec parsing ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with basic specs
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -156,15 +40,14 @@ EOF
 
     # Run sync --dry-run to see what paths would be used
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # Verify paths are generated correctly (flat layout by default)
     assert_contains "$output" "repo" "Basic spec 'owner/repo' generates correct repo name"
     assert_contains "$output" "gum" "Basic spec 'charmbracelet/gum' generates correct repo name"
     assert_contains "$output" "cli" "Basic spec 'cli/cli' generates correct repo name"
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -172,14 +55,10 @@ EOF
 #==============================================================================
 
 test_branch_pinning() {
-    echo ""
-    echo "=== Test: Branch pinning with @branch syntax ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with branch specs
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -191,14 +70,13 @@ EOF
 
     # Run sync --dry-run with JSON output
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # The dry-run should show the repos being processed
     assert_contains "$output" "repo" "Branch-pinned spec processes correctly"
     assert_contains "$output" "gum" "Branch-pinned spec for gum processes correctly"
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -206,14 +84,10 @@ EOF
 #==============================================================================
 
 test_custom_names() {
-    echo ""
-    echo "=== Test: Custom names with 'as' syntax ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with custom name specs
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -224,7 +98,7 @@ EOF
 
     # Run sync --dry-run and verify custom names are used
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # Should see custom names in output
     assert_contains "$output" "my-custom-name" "Custom name 'my-custom-name' is used"
@@ -233,8 +107,7 @@ EOF
     # Should NOT see original repo names as paths
     # (Note: The original names might appear in other contexts, so we check specifically)
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -242,14 +115,10 @@ EOF
 #==============================================================================
 
 test_combined_spec() {
-    echo ""
-    echo "=== Test: Combined branch pinning and custom names ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with combined specs
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -261,15 +130,14 @@ EOF
 
     # Run sync --dry-run
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # Verify custom names are used (not branch names or original names)
     assert_contains "$output" "dev-repo" "Combined spec uses custom name 'dev-repo'"
     assert_contains "$output" "gum-stable" "Combined spec uses custom name 'gum-stable'"
     assert_contains "$output" "github-cli-v2" "Combined spec uses custom name 'github-cli-v2'"
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -277,14 +145,10 @@ EOF
 #==============================================================================
 
 test_deduplication() {
-    echo ""
-    echo "=== Test: Deduplication by path ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with duplicate paths
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -300,7 +164,7 @@ EOF
 
     # Run sync --dry-run to see deduplication in action
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # The first two should dedupe to one, but the custom-named ones are different paths
     # So we should see github-cli-1 and github-cli-2
@@ -317,8 +181,7 @@ EOF
         fail "Expected at most 2 mentions of owner/repo, got $repo_count"
     fi
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -326,14 +189,10 @@ EOF
 #==============================================================================
 
 test_mixed_specs() {
-    echo ""
-    echo "=== Test: Mixed specs in one file ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with mixed specs
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -357,7 +216,7 @@ EOF
 
     # Run sync --dry-run
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # All repos should be processed
     assert_contains "$output" "repo" "Basic spec is processed"
@@ -367,8 +226,7 @@ EOF
     # Comments should not appear as repo names
     assert_not_contains "$output" "# Basic" "Comments are not treated as repos"
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -376,14 +234,10 @@ EOF
 #==============================================================================
 
 test_edge_cases() {
-    echo ""
-    echo "=== Test: Edge cases in spec parsing ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a repos file with edge cases
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -409,7 +263,7 @@ EOF
 
     # Run sync --dry-run
     local output
-    output=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
 
     # Verify various edge cases are handled
     assert_contains "$output" "my-repo" "Hyphenated repo name works"
@@ -418,8 +272,7 @@ EOF
     # Verify SSH URL is parsed (extracts 'sshrepo' from git@github.com:owner/sshrepo.git)
     assert_contains "$output" "sshrepo" "SSH URL format is parsed correctly"
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -427,14 +280,10 @@ EOF
 #==============================================================================
 
 test_layout_with_specs() {
-    echo ""
-    echo "=== Test: Layout affects path generation ==="
-
-    setup_test_env
-    trap cleanup_test_env EXIT
+    e2e_setup
 
     # Initialize ru config
-    "$RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
 
     # Create a simple repos file
     local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
@@ -445,58 +294,37 @@ EOF
 
     # Test with flat layout (default)
     local output_flat
-    output_flat=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output_flat=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
     assert_contains "$output_flat" "repo" "Flat layout (default) processes basic spec"
     assert_contains "$output_flat" "custom-name" "Flat layout honors custom name"
 
     # Configure owner-repo layout
-    "$RU_SCRIPT" config --set LAYOUT=owner-repo --non-interactive >/dev/null 2>&1 || true
+    "$E2E_RU_SCRIPT" config --set LAYOUT=owner-repo --non-interactive >/dev/null 2>&1 || true
 
     # Test with owner-repo layout
     local output_owner
-    output_owner=$("$RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    output_owner=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
     # Owner-repo layout should show owner-repo format for basic spec
     # but custom name still overrides
     assert_contains "$output_owner" "custom-name" "Owner-repo layout still honors custom name"
 
-    cleanup_test_env
-    trap - EXIT
+    e2e_cleanup
 }
 
 #==============================================================================
 # Run All Tests
 #==============================================================================
 
-echo "============================================"
-echo "E2E Tests: Repo Spec Parsing"
-echo "============================================"
+log_suite_start "E2E Tests: Repo Spec Parsing"
 
-test_basic_repo_spec
-echo ""
+run_test test_basic_repo_spec
+run_test test_branch_pinning
+run_test test_custom_names
+run_test test_combined_spec
+run_test test_deduplication
+run_test test_mixed_specs
+run_test test_edge_cases
+run_test test_layout_with_specs
 
-test_branch_pinning
-echo ""
-
-test_custom_names
-echo ""
-
-test_combined_spec
-echo ""
-
-test_deduplication
-echo ""
-
-test_mixed_specs
-echo ""
-
-test_edge_cases
-echo ""
-
-test_layout_with_specs
-echo ""
-
-echo "============================================"
-echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
-echo "============================================"
-
-[[ $TESTS_FAILED -eq 0 ]]
+print_results
+exit "$(get_exit_code)"

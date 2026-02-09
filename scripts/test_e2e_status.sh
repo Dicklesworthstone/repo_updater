@@ -11,126 +11,12 @@
 #   - Dirty repo detection
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
-# shellcheck disable=SC1090  # Dynamic sourcing is intentional
+# shellcheck disable=SC1091  # Sourced files checked separately
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RU_SCRIPT="$PROJECT_DIR/ru"
-
-#==============================================================================
-# Test Framework
-#==============================================================================
-
-TESTS_PASSED=0
-TESTS_FAILED=0
-TEMP_DIR=""
-MOCK_BIN=""
-
-# Colors (disabled if not a terminal)
-if [[ -t 2 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    RESET='\033[0m'
-else
-    RED='' GREEN='' YELLOW='' RESET=''
-fi
-
-setup_test_env() {
-    TEMP_DIR=$(mktemp -d)
-    MOCK_BIN="$TEMP_DIR/bin"
-    mkdir -p "$MOCK_BIN"
-    
-    # Override XDG directories to isolate tests
-    export XDG_CONFIG_HOME="$TEMP_DIR/config"
-    export XDG_STATE_HOME="$TEMP_DIR/state"
-    export XDG_CACHE_HOME="$TEMP_DIR/cache"
-    export HOME="$TEMP_DIR/home"
-    mkdir -p "$HOME"
-    
-    # Projects directory
-    export TEST_PROJECTS_DIR="$TEMP_DIR/projects"
-    mkdir -p "$TEST_PROJECTS_DIR"
-    
-    # Create mock gh for auth check
-    cat > "$MOCK_BIN/gh" << 'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == "auth" && "$2" == "status" ]]; then
-    echo "Logged in to github.com as testuser"
-    exit 0
-elif [[ "$1" == "repo" && "$2" == "clone" ]]; then
-    shift 2
-    source="$1"
-    target="$2"
-    shift 2
-    git clone "$source" "$target" "$@" 2>&1
-    exit $?
-else
-    echo "Mock gh: unhandled command: $*" >&2
-    exit 1
-fi
-EOF
-    chmod +x "$MOCK_BIN/gh"
-    export PATH="$MOCK_BIN:$PATH"
-}
-
-cleanup_test_env() {
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-    fi
-}
-
-pass() {
-    echo -e "${GREEN}PASS${RESET}: $1"
-    ((TESTS_PASSED++))
-}
-
-fail() {
-    echo -e "${RED}FAIL${RESET}: $1"
-    ((TESTS_FAILED++))
-}
-
-skip() {
-    echo -e "${YELLOW}SKIP${RESET}: $1"
-}
-
-#==============================================================================
-# Assertion Helpers
-#==============================================================================
-
-assert_exit_code() {
-    local expected="$1"
-    local actual="$2"
-    local msg="$3"
-    if [[ "$expected" -eq "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg (expected exit code $expected, got $actual)"
-    fi
-}
-
-assert_output_contains() {
-    local output="$1"
-    local pattern="$2"
-    local msg="$3"
-    if printf '%s\n' "$output" | grep -q "$pattern"; then
-        pass "$msg"
-    else
-        fail "$msg (pattern '$pattern' not found in output)"
-    fi
-}
-
-assert_output_not_contains() {
-    local output="$1"
-    local pattern="$2"
-    local msg="$3"
-    if ! printf '%s\n' "$output" | grep -q "$pattern"; then
-        pass "$msg"
-    else
-        fail "$msg (pattern '$pattern' unexpectedly found in output)"
-    fi
-}
+# shellcheck source=test_e2e_framework.sh
+source "$SCRIPT_DIR/test_e2e_framework.sh"
 
 #==============================================================================
 # Helper Functions
@@ -139,13 +25,13 @@ assert_output_not_contains() {
 # Create a bare "remote" repository with initial commit
 create_remote_repo() {
     local name="$1"
-    local remote_dir="$TEMP_DIR/remotes/$name.git"
-    local work_dir="$TEMP_DIR/work/$name"
-    
+    local remote_dir="$E2E_TEMP_DIR/remotes/$name.git"
+    local work_dir="$E2E_TEMP_DIR/work/$name"
+
     mkdir -p "$remote_dir" "$work_dir"
     git init --bare "$remote_dir" >/dev/null 2>&1
     git -C "$remote_dir" symbolic-ref HEAD refs/heads/main
-    
+
     git clone "$remote_dir" "$work_dir" >/dev/null 2>&1
     git -C "$work_dir" config user.email "test@test.com"
     git -C "$work_dir" config user.name "Test User"
@@ -154,7 +40,7 @@ create_remote_repo() {
     git -C "$work_dir" add file.txt
     git -C "$work_dir" commit -m "Initial commit" >/dev/null 2>&1
     git -C "$work_dir" push -u origin main >/dev/null 2>&1
-    
+
     echo "$remote_dir"
 }
 
@@ -180,7 +66,7 @@ clone_to_projects() {
 add_remote_commit() {
     local work_dir="$1"
     local msg="${2:-Remote change}"
-    
+
     echo "$msg" >> "$work_dir/file.txt"
     git -C "$work_dir" add file.txt
     git -C "$work_dir" commit -m "$msg" >/dev/null 2>&1
@@ -191,7 +77,7 @@ add_remote_commit() {
 add_local_commit() {
     local repo_dir="$1"
     local msg="${2:-Local change}"
-    
+
     echo "$msg" >> "$repo_dir/file.txt"
     git -C "$repo_dir" add file.txt
     git -C "$repo_dir" commit -m "$msg" >/dev/null 2>&1
@@ -203,9 +89,38 @@ make_dirty() {
     echo "dirty content" >> "$repo_dir/file.txt"
 }
 
+# Set up status test environment (calls e2e_setup + creates mock gh + projects dir)
+setup_status_env() {
+    e2e_setup
+
+    # Create mock gh for auth check
+    cat > "$E2E_MOCK_BIN/gh" << 'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" && "$2" == "status" ]]; then
+    echo "Logged in to github.com as testuser"
+    exit 0
+elif [[ "$1" == "repo" && "$2" == "clone" ]]; then
+    shift 2
+    source="$1"
+    target="$2"
+    shift 2
+    git clone "$source" "$target" "$@" 2>&1
+    exit $?
+else
+    echo "Mock gh: unhandled command: $*" >&2
+    exit 1
+fi
+EOF
+    chmod +x "$E2E_MOCK_BIN/gh"
+
+    # Projects directory
+    export TEST_PROJECTS_DIR="$E2E_TEMP_DIR/projects"
+    mkdir -p "$TEST_PROJECTS_DIR"
+}
+
 # Initialize ru config
 init_test_config() {
-    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
 
     local config_file="$XDG_CONFIG_HOME/ru/config"
     local tmp_file="$config_file.tmp"
@@ -231,122 +146,117 @@ add_repo_to_config() {
 #==============================================================================
 
 test_status_shows_current() {
-    echo "Test: ru status shows 'current' for up-to-date repo"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "current-test")
     clone_to_projects "$remote" "current-test"
-    
+
     init_test_config
     add_repo_to_config "current-test"
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
     local exit_code=$?
-    
-    assert_exit_code 0 "$exit_code" "status exits with code 0"
-    assert_output_contains "$output" "current" "Shows 'current' status"
-    
-    cleanup_test_env
+
+    assert_equals "0" "$exit_code" "status exits with code 0"
+    assert_contains "$output" "current" "Shows 'current' status"
+
+    e2e_cleanup
 }
 
 test_status_shows_behind() {
-    echo "Test: ru status shows 'behind' when remote has new commits"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "behind-test")
     clone_to_projects "$remote" "behind-test"
-    
+
     # Add commit to remote (via work dir)
-    add_remote_commit "$TEMP_DIR/work/behind-test" "New remote commit"
-    
+    add_remote_commit "$E2E_TEMP_DIR/work/behind-test" "New remote commit"
+
     # Fetch to update refs (status needs to see remote changes)
     git -C "$TEST_PROJECTS_DIR/behind-test" fetch >/dev/null 2>&1
-    
+
     init_test_config
     add_repo_to_config "behind-test"
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
-    assert_output_contains "$output" "behind" "Shows 'behind' status"
-    
-    cleanup_test_env
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
+    assert_contains "$output" "behind" "Shows 'behind' status"
+
+    e2e_cleanup
 }
 
 test_status_shows_ahead() {
-    echo "Test: ru status shows 'ahead' when local has unpushed commits"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "ahead-test")
     clone_to_projects "$remote" "ahead-test"
-    
+
     # Add local commit without pushing
     add_local_commit "$TEST_PROJECTS_DIR/ahead-test" "Local commit"
-    
+
     init_test_config
     add_repo_to_config "ahead-test"
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
-    assert_output_contains "$output" "ahead" "Shows 'ahead' status"
-    
-    cleanup_test_env
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
+    assert_contains "$output" "ahead" "Shows 'ahead' status"
+
+    e2e_cleanup
 }
 
 test_status_shows_diverged() {
-    echo "Test: ru status shows 'diverged' when both have commits"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "diverged-test")
     clone_to_projects "$remote" "diverged-test"
-    
+
     # Add local commit
     add_local_commit "$TEST_PROJECTS_DIR/diverged-test" "Local diverge"
-    
+
     # Add remote commit
-    add_remote_commit "$TEMP_DIR/work/diverged-test" "Remote diverge"
-    
+    add_remote_commit "$E2E_TEMP_DIR/work/diverged-test" "Remote diverge"
+
     # Fetch to see remote changes
     git -C "$TEST_PROJECTS_DIR/diverged-test" fetch >/dev/null 2>&1
-    
+
     init_test_config
     add_repo_to_config "diverged-test"
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
-    assert_output_contains "$output" "diverged" "Shows 'diverged' status"
-    
-    cleanup_test_env
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
+    assert_contains "$output" "diverged" "Shows 'diverged' status"
+
+    e2e_cleanup
 }
 
 test_status_shows_dirty() {
-    echo "Test: ru status indicates dirty (uncommitted changes)"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "dirty-test")
     clone_to_projects "$remote" "dirty-test"
-    
+
     # Make it dirty
     make_dirty "$TEST_PROJECTS_DIR/dirty-test"
-    
+
     init_test_config
     add_repo_to_config "dirty-test"
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
     # Dirty indicator is typically * or similar
-    assert_output_contains "$output" "*" "Shows dirty indicator"
-    
-    cleanup_test_env
+    assert_contains "$output" "*" "Shows dirty indicator"
+
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -354,40 +264,39 @@ test_status_shows_dirty() {
 #==============================================================================
 
 test_status_multiple_repos() {
-    echo "Test: ru status shows status for multiple repos"
-    setup_test_env
-    
+    setup_status_env
+
     # Create multiple repos in different states
     local remote1 remote2 remote3
     remote1=$(create_remote_repo "multi1")
     remote2=$(create_remote_repo "multi2")
     remote3=$(create_remote_repo "multi3")
-    
+
     clone_to_projects "$remote1" "multi1"
     clone_to_projects "$remote2" "multi2"
     clone_to_projects "$remote3" "multi3"
-    
+
     # Make multi2 behind
-    add_remote_commit "$TEMP_DIR/work/multi2" "Remote commit"
+    add_remote_commit "$E2E_TEMP_DIR/work/multi2" "Remote commit"
     git -C "$TEST_PROJECTS_DIR/multi2" fetch >/dev/null 2>&1
-    
+
     # Make multi3 ahead
     add_local_commit "$TEST_PROJECTS_DIR/multi3" "Local commit"
-    
+
     init_test_config
     add_repo_to_config "multi1"
     add_repo_to_config "multi2"
     add_repo_to_config "multi3"
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
     # All repos should be mentioned
-    assert_output_contains "$output" "multi1" "Shows multi1"
-    assert_output_contains "$output" "multi2" "Shows multi2"
-    assert_output_contains "$output" "multi3" "Shows multi3"
-    
-    cleanup_test_env
+    assert_contains "$output" "multi1" "Shows multi1"
+    assert_contains "$output" "multi2" "Shows multi2"
+    assert_contains "$output" "multi3" "Shows multi3"
+
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -395,38 +304,36 @@ test_status_multiple_repos() {
 #==============================================================================
 
 test_status_no_fetch_uses_cache() {
-    echo "Test: ru status --no-fetch uses cached state"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "nofetch-test")
     clone_to_projects "$remote" "nofetch-test"
-    
+
     # Add remote commit but don't fetch yet
-    add_remote_commit "$TEMP_DIR/work/nofetch-test" "Remote commit"
-    
+    add_remote_commit "$E2E_TEMP_DIR/work/nofetch-test" "Remote commit"
+
     init_test_config
     add_repo_to_config "nofetch-test"
-    
+
     # Without fetching, status should show current (not behind)
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
-    assert_output_contains "$output" "current" "--no-fetch shows current (not fetched)"
-    
-    cleanup_test_env
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
+    assert_contains "$output" "current" "--no-fetch shows current (not fetched)"
+
+    e2e_cleanup
 }
 
 test_status_fetch_updates_refs() {
-    echo "Test: ru status --fetch updates remote refs"
-    setup_test_env
+    setup_status_env
 
     local remote
     remote=$(create_remote_repo "fetch-test")
     clone_to_projects "$remote" "fetch-test"
 
     # Add remote commit
-    add_remote_commit "$TEMP_DIR/work/fetch-test" "Remote commit"
+    add_remote_commit "$E2E_TEMP_DIR/work/fetch-test" "Remote commit"
 
     init_test_config
     add_repo_to_config "fetch-test"
@@ -439,11 +346,11 @@ test_status_fetch_updates_refs() {
 
     # Now status with --no-fetch should show behind (refs were just updated)
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
 
-    assert_output_contains "$output" "behind" "--fetch shows behind (fetched remote)"
+    assert_contains "$output" "behind" "--fetch shows behind (fetched remote)"
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -451,18 +358,17 @@ test_status_fetch_updates_refs() {
 #==============================================================================
 
 test_status_shows_missing() {
-    echo "Test: ru status shows 'missing' for unconfigured repos"
-    setup_test_env
-    
+    setup_status_env
+
     init_test_config
     add_repo_to_config "missing-repo"  # No actual repo exists
-    
+
     local output
-    output=$("$RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
-    
-    assert_output_contains "$output" "missing" "Shows 'missing' for non-existent repo"
-    
-    cleanup_test_env
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --non-interactive 2>&1)
+
+    assert_contains "$output" "missing" "Shows 'missing' for non-existent repo"
+
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -470,30 +376,29 @@ test_status_shows_missing() {
 #==============================================================================
 
 test_status_json_output() {
-    echo "Test: ru status --json produces valid output"
-    setup_test_env
-    
+    setup_status_env
+
     local remote
     remote=$(create_remote_repo "json-test")
     clone_to_projects "$remote" "json-test"
-    
+
     init_test_config
     add_repo_to_config "json-test"
-    
+
     local json_output
-    json_output=$("$RU_SCRIPT" status --no-fetch --json --non-interactive 2>/dev/null)
+    json_output=$("$E2E_RU_SCRIPT" status --no-fetch --json --non-interactive 2>/dev/null)
     local exit_code=$?
-    
-    assert_exit_code 0 "$exit_code" "status --json exits with code 0"
-    
+
+    assert_equals "0" "$exit_code" "status --json exits with code 0"
+
     # Check if valid JSON
     if printf '%s\n' "$json_output" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
         pass "JSON output is valid"
     else
         fail "JSON output is invalid"
     fi
-    
-    cleanup_test_env
+
+    e2e_cleanup
 }
 
 test_status_json_revlist_failure() {
@@ -501,8 +406,7 @@ test_status_json_revlist_failure() {
     # The actual rev-list failure case (outputting -1) is tested via mock in
     # test_local_git.sh:test_status_revlist_failure_numeric which uses a mock
     # git wrapper to force the failure scenario.
-    echo "Test: ru status --json handles rev-list failure gracefully (bd-jleo regression)"
-    setup_test_env
+    setup_status_env
 
     # Create a remote repo
     local remote
@@ -528,7 +432,7 @@ test_status_json_revlist_failure() {
 
     # Run status with this diverged state
     local json_output
-    json_output=$("$RU_SCRIPT" status --no-fetch --json --non-interactive 2>/dev/null)
+    json_output=$("$E2E_RU_SCRIPT" status --no-fetch --json --non-interactive 2>/dev/null)
     local exit_code=$?
 
     # Should still exit cleanly (exit code 0 or 2 for diverged)
@@ -564,53 +468,26 @@ test_status_json_revlist_failure() {
         fail "behind is not numeric: $behind"
     fi
 
-    cleanup_test_env
+    e2e_cleanup
 }
 
 #==============================================================================
 # Run Tests
 #==============================================================================
 
-echo "============================================"
-echo "E2E Tests: ru status workflow"
-echo "============================================"
-echo ""
+log_suite_start "E2E Tests: ru status workflow"
 
-test_status_shows_current
-echo ""
+run_test test_status_shows_current
+run_test test_status_shows_behind
+run_test test_status_shows_ahead
+run_test test_status_shows_diverged
+run_test test_status_shows_dirty
+run_test test_status_multiple_repos
+run_test test_status_no_fetch_uses_cache
+run_test test_status_fetch_updates_refs
+run_test test_status_shows_missing
+run_test test_status_json_output
+run_test test_status_json_revlist_failure
 
-test_status_shows_behind
-echo ""
-
-test_status_shows_ahead
-echo ""
-
-test_status_shows_diverged
-echo ""
-
-test_status_shows_dirty
-echo ""
-
-test_status_multiple_repos
-echo ""
-
-test_status_no_fetch_uses_cache
-echo ""
-
-test_status_fetch_updates_refs
-echo ""
-
-test_status_shows_missing
-echo ""
-
-test_status_json_output
-echo ""
-
-test_status_json_revlist_failure
-echo ""
-
-echo "============================================"
-echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
-echo "============================================"
-
-[[ $TESTS_FAILED -eq 0 ]]
+print_results
+exit "$(get_exit_code)"
