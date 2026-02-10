@@ -559,8 +559,8 @@ else
     fail "whitespace-only lines skipped" "1" "${#my_repos[@]}"
 fi
 
-cleanup_test_env
 restore_home
+cleanup_test_env
 
 #==============================================================================
 # Tests: Fork helper functions (require git repos)
