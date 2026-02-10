@@ -60,6 +60,8 @@ cleanup_test_env() {
     fi
 }
 
+# NOTE: This trap is replaced later when fork tests set up FORK_TEMP.
+# cleanup_test_env is called explicitly before that point (line ~560).
 trap cleanup_test_env EXIT
 
 pass() {
@@ -568,7 +570,7 @@ section "has_upstream_remote"
 
 # Create a temporary git repo setup for fork tests
 FORK_TEMP=$(mktemp -d)
-trap 'rm -rf "$FORK_TEMP"' EXIT
+trap 'rm -rf "$FORK_TEMP"; cleanup_test_env' EXIT
 
 # Step 1: Create "upstream" as a normal repo with a commit on main
 git init "$FORK_TEMP/upstream" >/dev/null 2>&1
@@ -749,13 +751,7 @@ else
 fi
 
 #==============================================================================
-# Cleanup
-#==============================================================================
-
-rm -rf "$FORK_TEMP"
-
-#==============================================================================
-# Results
+# Results (FORK_TEMP cleaned by EXIT trap)
 #==============================================================================
 
 echo ""
