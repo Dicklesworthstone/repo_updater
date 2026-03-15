@@ -51,13 +51,13 @@ brew install dicklesworthstone/tap/ru
 
 ```bash
 # Sync all repos (machine-readable)
-ru sync --format json
+ru sync --json
 
 # Preview without changes
-ru sync --dry-run --format json
+ru sync --dry-run --json
 
 # Status only (no fetch)
-ru status --no-fetch --format json
+ru status --no-fetch --json
 
 # Machine-readable CLI documentation
 ru robot-docs                   # All topics as JSON
@@ -88,13 +88,13 @@ ru status --no-fetch       # Quick local status
 ru list --paths            # Repo paths (stdout)
 ```
 
-**Automation:** `--non-interactive --format json|toon` (structured→stdout, human→stderr). (`--json` == `--format json`)
+**Automation:** `--non-interactive --json` (structured→stdout, human→stderr).
 
 **Exit:** 0=ok | 1=partial | 2=conflicts | 3=system | 4=bad args | 5=interrupted (`--resume`)
 
 **Critical:**
 - Never create worktrees/clones in projects dir → use `/tmp/`
-- Never parse human output → use `--format json|toon`
+- Never parse human output → use `--json`
 ````
 
 ---
