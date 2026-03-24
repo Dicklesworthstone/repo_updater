@@ -8511,12 +8511,14 @@ cmd_status() {
                 fi
                 [[ "$first" == "true" ]] || echo ","
                 first="false"
-                # Escape path for JSON safety (may contain special characters)
-                local safe_path safe_branch
+                # Escape all string fields for JSON safety
+                local safe_path safe_branch safe_repo_id safe_status
                 safe_path=$(json_escape "$local_path")
                 safe_branch=$(json_escape "$branch_name")
+                safe_repo_id=$(json_escape "$repo_id")
+                safe_status=$(json_escape "$status")
                 printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s,"mismatch":%s}' \
-                    "$repo_id" "$safe_path" "$status" "$safe_branch" "$ahead" "$behind" "$dirty" "$mismatch"
+                    "$safe_repo_id" "$safe_path" "$safe_status" "$safe_branch" "$ahead" "$behind" "$dirty" "$mismatch"
             done
             echo "]"
         )"
@@ -19640,8 +19642,8 @@ cmd_fork_clean() {
                 clean_ok="true"
             fi
         else
-            # Default: ff-only merge after reset
-            if git -C "$local_path" reset --hard "${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
+            # Default: ff-only merge to upstream (non-destructive)
+            if git -C "$local_path" merge --ff-only "${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
                 clean_ok="true"
             fi
         fi
@@ -19713,7 +19715,7 @@ cs_classify_file() {
             echo "config"; return ;;
     esac
     case "$base" in
-        *.toml|*.yaml|*.yml|*.json|*.lock|*.cfg|*.ini|*.conf|.gitignore|.editorconfig|.prettierrc*|.eslintrc*|Cargo.lock|package-lock.json|yarn.lock|flake.lock)
+        *.toml|*.yaml|*.yml|*.json|*.lock|*.cfg|*.ini|*.conf|.gitignore|.editorconfig|.prettierrc*|.eslintrc*)
             echo "config"; return ;;
     esac
 
@@ -19910,6 +19912,7 @@ cs_process_repo() {
 
     for entry in "${plan_entries[@]}"; do
         local bucket_name msg file_list
+        # shellcheck disable=SC2034  # bucket_name parsed as part of delimited format but unused here
         IFS='|' read -r bucket_name msg file_list <<< "$entry"
 
         local file_count
