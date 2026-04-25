@@ -73,25 +73,25 @@ jobs:
       - name: Generate release notes
         run: |
           cat > release_notes.md << 'EOF'
-## Installation
+          ## Installation
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
-```
+          ```bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+          ```
 
-## Verify Installation (Optional)
+          ## Verify Installation (Optional)
 
-After downloading, verify the checksum:
+          After downloading, verify the checksum:
 
-```bash
-# Verify ru script
-echo "$(curl -fsSL https://github.com/Dicklesworthstone/repo_updater/releases/download/v${{ steps.version.outputs.version }}/ru.sha256)  ru" | sha256sum -c -
-```
+          ```bash
+          # Verify ru script
+          echo "$(curl -fsSL https://github.com/Dicklesworthstone/repo_updater/releases/download/v${{ steps.version.outputs.version }}/ru.sha256)  ru" | sha256sum -c -
+          ```
 
-## Checksums
+          ## Checksums
 
-SHA256 checksums for this release are attached as `checksums.txt`.
-EOF
+          SHA256 checksums for this release are attached as `checksums.txt`.
+          EOF
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
