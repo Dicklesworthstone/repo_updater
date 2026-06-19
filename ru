@@ -1447,6 +1447,7 @@ spawn_ai_session() {
     case "$agent_type" in
         claude|cc)  agent_flag="--cc=1"; send_flag="--cc" ;;
         codex|cod)  agent_flag="--cod=1"; send_flag="--cod" ;;
+        antigravity|agy) agent_flag="--agy=1"; send_flag="--agy" ;;
         gemini|gmi) agent_flag="--gmi=1"; send_flag="--gmi" ;;
         *)
             log_error "spawn_ai_session: Unknown agent type: $agent_type"
