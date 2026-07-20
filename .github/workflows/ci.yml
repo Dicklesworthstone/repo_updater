@@ -71,7 +71,7 @@ jobs:
 
       - name: Setup Homebrew cache (macOS)
         if: runner.os == 'macOS'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/Library/Caches/Homebrew
@@ -168,7 +168,7 @@ jobs:
 
       - name: Setup Homebrew cache (macOS)
         if: runner.os == 'macOS'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/Library/Caches/Homebrew
