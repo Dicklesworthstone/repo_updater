@@ -357,12 +357,11 @@ This method provides:
 - Dependency management
 - Easy uninstall via `brew uninstall`
 
-#### Windows: Scoop
+#### Windows: WSL2
 
-```powershell
-scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
-scoop install dicklesworthstone/ru
-```
+`ru` is a bash script, so there is no native Windows package (no Scoop or winget
+manifest). On Windows, install it inside WSL2 using either the Homebrew command
+above or the install script below.
 
 #### Alternative: Install Script
 
