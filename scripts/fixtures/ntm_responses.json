@@ -2,7 +2,7 @@
   "spawn_success": {
     "success": true,
     "session": "ru_sweep_test_12345",
-    "agents": [{"pane": "0.1", "type": "claude", "ready": true}]
+    "agents": [{ "pane": "0.1", "type": "claude", "ready": true }]
   },
   "spawn_resource_busy": {
     "success": false,
