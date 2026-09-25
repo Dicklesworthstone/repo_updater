@@ -5064,9 +5064,9 @@ error_preflight_uncommitted() {
         "Cannot run agent-sweep on $(basename "$repo_path")" \
         "Repository has uncommitted changes" \
         "cd $repo_path
-git stash       # Save changes temporarily
-ru agent-sweep  # Run sweep
-git stash pop   # Restore changes"
+git stash push --include-untracked  # Save changes, untracked files too
+ru agent-sweep                      # Run sweep
+git stash pop                       # Restore changes"
 }
 
 error_preflight_conflicts() {
@@ -7971,8 +7971,13 @@ print_conflict_help() {
                 printf '%b\n' "     ${GREEN}a)${RESET} Use ru with --autostash (${GREEN}recommended${RESET}):" >&2
                 printf '%b\n' "        ${CYAN}ru sync --autostash${RESET}" >&2
                 echo "" >&2
-                printf '%b\n' "     ${GREEN}b)${RESET} Stash and pull manually:" >&2
-                printf '%b\n' "        ${CYAN}cd \"$path\" && git stash && git pull && git stash pop${RESET}" >&2
+                # Not `git stash && git pull && git stash pop`: when git stash
+                # saves nothing (e.g. only untracked files are dirty), the pop
+                # applies and drops an older, unrelated stash (GH #15). Git's
+                # autostash creates a stash only when needed and restores only
+                # that one, keeping it listed if restoring conflicts.
+                printf '%b\n' "     ${GREEN}b)${RESET} Stash and pull manually (git restores only its own stash):" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git pull --autostash${RESET}" >&2
                 echo "" >&2
                 printf '%b\n' "     ${GREEN}c)${RESET} Commit your changes:" >&2
                 printf '%b\n' "        ${CYAN}cd \"$path\" && git add . && git commit -m \"WIP\"${RESET}" >&2

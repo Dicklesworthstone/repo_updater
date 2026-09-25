@@ -451,6 +451,80 @@ test_stash_and_pull() {
     e2e_cleanup
 }
 
+# Print the "Stash and pull manually" command that `ru sync`'s conflict report
+# (print_conflict_help) suggests for a dirty repo at the given path.
+conflict_help_stash_recipe() {
+    local repo_path="$1"
+    local results_file="$E2E_TEMP_DIR/results.ndjson"
+    printf '{"repo":"stash-help","status":"dirty","path":"%s"}\n' "$repo_path" > "$results_file"
+    (
+        BOLD="" DIM="" RED="" GREEN="" YELLOW="" CYAN="" RESET=""
+        RESULTS_FILE="$results_file"
+        PROJECTS_DIR="$RU_PROJECTS_DIR"
+        eval "$(sed -n '/^print_conflict_help()/,/^}/p' "$E2E_RU_SCRIPT")"
+        print_conflict_help
+    ) 2>&1 | grep -A1 'b) Stash and pull manually' | tail -n 1 | sed 's/^ *//'
+}
+
+# GH #15: `git stash && git pull && git stash pop` pops an older, unrelated
+# stash when git stash saves nothing (only untracked files are dirty).
+test_conflict_help_stash_recipe_untracked_only_keeps_older_stash() {
+    setup_edge_case_env
+
+    local remote_dir
+    remote_dir=$(create_test_bare_repo "stash-help-untracked")
+    local local_repo="$RU_PROJECTS_DIR/stash-help-untracked"
+    init_local_repo "$remote_dir" "$local_repo"
+
+    # An older, unrelated stash that the recipe must not touch
+    echo "old edit" > "$local_repo/file.txt"
+    git -C "$local_repo" stash push -m "older stash" >/dev/null 2>&1
+    # Today's dirt is an untracked file only; upstream moves on
+    echo "scratch" > "$local_repo/scratch.txt"
+    add_remote_commit "$remote_dir" "file.txt" "remote content"
+
+    local recipe
+    recipe=$(conflict_help_stash_recipe "$local_repo")
+    assert_contains "$recipe" "cd \"$local_repo\" && " "Recipe targets the repo path"
+
+    local recipe_exit=0
+    bash -c "$recipe" >/dev/null 2>&1 || recipe_exit=$?
+
+    assert_equals "0" "$recipe_exit" "Printed recipe succeeds on an untracked-only repo"
+    assert_equals "stash@{0}: On main: older stash" "$(git -C "$local_repo" stash list)" \
+        "Older stash is neither applied nor dropped"
+    assert_equals "remote content" "$(cat "$local_repo/file.txt")" "Pull landed without the older stash applied"
+    assert_equals "?? scratch.txt" "$(git -C "$local_repo" status --porcelain)" "Only the untracked file remains"
+
+    e2e_cleanup
+}
+
+test_conflict_help_stash_recipe_tracked_edit_restored() {
+    setup_edge_case_env
+
+    local remote_dir
+    remote_dir=$(create_test_bare_repo "stash-help-tracked")
+    local local_repo="$RU_PROJECTS_DIR/stash-help-tracked"
+    init_local_repo "$remote_dir" "$local_repo"
+
+    echo "old edit" > "$local_repo/file.txt"
+    git -C "$local_repo" stash push -m "older stash" >/dev/null 2>&1
+    echo "local edit" >> "$local_repo/file.txt"
+    add_remote_commit "$remote_dir" "remote.txt" "remote content"
+
+    local recipe recipe_exit=0
+    recipe=$(conflict_help_stash_recipe "$local_repo")
+    bash -c "$recipe" >/dev/null 2>&1 || recipe_exit=$?
+
+    assert_equals "0" "$recipe_exit" "Printed recipe succeeds with a tracked edit"
+    assert_file_exists "$local_repo/remote.txt" "Pull landed"
+    assert_file_contains "$local_repo/file.txt" "local edit" "Today's edit is restored"
+    assert_equals "stash@{0}: On main: older stash" "$(git -C "$local_repo" stash list)" \
+        "Only the older stash remains listed"
+
+    e2e_cleanup
+}
+
 #==============================================================================
 # Tests: Error Scenarios
 #==============================================================================
@@ -714,6 +788,8 @@ run_test test_exit_code_ff_only_diverged
 # Autostash tests
 run_test test_autostash_dirty_repo
 run_test test_stash_and_pull
+run_test test_conflict_help_stash_recipe_untracked_only_keeps_older_stash
+run_test test_conflict_help_stash_recipe_tracked_edit_restored
 
 # Error scenario tests
 run_test test_not_git_repo_detected

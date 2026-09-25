@@ -1084,8 +1084,8 @@ When ru encounters issues, it provides actionable resolution commands.
    Log:    ~/.local/state/ru/logs/2025-01-03/repos/mcp_agent_mail.log
 
    Resolution options:
-     a) Stash and pull:
-        cd /data/projects/mcp_agent_mail && git stash && git pull && git stash pop
+     a) Stash and pull (git restores only its own stash):
+        cd /data/projects/mcp_agent_mail && git pull --autostash
 
      b) Commit your changes:
         cd /data/projects/mcp_agent_mail && git add . && git commit -m "WIP"
@@ -3615,7 +3615,7 @@ ru sync --non-interactive
 **Cause:** Uncommitted local changes.
 
 **Fixes:**
-1. Stash: `git stash && git pull && git stash pop`
+1. Stash and pull: `git pull --autostash` (a bare `git stash && git pull && git stash pop` pops an older stash when only untracked files are dirty)
 2. Commit: `git add . && git commit -m "WIP"`
 3. Use `--autostash`: `ru sync --autostash`
 4. Discard (careful!): `git checkout . && git clean -fd`
