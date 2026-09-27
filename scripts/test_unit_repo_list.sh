@@ -21,6 +21,7 @@ source "$SCRIPT_DIR/test_framework.sh"
 source_ru_function "_is_valid_var_name"
 source_ru_function "_set_out_var"
 source_ru_function "_is_safe_path_segment"
+source_ru_function "_is_safe_group_path"
 source_ru_function "load_repo_list"
 source_ru_function "parse_repo_spec"
 source_ru_function "parse_repo_url"
@@ -270,6 +271,120 @@ test_parse_repo_spec_https_with_branch() {
 
     assert_equals "https://github.com/owner/repo" "$url" "URL should be HTTPS URL"
     assert_equals "feature" "$branch" "Branch should be feature"
+
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: repo groups ('in <group>', GH #16)
+#==============================================================================
+
+test_parse_repo_spec_group() {
+    local test_name="parse_repo_spec parses 'in <group>' in either order with 'as'"
+    log_test_start "$test_name"
+
+    local url branch local_name group
+    parse_repo_spec "owner/repo in illo" url branch local_name group
+    assert_equals "owner/repo" "$url" "URL without modifiers"
+    assert_equals "illo" "$group" "Group parsed"
+    assert_equals "" "$local_name" "No local name"
+
+    parse_repo_spec "owner/repo@develop in clients/acme as web" url branch local_name group
+    assert_equals "owner/repo" "$url" "URL with branch, group, name"
+    assert_equals "develop" "$branch" "Branch kept"
+    assert_equals "clients/acme" "$group" "Nested group parsed"
+    assert_equals "web" "$local_name" "Name parsed after group"
+
+    parse_repo_spec "owner/repo as web in illo" url branch local_name group
+    assert_equals "owner/repo" "$url" "URL with name before group"
+    assert_equals "illo" "$group" "Group parsed after name"
+    assert_equals "web" "$local_name" "Name parsed before group"
+
+    # Legacy 4-argument callers still get a clean URL
+    parse_repo_spec "git@github.com:owner/repo.git in illo" url branch local_name
+    assert_equals "git@github.com:owner/repo.git" "$url" "SSH URL with group, 4-arg call"
+    assert_equals "" "$branch" "SSH '@' is not a branch"
+
+    log_test_pass "$test_name"
+}
+
+test_resolve_repo_spec_group_all_layouts() {
+    local test_name="resolve_repo_spec puts the group after the layout prefix"
+    log_test_start "$test_name"
+
+    local url branch custom path repo_id group
+    resolve_repo_spec "tmchow/illo-website in illo" "/p" "flat" url branch custom path repo_id group
+    assert_equals "/p/illo/illo-website" "$path" "flat layout"
+    assert_equals "illo" "$group" "group output var"
+    assert_equals "tmchow/illo-website" "$repo_id" "repo_id unaffected by group"
+
+    resolve_repo_spec "tmchow/illo-website in illo" "/p" "owner-repo" url branch custom path repo_id
+    assert_equals "/p/tmchow/illo/illo-website" "$path" "owner-repo layout"
+
+    resolve_repo_spec "tmchow/illo-website in illo" "/p" "full" url branch custom path repo_id
+    assert_equals "/p/github.com/tmchow/illo/illo-website" "$path" "full layout"
+
+    resolve_repo_spec "tmchow/illo-characters@dev in illo as characters" "/p" "owner-repo" url branch custom path repo_id
+    assert_equals "/p/tmchow/illo/characters" "$path" "'as' renames only the leaf inside a group"
+    assert_equals "dev" "$branch" "branch kept with group"
+
+    resolve_repo_spec "tmchow/x in clients/acme" "/p" "flat" url branch custom path repo_id
+    assert_equals "/p/clients/acme/x" "$path" "nested group"
+
+    # Without a group, 'as' keeps its legacy meaning (replaces the layout path)
+    resolve_repo_spec "tmchow/x as y" "/p" "owner-repo" url branch custom path repo_id
+    assert_equals "/p/y" "$path" "legacy 'as' unchanged"
+
+    log_test_pass "$test_name"
+}
+
+test_resolve_repo_spec_rejects_unsafe_groups() {
+    local test_name="resolve_repo_spec rejects unsafe group paths"
+    log_test_start "$test_name"
+
+    local url branch custom path repo_id bad
+    for bad in ".." "a/../b" "/abs" "a/" "a//b" "-x" "a/-x" "." "a/./b"; do
+        if resolve_repo_spec "owner/repo in $bad" "/p" "flat" url branch custom path repo_id; then
+            fail "group '$bad' should be rejected (got $path)"
+        else
+            pass "group '$bad' rejected"
+        fi
+    done
+
+    if resolve_repo_spec "owner/repo in illo as a/b" "/p" "flat" url branch custom path repo_id; then
+        fail "multi-segment 'as' should still be rejected inside a group"
+    else
+        pass "multi-segment 'as' rejected inside a group"
+    fi
+
+    log_test_pass "$test_name"
+}
+
+test_dedupe_repos_same_repo_in_two_groups() {
+    local test_name="dedupe_repos keeps one copy of a repo listed plain and grouped"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+
+    PROJECTS_DIR="$test_env/projects"
+    LAYOUT="owner-repo"
+
+    local input result warnings
+    input=$(cat << 'EOF'
+tmchow/illo-website
+tmchow/illo-website in illo
+tmchow/illo-skill in illo
+tmchow/illo-skill in illo as skill-v2
+EOF
+)
+    result=$(echo "$input" | dedupe_repos 2>"$test_env/err")
+    warnings=$(cat "$test_env/err")
+
+    assert_contains "$result" "tmchow/illo-website" "first listing kept"
+    assert_not_contains "$result" "tmchow/illo-website in illo" "grouped duplicate dropped"
+    assert_contains "$warnings" "tmchow/illo-website in illo" "duplicate is reported"
+    assert_contains "$result" "tmchow/illo-skill in illo" "grouped repo kept"
+    assert_contains "$result" "tmchow/illo-skill in illo as skill-v2" "distinct 'as' name still allowed"
 
     log_test_pass "$test_name"
 }
@@ -698,6 +813,10 @@ run_test test_parse_repo_spec_combined
 run_test test_parse_repo_spec_https_url
 run_test test_parse_repo_spec_ssh_url
 run_test test_parse_repo_spec_https_with_branch
+run_test test_parse_repo_spec_group
+run_test test_resolve_repo_spec_group_all_layouts
+run_test test_resolve_repo_spec_rejects_unsafe_groups
+run_test test_dedupe_repos_same_repo_in_two_groups
 
 # dedupe_repos tests
 run_test test_dedupe_repos_removes_duplicates

@@ -747,6 +747,10 @@ git@github.com:owner/repo.git
 
 # SSH with custom name
 git@github.com:owner/repo.git as myrepo
+
+# Group related repos under a shared subfolder (see "Grouping Repos" below)
+owner/repo-website in myproject
+owner/repo-cli@develop in myproject as cli
 ```
 
 ### Advanced Repo Spec Syntax
@@ -754,7 +758,7 @@ git@github.com:owner/repo.git as myrepo
 The repo spec parser supports flexible combinations:
 
 ```
-<url_or_shorthand>[@<branch>] [as <local_name>]
+<url_or_shorthand>[@<branch>] [in <group>] [as <local_name>]
 ```
 
 | Spec | URL | Branch | Local Name |
@@ -771,6 +775,23 @@ The repo spec parser supports flexible combinations:
 - Branch names cannot contain `/` (use `v2` not `feature/v2`)
 - The SSH `@` in `git@github.com` is not confused with branch syntax
 - Custom names are case-sensitive and become the directory name
+- `in <group>` and `as <name>` may appear in either order, once each
+
+### Grouping Repos
+
+`in <group>` inserts a folder between whatever the layout produces and the repo folder. The group folder is never a repo itself; it is just a place to keep related checkouts together. URL, branch, and remotes are unchanged.
+
+| Layout | `tmchow/illo-website in illo` |
+|--------|-------------------------------|
+| `flat` | `$PROJECTS_DIR/illo/illo-website` |
+| `owner-repo` | `$PROJECTS_DIR/tmchow/illo/illo-website` |
+| `full` | `$PROJECTS_DIR/github.com/tmchow/illo/illo-website` |
+
+- Groups can be nested: `owner/repo in clients/acme`. Each segment is validated like a custom name (no `..`, no leading `-`).
+- Inside a group, `as <name>` renames only the repo folder: `tmchow/illo-characters in illo as characters` resolves to `.../tmchow/illo/characters`. Without a group, `as <name>` keeps its old meaning and replaces the whole layout path with `$PROJECTS_DIR/<name>`.
+- The group is part of the line, so it works the same in `public.txt` and `private.txt`. `ru add --group illo owner/repo` writes the `in illo` form for you.
+- A repo listed twice with the same local name but different groups (for example once plain and once `in illo`) is kept only at its first location, with a warning.
+- ru refuses to clone into a path that sits inside another repository's working tree (for example a group named like an existing repo), and `ru prune` scans deep enough to see grouped repos.
 
 ### Supported URL Formats
 

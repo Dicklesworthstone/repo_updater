@@ -312,6 +312,63 @@ EOF
 }
 
 #==============================================================================
+# Test: Repo groups ('in <group>', GH #16)
+#==============================================================================
+
+test_group_specs() {
+    e2e_setup
+    export RU_LAYOUT="owner-repo"
+
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+
+    # ru add --group writes the 'in <group>' form and keeps branch/name
+    "$E2E_RU_SCRIPT" add --group illo tmchow/illo-website >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add --group=illo "tmchow/illo-characters@dev as characters" >/dev/null 2>&1
+    local add_bad_output
+    add_bad_output=$("$E2E_RU_SCRIPT" add --group ../x tmchow/evil 2>&1)
+    local add_bad_exit=$?
+
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    local contents
+    contents=$(cat "$repos_file")
+    assert_contains "$contents" "tmchow/illo-website in illo" "--group appends 'in illo'"
+    assert_contains "$contents" "tmchow/illo-characters@dev in illo as characters" "--group keeps branch and name"
+    assert_equals "4" "$add_bad_exit" "Unsafe --group is rejected"
+    assert_contains "$add_bad_output" "Invalid group" "Unsafe --group explains why"
+    assert_not_contains "$contents" "tmchow/evil" "Unsafe group is not written"
+
+    local output
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    assert_contains "$output" "$RU_PROJECTS_DIR/tmchow/illo/illo-website" "Group path composes with owner-repo layout"
+    assert_contains "$output" "$RU_PROJECTS_DIR/tmchow/illo/characters" "'as' renames the leaf inside a group"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_group_refuses_to_nest_inside_repo() {
+    e2e_setup
+    export RU_LAYOUT="owner-repo"
+
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+
+    # $PROJECTS_DIR/tmchow/illo is an existing repo; group 'illo' would nest inside it
+    mkdir -p "$RU_PROJECTS_DIR/tmchow/illo"
+    git -C "$RU_PROJECTS_DIR/tmchow/illo" init --quiet 2>/dev/null
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    printf '%s\n' "tmchow/illo" "tmchow/illo-website in illo" >> "$repos_file"
+
+    local output
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    assert_contains "$output" "Refusing to clone" "Clone into another repo's tree is refused"
+    assert_contains "$output" "inside the git repository $RU_PROJECTS_DIR/tmchow/illo" "Names the enclosing repo"
+    assert_not_contains "$output" "Would clone: tmchow/illo-website" "No clone planned into the nested path"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+#==============================================================================
 # Run All Tests
 #==============================================================================
 
@@ -325,6 +382,8 @@ run_test test_deduplication
 run_test test_mixed_specs
 run_test test_edge_cases
 run_test test_layout_with_specs
+run_test test_group_specs
+run_test test_group_refuses_to_nest_inside_repo
 
 print_results
 exit "$(get_exit_code)"

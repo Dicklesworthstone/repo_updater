@@ -231,6 +231,32 @@ test_prune_owner_repo_layout() {
     unset RU_LAYOUT
 }
 
+test_prune_grouped_repos() {
+    setup_initialized_env
+    export RU_LAYOUT="owner-repo"
+
+    # Configured grouped repo, plus an unconfigured repo in the same group folder
+    "$E2E_RU_SCRIPT" add --group illo tmchow/illo-website >/dev/null 2>&1
+    mkdir -p "$RU_PROJECTS_DIR/tmchow/illo/illo-website" "$RU_PROJECTS_DIR/tmchow/illo/stale"
+    git -C "$RU_PROJECTS_DIR/tmchow/illo/illo-website" init --quiet 2>/dev/null
+    git -C "$RU_PROJECTS_DIR/tmchow/illo/stale" init --quiet 2>/dev/null
+    # A repo nested inside a configured working tree is not an orphan
+    mkdir -p "$RU_PROJECTS_DIR/tmchow/illo/illo-website/vendor/dep"
+    git -C "$RU_PROJECTS_DIR/tmchow/illo/illo-website/vendor/dep" init --quiet 2>/dev/null
+
+    local stderr_output
+    stderr_output=$("$E2E_RU_SCRIPT" prune 2>&1 >/dev/null)
+    local exit_code=$?
+
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_contains "$stderr_output" "Found 1 orphan" "Only the stale grouped repo is an orphan"
+    assert_contains "$stderr_output" "tmchow/illo/stale" "Scans one level deeper for the group"
+    assert_not_contains "$stderr_output" "vendor/dep" "Skips repos nested in configured repos"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
 test_prune_full_layout() {
     setup_initialized_env
     export RU_LAYOUT="full"
@@ -350,6 +376,7 @@ run_test test_prune_unknown_option
 # Layout modes
 run_test test_prune_owner_repo_layout
 run_test test_prune_full_layout
+run_test test_prune_grouped_repos
 
 # Custom names
 run_test test_prune_respects_custom_names

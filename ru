@@ -5526,6 +5526,8 @@ INIT OPTIONS:
 ADD OPTIONS:
     --private            Add to private.txt instead of public.txt
     --from-cwd           Detect repo from current working directory
+    --group NAME         Clone into a NAME/ subfolder of the layout path
+                         (writes 'owner/repo in NAME'; NAME may be nested: a/b)
 
 LIST OPTIONS:
     --paths              Show local paths instead of URLs
@@ -6373,32 +6375,43 @@ load_repo_list() {
     done < "$file"
 }
 
-# Parse a repo specification with optional branch and custom name
+# Parse a repo specification with optional branch, group, and custom name
 # Syntax patterns:
 #   owner/repo                    -> url, empty branch, empty local_name
 #   owner/repo@develop            -> url, develop branch, empty local_name
 #   owner/repo as myname          -> url, empty branch, myname local_name
 #   owner/repo@develop as myname  -> url, develop branch, myname local_name
 #   owner/repo@feature/foo        -> url, feature/foo branch (branches can contain /)
-# Args: spec url_var branch_var local_name_var (variable names)
+#   owner/repo in mygroup         -> url, empty branch, empty local_name, mygroup group
+#   owner/repo in a/b as myname   -> 'in' and 'as' may appear in either order, once each
+# Args: spec url_var branch_var local_name_var [group_var] (variable names)
 parse_repo_spec() {
     local spec="$1"
     local url_var="$2"
     local branch_var="$3"
     local local_name_var="$4"
+    local group_var="${5:-}"
 
     # Use _out_ prefix to avoid shadowing caller's output variable names.
-    local _out_url="" _out_branch="" _out_local_name=""
+    local _out_url="" _out_branch="" _out_local_name="" _out_group=""
 
-    # Extract 'as <name>' if present (must be last)
-    if [[ "$spec" =~ ^(.+)[[:space:]]+as[[:space:]]+([^[:space:]]+)$ ]]; then
-        spec="${BASH_REMATCH[1]}"
+    # Extract trailing 'as <name>' and 'in <group>' modifiers (either order,
+    # at most one of each). Neither URLs nor branch names contain whitespace,
+    # so these keywords cannot be confused with the repo part of the spec.
+    local _pass
+    for _pass in 1 2; do
+        if [[ -z "$_out_local_name" && "$spec" =~ ^(.+)[[:space:]]+as[[:space:]]+([^[:space:]]+)$ ]]; then
+            spec="${BASH_REMATCH[1]}"
+            _out_local_name="${BASH_REMATCH[2]}"
+        elif [[ -z "$_out_group" && "$spec" =~ ^(.+)[[:space:]]+in[[:space:]]+([^[:space:]]+)$ ]]; then
+            spec="${BASH_REMATCH[1]}"
+            _out_group="${BASH_REMATCH[2]}"
+        else
+            break
+        fi
         # Trim trailing whitespace from spec (greedy .+ may capture trailing spaces)
         spec="${spec%"${spec##*[![:space:]]}"}"
-        _out_local_name="${BASH_REMATCH[2]}"
-    else
-        _out_local_name=""
-    fi
+    done
 
     # Default: no branch
     _out_url="$spec"
@@ -6423,12 +6436,40 @@ parse_repo_spec() {
     _set_out_var "$url_var" "$_out_url" || return 1
     _set_out_var "$branch_var" "$_out_branch" || return 1
     _set_out_var "$local_name_var" "$_out_local_name" || return 1
+    if [[ -n "$group_var" ]]; then
+        _set_out_var "$group_var" "$_out_group" || return 1
+    fi
+}
+
+# Validate a repo group path (one or more safe segments joined by '/').
+# Groups only add directories between the layout prefix and the repo folder.
+# Returns: 0 if safe, 1 if unsafe
+_is_safe_group_path() {
+    local group="$1"
+    [[ -z "$group" ]] && return 1
+    # Reject absolute paths, trailing slashes, and empty segments (a//b)
+    [[ "$group" == /* || "$group" == */ || "$group" == *//* ]] && return 1
+    local _gseg
+    local -a _gsegs
+    IFS='/' read -r -a _gsegs <<< "$group"
+    [[ ${#_gsegs[@]} -gt 0 ]] || return 1
+    for _gseg in "${_gsegs[@]}"; do
+        _is_safe_path_segment "$_gseg" || return 1
+    done
+    return 0
 }
 
 # Resolve a repo spec into validated parts and a local path
 # This is the central function for parsing and validating repo specifications.
-# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var (variable names)
+# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var [group_var]
 # repo_id is canonical for reporting (host/owner/repo, or owner/repo for github.com)
+# Path rules:
+#   no group, no name:  <layout prefix>/<repo>
+#   no group, 'as N':   $projects_dir/N               (legacy: replaces the layout path)
+#   'in G':             <layout prefix>/G/<repo>
+#   'in G' + 'as N':    <layout prefix>/G/N           (the name only renames the leaf)
+# where <layout prefix> is $projects_dir (flat), $projects_dir/owner (owner-repo),
+# or $projects_dir/host/owner (full).
 # Returns: 0 on success, 1 on invalid spec
 resolve_repo_spec() {
     local spec="$1"
@@ -6439,11 +6480,12 @@ resolve_repo_spec() {
     local custom_var="$6"
     local path_var="$7"
     local repo_id_var="$8"
+    local group_var="${9:-}"
 
     # Use unique prefixes to avoid shadowing caller variables and
     # avoid conflicts with variables used in parse_repo_spec and parse_repo_url
-    local spec_url spec_branch spec_custom spec_host spec_owner spec_repo
-    parse_repo_spec "$spec" spec_url spec_branch spec_custom
+    local spec_url spec_branch spec_custom spec_group spec_host spec_owner spec_repo
+    parse_repo_spec "$spec" spec_url spec_branch spec_custom spec_group
 
     # Validate branch name to prevent option-injection into git checkout/switch
     if [[ -n "$spec_branch" ]]; then
@@ -6465,14 +6507,23 @@ resolve_repo_spec() {
     local _rrs_path=""
     if [[ -n "$spec_custom" ]]; then
         _is_safe_path_segment "$spec_custom" || return 1
+    fi
+    if [[ -n "$spec_group" ]]; then
+        _is_safe_group_path "$spec_group" || return 1
+    fi
+
+    if [[ -n "$spec_custom" && -z "$spec_group" ]]; then
         _rrs_path="${projects_dir}/${spec_custom}"
     else
+        local _rrs_prefix=""
         case "$layout" in
-            flat)       _rrs_path="${projects_dir}/${spec_repo}" ;;
-            owner-repo) _rrs_path="${projects_dir}/${spec_owner}/${spec_repo}" ;;
-            full)       _rrs_path="${projects_dir}/${spec_host}/${spec_owner}/${spec_repo}" ;;
+            flat)       _rrs_prefix="${projects_dir}" ;;
+            owner-repo) _rrs_prefix="${projects_dir}/${spec_owner}" ;;
+            full)       _rrs_prefix="${projects_dir}/${spec_host}/${spec_owner}" ;;
             *)          return 1 ;;
         esac
+        [[ -n "$spec_group" ]] && _rrs_prefix+="/${spec_group}"
+        _rrs_path="${_rrs_prefix}/${spec_custom:-$spec_repo}"
     fi
 
     # Build canonical repo ID for display/reporting
@@ -6488,15 +6539,23 @@ resolve_repo_spec() {
     _set_out_var "$custom_var" "$spec_custom" || return 1
     _set_out_var "$path_var" "$_rrs_path" || return 1
     _set_out_var "$repo_id_var" "$_rrs_repo_id" || return 1
+    if [[ -n "$group_var" ]]; then
+        _set_out_var "$group_var" "$spec_group" || return 1
+    fi
 
     return 0
 }
 
 # Deduplicate repos by resolved local path
+# Also drops a repo that is listed again with the same local name but in a
+# different group (e.g. once plain and once with 'in <group>'), which would
+# otherwise clone the same repo twice. Distinct 'as' names stay allowed so a
+# repo can still be checked out more than once on purpose.
 # Input: lines of repo specs (stdin)
-# Output: unique repo specs by path (first occurrence wins)
+# Output: unique repo specs (first occurrence wins)
 dedupe_repos() {
     local -A seen_paths
+    local -A seen_ids
 
     while IFS= read -r spec; do
         local url branch local_name path repo_id
@@ -6505,11 +6564,15 @@ dedupe_repos() {
             continue
         fi
 
-        if [[ -z "${seen_paths[$path]:-}" ]]; then
-            seen_paths[$path]=1
-            echo "$spec"
-        else
+        local id_key="${repo_id}|${local_name}"
+        if [[ -n "${seen_paths[$path]:-}" ]]; then
             log_verbose "Skipping duplicate: $spec (same path as previous)"
+        elif [[ -n "${seen_ids[$id_key]:-}" ]]; then
+            log_warn "Skipping duplicate: $spec (already configured as: ${seen_ids[$id_key]})"
+        else
+            seen_paths[$path]=1
+            seen_ids[$id_key]="$spec"
+            echo "$spec"
         fi
     done
 }
@@ -6816,6 +6879,30 @@ is_timeout_error() {
     [[ "$output" == *"transfer rate"* ]]
 }
 
+# Find a git working tree that would enclose target_dir.
+# Only directories strictly between projects_dir and target_dir are checked, so
+# a projects dir that itself lives inside a repo (e.g. a dotfiles repo in $HOME)
+# is not flagged. Guards against grouped/renamed paths landing inside another
+# configured repo's working tree.
+# Args: target_dir projects_dir
+# Output: the enclosing repo path on stdout; returns 0 if one was found, 1 otherwise
+_find_enclosing_repo() {
+    local target_dir="${1%/}"
+    local projects_dir="${2%/}"
+    [[ -n "$target_dir" && -n "$projects_dir" ]] || return 1
+    [[ "$target_dir" == "$projects_dir"/* ]] || return 1
+
+    local dir="${target_dir%/*}"
+    while [[ "$dir" == "$projects_dir"/* ]]; do
+        if [[ -e "$dir/.git" ]]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        dir="${dir%/*}"
+    done
+    return 1
+}
+
 # Clone repository using gh
 # Args: url target_dir repo_name [branch]
 do_clone() {
@@ -6823,6 +6910,16 @@ do_clone() {
     local target_dir="$2"
     local repo_name="$3"
     local branch="${4:-}"
+
+    # Never clone into another repository's working tree (e.g. a group folder
+    # that is also the path of a configured repo).
+    local enclosing_repo
+    if enclosing_repo=$(_find_enclosing_repo "$target_dir" "${PROJECTS_DIR:-}"); then
+        log_error "Refusing to clone $repo_name: $target_dir is inside the git repository $enclosing_repo"
+        log_info "  Choose a different group ('in <group>') or name ('as <name>') for one of them"
+        write_result "$repo_name" "clone" "failed" "0" "target is inside git repository $enclosing_repo" "$target_dir"
+        return 1
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         local branch_info=""
@@ -7650,6 +7747,23 @@ parse_args() {
             sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep|ai-sync|dep-update|robot-docs|fork-status|fork-sync|fork-clean|commit-sweep)
                 COMMAND="$1"
                 shift
+                ;;
+            --group|--group=*)
+                if [[ "$COMMAND" != "add" ]]; then
+                    log_error "Unknown option: $1 (only valid for 'ru add')"
+                    exit 4
+                fi
+                if [[ "$1" == "--group" ]]; then
+                    if [[ $# -lt 2 || -z "$2" ]]; then
+                        log_error "--group requires a value"
+                        exit 4
+                    fi
+                    ARGS+=("--group=$2")
+                    shift 2
+                else
+                    ARGS+=("$1")
+                    shift
+                fi
                 ;;
             --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd|--review)
                 # Subcommand-specific options - pass through to ARGS
@@ -8635,15 +8749,34 @@ cmd_add() {
     # Parse command-specific options
     local use_private="false"
     local from_cwd="false"
+    local add_group=""
+    local expect_group="false"
     local repo_args=()
 
     for arg in "${ARGS[@]}"; do
+        if [[ "$expect_group" == "true" ]]; then
+            add_group="$arg"
+            expect_group="false"
+            continue
+        fi
         case "$arg" in
             --private) use_private="true" ;;
             --from-cwd) from_cwd="true" ;;
+            --group) expect_group="true" ;;
+            --group=*) add_group="${arg#--group=}"
+                [[ -n "$add_group" ]] || { log_error "--group requires a value"; exit 4; } ;;
             *) repo_args+=("$arg") ;;
         esac
     done
+
+    if [[ "$expect_group" == "true" ]]; then
+        log_error "--group requires a value"
+        exit 4
+    fi
+    if [[ -n "$add_group" ]] && ! _is_safe_group_path "$add_group"; then
+        log_error "Invalid group: $add_group (use folder names separated by '/', e.g. illo or clients/acme)"
+        exit 4
+    fi
 
     # Handle --from-cwd: detect repo from current directory
     if [[ "$from_cwd" == "true" ]]; then
@@ -8667,6 +8800,7 @@ cmd_add() {
         log_info "  ru add https://github.com/owner/repo"
         log_info "  ru add --from-cwd          # Add current directory's repo"
         log_info "  ru add --private owner/repo  # Add to private list"
+        log_info "  ru add --group illo owner/repo  # Clone into a shared subfolder"
         exit 4
     fi
 
@@ -8688,8 +8822,27 @@ cmd_add() {
     for repo in "${repo_args[@]}"; do
         # Parse the repo spec to extract URL (ignoring branch/custom name for dupe check)
         # shellcheck disable=SC2034  # spec_branch/spec_name set by parse_repo_spec, intentionally unused
-        local spec_url spec_branch spec_name
-        parse_repo_spec "$repo" spec_url spec_branch spec_name
+        local spec_url spec_branch spec_name spec_group
+        parse_repo_spec "$repo" spec_url spec_branch spec_name spec_group
+
+        # --group adds an 'in <group>' modifier; it must not contradict the spec's own
+        if [[ -n "$add_group" ]]; then
+            if [[ -n "$spec_group" && "$spec_group" != "$add_group" ]]; then
+                log_error "Conflicting groups for $repo: spec says '$spec_group', --group says '$add_group'"
+                continue
+            fi
+            if [[ -z "$spec_group" ]]; then
+                repo="${spec_url}"
+                [[ -n "$spec_branch" ]] && repo+="@${spec_branch}"
+                repo+=" in ${add_group}"
+                [[ -n "$spec_name" ]] && repo+=" as ${spec_name}"
+            fi
+            spec_group="$add_group"
+        fi
+        if [[ -n "$spec_group" ]] && ! _is_safe_group_path "$spec_group"; then
+            log_error "Invalid group in spec: $repo"
+            continue
+        fi
 
         # Validate the URL can be parsed and get canonical form
         local host owner repo_name
@@ -8902,8 +9055,8 @@ cmd_import() {
 
             # Parse the repo spec to get base URL and metadata
             # shellcheck disable=SC2034 # Variables set by parse_repo_spec
-            local spec_url spec_branch spec_name
-            parse_repo_spec "$line" spec_url spec_branch spec_name
+            local spec_url spec_branch spec_name spec_group
+            parse_repo_spec "$line" spec_url spec_branch spec_name spec_group
 
             # Parse the URL
             local host="" owner="" repo=""
@@ -8918,6 +9071,7 @@ cmd_import() {
             normalized=$(normalize_url "$spec_url")
             output_spec="$normalized"
             [[ -n "$spec_branch" ]] && output_spec+="@$spec_branch"
+            [[ -n "$spec_group" ]] && output_spec+=" in $spec_group"
             [[ -n "$spec_name" ]] && output_spec+=" as $spec_name"
 
             # Check for duplicates using canonical ID
@@ -9738,7 +9892,8 @@ cmd_prune() {
     done < <(get_all_repos) | sort -u > "$configured_paths"
 
     # Find all git repositories in projects directory
-    # Depth to .git directory: flat=2, owner-repo=3, full=4
+    # Depth to .git directory: flat=2, owner-repo=3, full=4. Grouped repos
+    # ('in <group>') sit deeper, so extend the scan to the deepest configured path.
     local orphans=()
     local depth_limit
     case "$LAYOUT" in
@@ -9748,11 +9903,33 @@ cmd_prune() {
         *)          depth_limit=4 ;;
     esac
 
+    local -a configured_list=()
+    local cfg_path
+    while IFS= read -r cfg_path; do
+        [[ -z "$cfg_path" ]] && continue
+        configured_list+=("$cfg_path")
+        local rel="${cfg_path#"$PROJECTS_DIR"/}"
+        [[ "$rel" == "$cfg_path" ]] && continue
+        local slashes="${rel//[^\/]/}"
+        local cfg_depth=$(( ${#slashes} + 2 ))
+        (( cfg_depth > depth_limit )) && depth_limit=$cfg_depth
+    done < "$configured_paths"
+
     while IFS= read -r repo_path; do
         # Skip if in configured paths
         if grep -qxF "$repo_path" "$configured_paths" 2>/dev/null; then
             continue
         fi
+        # Skip repos nested inside a configured repo's working tree (vendored
+        # clones, test fixtures); those are not ru's to archive or delete.
+        local nested="false"
+        for cfg_path in "${configured_list[@]}"; do
+            if [[ "$repo_path" == "$cfg_path"/* ]]; then
+                nested="true"
+                break
+            fi
+        done
+        [[ "$nested" == "true" ]] && continue
         orphans+=("$repo_path")
     done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
 
@@ -22244,7 +22421,8 @@ _robot_docs_commands() {
       "args": ["<owner/repo>"],
       "flags": [
         {"flag": "--private", "description": "Add to private.txt instead of public.txt"},
-        {"flag": "--from-cwd", "description": "Detect repo from current working directory"}
+        {"flag": "--from-cwd", "description": "Detect repo from current working directory"},
+        {"flag": "--group NAME", "description": "Clone into a NAME/ subfolder of the layout path (writes 'owner/repo in NAME')"}
       ]
     },
     {
