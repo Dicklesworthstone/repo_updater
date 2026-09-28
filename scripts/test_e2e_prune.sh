@@ -332,6 +332,75 @@ test_prune_refuses_destructive_modes_with_unresolvable_specs() {
     e2e_cleanup
 }
 
+test_prune_matches_configured_repo_across_unicode_normalization() {
+    setup_initialized_env
+
+    # Config spells the name precomposed (NFC); the clone on disk is
+    # decomposed (NFD), as HFS+ stores it or as a hand-made clone may be.
+    # Same directory on a normalization-insensitive filesystem (APFS, HFS+).
+    local nfc nfd
+    nfc=$(printf 'caf\xc3\xa9')
+    nfd=$(printf 'cafe\xcc\x81')
+    printf '%s\n' "owner/tool as $nfc" "owner/lib in $nfc" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_orphan_repo "$nfd"
+    if [[ ! "$RU_PROJECTS_DIR/$nfc" -ef "$RU_PROJECTS_DIR/$nfd" ]]; then
+        # Normalization-sensitive filesystem: the two names are two folders
+        e2e_cleanup
+        return 0
+    fi
+    create_orphan_repo "$nfd/lib"
+
+    "$E2E_RU_SCRIPT" prune --delete --non-interactive >/dev/null 2>&1
+
+    assert_dir_exists "$RU_PROJECTS_DIR/$nfd/.git" "Configured repo spelled in another Unicode normalization survives"
+    assert_dir_exists "$RU_PROJECTS_DIR/$nfd/lib/.git" "Grouped repo under that folder survives"
+
+    e2e_cleanup
+}
+
+test_prune_refuses_destructive_modes_with_unreadable_list() {
+    setup_initialized_env
+
+    printf '%s\n' "owner/tool" > "$XDG_CONFIG_HOME/ru/repos.d/work.txt"
+    create_orphan_repo "tool"
+    chmod 000 "$XDG_CONFIG_HOME/ru/repos.d/work.txt"
+    if [[ -r "$XDG_CONFIG_HOME/ru/repos.d/work.txt" ]]; then
+        # Running as root: permissions do not apply
+        chmod 644 "$XDG_CONFIG_HOME/ru/repos.d/work.txt"
+        e2e_cleanup
+        return 0
+    fi
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --delete --non-interactive 2>&1)
+    exit_code=$?
+    chmod 644 "$XDG_CONFIG_HOME/ru/repos.d/work.txt"
+
+    assert_equals "4" "$exit_code" "Exits with code 4"
+    assert_contains "$output" "Refusing to archive or delete" "Explains the refusal"
+    assert_dir_exists "$RU_PROJECTS_DIR/tool/.git" "Clone listed in the unreadable file survives"
+
+    e2e_cleanup
+}
+
+test_prune_never_acts_on_newline_split_fragments() {
+    setup_initialized_env
+
+    # A clone folder whose name holds a newline reaches prune as two lines
+    # of find output; the relative fragment "bar" must not resolve against
+    # the current directory.
+    create_orphan_repo $'x\nbar'
+    local cwd="$E2E_TEMP_DIR/cwd"
+    mkdir -p "$cwd/bar"
+    git -C "$cwd/bar" init --quiet 2>/dev/null
+
+    (cd "$cwd" && "$E2E_RU_SCRIPT" prune --delete --non-interactive >/dev/null 2>&1)
+
+    assert_dir_exists "$cwd/bar/.git" "Repo in the current directory is untouched"
+
+    e2e_cleanup
+}
+
 test_prune_keeps_clone_of_deduped_repeat() {
     setup_initialized_env
 
@@ -474,6 +543,9 @@ run_test test_prune_group_does_not_widen_scan
 run_test test_prune_never_deletes_repo_containing_configured_repo
 run_test test_prune_matches_configured_repo_by_physical_path
 run_test test_prune_refuses_destructive_modes_with_unresolvable_specs
+run_test test_prune_matches_configured_repo_across_unicode_normalization
+run_test test_prune_refuses_destructive_modes_with_unreadable_list
+run_test test_prune_never_acts_on_newline_split_fragments
 run_test test_prune_keeps_clone_of_deduped_repeat
 
 # Custom names

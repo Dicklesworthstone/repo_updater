@@ -9950,11 +9950,16 @@ cmd_prune() {
     # not look like an orphan. A line that does not resolve (typo, a modifier
     # this version rejects) still points at a clone we cannot locate, so the
     # destructive modes are refused until it is fixed.
-    local -a unresolved_specs=()
+    local -a unresolved_specs=() unreadable_lists=()
     local spec list_file
     local repos_dir="${RU_CONFIG_DIR}/repos.d"
     for list_file in "$repos_dir"/*.txt; do
         [[ -f "$list_file" ]] || continue
+        # An unreadable list hides every clone it names
+        if [[ ! -r "$list_file" ]]; then
+            unreadable_lists+=("$list_file")
+            continue
+        fi
         while IFS= read -r spec; do
             [[ -z "$spec" ]] && continue
             local url branch custom_name local_path repo_id
@@ -9967,14 +9972,23 @@ cmd_prune() {
     done
     sort -u -o "$configured_paths" "$configured_paths"
 
-    if [[ ${#unresolved_specs[@]} -gt 0 ]]; then
+    if [[ ${#unresolved_specs[@]} -gt 0 || ${#unreadable_lists[@]} -gt 0 ]]; then
         local bad_spec
-        for bad_spec in "${unresolved_specs[@]}"; do
+        for bad_spec in ${unresolved_specs[@]+"${unresolved_specs[@]}"}; do
             log_warn "Invalid repo spec in config (its clone may be listed as an orphan): $bad_spec"
         done
+        for bad_spec in ${unreadable_lists[@]+"${unreadable_lists[@]}"}; do
+            log_warn "Cannot read repo list (its clones may be listed as orphans): $bad_spec"
+        done
         if [[ "$archive_mode" == "true" || "$delete_mode" == "true" ]]; then
-            log_error "Refusing to archive or delete while ${#unresolved_specs[@]} repo spec(s) cannot be resolved"
-            log_info "Fix or remove those lines (ru list --paths shows what resolves), then re-run prune."
+            if [[ ${#unresolved_specs[@]} -gt 0 ]]; then
+                log_error "Refusing to archive or delete while ${#unresolved_specs[@]} repo spec(s) cannot be resolved"
+                log_info "Fix or remove those lines (ru list --paths shows what resolves), then re-run prune."
+            fi
+            if [[ ${#unreadable_lists[@]} -gt 0 ]]; then
+                log_error "Refusing to archive or delete while ${#unreadable_lists[@]} repo list file(s) cannot be read"
+                log_info "Fix the file permissions, then re-run prune."
+            fi
             exit 4
         fi
     fi
@@ -10012,7 +10026,12 @@ cmd_prune() {
     local -a candidates=()
     local group_dir repo_path
     while IFS= read -r repo_path; do
-        [[ -n "$repo_path" ]] && candidates+=("$repo_path")
+        # find output is line-based: a folder name holding a newline splits
+        # into fragments that must never reach rm/mv (a relative fragment would
+        # resolve against the current directory). Keep only real clones under
+        # PROJECTS_DIR.
+        [[ "$repo_path" == "${PROJECTS_DIR%/}"/* && -d "$repo_path/.git" ]] || continue
+        candidates+=("$repo_path")
     done < <(
         {
             find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null
@@ -10069,6 +10088,32 @@ cmd_prune() {
                 skip="true"
                 break
             fi
+        done
+        [[ "$skip" == "true" ]] && continue
+        # Last, compare by file identity: the same folder can also be spelled in
+        # another Unicode normalization (config NFC, clone NFD as HFS+ stores
+        # it), which neither physical paths nor case folding reconcile. Walk each
+        # configured path up to PROJECTS_DIR (the candidate is, or contains, a
+        # configured repo) and the candidate up likewise (it sits inside one).
+        # Only candidates that got this far pay for it: the likely orphans.
+        local projects_root="${PROJECTS_DIR%/}" anc
+        for cfg_path in ${configured_list[@]+"${configured_list[@]}"}; do
+            anc="$cfg_path"
+            while [[ "$anc" == "$projects_root"/* ]]; do
+                if [[ "$anc" -ef "$repo_path" ]]; then
+                    skip="true"
+                    break 2
+                fi
+                anc="${anc%/*}"
+            done
+            anc="${repo_path%/*}"
+            while [[ "$anc" == "$projects_root"/* ]]; do
+                if [[ "$anc" -ef "$cfg_path" ]]; then
+                    skip="true"
+                    break 2
+                fi
+                anc="${anc%/*}"
+            done
         done
         [[ "$skip" == "true" ]] && continue
         orphans+=("$repo_path")

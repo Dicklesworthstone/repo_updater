@@ -1201,8 +1201,8 @@ ru --non-interactive prune --delete
 - Interactive mode requires explicit confirmation
 - `--archive` and `--delete` are mutually exclusive
 - Only git repositories are considered (plain directories ignored)
-- Paths are compared physically, so a configured repo reached through a symlinked folder, spelled with different letter case on a case-insensitive filesystem, or under a `PROJECTS_DIR` with a trailing slash is never an orphan
-- `--archive` and `--delete` refuse to run while any repo line in your config cannot be parsed, since its clone would otherwise look like an orphan
+- Paths are compared physically, so a configured repo reached through a symlinked folder, spelled with different letter case or Unicode normalization on a case-insensitive filesystem, or under a `PROJECTS_DIR` with a trailing slash is never an orphan
+- `--archive` and `--delete` refuse to run while any repo line in your config cannot be parsed or any list file cannot be read, since its clone would otherwise look like an orphan
 
 ### Layout Awareness
 
