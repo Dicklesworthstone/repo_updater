@@ -357,6 +357,16 @@ test_resolve_repo_spec_rejects_unsafe_groups() {
         pass "multi-segment 'as' rejected inside a group"
     fi
 
+    # A repeated modifier must not leak into the repo name as 'repo in a'
+    local dup
+    for dup in "owner/repo in a in b" "owner/repo as x as y" "owner/repo in a as x in b"; do
+        if resolve_repo_spec "$dup" "/p" "flat" url branch custom path repo_id; then
+            fail "'$dup' should be rejected (got $path)"
+        else
+            pass "'$dup' rejected"
+        fi
+    done
+
     log_test_pass "$test_name"
 }
 

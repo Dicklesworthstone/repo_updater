@@ -6497,7 +6497,10 @@ resolve_repo_spec() {
         fi
     fi
 
-    # Parse and validate the URL
+    # Parse and validate the URL. A URL never contains whitespace; if it does,
+    # the line has an unrecognized or repeated modifier (e.g. 'in a in b') or
+    # an inline comment, and must not turn into a directory name with spaces.
+    [[ "$spec_url" =~ [[:space:]] ]] && return 1
     if ! parse_repo_url "$spec_url" spec_host spec_owner spec_repo; then
         return 1
     fi
@@ -9893,7 +9896,10 @@ cmd_prune() {
 
     # Find all git repositories in projects directory
     # Depth to .git directory: flat=2, owner-repo=3, full=4. Grouped repos
-    # ('in <group>') sit deeper, so extend the scan to the deepest configured path.
+    # ('in <group>') sit deeper; for those, only the group folders themselves
+    # are scanned one level down. Scanning the whole tree deeper would expose
+    # unrelated repos in plain folders (e.g. $PROJECTS_DIR/work/foo in flat
+    # layout) that ru never managed.
     local orphans=()
     local depth_limit
     case "$LAYOUT" in
@@ -9904,6 +9910,7 @@ cmd_prune() {
     esac
 
     local -a configured_list=()
+    local -A group_dirs=()
     local cfg_path
     while IFS= read -r cfg_path; do
         [[ -z "$cfg_path" ]] && continue
@@ -9912,26 +9919,43 @@ cmd_prune() {
         [[ "$rel" == "$cfg_path" ]] && continue
         local slashes="${rel//[^\/]/}"
         local cfg_depth=$(( ${#slashes} + 2 ))
-        (( cfg_depth > depth_limit )) && depth_limit=$cfg_depth
+        (( cfg_depth > depth_limit )) && group_dirs["${cfg_path%/*}"]=1
     done < "$configured_paths"
 
+    local group_dir
     while IFS= read -r repo_path; do
+        [[ -z "$repo_path" ]] && continue
         # Skip if in configured paths
         if grep -qxF "$repo_path" "$configured_paths" 2>/dev/null; then
             continue
         fi
         # Skip repos nested inside a configured repo's working tree (vendored
-        # clones, test fixtures); those are not ru's to archive or delete.
-        local nested="false"
+        # clones, test fixtures), and repos that CONTAIN a configured repo (e.g.
+        # a group folder someone ran 'git init' in): archiving or deleting those
+        # would take configured repos with them.
+        local skip="false"
         for cfg_path in "${configured_list[@]}"; do
             if [[ "$repo_path" == "$cfg_path"/* ]]; then
-                nested="true"
+                skip="true"
+                break
+            fi
+            if [[ "$cfg_path" == "$repo_path"/* ]]; then
+                log_warn "Not treating $repo_path as an orphan: it contains configured repo $cfg_path"
+                skip="true"
                 break
             fi
         done
-        [[ "$nested" == "true" ]] && continue
+        [[ "$skip" == "true" ]] && continue
         orphans+=("$repo_path")
-    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
+    done < <(
+        {
+            find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null
+            for group_dir in "${!group_dirs[@]}"; do
+                [[ -d "$group_dir" ]] || continue
+                find "$group_dir" -mindepth 2 -maxdepth 2 -type d -name ".git" -exec dirname {} \; 2>/dev/null
+            done
+        } | sort -u
+    )
 
     # Report results
     if [[ ${#orphans[@]} -eq 0 ]]; then

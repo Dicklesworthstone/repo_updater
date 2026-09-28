@@ -257,6 +257,38 @@ test_prune_grouped_repos() {
     unset RU_LAYOUT
 }
 
+test_prune_group_does_not_widen_scan() {
+    setup_initialized_env
+
+    # One grouped repo must not expose unrelated deeper repos elsewhere
+    "$E2E_RU_SCRIPT" add --group illo owner/illo-website >/dev/null 2>&1
+    create_orphan_repo "illo/illo-website"
+    create_orphan_repo "work/client-a"
+
+    local stderr_output
+    stderr_output=$("$E2E_RU_SCRIPT" prune 2>&1 >/dev/null)
+
+    assert_contains "$stderr_output" "No orphan" "Plain folders stay out of the scan"
+    assert_not_contains "$stderr_output" "work/client-a" "Unmanaged repo in a plain folder is not an orphan"
+
+    e2e_cleanup
+}
+
+test_prune_never_deletes_repo_containing_configured_repo() {
+    setup_initialized_env
+
+    "$E2E_RU_SCRIPT" add --group illo owner/illo-website >/dev/null 2>&1
+    create_orphan_repo "illo/illo-website"
+    # Someone ran 'git init' in the group folder itself
+    git -C "$RU_PROJECTS_DIR/illo" init --quiet 2>/dev/null
+
+    "$E2E_RU_SCRIPT" prune --delete --non-interactive >/dev/null 2>&1
+
+    assert_dir_exists "$RU_PROJECTS_DIR/illo/illo-website/.git" "Configured grouped repo survives prune --delete"
+
+    e2e_cleanup
+}
+
 test_prune_full_layout() {
     setup_initialized_env
     export RU_LAYOUT="full"
@@ -377,6 +409,8 @@ run_test test_prune_unknown_option
 run_test test_prune_owner_repo_layout
 run_test test_prune_full_layout
 run_test test_prune_grouped_repos
+run_test test_prune_group_does_not_widen_scan
+run_test test_prune_never_deletes_repo_containing_configured_repo
 
 # Custom names
 run_test test_prune_respects_custom_names
