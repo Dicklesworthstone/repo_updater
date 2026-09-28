@@ -1176,8 +1176,9 @@ Move orphans to a timestamped archive directory instead of deleting:
 ru prune --archive
 
 # Orphans moved to:
-# ~/.local/state/ru/archived/old-experiment-2025-01-03-143022/
-# ~/.local/state/ru/archived/manually-cloned-2025-01-03-143022/
+# ~/.local/state/ru/archived/old-experiment_20250103_143022/
+# ~/.local/state/ru/archived/manually-cloned_20250103_143022/
+# (same-named orphans archived in the same second get a _1, _2, ... suffix)
 ```
 
 **Benefits of archiving:**
@@ -1200,9 +1201,9 @@ ru --non-interactive prune --delete
 **Safety measures:**
 - Interactive mode requires explicit confirmation
 - `--archive` and `--delete` are mutually exclusive
-- Only git repositories are considered (plain directories ignored)
+- Only git repositories with a `.git` directory are considered (plain directories, and worktrees or submodules whose `.git` is a file, are ignored)
 - Paths are compared physically, so a configured repo reached through a symlinked folder, spelled with different letter case or Unicode normalization on a case-insensitive filesystem, or under a `PROJECTS_DIR` with a trailing slash is never an orphan
-- `--archive` and `--delete` refuse to run while any repo line in your config cannot be parsed or any list file cannot be read, since its clone would otherwise look like an orphan
+- `--archive` and `--delete` refuse to run while any repo line in your config cannot be parsed, any list file (or `repos.d` itself) is missing or unreadable, or no repo is configured at all, since those clones would otherwise look like orphans
 
 ### Layout Awareness
 

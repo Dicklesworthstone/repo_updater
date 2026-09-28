@@ -9953,6 +9953,12 @@ cmd_prune() {
     local -a unresolved_specs=() unreadable_lists=()
     local spec list_file
     local repos_dir="${RU_CONFIG_DIR}/repos.d"
+    # A missing or unlistable repos.d hides every list in it (the glob below
+    # then matches nothing), so every configured clone would look like an
+    # orphan; e.g. 'sudo ru prune --delete' reads root's config dir.
+    if [[ ! -d "$repos_dir" || ! -r "$repos_dir" || ! -x "$repos_dir" ]]; then
+        unreadable_lists+=("$repos_dir")
+    fi
     for list_file in "$repos_dir"/*.txt; do
         [[ -f "$list_file" ]] || continue
         # An unreadable list hides every clone it names
@@ -9987,10 +9993,19 @@ cmd_prune() {
             fi
             if [[ ${#unreadable_lists[@]} -gt 0 ]]; then
                 log_error "Refusing to archive or delete while ${#unreadable_lists[@]} repo list file(s) cannot be read"
-                log_info "Fix the file permissions, then re-run prune."
+                log_info "Check that the list exists and is readable (ru init creates it), then re-run prune."
             fi
             exit 4
         fi
+    fi
+
+    # No configured repos at all (empty lists, config dir of another user)
+    # makes every clone under PROJECTS_DIR an orphan. Listing them is fine;
+    # archiving or deleting all of them is never what was meant.
+    if [[ ! -s "$configured_paths" && ( "$archive_mode" == "true" || "$delete_mode" == "true" ) ]]; then
+        log_error "Refusing to archive or delete: no repos are configured in ${repos_dir}"
+        log_info "Add repos (ru add) or check which config ru is reading, then re-run prune."
+        exit 4
     fi
 
     # Find all git repositories in projects directory
@@ -10161,8 +10176,16 @@ cmd_prune() {
             local timestamp
             timestamp=$(date +%Y%m%d_%H%M%S)
             local dest="${archive_dir}/${name}_${timestamp}"
+            # Same-named orphans (owner-a/tool, owner-b/tool) archived within
+            # the same second: mv onto an existing folder would move the clone
+            # INTO the earlier one's working tree, so pick a free name.
+            local n=1
+            while [[ -e "$dest" || -L "$dest" ]]; do
+                dest="${archive_dir}/${name}_${timestamp}_${n}"
+                ((n++))
+            done
 
-            if mv "$path" "$dest" 2>/dev/null; then
+            if mv -- "$path" "$dest" 2>/dev/null; then
                 log_step "Archived: $name -> $dest"
                 ((archived++))
             else
@@ -10211,7 +10234,7 @@ cmd_prune() {
         for path in "${orphans[@]}"; do
             local name
             name=$(basename "$path")
-            if rm -rf "$path" 2>/dev/null; then
+            if rm -rf -- "$path" 2>/dev/null; then
                 log_step "Deleted: $name"
                 ((deleted++))
             else

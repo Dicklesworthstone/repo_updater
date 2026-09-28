@@ -35,6 +35,12 @@ setup_initialized_env() {
     "$E2E_RU_SCRIPT" init >/dev/null 2>&1
 }
 
+# Configure one repo that is never cloned. Destructive prune refuses to run
+# with no configured repos at all (every clone would be an "orphan").
+configure_placeholder_repo() {
+    printf '%s\n' "owner/placeholder" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+}
+
 # Create an orphan git repo
 create_orphan_repo() {
     local name="$1"
@@ -125,6 +131,7 @@ test_prune_nonexistent_projects_dir() {
 
 test_prune_archive_mode() {
     setup_initialized_env
+    configure_placeholder_repo
 
     create_orphan_repo "orphan-to-archive"
 
@@ -158,6 +165,7 @@ test_prune_archive_mode() {
 
 test_prune_delete_noninteractive() {
     setup_initialized_env
+    configure_placeholder_repo
 
     create_orphan_repo "orphan-to-delete"
 
@@ -360,6 +368,7 @@ test_prune_matches_configured_repo_across_unicode_normalization() {
 
 test_prune_refuses_destructive_modes_with_unreadable_list() {
     setup_initialized_env
+    configure_placeholder_repo
 
     printf '%s\n' "owner/tool" > "$XDG_CONFIG_HOME/ru/repos.d/work.txt"
     create_orphan_repo "tool"
@@ -493,6 +502,7 @@ test_prune_json_output() {
 
 test_prune_archive_multiple() {
     setup_initialized_env
+    configure_placeholder_repo
 
     create_orphan_repo "orphan-a"
     create_orphan_repo "orphan-b"
@@ -512,6 +522,83 @@ test_prune_archive_multiple() {
     unset RU_LAYOUT
 }
 
+test_prune_archive_same_named_orphans_stay_separate() {
+    setup_initialized_env
+    export RU_LAYOUT="owner-repo"
+    configure_placeholder_repo
+
+    # owner-a/tool, owner-b/tool, owner-c/tool archive to the same
+    # <name>_<timestamp> within one second; each must get its own folder
+    # rather than being moved into the previous one's working tree.
+    local o
+    for o in owner-a owner-b owner-c; do
+        create_orphan_repo "$o/tool"
+        printf '%s\n' "$o" | tee "$RU_PROJECTS_DIR/$o/tool/marker" >/dev/null
+    done
+
+    local stderr_output
+    stderr_output=$("$E2E_RU_SCRIPT" prune --archive 2>&1 >/dev/null)
+
+    assert_contains "$stderr_output" "Archived 3" "Reports 3 archived"
+    local top_level nested
+    top_level=$(/usr/bin/find "$XDG_STATE_HOME/ru/archived" -mindepth 2 -maxdepth 2 -name marker | wc -l | tr -d ' ')
+    nested=$(/usr/bin/find "$XDG_STATE_HOME/ru/archived" -mindepth 3 -name marker | wc -l | tr -d ' ')
+    assert_equals "3" "$top_level" "Each clone has its own archive folder"
+    assert_equals "0" "$nested" "No clone archived inside another"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_refuses_destructive_modes_with_unlistable_list_dir() {
+    setup_initialized_env
+
+    printf '%s\n' "owner/tool" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_orphan_repo "tool"
+    # Searchable but not listable: the *.txt glob matches nothing, so no
+    # list is read at all and every configured clone looks like an orphan.
+    chmod 311 "$XDG_CONFIG_HOME/ru/repos.d"
+    if [[ -r "$XDG_CONFIG_HOME/ru/repos.d" ]]; then
+        # Running as root: permissions do not apply
+        chmod 755 "$XDG_CONFIG_HOME/ru/repos.d"
+        e2e_cleanup
+        return 0
+    fi
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --archive 2>&1)
+    exit_code=$?
+    chmod 755 "$XDG_CONFIG_HOME/ru/repos.d"
+
+    assert_equals "4" "$exit_code" "Exits with code 4"
+    assert_contains "$output" "Refusing to archive or delete" "Explains the refusal"
+    assert_dir_exists "$RU_PROJECTS_DIR/tool/.git" "Configured clone survives"
+
+    e2e_cleanup
+}
+
+test_prune_refuses_destructive_modes_without_configured_repos() {
+    setup_initialized_env
+
+    # Fresh 'ru init' (or another user's config dir, e.g. under sudo): no
+    # repo is configured, so every clone would be deleted.
+    create_orphan_repo "work"
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --delete --non-interactive 2>&1)
+    exit_code=$?
+
+    assert_equals "4" "$exit_code" "Exits with code 4"
+    assert_contains "$output" "no repos are configured" "Explains the refusal"
+    assert_dir_exists "$RU_PROJECTS_DIR/work/.git" "Clone survives"
+
+    # Listing still works
+    output=$("$E2E_RU_SCRIPT" prune 2>&1)
+    assert_contains "$output" "Found 1 orphan" "Dry run still lists"
+
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -527,6 +614,7 @@ run_test test_prune_nonexistent_projects_dir
 # Archive mode
 run_test test_prune_archive_mode
 run_test test_prune_archive_multiple
+run_test test_prune_archive_same_named_orphans_stay_separate
 
 # Delete mode
 run_test test_prune_delete_noninteractive
@@ -545,6 +633,8 @@ run_test test_prune_matches_configured_repo_by_physical_path
 run_test test_prune_refuses_destructive_modes_with_unresolvable_specs
 run_test test_prune_matches_configured_repo_across_unicode_normalization
 run_test test_prune_refuses_destructive_modes_with_unreadable_list
+run_test test_prune_refuses_destructive_modes_with_unlistable_list_dir
+run_test test_prune_refuses_destructive_modes_without_configured_repos
 run_test test_prune_never_acts_on_newline_split_fragments
 run_test test_prune_keeps_clone_of_deduped_repeat
 
