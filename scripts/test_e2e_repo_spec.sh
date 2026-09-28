@@ -368,6 +368,28 @@ test_group_refuses_to_nest_inside_repo() {
     unset RU_LAYOUT
 }
 
+test_nest_guard_ignores_layout_prefix_folders() {
+    e2e_setup
+    export RU_LAYOUT="owner-repo"
+
+    "$E2E_RU_SCRIPT" init --non-interactive >/dev/null 2>&1
+
+    # The owner folder itself is a git repo. Plain clones into it worked before
+    # groups existed and must keep working; only group folders are guarded.
+    mkdir -p "$RU_PROJECTS_DIR/acme"
+    git -C "$RU_PROJECTS_DIR/acme" init --quiet 2>/dev/null
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    printf '%s\n' "acme/widget" >> "$repos_file"
+
+    local output
+    output=$("$E2E_RU_SCRIPT" sync --dry-run --non-interactive 2>&1) || true
+    assert_not_contains "$output" "Refusing to clone" "Owner folder that is a repo does not block a plain clone"
+    assert_contains "$output" "$RU_PROJECTS_DIR/acme/widget" "Plain clone planned under the owner folder"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
 #==============================================================================
 # Run All Tests
 #==============================================================================
@@ -384,6 +406,7 @@ run_test test_edge_cases
 run_test test_layout_with_specs
 run_test test_group_specs
 run_test test_group_refuses_to_nest_inside_repo
+run_test test_nest_guard_ignores_layout_prefix_folders
 
 print_results
 exit "$(get_exit_code)"

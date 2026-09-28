@@ -791,7 +791,7 @@ The repo spec parser supports flexible combinations:
 - Inside a group, `as <name>` renames only the repo folder: `tmchow/illo-characters in illo as characters` resolves to `.../tmchow/illo/characters`. Without a group, `as <name>` keeps its old meaning and replaces the whole layout path with `$PROJECTS_DIR/<name>`.
 - The group is part of the line, so it works the same in `public.txt` and `private.txt`. `ru add --group illo owner/repo` writes the `in illo` form for you.
 - A repo listed twice with the same local name but different groups (for example once plain and once `in illo`) is kept only at its first location, with a warning.
-- ru refuses to clone into a path that sits inside another repository's working tree (for example a group named like an existing repo), and `ru prune` scans deep enough to see grouped repos.
+- ru refuses to clone into a path that sits inside another repository's working tree when a group folder is itself a repo (for example a group named like an existing repo). Owner and host folders are not checked, so an owner folder under version control still works. `ru prune` scans one level inside group folders, and never treats a repo that contains a configured repo as an orphan.
 
 ### Supported URL Formats
 
@@ -1201,6 +1201,8 @@ ru --non-interactive prune --delete
 - Interactive mode requires explicit confirmation
 - `--archive` and `--delete` are mutually exclusive
 - Only git repositories are considered (plain directories ignored)
+- Paths are compared physically, so a configured repo reached through a symlinked folder, spelled with different letter case on a case-insensitive filesystem, or under a `PROJECTS_DIR` with a trailing slash is never an orphan
+- `--archive` and `--delete` refuse to run while any repo line in your config cannot be parsed, since its clone would otherwise look like an orphan
 
 ### Layout Awareness
 

@@ -289,6 +289,67 @@ test_prune_never_deletes_repo_containing_configured_repo() {
     e2e_cleanup
 }
 
+test_prune_matches_configured_repo_by_physical_path() {
+    setup_initialized_env
+    export RU_LAYOUT="owner-repo"
+
+    # Configured under an owner folder that is a symlink to the real one (org
+    # rename), and with different letter case than the clone on disk.
+    "$E2E_RU_SCRIPT" add OldOrg/tool >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add Owner/Repo >/dev/null 2>&1
+    create_orphan_repo "NewOrg/tool"
+    ln -s NewOrg "$RU_PROJECTS_DIR/OldOrg"
+    create_orphan_repo "owner/repo"
+    # Same repo spelled with a trailing slash in PROJECTS_DIR
+    local projects_dir="$RU_PROJECTS_DIR"
+    export RU_PROJECTS_DIR="$projects_dir/"
+
+    "$E2E_RU_SCRIPT" prune --delete --non-interactive >/dev/null 2>&1
+
+    export RU_PROJECTS_DIR="$projects_dir"
+    assert_dir_exists "$RU_PROJECTS_DIR/NewOrg/tool/.git" "Repo configured via a symlinked owner folder survives"
+    assert_dir_exists "$RU_PROJECTS_DIR/owner/repo/.git" "Repo configured with different case survives"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_refuses_destructive_modes_with_unresolvable_specs() {
+    setup_initialized_env
+
+    # An older ru resolved this line to $PROJECTS_DIR/y; this one rejects it.
+    printf '%s\n' "owner/repo as x as y" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_orphan_repo "y"
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --delete --non-interactive 2>&1)
+    exit_code=$?
+
+    assert_equals "4" "$exit_code" "Exits with code 4"
+    assert_contains "$output" "Refusing to archive or delete" "Explains the refusal"
+    assert_dir_exists "$RU_PROJECTS_DIR/y/.git" "Clone of the unresolvable line survives"
+
+    e2e_cleanup
+}
+
+test_prune_keeps_clone_of_deduped_repeat() {
+    setup_initialized_env
+
+    # Listed plain and again in a group: sync dedupes to the plain line, but a
+    # clone at the grouped path is still a configured location, not an orphan.
+    printf '%s\n' "owner/tool" "owner/tool in grp" "owner/other in grp" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_orphan_repo "tool"
+    create_orphan_repo "grp/tool"
+    create_orphan_repo "grp/other"
+
+    "$E2E_RU_SCRIPT" prune --delete --non-interactive >/dev/null 2>&1
+
+    assert_dir_exists "$RU_PROJECTS_DIR/grp/tool/.git" "Grouped repeat's clone survives"
+    assert_dir_exists "$RU_PROJECTS_DIR/tool/.git" "Plain clone survives"
+
+    e2e_cleanup
+}
+
 test_prune_full_layout() {
     setup_initialized_env
     export RU_LAYOUT="full"
@@ -411,6 +472,9 @@ run_test test_prune_full_layout
 run_test test_prune_grouped_repos
 run_test test_prune_group_does_not_widen_scan
 run_test test_prune_never_deletes_repo_containing_configured_repo
+run_test test_prune_matches_configured_repo_by_physical_path
+run_test test_prune_refuses_destructive_modes_with_unresolvable_specs
+run_test test_prune_keeps_clone_of_deduped_repeat
 
 # Custom names
 run_test test_prune_respects_custom_names

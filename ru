@@ -6883,20 +6883,39 @@ is_timeout_error() {
 }
 
 # Find a git working tree that would enclose target_dir.
-# Only directories strictly between projects_dir and target_dir are checked, so
-# a projects dir that itself lives inside a repo (e.g. a dotfiles repo in $HOME)
-# is not flagged. Guards against grouped/renamed paths landing inside another
-# configured repo's working tree.
-# Args: target_dir projects_dir
+# Only the folders a group ('in <group>') adds are checked: the ones between
+# the layout prefix ($projects_dir, $projects_dir/<owner>, or
+# $projects_dir/<host>/<owner>) and target_dir. The prefix folders themselves
+# are left alone, so a projects dir or owner folder that happens to be a git
+# repo (a dotfiles repo in $HOME, an org folder under version control) does not
+# block ordinary clones, as it never did before groups existed. Guards against
+# grouped paths landing inside another repository's working tree.
+# Args: target_dir projects_dir [layout]
 # Output: the enclosing repo path on stdout; returns 0 if one was found, 1 otherwise
 _find_enclosing_repo() {
-    local target_dir="${1%/}"
-    local projects_dir="${2%/}"
+    local target_dir="$1"
+    local projects_dir="$2"
+    local layout="${3:-flat}"
+    while [[ "$target_dir" == *//* ]]; do target_dir="${target_dir//\/\//\/}"; done
+    while [[ "$projects_dir" == *//* ]]; do projects_dir="${projects_dir//\/\//\/}"; done
+    target_dir="${target_dir%/}"
+    projects_dir="${projects_dir%/}"
     [[ -n "$target_dir" && -n "$projects_dir" ]] || return 1
     [[ "$target_dir" == "$projects_dir"/* ]] || return 1
 
-    local dir="${target_dir%/*}"
+    local prefix_depth
+    case "$layout" in
+        owner-repo) prefix_depth=1 ;;
+        full)       prefix_depth=2 ;;
+        *)          prefix_depth=0 ;;
+    esac
+
+    local dir="${target_dir%/*}" rel slashes
     while [[ "$dir" == "$projects_dir"/* ]]; do
+        rel="${dir#"$projects_dir"/}"
+        slashes="${rel//[^\/]/}"
+        # rel has (#slashes + 1) segments; stop once inside the layout prefix
+        (( ${#slashes} + 1 > prefix_depth )) || break
         if [[ -e "$dir/.git" ]]; then
             printf '%s\n' "$dir"
             return 0
@@ -6917,7 +6936,7 @@ do_clone() {
     # Never clone into another repository's working tree (e.g. a group folder
     # that is also the path of a configured repo).
     local enclosing_repo
-    if enclosing_repo=$(_find_enclosing_repo "$target_dir" "${PROJECTS_DIR:-}"); then
+    if enclosing_repo=$(_find_enclosing_repo "$target_dir" "${PROJECTS_DIR:-}" "${LAYOUT:-flat}"); then
         log_error "Refusing to clone $repo_name: $target_dir is inside the git repository $enclosing_repo"
         log_info "  Choose a different group ('in <group>') or name ('as <name>') for one of them"
         write_result "$repo_name" "clone" "failed" "0" "target is inside git repository $enclosing_repo" "$target_dir"
@@ -9850,6 +9869,45 @@ cmd_config() {
 }
 
 #------------------------------------------------------------------------------
+# Print a comparison key for each directory path read from stdin (one per line):
+# the physical path (symlinks and '.', '..', '//' resolved, and on macOS the
+# on-disk letter case with bash 5) folded to lower case. A path that does not
+# exist yet keeps its missing tail, appended to its deepest existing ancestor.
+# A folder that exists but cannot be entered prints an empty line (no key).
+# prune uses these keys only to decide what is NOT an orphan, so folding case
+# can only make it more conservative (a case-only twin is never deleted), while
+# comparing raw strings deleted configured repos reached through a symlinked
+# folder, a trailing slash in PROJECTS_DIR, or a different letter case on a
+# case-insensitive filesystem.
+_prune_path_keys() {
+    (
+        CDPATH=""
+        local p head tail here="$PWD"
+        while IFS= read -r p; do
+            head="$p"
+            tail=""
+            while [[ -n "$head" && "$head" != "/" && ! -d "$head" ]]; do
+                tail="/${head##*/}${tail}"
+                if [[ "$head" == */* ]]; then head="${head%/*}"; else head=""; fi
+            done
+            if [[ -z "$head" ]]; then
+                if [[ "$p" == /* ]]; then head="/"; else head="."; fi
+            fi
+            if cd -P -- "$head" 2>/dev/null; then
+                head="$PWD"
+                cd -- "$here" 2>/dev/null || true
+            else
+                # Unreadable folder: no trustworthy key
+                printf '\n'
+                continue
+            fi
+            head="${head%/}${tail}"
+            head="${head:-/}"
+            printf '%s\n' "${head,,}"
+        done
+    )
+}
+
 # cmd_prune: Find and manage orphan repositories
 #------------------------------------------------------------------------------
 cmd_prune() {
@@ -9886,13 +9944,40 @@ cmd_prune() {
     # shellcheck disable=SC2064  # Immediate expansion is intentional - path is already known
     trap "rm -f \"$configured_paths\"" RETURN
 
-    while IFS= read -r spec; do
-        [[ -z "$spec" ]] && continue
-        local url branch custom_name local_path repo_id
-        if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
-            echo "$local_path"
+    # Read every list line directly rather than through get_all_repos: its
+    # dedupe drops invalid lines and repeats (e.g. the same repo once plain and
+    # once 'in <group>'), yet each of those can name a clone on disk that must
+    # not look like an orphan. A line that does not resolve (typo, a modifier
+    # this version rejects) still points at a clone we cannot locate, so the
+    # destructive modes are refused until it is fixed.
+    local -a unresolved_specs=()
+    local spec list_file
+    local repos_dir="${RU_CONFIG_DIR}/repos.d"
+    for list_file in "$repos_dir"/*.txt; do
+        [[ -f "$list_file" ]] || continue
+        while IFS= read -r spec; do
+            [[ -z "$spec" ]] && continue
+            local url branch custom_name local_path repo_id
+            if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                echo "$local_path" >> "$configured_paths"
+            else
+                unresolved_specs+=("$spec")
+            fi
+        done < <(load_repo_list "$list_file")
+    done
+    sort -u -o "$configured_paths" "$configured_paths"
+
+    if [[ ${#unresolved_specs[@]} -gt 0 ]]; then
+        local bad_spec
+        for bad_spec in "${unresolved_specs[@]}"; do
+            log_warn "Invalid repo spec in config (its clone may be listed as an orphan): $bad_spec"
+        done
+        if [[ "$archive_mode" == "true" || "$delete_mode" == "true" ]]; then
+            log_error "Refusing to archive or delete while ${#unresolved_specs[@]} repo spec(s) cannot be resolved"
+            log_info "Fix or remove those lines (ru list --paths shows what resolves), then re-run prune."
+            exit 4
         fi
-    done < <(get_all_repos) | sort -u > "$configured_paths"
+    fi
 
     # Find all git repositories in projects directory
     # Depth to .git directory: flat=2, owner-repo=3, full=4. Grouped repos
@@ -9922,31 +10007,12 @@ cmd_prune() {
         (( cfg_depth > depth_limit )) && group_dirs["${cfg_path%/*}"]=1
     done < "$configured_paths"
 
-    local group_dir
+    # Candidates: every .git directory at layout depth, plus one level inside
+    # the folders that hold grouped repos.
+    local -a candidates=()
+    local group_dir repo_path
     while IFS= read -r repo_path; do
-        [[ -z "$repo_path" ]] && continue
-        # Skip if in configured paths
-        if grep -qxF "$repo_path" "$configured_paths" 2>/dev/null; then
-            continue
-        fi
-        # Skip repos nested inside a configured repo's working tree (vendored
-        # clones, test fixtures), and repos that CONTAIN a configured repo (e.g.
-        # a group folder someone ran 'git init' in): archiving or deleting those
-        # would take configured repos with them.
-        local skip="false"
-        for cfg_path in "${configured_list[@]}"; do
-            if [[ "$repo_path" == "$cfg_path"/* ]]; then
-                skip="true"
-                break
-            fi
-            if [[ "$cfg_path" == "$repo_path"/* ]]; then
-                log_warn "Not treating $repo_path as an orphan: it contains configured repo $cfg_path"
-                skip="true"
-                break
-            fi
-        done
-        [[ "$skip" == "true" ]] && continue
-        orphans+=("$repo_path")
+        [[ -n "$repo_path" ]] && candidates+=("$repo_path")
     done < <(
         {
             find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null
@@ -9956,6 +10022,57 @@ cmd_prune() {
             done
         } | sort -u
     )
+
+    # Compare physical, case-folded paths (see _prune_path_keys), not raw
+    # strings: the same directory can be spelled differently on each side.
+    local -a configured_keys=() candidate_keys=()
+    local -A configured_key_set=()
+    local key
+    if [[ ${#configured_list[@]} -gt 0 ]]; then
+        while IFS= read -r key; do
+            # No physical key (unreadable folder): fall back to the spelled path
+            [[ -z "$key" ]] && key="${configured_list[${#configured_keys[@]}],,}"
+            configured_keys+=("$key")
+            configured_key_set["$key"]=1
+        done < <(printf '%s\n' "${configured_list[@]}" | _prune_path_keys)
+    fi
+    if [[ ${#candidates[@]} -gt 0 ]]; then
+        while IFS= read -r key; do
+            candidate_keys+=("$key")
+        done < <(printf '%s\n' "${candidates[@]}" | _prune_path_keys)
+    fi
+
+    local -A seen_keys=()
+    local i j cfg_key
+    for i in "${!candidates[@]}"; do
+        repo_path="${candidates[$i]}"
+        key="${candidate_keys[$i]:-}"
+        # Fail safe: no key means we cannot tell what this is.
+        [[ -z "$key" ]] && continue
+        [[ -n "${seen_keys[$key]:-}" ]] && continue
+        seen_keys["$key"]=1
+        # A configured repo, however it is spelled
+        [[ -n "${configured_key_set[$key]:-}" ]] && continue
+        # Skip repos nested inside a configured repo's working tree (vendored
+        # clones, test fixtures), and repos that CONTAIN a configured repo (e.g.
+        # a group folder someone ran 'git init' in): archiving or deleting those
+        # would take configured repos with them.
+        local skip="false"
+        for j in "${!configured_keys[@]}"; do
+            cfg_key="${configured_keys[$j]}"
+            if [[ "$key" == "$cfg_key"/* ]]; then
+                skip="true"
+                break
+            fi
+            if [[ "$cfg_key" == "$key"/* ]]; then
+                log_warn "Not treating $repo_path as an orphan: it contains configured repo ${configured_list[$j]}"
+                skip="true"
+                break
+            fi
+        done
+        [[ "$skip" == "true" ]] && continue
+        orphans+=("$repo_path")
+    done
 
     # Report results
     if [[ ${#orphans[@]} -eq 0 ]]; then
