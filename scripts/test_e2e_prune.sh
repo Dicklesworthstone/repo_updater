@@ -577,6 +577,28 @@ test_prune_refuses_destructive_modes_with_unlistable_list_dir() {
     e2e_cleanup
 }
 
+test_prune_refuses_destructive_modes_with_dangling_list_symlink() {
+    setup_initialized_env
+
+    # A list kept elsewhere (dotfiles repo, unmounted share) and symlinked into
+    # repos.d: while the target is missing the link is not a regular file, so
+    # the list was skipped silently and its clones looked like orphans.
+    printf '%s\n' "owner/keep" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    ln -s "$E2E_TEMP_DIR/missing/work.txt" "$XDG_CONFIG_HOME/ru/repos.d/work.txt"
+    create_orphan_repo "keep"
+    create_orphan_repo "tool"
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --delete --non-interactive 2>&1)
+    exit_code=$?
+
+    assert_equals "4" "$exit_code" "Exits with code 4"
+    assert_contains "$output" "work.txt" "Names the missing list"
+    assert_dir_exists "$RU_PROJECTS_DIR/tool/.git" "Clone named by the missing list survives"
+
+    e2e_cleanup
+}
+
 test_prune_refuses_destructive_modes_without_configured_repos() {
     setup_initialized_env
 
@@ -634,6 +656,7 @@ run_test test_prune_refuses_destructive_modes_with_unresolvable_specs
 run_test test_prune_matches_configured_repo_across_unicode_normalization
 run_test test_prune_refuses_destructive_modes_with_unreadable_list
 run_test test_prune_refuses_destructive_modes_with_unlistable_list_dir
+run_test test_prune_refuses_destructive_modes_with_dangling_list_symlink
 run_test test_prune_refuses_destructive_modes_without_configured_repos
 run_test test_prune_never_acts_on_newline_split_fragments
 run_test test_prune_keeps_clone_of_deduped_repeat

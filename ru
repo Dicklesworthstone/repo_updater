@@ -9908,6 +9908,29 @@ _prune_path_keys() {
     )
 }
 
+# Print "device:inode" for each argument, symlinks followed, one line per
+# argument in order (the identity [[ a -ef b ]] compares), from a few batched
+# stat calls. Returns 1, possibly after partial output, when no known stat
+# flavour is available or an argument cannot be stat'ed; callers then fall back
+# to [[ -ef ]].
+_prune_identity_keys() {
+    [[ $# -eq 0 ]] && return 0
+    local -a fmt
+    if stat -L -c '%d:%i' -- / >/dev/null 2>&1; then
+        fmt=(-c '%d:%i')      # GNU coreutils, BusyBox
+    elif stat -L -f '%d:%i' -- / >/dev/null 2>&1; then
+        fmt=(-f '%d:%i')      # BSD, macOS
+    else
+        return 1
+    fi
+    local -a batch
+    while [[ $# -gt 0 ]]; do
+        batch=("${@:1:256}")
+        shift "${#batch[@]}"
+        stat -L "${fmt[@]}" -- "${batch[@]}" 2>/dev/null || return 1
+    done
+}
+
 # cmd_prune: Find and manage orphan repositories
 #------------------------------------------------------------------------------
 cmd_prune() {
@@ -9960,7 +9983,12 @@ cmd_prune() {
         unreadable_lists+=("$repos_dir")
     fi
     for list_file in "$repos_dir"/*.txt; do
-        [[ -f "$list_file" ]] || continue
+        if [[ ! -f "$list_file" ]]; then
+            # A symlinked list whose target is missing (dotfiles checkout,
+            # unmounted share) hides every clone it names, like an unreadable one
+            [[ -L "$list_file" && ! -e "$list_file" ]] && unreadable_lists+=("$list_file")
+            continue
+        fi
         # An unreadable list hides every clone it names
         if [[ ! -r "$list_file" ]]; then
             unreadable_lists+=("$list_file")
@@ -10078,6 +10106,7 @@ cmd_prune() {
 
     local -A seen_keys=()
     local i j cfg_key
+    local -a maybe_orphans=()
     for i in "${!candidates[@]}"; do
         repo_path="${candidates[$i]}"
         key="${candidate_keys[$i]:-}"
@@ -10105,31 +10134,88 @@ cmd_prune() {
             fi
         done
         [[ "$skip" == "true" ]] && continue
-        # Last, compare by file identity: the same folder can also be spelled in
-        # another Unicode normalization (config NFC, clone NFD as HFS+ stores
-        # it), which neither physical paths nor case folding reconcile. Walk each
-        # configured path up to PROJECTS_DIR (the candidate is, or contains, a
-        # configured repo) and the candidate up likewise (it sits inside one).
-        # Only candidates that got this far pay for it: the likely orphans.
-        local projects_root="${PROJECTS_DIR%/}" anc
-        for cfg_path in ${configured_list[@]+"${configured_list[@]}"}; do
-            anc="$cfg_path"
-            while [[ "$anc" == "$projects_root"/* ]]; do
-                if [[ "$anc" -ef "$repo_path" ]]; then
-                    skip="true"
-                    break 2
-                fi
-                anc="${anc%/*}"
-            done
-            anc="${repo_path%/*}"
-            while [[ "$anc" == "$projects_root"/* ]]; do
-                if [[ "$anc" -ef "$cfg_path" ]]; then
-                    skip="true"
-                    break 2
-                fi
-                anc="${anc%/*}"
-            done
+        maybe_orphans+=("$repo_path")
+    done
+
+    # Last, compare by file identity: the same folder can also be spelled in
+    # another Unicode normalization (config NFC, clone NFD as HFS+ stores it),
+    # which neither physical paths nor case folding reconcile. A candidate is
+    # kept when it IS or CONTAINS a configured repo (it is the configured path
+    # or one of its ancestors below PROJECTS_DIR) or sits INSIDE one (one of
+    # its own ancestors is a configured path). Only the likely orphans pay for
+    # this. Identities come from one batched stat; if that is unavailable or
+    # incomplete, fall back to pairwise [[ -ef ]] (orphans x configured x depth).
+    local projects_root="${PROJECTS_DIR%/}" anc
+    local -a id_paths=()
+    local -A id_seen=()
+    for cfg_path in ${configured_list[@]+"${configured_list[@]}"} ${maybe_orphans[@]+"${maybe_orphans[@]}"}; do
+        anc="$cfg_path"
+        while [[ "$anc" == "$projects_root"/* ]]; do
+            if [[ -z "${id_seen[$anc]:-}" && -e "$anc" ]]; then
+                id_seen["$anc"]=1
+                id_paths+=("$anc")
+            fi
+            anc="${anc%/*}"
         done
+    done
+    local -A id_of=() cfg_or_ancestor_ids=() cfg_ids=()
+    local use_ids="false" id_out
+    local -a id_list=()
+    if [[ ${#maybe_orphans[@]} -gt 0 ]] && id_out=$(_prune_identity_keys ${id_paths[@]+"${id_paths[@]}"}); then
+        [[ -n "$id_out" ]] && mapfile -t id_list <<< "$id_out"
+        if [[ ${#id_list[@]} -eq ${#id_paths[@]} ]]; then
+            use_ids="true"
+            for i in "${!id_paths[@]}"; do
+                id_of["${id_paths[$i]}"]="${id_list[$i]}"
+            done
+            for cfg_path in ${configured_list[@]+"${configured_list[@]}"}; do
+                [[ -n "${id_of[$cfg_path]:-}" ]] && cfg_ids["${id_of[$cfg_path]}"]=1
+                anc="$cfg_path"
+                while [[ "$anc" == "$projects_root"/* ]]; do
+                    [[ -n "${id_of[$anc]:-}" ]] && cfg_or_ancestor_ids["${id_of[$anc]}"]=1
+                    anc="${anc%/*}"
+                done
+            done
+        fi
+    fi
+    for repo_path in ${maybe_orphans[@]+"${maybe_orphans[@]}"}; do
+        skip="false"
+        if [[ "$use_ids" == "true" ]]; then
+            key="${id_of[$repo_path]:-}"
+            # No identity (vanished meanwhile): cannot tell, keep it
+            if [[ -z "$key" || -n "${cfg_or_ancestor_ids[$key]:-}" ]]; then
+                skip="true"
+            else
+                anc="${repo_path%/*}"
+                while [[ "$anc" == "$projects_root"/* ]]; do
+                    key="${id_of[$anc]:-}"
+                    if [[ -n "$key" && -n "${cfg_ids[$key]:-}" ]]; then
+                        skip="true"
+                        break
+                    fi
+                    anc="${anc%/*}"
+                done
+            fi
+        else
+            for cfg_path in ${configured_list[@]+"${configured_list[@]}"}; do
+                anc="$cfg_path"
+                while [[ "$anc" == "$projects_root"/* ]]; do
+                    if [[ "$anc" -ef "$repo_path" ]]; then
+                        skip="true"
+                        break 2
+                    fi
+                    anc="${anc%/*}"
+                done
+                anc="${repo_path%/*}"
+                while [[ "$anc" == "$projects_root"/* ]]; do
+                    if [[ "$anc" -ef "$cfg_path" ]]; then
+                        skip="true"
+                        break 2
+                    fi
+                    anc="${anc%/*}"
+                done
+            done
+        fi
         [[ "$skip" == "true" ]] && continue
         orphans+=("$repo_path")
     done
