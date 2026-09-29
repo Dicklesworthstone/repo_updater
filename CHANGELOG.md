@@ -8,9 +8,35 @@ Links point to individual commits on GitHub. Version headers link to comparison 
 
 ---
 
-## [Unreleased](https://github.com/Dicklesworthstone/repo_updater/compare/v1.2.1...HEAD)
+## [v1.4.0](https://github.com/Dicklesworthstone/repo_updater/compare/v1.3.1...v1.4.0) -- 2026-09-29
 
-Ongoing development since v1.2.1 (2026-01-09). Includes new commands, output formats, fork management groundwork, and significant test hardening.
+Repo lists can now group related repos under a subfolder, and `ru prune` no longer treats a configured repo as an orphan when its path is spelled differently or its list cannot be read. Also fixes the stash-and-pull hint that could pop an unrelated older stash.
+
+### Added
+
+- **Group repos under a subfolder with `in <group>`** (GH #16). A repo line such as `owner/repo in work` puts the clone in a folder between the layout prefix and the repo folder, for every layout: `flat` gives `$PROJECTS_DIR/work/repo`, `owner-repo` gives `$PROJECTS_DIR/owner/work/repo`, `full` gives `$PROJECTS_DIR/host/owner/work/repo`. Groups can be nested (`in a/b`), and `in` and `as` can appear in either order; inside a group, `as` renames only the repo folder. `ru add --group NAME` writes the `in NAME` form and `ru import` keeps groups. A repo listed twice with the same folder name in different groups is cloned once, with a warning, and ru refuses to clone into a folder that sits inside another repo's working tree ([dd210a6](https://github.com/Dicklesworthstone/repo_updater/commit/dd210a694982ffa210a37bfcdf36ca9a7f1f098d)).
+- `antigravity` / `agy` agent types map to ntm's `--agy` flags for ru-driven sessions ([e84763f](https://github.com/Dicklesworthstone/repo_updater/commit/e84763fa2ef9919e93af9d25cc90e57c332b9bc7)).
+
+### Fixed
+
+- **The stash-and-pull hint could apply and drop an unrelated older stash** (GH #15). ru counts untracked files as dirty, but `git stash` does not save them, so the suggested `git stash && git pull && git stash pop` stashed nothing and then popped whatever stash was already on top. The conflict report now suggests `git pull --autostash`, which only restores a stash it created ([0d1813d](https://github.com/Dicklesworthstone/repo_updater/commit/0d1813db82574ea03bb320e37b3cb5256d47e456)).
+- **`ru prune` could report, archive or delete configured repos as orphans** when the configured path and the clone on disk were spelled differently: an owner folder reached through a symlink, a different letter case on a case-insensitive filesystem (macOS), a different Unicode normalization of the same name, or a `PROJECTS_DIR` with a trailing slash. Prune now compares physical, case-folded paths and then file identity (device and inode), so a clone that is the same folder as a configured path is never an orphan ([dbf455e](https://github.com/Dicklesworthstone/repo_updater/commit/dbf455e954fde6f5291cc198ca876f9e3573081e), [e243a98](https://github.com/Dicklesworthstone/repo_updater/commit/e243a980c312592c9f3b2993aa42e873cb54ef74), [ed42656](https://github.com/Dicklesworthstone/repo_updater/commit/ed4265607f1936beeed1769113861325b5526e98)).
+- `ru prune --archive` / `--delete` now refuse (exit 4) when they cannot know the full configured set: a list line that cannot be resolved, an unreadable list file, a `repos.d` directory that is missing or cannot be listed, a dangling symlinked list, or no configured repos at all. Before, every clone such a list names was treated as an orphan. The dry-run listing is unchanged ([dbf455e](https://github.com/Dicklesworthstone/repo_updater/commit/dbf455e954fde6f5291cc198ca876f9e3573081e), [e243a98](https://github.com/Dicklesworthstone/repo_updater/commit/e243a980c312592c9f3b2993aa42e873cb54ef74), [20b37e2](https://github.com/Dicklesworthstone/repo_updater/commit/20b37e22358ea5efe2e164123ef7c4911c50a0e2), [ed42656](https://github.com/Dicklesworthstone/repo_updater/commit/ed4265607f1936beeed1769113861325b5526e98)).
+- Prune never acts on a repo that contains configured repos, never on fragments of a folder name that contains a newline, and only scans one level deeper inside group folders rather than across the whole projects directory ([c5af33c](https://github.com/Dicklesworthstone/repo_updater/commit/c5af33cd5e6391b2f7240a0f2a690412f09d55f5), [e243a98](https://github.com/Dicklesworthstone/repo_updater/commit/e243a980c312592c9f3b2993aa42e873cb54ef74)).
+- Archiving two same-named orphans in the same second (`owner-a/tool`, `owner-b/tool`) moved the second into the first one's working tree. Each archive now gets its own `_1`, `_2`, ... suffix ([20b37e2](https://github.com/Dicklesworthstone/repo_updater/commit/20b37e22358ea5efe2e164123ef7c4911c50a0e2)).
+- Repo specs whose name still contains whitespace after parsing (`owner/repo in a in b`) are rejected instead of resolving to a folder named `repo in a` ([c5af33c](https://github.com/Dicklesworthstone/repo_updater/commit/c5af33cd5e6391b2f7240a0f2a690412f09d55f5)).
+- README: removed the Scoop install instructions. ru is a bash script and there is no Scoop manifest; Windows users should use WSL2 with Homebrew or the install script ([b5fe013](https://github.com/Dicklesworthstone/repo_updater/commit/b5fe0131d3bb53fe311f6ebfc54d60fbc2404c73)).
+
+### Upgrade notes
+
+- Scripts that run `ru prune --delete` or `--archive` right after `ru init`, or with a list that fails to parse, now get exit code 4 instead of a prune.
+- A list line that an older ru accepted but that is now rejected (for example `owner/repo as x as y`) makes destructive prune modes refuse until the line is fixed; `ru prune` without flags lists it.
+
+---
+
+## [v1.3.1](https://github.com/Dicklesworthstone/repo_updater/compare/v1.2.1...v1.3.1) -- 2026-04-25
+
+Covers v1.3.0 (tagged 2026-04-24, no GitHub Release) and v1.3.1 (2026-04-25), which re-released the same code after a release workflow fix. Changes since v1.2.1 (2026-01-09). Includes new commands, output formats, fork management groundwork, and significant test hardening.
 
 ### New Commands
 
