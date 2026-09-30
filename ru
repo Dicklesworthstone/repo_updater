@@ -10157,8 +10157,8 @@ _prune_inspect_worktree() {
     done < <(
         _prune_git "$phys" ls-files -v -z 2>/dev/null | LC_ALL=C grep -z '^[abcdefghijklmnopqrstuvwxyzS] '
         # git must succeed; grep finding nothing (1) is fine
-        st=("${PIPESTATUS[@]}")
-        if [[ "${st[0]}" -eq 0 && "${st[1]}" -le 1 ]]; then printf 'rc=0\0'; else printf 'rc=1\0'; fi
+        prune_ls_st=("${PIPESTATUS[@]}")
+        if [[ "${prune_ls_st[0]}" -eq 0 && "${prune_ls_st[1]}" -le 1 ]]; then printf 'rc=0\0'; else printf 'rc=1\0'; fi
     )
     if [[ ${#entries[@]} -eq 0 || "${entries[${#entries[@]}-1]}" != "rc=0" ]]; then
         printf 'error\t%sgit ls-files failed\n' "$prefix"
