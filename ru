@@ -9987,7 +9987,10 @@ _prune_git() {
 # Inspect an orphan clone before prune archives or deletes it. Prints one
 # tab-separated line per finding:
 #   origin <key>    a comparison key (_prune_url_key) of its origin URL
-#   unsaved <why>   work that deleting it would lose (only with $2 == "full")
+#   unsaved <why>   work that deleting it would lose (only with $2 == "full");
+#                   "in <subdir>: <why>" for a repository nested inside it
+#   precious <path> an ignored path that may hold secrets or local state (only
+#                   with $2 == "full"); named in the listing, never blocking
 #   error <why>     what could not be checked; an error never counts as clean
 # With $2 == "origin" only the origin URL is read (enough for --archive).
 _prune_inspect_orphan() {
@@ -10041,90 +10044,232 @@ _prune_inspect_orphan() {
         return 0
     fi
 
+    _prune_inspect_worktree "$phys" "" || return 0
+
+    # Ignored files are not unsaved work (build output, caches), but a few
+    # ignored names usually hold things that exist nowhere else: named in the
+    # listing, never blocking.
+    _prune_note_precious_ignored "$phys"
+
+    # Repositories inside it go with it: submodules, and clones the outer repo
+    # may ignore (vendored checkouts, scratch clones). Its own status reports
+    # neither a submodule's unpushed commits nor anything in an ignored clone,
+    # so each is checked on its own. A tree that cannot be fully listed is not
+    # known to be clean.
+    local -a found=()
+    local -A nested_gitdirs=()
+    local rec nested rel gd
+    while IFS= read -r -d '' rec; do
+        found+=("$rec")
+    done < <(find "$phys" -mindepth 1 \( -name .git -print0 -prune \) -o \( -type d -name objects -print0 \) 2>/dev/null; printf 'rc=%d\0' "$?")
+    if [[ ${#found[@]} -eq 0 || "${found[${#found[@]}-1]}" != "rc=0" ]]; then
+        printf 'error\tcannot list its folders to look for repositories inside it\n'
+        return 0
+    fi
+    unset 'found[${#found[@]}-1]'
+    local -a bare_dirs=()
+    for rec in ${found[@]+"${found[@]}"}; do
+        [[ "$rec" == "$phys/.git" ]] && continue
+        if [[ "$rec" == */objects ]]; then
+            # A bare repository (a local "remote", a mirror) has no .git
+            gd="${rec%/objects}"
+            [[ -f "$gd/HEAD" && -d "$gd/refs" ]] && bare_dirs+=("$gd")
+            continue
+        fi
+        nested="${rec%/.git}"
+        rel="${nested#"$phys"/}"
+        _prune_inspect_worktree "$nested" "in $rel: " || return 0
+        if gd=$(_prune_git "$nested" rev-parse --absolute-git-dir 2>/dev/null) && [[ -n "$gd" ]]; then
+            nested_gitdirs["$gd"]=1
+        fi
+    done
+    for gd in ${bare_dirs[@]+"${bare_dirs[@]}"}; do
+        rel="${gd#"$phys"/}"
+        _prune_inspect_refs "$gd" "in $rel: " --git-dir="$gd" || return 0
+    done
+
+    # A submodule whose work tree is gone (deinit, folder removed) keeps its
+    # repository, and any commits only it has, under .git/modules.
+    if [[ -d "$phys/.git/modules" ]]; then
+        found=()
+        while IFS= read -r -d '' rec; do
+            found+=("$rec")
+        done < <(find "$phys/.git/modules" -type d -name objects -print0 -prune 2>/dev/null; printf 'rc=%d\0' "$?")
+        if [[ ${#found[@]} -eq 0 || "${found[${#found[@]}-1]}" != "rc=0" ]]; then
+            printf 'error\tcannot list .git/modules\n'
+            return 0
+        fi
+        unset 'found[${#found[@]}-1]'
+        local seen_gd skip_gd
+        for rec in ${found[@]+"${found[@]}"}; do
+            gd="${rec%/objects}"
+            [[ -f "$gd/HEAD" ]] || continue
+            skip_gd="false"
+            for seen_gd in "${!nested_gitdirs[@]}"; do
+                if [[ "$seen_gd" -ef "$gd" ]]; then
+                    skip_gd="true"
+                    break
+                fi
+            done
+            [[ "$skip_gd" == "true" ]] && continue
+            rel="${gd#"$phys"/}"
+            _prune_inspect_refs "$gd" "in $rel: " --git-dir="$gd" || return 0
+        done
+    fi
+    return 0
+}
+
+# Check the work tree at $1 (physical path) for work that exists only there;
+# prints 'unsaved'/'error' lines (see _prune_inspect_orphan), each detail
+# prefixed with $2. Returns 1 after an error line.
+_prune_inspect_worktree() {
+    local phys="$1" prefix="$2"
+    local out top
+
+    if ! top=$(_prune_git "$phys" rev-parse --show-toplevel 2>/dev/null) || [[ -z "$top" || ! "$top" -ef "$phys" ]]; then
+        printf 'error\t%sgit cannot open it as a work tree\n' "$prefix"
+        return 1
+    fi
+
     # Uncommitted changes and untracked paths that are not ignored (an
     # untracked folder counts once). The flags override repository config that
     # would hide them (status.showUntrackedFiles, diff.ignoreSubmodules).
     if ! out=$(_prune_git "$phys" status --porcelain=v1 --untracked-files=normal --ignore-submodules=none 2>/dev/null); then
-        printf 'error\tgit status failed\n'
-        return 0
+        printf 'error\t%sgit status failed\n' "$prefix"
+        return 1
     fi
     local changed untracked
     untracked=$(grep -c '^?? ' <<< "$out")
     changed=$(grep -c -v -e '^?? ' -e '^$' <<< "$out")
-    ((changed > 0)) && printf 'unsaved\t%d uncommitted change(s)\n' "$changed"
-    ((untracked > 0)) && printf 'unsaved\t%d untracked path(s)\n' "$untracked"
+    ((changed > 0)) && printf 'unsaved\t%s%d uncommitted change(s)\n' "$prefix" "$changed"
+    ((untracked > 0)) && printf 'unsaved\t%s%d untracked path(s)\n' "$prefix" "$untracked"
 
     # Files whose changes git status does not report: lower-case tag =
-    # assume-unchanged, S = skip-worktree
-    if ! out=$(_prune_git "$phys" ls-files -v 2>/dev/null); then
-        printf 'error\tgit ls-files failed\n'
-        return 0
+    # assume-unchanged; S = skip-worktree, which sparse checkout also sets on
+    # every file outside its cone. Those are absent from the work tree and
+    # lose nothing, so a skip-worktree file counts only when it is present.
+    # (Only those entries reach the shell: reading every path of a large
+    # repository one NUL-terminated record at a time takes seconds.)
+    local -a entries=()
+    local rec hidden=0
+    while IFS= read -r -d '' rec; do
+        entries+=("$rec")
+    done < <(
+        _prune_git "$phys" ls-files -v -z 2>/dev/null | LC_ALL=C grep -z '^[abcdefghijklmnopqrstuvwxyzS] '
+        # git must succeed; grep finding nothing (1) is fine
+        st=("${PIPESTATUS[@]}")
+        if [[ "${st[0]}" -eq 0 && "${st[1]}" -le 1 ]]; then printf 'rc=0\0'; else printf 'rc=1\0'; fi
+    )
+    if [[ ${#entries[@]} -eq 0 || "${entries[${#entries[@]}-1]}" != "rc=0" ]]; then
+        printf 'error\t%sgit ls-files failed\n' "$prefix"
+        return 1
     fi
-    local hidden
-    hidden=$(LC_ALL=C grep -c '^[abcdefghijklmnopqrstuvwxyzS] ' <<< "$out")
-    ((hidden > 0)) && printf 'unsaved\t%d file(s) marked assume-unchanged or skip-worktree (their changes are hidden from git status)\n' "$hidden"
+    unset 'entries[${#entries[@]}-1]'
+    for rec in ${entries[@]+"${entries[@]}"}; do
+        case "$rec" in
+            [abcdefghijklmnopqrstuvwxyz]\ *) ((hidden++)) ;;
+            S\ *) [[ -e "$phys/${rec#S }" || -L "$phys/${rec#S }" ]] && ((hidden++)) ;;
+        esac
+    done
+    ((hidden > 0)) && printf 'unsaved\t%s%d file(s) marked assume-unchanged or skip-worktree (their changes are hidden from git status)\n' "$prefix" "$hidden"
 
-    # Stashes
-    if ! out=$(_prune_git "$phys" for-each-ref --format='%(refname)' refs/stash 2>/dev/null); then
-        printf 'error\tcannot read refs\n'
-        return 0
-    fi
-    if [[ -n "$out" ]]; then
-        local stashes=0
-        if out=$(_prune_git "$phys" stash list 2>/dev/null); then
-            while IFS= read -r line; do
-                [[ -n "$line" ]] && ((stashes++))
-            done <<< "$out"
-        fi
-        ((stashes < 1)) && stashes=1
-        printf 'unsaved\t%d stash(es)\n' "$stashes"
-    fi
-
-    # Commits not on any remote-tracking branch: from every local branch, and
-    # from HEAD when it is detached. (Tags are left out: fetched tags often sit
-    # on commits no remote branch contains, and would flag every such clone.)
-    # An unborn HEAD (no commit yet) is fine; a HEAD that cannot be resolved
-    # otherwise is not.
-    local -a tips=()
-    if _prune_git "$phys" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
-        tips+=(HEAD)
-    else
-        local head_ref
-        if ! head_ref=$(_prune_git "$phys" symbolic-ref --quiet HEAD 2>/dev/null) \
-            || _prune_git "$phys" show-ref --verify --quiet "$head_ref" 2>/dev/null; then
-            printf 'error\tHEAD cannot be resolved\n'
-            return 0
-        fi
-    fi
-    local ahead
-    if ! ahead=$(_prune_git "$phys" rev-list --count ${tips[@]+"${tips[@]}"} --branches --not --remotes 2>/dev/null) \
-        || [[ ! "$ahead" =~ ^[0-9]+$ ]]; then
-        printf 'error\tcannot list commits\n'
-        return 0
-    fi
-    if ((ahead > 0)); then
-        local remotes
-        if ! remotes=$(_prune_git "$phys" remote 2>/dev/null); then
-            printf 'error\tcannot list remotes\n'
-            return 0
-        fi
-        if [[ -z "$remotes" ]]; then
-            printf 'unsaved\tno remote, %d local commit(s)\n' "$ahead"
-        else
-            printf 'unsaved\t%d commit(s) not on any remote branch\n' "$ahead"
-        fi
-    fi
+    _prune_inspect_refs "$phys" "$prefix" || return 1
 
     # Linked worktrees live elsewhere but keep their metadata in this clone
     if ! out=$(_prune_git "$phys" worktree list --porcelain 2>/dev/null); then
-        printf 'error\tgit worktree list failed\n'
-        return 0
+        printf 'error\t%sgit worktree list failed\n' "$prefix"
+        return 1
     fi
     # Stale entries (folder already gone) are 'prunable' and do not count
     local trees stale
     trees=$(grep -c '^worktree ' <<< "$out")
     stale=$(grep -c '^prunable' <<< "$out")
-    ((trees - stale > 1)) && printf 'unsaved\t%d linked worktree(s) depend on it\n' "$((trees - stale - 1))"
+    ((trees - stale > 1)) && printf 'unsaved\t%s%d linked worktree(s) depend on it\n' "$prefix" "$((trees - stale - 1))"
+    return 0
+}
+
+# Check the refs of the repository at $1 (run as _prune_git "$1" "${@:3}", so
+# extra global options such as --git-dir= can be passed) for stashes and for
+# commits no remote-tracking branch contains. Prints like
+# _prune_inspect_worktree; returns 1 after an error line.
+_prune_inspect_refs() {
+    local dir="$1" prefix="$2"
+    shift 2
+    local -a gopts=("$@")
+    local out line
+
+    # Stashes
+    if ! out=$(_prune_git "$dir" ${gopts[@]+"${gopts[@]}"} for-each-ref --format='%(refname)' refs/stash 2>/dev/null); then
+        printf 'error\t%scannot read refs\n' "$prefix"
+        return 1
+    fi
+    if [[ -n "$out" ]]; then
+        local stashes=0
+        if out=$(_prune_git "$dir" ${gopts[@]+"${gopts[@]}"} stash list 2>/dev/null); then
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && ((stashes++))
+            done <<< "$out"
+        fi
+        ((stashes < 1)) && stashes=1
+        printf 'unsaved\t%s%d stash(es)\n' "$prefix" "$stashes"
+    fi
+
+    # Commits not on any remote-tracking branch, reachable from HEAD (also
+    # when detached), local branches, notes, or any other local ref. Left
+    # out: tags (fetched tags often sit on commits no remote branch
+    # contains, and would flag every such clone), the stash (above), and
+    # refs/prefetch (copies of remote branches made by 'git maintenance').
+    # An unborn HEAD (no commit yet) is fine; a HEAD that cannot be resolved
+    # otherwise is not.
+    if ! _prune_git "$dir" ${gopts[@]+"${gopts[@]}"} rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
+        local head_ref
+        if ! head_ref=$(_prune_git "$dir" ${gopts[@]+"${gopts[@]}"} symbolic-ref --quiet HEAD 2>/dev/null) \
+            || _prune_git "$dir" ${gopts[@]+"${gopts[@]}"} show-ref --verify --quiet "$head_ref" 2>/dev/null; then
+            printf 'error\t%sHEAD cannot be resolved\n' "$prefix"
+            return 1
+        fi
+    fi
+    local ahead
+    if ! ahead=$(_prune_git "$dir" ${gopts[@]+"${gopts[@]}"} rev-list --count \
+            --exclude='refs/remotes/*' --exclude='refs/tags/*' --exclude=refs/stash \
+            --exclude='refs/prefetch/*' --all --not --remotes 2>/dev/null) \
+        || [[ ! "$ahead" =~ ^[0-9]+$ ]]; then
+        printf 'error\t%scannot list commits\n' "$prefix"
+        return 1
+    fi
+    if ((ahead > 0)); then
+        local remotes
+        if ! remotes=$(_prune_git "$dir" ${gopts[@]+"${gopts[@]}"} remote 2>/dev/null); then
+            printf 'error\t%scannot list remotes\n' "$prefix"
+            return 1
+        fi
+        if [[ -z "$remotes" ]]; then
+            printf 'unsaved\t%sno remote, %d local commit(s)\n' "$prefix" "$ahead"
+        else
+            printf 'unsaved\t%s%d commit(s) not on any remote branch\n' "$prefix" "$ahead"
+        fi
+    fi
+    return 0
+}
+
+# Print a 'precious' line (see _prune_inspect_orphan) for each ignored path in
+# the work tree at $1 whose name suggests secrets or local state (.env, keys,
+# Terraform state). Ignored folders are named as a whole, not searched.
+_prune_note_precious_ignored() {
+    local phys="$1" rec base
+    while IFS= read -r -d '' rec; do
+        [[ "$rec" == *$'\n'* || "$rec" == *$'\t'* ]] && continue
+        # Beads databases are rebuilt from the tracked JSONL
+        [[ "$rec" == .beads/* ]] && continue
+        base="${rec%/}"
+        base="${base##*/}"
+        case "${base,,}" in
+            .env.example|.env.sample|.env.template|.env.dist) ;;
+            .env|.env.*|.envrc|*.pem|*.key|*.p12|*.pfx|*.jks|*.keystore|id_rsa*|id_ed25519*|id_ecdsa*|id_dsa*|\
+            .npmrc|.pypirc|.netrc|*.tfstate|*.tfstate.*|*.tfvars|*secret*|*credential*)
+                printf 'precious\t%s\n' "$rec" ;;
+        esac
+    done < <(_prune_git "$phys" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null)
     return 0
 }
 
@@ -10442,7 +10587,7 @@ cmd_prune() {
     # as clean. --archive needs only the origin check.
     local inspect_depth="full"
     [[ "$archive_mode" == "true" ]] && inspect_depth="origin"
-    local -A orphan_clone_of=() orphan_unsaved=() orphan_error=() orphan_blockers=()
+    local -A orphan_clone_of=() orphan_unsaved=() orphan_error=() orphan_blockers=() orphan_precious=() orphan_precious_note=()
     local orphan kind detail
     for orphan in "${orphans[@]}"; do
         while IFS=$'\t' read -r kind detail; do
@@ -10455,6 +10600,9 @@ cmd_prune() {
                     ;;
                 unsaved)
                     orphan_unsaved["$orphan"]+="${orphan_unsaved[$orphan]:+$'\n'}$detail"
+                    ;;
+                precious)
+                    orphan_precious["$orphan"]+="${orphan_precious[$orphan]:+$'\n'}$detail"
                     ;;
                 *)
                     orphan_error["$orphan"]="$detail"
@@ -10478,6 +10626,21 @@ cmd_prune() {
             why+="${why:+; }unsaved work: ${orphan_unsaved[$orphan]//$'\n'/, }"
         fi
         orphan_blockers["$orphan"]="$why"
+
+        # Ignored files deleting it would lose (named, not blocking)
+        if [[ -n "${orphan_precious[$orphan]:-}" ]]; then
+            local -a precious_items=()
+            local precious_list="" pi
+            mapfile -t precious_items <<< "${orphan_precious[$orphan]}"
+            for pi in "${!precious_items[@]}"; do
+                if ((pi == 5)); then
+                    precious_list+=", +$(( ${#precious_items[@]} - 5 )) more"
+                    break
+                fi
+                precious_list+="${precious_list:+, }${precious_items[$pi]}"
+            done
+            orphan_precious_note["$orphan"]="ignored files that may hold secrets or local state: $precious_list"
+        fi
     done
 
     local path blockers
@@ -10510,6 +10673,16 @@ cmd_prune() {
                 done <<< "${orphan_unsaved[$path]}"
                 json_array+="]"
             fi
+            if [[ -n "${orphan_precious[$path]:-}" ]]; then
+                local p_item p_first="true"
+                json_array+=",\"ignored_precious\":["
+                while IFS= read -r p_item; do
+                    [[ "$p_first" == "true" ]] || json_array+=","
+                    p_first="false"
+                    json_array+="\"$(json_escape "$p_item")\""
+                done <<< "${orphan_precious[$path]}"
+                json_array+="]"
+            fi
             json_array+="}"
         done
         json_array+="]"
@@ -10521,6 +10694,9 @@ cmd_prune() {
             # Action modes explain each kept orphan below instead
             if [[ "$archive_mode" != "true" && "$delete_mode" != "true" && -n "${orphan_blockers[$path]}" ]]; then
                 echo "      ${orphan_blockers[$path]}" >&2
+            fi
+            if [[ "$archive_mode" != "true" && "$delete_mode" != "true" && -n "${orphan_precious_note[$path]:-}" ]]; then
+                echo "      note: ${orphan_precious_note[$path]}" >&2
             fi
         done
     fi
@@ -10540,6 +10716,13 @@ cmd_prune() {
                 kept+=("$path")
             fi
         done
+        if [[ "$delete_mode" == "true" ]]; then
+            for path in ${targets[@]+"${targets[@]}"}; do
+                if [[ -n "${orphan_precious_note[$path]:-}" ]]; then
+                    log_warn "Deleting $path also deletes ${orphan_precious_note[$path]}"
+                fi
+            done
+        fi
         if [[ ${#kept[@]} -gt 0 ]]; then
             log_info "Kept ${#kept[@]} orphan(s) listed above; check them, then re-run with --force to include them."
         fi

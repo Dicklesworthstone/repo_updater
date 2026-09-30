@@ -982,6 +982,198 @@ test_prune_json_reports_unsaved_work() {
 }
 
 #==============================================================================
+# Tests: Work the top-level checks cannot see (review of 8bb734c)
+#==============================================================================
+
+test_prune_delete_keeps_ignored_nested_repo_with_unpushed_commits() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "outer"
+    local path="$RU_PROJECTS_DIR/outer"
+    # A nested clone the outer repo ignores (vendored checkout, scratch clone)
+    printf 'vendor/\n' | tee -a "$path/.git/info/exclude" >/dev/null
+    mkdir -p "$path/vendor"
+    prune_git init --quiet "$path/vendor/lib"
+    prune_git -C "$path/vendor/lib" commit --quiet --allow-empty -m only-here
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$path/vendor/lib/.git" "Orphan holding an ignored nested repo with local commits kept"
+    assert_contains "$output" "in vendor/lib: no remote, 1 local commit(s)" "Names the nested repo's work"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_keeps_submodule_with_unpushed_commits() {
+    setup_initialized_env
+    configure_placeholder_repo
+    local sub_bare="$E2E_TEMP_DIR/remotes/sub.git" seed="$E2E_TEMP_DIR/sub-seed"
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    prune_git init --quiet --bare "$sub_bare"
+    prune_git clone --quiet "$sub_bare" "$seed" 2>/dev/null
+    prune_git -C "$seed" commit --quiet --allow-empty -m sub-init
+    prune_git -C "$seed" push --quiet origin HEAD 2>/dev/null
+
+    create_pushed_orphan "super"
+    local path="$RU_PROJECTS_DIR/super"
+    prune_git -C "$path" -c protocol.file.allow=always submodule --quiet add "$sub_bare" sub 2>/dev/null
+    prune_git -C "$path" commit --quiet -m add-sub
+    # Commit in the submodule, recorded (and pushed) in the superproject; the
+    # submodule commit itself was never pushed, so only this clone has it.
+    prune_git -C "$path/sub" commit --quiet --allow-empty -m sub-local
+    prune_git -C "$path" add sub
+    prune_git -C "$path" commit --quiet -m bump-sub
+    prune_git -C "$path" push --quiet origin HEAD 2>/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$path/.git" "Orphan whose submodule holds unpushed commits kept"
+    assert_contains "$output" "in sub: 1 commit(s) not on any remote branch" "Names the submodule's commits"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_keeps_notes_and_other_local_refs() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "noted"
+    prune_git -C "$RU_PROJECTS_DIR/noted" notes add -m "review notes" HEAD
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$RU_PROJECTS_DIR/noted/.git" "Orphan with local notes kept"
+    assert_contains "$output" "not on any remote branch" "Names the unpushed notes commit"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_removes_clean_sparse_checkout() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "sparse"
+    local path="$RU_PROJECTS_DIR/sparse"
+    mkdir -p "$path/a" "$path/b"
+    printf 'a\n' | tee "$path/a/f" >/dev/null
+    printf 'b\n' | tee "$path/b/f" >/dev/null
+    prune_git -C "$path" add a b
+    prune_git -C "$path" commit --quiet -m dirs
+    prune_git -C "$path" push --quiet origin HEAD 2>/dev/null
+    prune_git -C "$path" sparse-checkout set a 2>/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_dir_not_exists "$path" "Clean sparse checkout deleted (files outside the cone are not unsaved work)"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_names_ignored_files_that_may_hold_secrets() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "with-env"
+    local path="$RU_PROJECTS_DIR/with-env"
+    printf '.env\nbuild/\n' | tee -a "$path/.git/info/exclude" >/dev/null
+    printf 'TOKEN=x\n' | tee "$path/.env" >/dev/null
+    mkdir -p "$path/build"
+    printf 'x\n' | tee "$path/build/out.o" >/dev/null
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune 2>&1)
+    assert_contains "$output" "ignored files that may hold secrets or local state: .env" "Dry run names the ignored .env"
+    assert_not_contains "$output" "out.o" "Build output is not named"
+    output=$("$E2E_RU_SCRIPT" --json prune 2>/dev/null)
+    assert_contains "$output" '"ignored_precious":[".env"]' "JSON lists it"
+
+    # Listed, not blocking
+    output=$(prune_delete)
+    exit_code=$?
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_dir_not_exists "$path" "Deleted"
+    assert_contains "$output" "also deletes ignored files" "Warns while deleting"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_keeps_ignored_bare_repo_with_commits() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "holds-bare"
+    local path="$RU_PROJECTS_DIR/holds-bare"
+    printf 'mirrors/\n' | tee -a "$path/.git/info/exclude" >/dev/null
+    mkdir -p "$path/mirrors"
+    prune_git init --quiet --bare "$path/mirrors/scratch.git"
+    prune_git -C "$path" push --quiet "$path/mirrors/scratch.git" HEAD:refs/heads/main 2>/dev/null
+    # A folder named 'objects' that is not a repository is not an error
+    mkdir -p "$path/src/objects"
+    printf 'x\n' | tee "$path/src/objects/a.txt" >/dev/null
+    prune_git -C "$path" add src
+    prune_git -C "$path" commit --quiet -m src
+    prune_git -C "$path" push --quiet origin HEAD 2>/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$path/mirrors/scratch.git" "Orphan holding an ignored bare repo kept"
+    assert_contains "$output" "in mirrors/scratch.git: no remote" "Names the bare repo's commits"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_keeps_deinitialized_submodule_repository() {
+    setup_initialized_env
+    configure_placeholder_repo
+    local sub_bare="$E2E_TEMP_DIR/remotes/sub2.git" seed="$E2E_TEMP_DIR/sub2-seed"
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    prune_git init --quiet --bare "$sub_bare"
+    prune_git clone --quiet "$sub_bare" "$seed" 2>/dev/null
+    prune_git -C "$seed" commit --quiet --allow-empty -m sub-init
+    prune_git -C "$seed" push --quiet origin HEAD 2>/dev/null
+
+    create_pushed_orphan "super2"
+    local path="$RU_PROJECTS_DIR/super2"
+    prune_git -C "$path" -c protocol.file.allow=always submodule --quiet add "$sub_bare" sub 2>/dev/null
+    prune_git -C "$path" commit --quiet -m add-sub
+    prune_git -C "$path/sub" checkout --quiet -b local-work
+    prune_git -C "$path/sub" commit --quiet --allow-empty -m sub-local
+    prune_git -C "$path/sub" checkout --quiet --detach origin/HEAD 2>/dev/null \
+        || prune_git -C "$path/sub" checkout --quiet --detach HEAD~1
+    prune_git -C "$path" push --quiet origin HEAD 2>/dev/null
+    # Work tree gone; the repository (and its local branch) stays in .git/modules
+    prune_git -C "$path" submodule --quiet deinit -f sub 2>/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$path/.git/modules/sub" "Orphan keeping a deinitialized submodule's commits kept"
+    assert_contains "$output" "in .git/modules/sub: 1 commit(s) not on any remote branch" "Names them"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -1040,5 +1232,12 @@ run_test test_prune_keeps_clone_left_by_as_rename
 run_test test_prune_json_reports_unsaved_work
 run_test test_prune_delete_ignores_tags_on_commits_off_branches
 run_test test_prune_archive_keeps_orphan_with_unreadable_config
+run_test test_prune_delete_keeps_ignored_nested_repo_with_unpushed_commits
+run_test test_prune_delete_keeps_submodule_with_unpushed_commits
+run_test test_prune_delete_keeps_notes_and_other_local_refs
+run_test test_prune_delete_removes_clean_sparse_checkout
+run_test test_prune_names_ignored_files_that_may_hold_secrets
+run_test test_prune_delete_keeps_ignored_bare_repo_with_commits
+run_test test_prune_delete_keeps_deinitialized_submodule_repository
 
 print_results
