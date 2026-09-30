@@ -99,6 +99,8 @@ ru list
 ru prune           # Preview
 ru prune --delete  # Actually remove
 ru prune --archive # Move to archive directory
+# --delete keeps orphans with unsaved work (dirty, untracked, stashes, unpushed);
+# both keep clones of configured repos at old paths. --force overrides; exit 1 if any kept.
 ```
 
 ### Diagnostics

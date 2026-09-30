@@ -14,6 +14,8 @@
 #   - ru prune respects custom names
 #   - ru prune with conflicting options shows error
 #   - ru prune handles JSON output
+#   - ru prune --delete keeps orphans with unsaved work unless --force
+#   - ru prune --archive/--delete keep clones of configured repos at old paths
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
 # shellcheck disable=SC1091  # Sourced files checked separately
@@ -622,6 +624,364 @@ test_prune_refuses_destructive_modes_without_configured_repos() {
 }
 
 #==============================================================================
+# Tests: Unsaved work and clones of configured repos (A12)
+#==============================================================================
+
+prune_git() {
+    git -c user.name=ru-test -c user.email=ru-test@example.invalid -c init.defaultBranch=main "$@"
+}
+
+# Create an orphan cloned from a local bare "remote" and fully pushed, so it
+# holds no unsaved work: the baseline that --delete may remove.
+create_pushed_orphan() {
+    local name="$1"
+    local bare="$E2E_TEMP_DIR/remotes/$name.git"
+    local path="$RU_PROJECTS_DIR/$name"
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    prune_git init --quiet --bare "$bare"
+    prune_git clone --quiet "$bare" "$path" 2>/dev/null
+    printf 'hello\n' | tee "$path/README" >/dev/null
+    prune_git -C "$path" add README
+    prune_git -C "$path" commit --quiet -m init
+    prune_git -C "$path" push --quiet origin HEAD 2>/dev/null
+}
+
+prune_delete() {
+    "$E2E_RU_SCRIPT" --non-interactive prune --delete "$@" 2>&1
+}
+
+test_prune_delete_removes_clean_pushed_clone() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "done-with-it"
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/done-with-it" "Clean, pushed clone deleted"
+    assert_not_contains "$output" "Skipping" "Nothing skipped"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_keeps_orphans_with_unsaved_work() {
+    setup_initialized_env
+    configure_placeholder_repo
+
+    # Uncommitted change to a tracked file
+    create_pushed_orphan "edited"
+    printf 'changed\n' | tee -a "$RU_PROJECTS_DIR/edited/README" >/dev/null
+    # Untracked file that is not ignored
+    create_pushed_orphan "untracked"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/untracked/notes.txt" >/dev/null
+    # Stash
+    create_pushed_orphan "stashed"
+    printf 'wip\n' | tee -a "$RU_PROJECTS_DIR/stashed/README" >/dev/null
+    prune_git -C "$RU_PROJECTS_DIR/stashed" stash --quiet
+    # Commit not on any remote branch
+    create_pushed_orphan "ahead"
+    prune_git -C "$RU_PROJECTS_DIR/ahead" commit --quiet --allow-empty -m local
+    # Commit on a detached HEAD
+    create_pushed_orphan "detached"
+    prune_git -C "$RU_PROJECTS_DIR/detached" checkout --quiet --detach
+    prune_git -C "$RU_PROJECTS_DIR/detached" commit --quiet --allow-empty -m detached
+    # No remote at all, with commits
+    create_orphan_repo "local-only"
+    prune_git -C "$RU_PROJECTS_DIR/local-only" commit --quiet --allow-empty -m mine
+    # Change hidden from git status
+    create_pushed_orphan "hidden"
+    prune_git -C "$RU_PROJECTS_DIR/hidden" update-index --assume-unchanged README
+    printf 'secret\n' | tee -a "$RU_PROJECTS_DIR/hidden/README" >/dev/null
+    # Clean itself, but a linked worktree elsewhere depends on it
+    create_pushed_orphan "has-worktree"
+    prune_git -C "$RU_PROJECTS_DIR/has-worktree" worktree add --quiet -b side "$E2E_TEMP_DIR/side-tree" 2>/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1 when orphans are kept"
+    assert_contains "$output" "Nothing to prune" "Reports that nothing was pruned"
+    local name
+    for name in edited untracked stashed ahead detached local-only hidden has-worktree; do
+        assert_dir_exists "$RU_PROJECTS_DIR/$name/.git" "$name kept"
+    done
+    assert_contains "$output" "1 uncommitted change(s)" "Names the uncommitted change"
+    assert_contains "$output" "1 untracked path(s)" "Names the untracked path"
+    assert_contains "$output" "1 stash(es)" "Names the stash"
+    assert_contains "$output" "1 commit(s) not on any remote branch" "Names the unpushed commit"
+    assert_contains "$output" "no remote, 1 local commit(s)" "Names the remote-less commits"
+    assert_contains "$output" "assume-unchanged or skip-worktree" "Names the hidden change"
+    assert_contains "$output" "1 linked worktree(s)" "Names the linked worktree"
+    assert_contains "$output" "--force" "Points at --force"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_mixed_keeps_dirty_removes_clean() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "clean-one"
+    create_pushed_orphan "dirty-one"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/dirty-one/new.txt" >/dev/null
+    # Ignored files are not unsaved work
+    create_pushed_orphan "ignored-only"
+    printf 'build/\n' | tee -a "$RU_PROJECTS_DIR/ignored-only/.git/info/exclude" >/dev/null
+    mkdir -p "$RU_PROJECTS_DIR/ignored-only/build"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/ignored-only/build/out.o" >/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1 when some orphans are kept"
+    assert_contains "$output" "Deleted 2" "Deletes the two clean orphans"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/clean-one" "Clean orphan deleted"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/ignored-only" "Orphan with only ignored files deleted"
+    assert_dir_exists "$RU_PROJECTS_DIR/dirty-one/.git" "Dirty orphan kept"
+    assert_contains "$output" "Skipping $RU_PROJECTS_DIR/dirty-one" "Explains the skip"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_force_overrides_unsaved_work() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "dirty"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/dirty/new.txt" >/dev/null
+
+    local output exit_code
+    output=$(prune_delete --force)
+    exit_code=$?
+
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_contains "$output" "--force: including" "Says what --force overrides"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/dirty" "Dirty orphan deleted with --force"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_keeps_repos_git_cannot_inspect() {
+    setup_initialized_env
+    configure_placeholder_repo
+
+    # Corrupted: HEAD names no ref or object
+    create_pushed_orphan "corrupt"
+    printf 'garbage\n' | tee "$RU_PROJECTS_DIR/corrupt/.git/HEAD" >/dev/null
+    # Bare-ish: its .git says core.bare = true, so it has no work tree
+    create_pushed_orphan "bareish"
+    prune_git -C "$RU_PROJECTS_DIR/bareish" config core.bare true
+    # Missing object behind a branch
+    create_pushed_orphan "lost-objects"
+    local obj_dir="$RU_PROJECTS_DIR/lost-objects/.git/objects"
+    /usr/bin/find "$obj_dir" -type f -path '*/objects/??/*' -exec chmod 000 {} + 2>/dev/null
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$RU_PROJECTS_DIR/corrupt/.git" "Corrupted clone kept"
+    assert_dir_exists "$RU_PROJECTS_DIR/bareish/.git" "Bare-ish clone kept"
+    assert_dir_exists "$RU_PROJECTS_DIR/lost-objects/.git" "Clone with unreadable objects kept"
+    assert_contains "$output" "cannot check it for unsaved work" "Explains the inspection failure"
+
+    /usr/bin/find "$obj_dir" -type f -exec chmod 644 {} + 2>/dev/null
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_inspection_ignores_callers_git_environment() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "dirty"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/dirty/new.txt" >/dev/null
+    # A clean repo outside PROJECTS_DIR that GIT_DIR/GIT_WORK_TREE point at
+    local elsewhere="$E2E_TEMP_DIR/elsewhere"
+    mkdir -p "$elsewhere"
+    prune_git init --quiet "$elsewhere"
+
+    local output
+    output=$(GIT_DIR="$elsewhere/.git" GIT_WORK_TREE="$elsewhere" prune_delete)
+
+    assert_dir_exists "$RU_PROJECTS_DIR/dirty/.git" "Dirty orphan kept despite GIT_DIR pointing elsewhere"
+    assert_contains "$output" "1 untracked path(s)" "Inspected the orphan itself"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_archive_moves_dirty_orphans() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "dirty"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/dirty/new.txt" >/dev/null
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --archive 2>&1)
+    exit_code=$?
+
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/dirty" "Dirty orphan moved (archiving loses nothing)"
+    local archived
+    archived=$(/usr/bin/find "$XDG_STATE_HOME/ru/archived" -mindepth 2 -maxdepth 2 -name new.txt | wc -l | tr -d ' ')
+    assert_equals "1" "$archived" "Untracked file travels with the archive"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_keeps_clone_of_configured_repo_at_old_path() {
+    setup_initialized_env
+    configure_placeholder_repo
+    # Configured as owner/tool (flat layout: $RU_PROJECTS_DIR/tool); an older
+    # clone of the same repo sits at another path, remote spelled differently.
+    printf '%s\n' "owner/tool" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_orphan_repo "tool-old-ssh"
+    prune_git -C "$RU_PROJECTS_DIR/tool-old-ssh" remote add origin "git@github.com:Owner/Tool.git"
+    create_orphan_repo "tool-old-https"
+    prune_git -C "$RU_PROJECTS_DIR/tool-old-https" remote add origin "https://user@GitHub.com/owner/tool.git/"
+    create_orphan_repo "tool-old-sshurl"
+    prune_git -C "$RU_PROJECTS_DIR/tool-old-sshurl" remote add origin "ssh://git@github.com:22/owner/tool"
+    # A different repo with a similar name is a plain orphan
+    create_orphan_repo "toolkit"
+    prune_git -C "$RU_PROJECTS_DIR/toolkit" remote add origin "git@github.com:owner/toolkit.git"
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --archive 2>&1)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1 when orphans are kept"
+    assert_contains "$output" "clone of configured repo owner/tool (configured at $RU_PROJECTS_DIR/tool) at an old path" "Names the configured repo"
+    local name
+    for name in tool-old-ssh tool-old-https tool-old-sshurl; do
+        assert_dir_exists "$RU_PROJECTS_DIR/$name/.git" "$name kept by --archive"
+    done
+    assert_dir_not_exists "$RU_PROJECTS_DIR/toolkit" "Unrelated orphan archived"
+
+    output=$(prune_delete)
+    exit_code=$?
+    assert_equals "1" "$exit_code" "--delete exits with code 1"
+    for name in tool-old-ssh tool-old-https tool-old-sshurl; do
+        assert_dir_exists "$RU_PROJECTS_DIR/$name/.git" "$name kept by --delete"
+    done
+
+    # Listing and JSON explain it too
+    output=$("$E2E_RU_SCRIPT" prune 2>&1)
+    assert_contains "$output" "clone of configured repo owner/tool" "Dry run notes the clone"
+    output=$("$E2E_RU_SCRIPT" --json prune 2>/dev/null)
+    assert_contains "$output" '"clone_of":"owner/tool' "JSON carries clone_of"
+
+    output=$("$E2E_RU_SCRIPT" prune --archive --force 2>&1)
+    exit_code=$?
+    assert_equals "0" "$exit_code" "--force archive exits with code 0"
+    for name in tool-old-ssh tool-old-https tool-old-sshurl; do
+        assert_dir_not_exists "$RU_PROJECTS_DIR/$name" "$name archived with --force"
+    done
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_keeps_clone_left_by_as_rename() {
+    setup_initialized_env
+    configure_placeholder_repo
+    # Now configured under a custom name; the clone at the default name is
+    # what an 'as' rename leaves behind.
+    printf '%s\n' "https://gitlab.example.com/team/app.git as app-renamed" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_pushed_orphan "app"
+    prune_git -C "$RU_PROJECTS_DIR/app" remote set-url origin "git@gitlab.example.com:team/app.git"
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "1" "$exit_code" "Exits with code 1"
+    assert_dir_exists "$RU_PROJECTS_DIR/app/.git" "Clean clone at the old name kept"
+    assert_contains "$output" "clone of configured repo gitlab.example.com/team/app" "Names the configured repo"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_delete_ignores_tags_on_commits_off_branches() {
+    setup_initialized_env
+    configure_placeholder_repo
+    # The remote has a tag on a commit that no branch contains (a release
+    # tagged on a branch that was later deleted); the clone fetched it.
+    create_pushed_orphan "tagged"
+    local path="$RU_PROJECTS_DIR/tagged"
+    prune_git -C "$path" checkout --quiet --detach
+    prune_git -C "$path" commit --quiet --allow-empty -m release
+    prune_git -C "$path" tag v1
+    prune_git -C "$path" push --quiet origin v1 2>/dev/null
+    prune_git -C "$path" checkout --quiet main
+
+    local output exit_code
+    output=$(prune_delete)
+    exit_code=$?
+
+    assert_equals "0" "$exit_code" "Exits with code 0"
+    assert_dir_not_exists "$path" "Clone with a fetched off-branch tag deleted"
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_archive_keeps_orphan_with_unreadable_config() {
+    setup_initialized_env
+    configure_placeholder_repo
+    printf '%s\n' "owner/tool" >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    create_orphan_repo "tool-old"
+    prune_git -C "$RU_PROJECTS_DIR/tool-old" remote add origin "git@github.com:owner/tool.git"
+    # Unreadable config: git would read it as empty, i.e. "no origin"
+    chmod 000 "$RU_PROJECTS_DIR/tool-old/.git/config"
+
+    local output exit_code
+    output=$("$E2E_RU_SCRIPT" prune --archive 2>&1)
+    exit_code=$?
+    chmod 644 "$RU_PROJECTS_DIR/tool-old/.git/config"
+
+    if [[ "$(id -u)" == "0" ]]; then
+        skip_test "root can read the config anyway"
+    else
+        assert_equals "1" "$exit_code" "Exits with code 1"
+        assert_dir_exists "$RU_PROJECTS_DIR/tool-old/.git" "Orphan with unreadable origin kept"
+        assert_contains "$output" "cannot read its origin" "Explains why"
+    fi
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+test_prune_json_reports_unsaved_work() {
+    setup_initialized_env
+    configure_placeholder_repo
+    create_pushed_orphan "dirty"
+    printf 'x\n' | tee "$RU_PROJECTS_DIR/dirty/new.txt" >/dev/null
+
+    local output
+    output=$("$E2E_RU_SCRIPT" --json prune 2>/dev/null)
+    assert_contains "$output" '"unsaved_work":["1 untracked path(s)"]' "JSON lists unsaved work"
+    if command -v python3 >/dev/null 2>&1; then
+        if printf '%s' "$output" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+            pass "JSON parses"
+        else
+            fail "JSON does not parse: $output"
+        fi
+    fi
+
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -666,5 +1026,19 @@ run_test test_prune_respects_custom_names
 
 # JSON output
 run_test test_prune_json_output
+
+# Unsaved work and clones of configured repos
+run_test test_prune_delete_removes_clean_pushed_clone
+run_test test_prune_delete_keeps_orphans_with_unsaved_work
+run_test test_prune_delete_mixed_keeps_dirty_removes_clean
+run_test test_prune_delete_force_overrides_unsaved_work
+run_test test_prune_delete_keeps_repos_git_cannot_inspect
+run_test test_prune_inspection_ignores_callers_git_environment
+run_test test_prune_archive_moves_dirty_orphans
+run_test test_prune_keeps_clone_of_configured_repo_at_old_path
+run_test test_prune_keeps_clone_left_by_as_rename
+run_test test_prune_json_reports_unsaved_work
+run_test test_prune_delete_ignores_tags_on_commits_off_branches
+run_test test_prune_archive_keeps_orphan_with_unreadable_config
 
 print_results

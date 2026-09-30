@@ -5541,6 +5541,9 @@ PRUNE OPTIONS:
     (no options)         List orphan repositories (dry run)
     --archive            Move orphans to archive directory
     --delete             Delete orphans (requires confirmation)
+    --force              Include orphans that are clones of a configured repo
+                         at an old path, and (--delete) orphans with
+                         uncommitted/untracked files, stashes or unpushed commits
 
 FORK OPTIONS (fork-status, fork-sync, fork-clean):
     --upstream=NAME      Upstream remote name (default: upstream)
@@ -7825,8 +7828,10 @@ parse_args() {
                 fi
                 ;;
             --upstream=*|--no-rescue|--reset|--ff-only|--merge|--force)
-                # Fork command options
+                # Fork command options (prune also takes --force)
                 if [[ "$COMMAND" == fork-status || "$COMMAND" == fork-sync || "$COMMAND" == fork-clean ]]; then
+                    ARGS+=("$1")
+                elif [[ "$COMMAND" == "prune" && "$1" == "--force" ]]; then
                     ARGS+=("$1")
                 else
                     log_error "Unknown option: $1"
@@ -9931,17 +9936,211 @@ _prune_identity_keys() {
     done
 }
 
+# Print a comparison key "host/path" for a git remote URL, in lower case and
+# without scheme, user, port, trailing slashes or '.git', so the https, ssh://
+# and scp-like (git@host:owner/repo) spellings of one repo compare equal.
+# Prints nothing for a URL that names no host (a local path, file://).
+_prune_url_key() {
+    local u="$1" host="" path="" rest
+    while [[ "$u" == */ ]]; do u="${u%/}"; done
+    [[ "${u,,}" == *.git ]] && u="${u:0:${#u}-4}"
+    while [[ "$u" == */ ]]; do u="${u%/}"; done
+    if [[ "$u" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+        [[ "${u,,}" == file://* ]] && return 0
+        rest="${u#*://}"
+        host="${rest%%/*}"
+        [[ "$rest" == */* ]] && path="${rest#*/}"
+        host="${host##*@}"
+        host="${host%%:*}"
+    elif [[ "$u" =~ ^([^/@:]+@)?([^/:]+):(.+)$ ]]; then
+        host="${BASH_REMATCH[2]}"
+        path="${BASH_REMATCH[3]}"
+    else
+        return 0
+    fi
+    while [[ "$path" == /* ]]; do path="${path#/}"; done
+    [[ -z "$host" || -z "$path" ]] && return 0
+    printf '%s/%s\n' "${host,,}" "${path,,}"
+}
+
+# Run git in the clone at $1 (the folder holding .git; physical path) with
+# discovery pinned to that folder (a broken .git must fail, not fall through
+# to an enclosing repository), without pager, prompts, optional locks or an
+# fsmonitor hook, and with the caller's GIT_* environment (GIT_DIR,
+# GIT_INDEX_FILE, ...) cleared so it cannot point git at another repository.
+_prune_git() {
+    local dir="$1"
+    shift
+    (
+        local -a git_vars=()
+        local v
+        mapfile -t git_vars < <(compgen -e -X '!GIT_*')
+        for v in ${git_vars[@]+"${git_vars[@]}"}; do
+            unset "$v"
+        done
+        export GIT_CEILING_DIRECTORIES="${dir%/*}"
+        export GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_PAGER=cat PAGER=cat LC_ALL=C
+        exec git -C "$dir" --no-pager -c core.fsmonitor=false "$@"
+    )
+}
+
+# Inspect an orphan clone before prune archives or deletes it. Prints one
+# tab-separated line per finding:
+#   origin <key>    a comparison key (_prune_url_key) of its origin URL
+#   unsaved <why>   work that deleting it would lose (only with $2 == "full")
+#   error <why>     what could not be checked; an error never counts as clean
+# With $2 == "origin" only the origin URL is read (enough for --archive).
+_prune_inspect_orphan() {
+    local dir="$1" depth="${2:-full}"
+    local phys out rc line
+    if ! phys=$(cd -P -- "$dir" 2>/dev/null && pwd) || [[ -z "$phys" ]]; then
+        printf 'error\tcannot enter the folder\n'
+        return 0
+    fi
+
+    # Origin as written in .git/config (read as a file, so this works even
+    # when the repository itself is damaged), then as git rewrites it through
+    # url.<base>.insteadOf when the repository can be opened.
+    local -a raw_urls=()
+    # git config treats a missing or unreadable file as empty (exit 1)
+    if [[ ! -f "$phys/.git/config" || ! -r "$phys/.git/config" ]]; then
+        printf 'error\tcannot read .git/config\n'
+        return 0
+    fi
+    out=$(_prune_git "$phys" config --file "$phys/.git/config" --includes --get-all remote.origin.url 2>/dev/null)
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        mapfile -t raw_urls <<< "$out"
+    elif [[ $rc -ne 1 ]]; then
+        printf 'error\tcannot read .git/config\n'
+        return 0
+    fi
+
+    # Opening the repository: the work tree must be this very folder
+    local top repo_ok="true"
+    if ! top=$(_prune_git "$phys" rev-parse --show-toplevel 2>/dev/null) || [[ -z "$top" || ! "$top" -ef "$phys" ]]; then
+        repo_ok="false"
+    fi
+
+    local u key
+    if [[ ${#raw_urls[@]} -gt 0 && "$repo_ok" == "true" ]]; then
+        if out=$(_prune_git "$phys" remote get-url --all origin 2>/dev/null); then
+            mapfile -t -O "${#raw_urls[@]}" raw_urls <<< "$out"
+        fi
+    fi
+    for u in ${raw_urls[@]+"${raw_urls[@]}"}; do
+        [[ -z "$u" ]] && continue
+        key=$(_prune_url_key "$u")
+        [[ -n "$key" ]] && printf 'origin\t%s\n' "$key"
+    done
+
+    [[ "$depth" == "full" ]] || return 0
+
+    if [[ "$repo_ok" != "true" ]]; then
+        printf 'error\tgit cannot open it as a work tree (bare, corrupted, or owned by another user)\n'
+        return 0
+    fi
+
+    # Uncommitted changes and untracked paths that are not ignored (an
+    # untracked folder counts once). The flags override repository config that
+    # would hide them (status.showUntrackedFiles, diff.ignoreSubmodules).
+    if ! out=$(_prune_git "$phys" status --porcelain=v1 --untracked-files=normal --ignore-submodules=none 2>/dev/null); then
+        printf 'error\tgit status failed\n'
+        return 0
+    fi
+    local changed untracked
+    untracked=$(grep -c '^?? ' <<< "$out")
+    changed=$(grep -c -v -e '^?? ' -e '^$' <<< "$out")
+    ((changed > 0)) && printf 'unsaved\t%d uncommitted change(s)\n' "$changed"
+    ((untracked > 0)) && printf 'unsaved\t%d untracked path(s)\n' "$untracked"
+
+    # Files whose changes git status does not report: lower-case tag =
+    # assume-unchanged, S = skip-worktree
+    if ! out=$(_prune_git "$phys" ls-files -v 2>/dev/null); then
+        printf 'error\tgit ls-files failed\n'
+        return 0
+    fi
+    local hidden
+    hidden=$(LC_ALL=C grep -c '^[abcdefghijklmnopqrstuvwxyzS] ' <<< "$out")
+    ((hidden > 0)) && printf 'unsaved\t%d file(s) marked assume-unchanged or skip-worktree (their changes are hidden from git status)\n' "$hidden"
+
+    # Stashes
+    if ! out=$(_prune_git "$phys" for-each-ref --format='%(refname)' refs/stash 2>/dev/null); then
+        printf 'error\tcannot read refs\n'
+        return 0
+    fi
+    if [[ -n "$out" ]]; then
+        local stashes=0
+        if out=$(_prune_git "$phys" stash list 2>/dev/null); then
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && ((stashes++))
+            done <<< "$out"
+        fi
+        ((stashes < 1)) && stashes=1
+        printf 'unsaved\t%d stash(es)\n' "$stashes"
+    fi
+
+    # Commits not on any remote-tracking branch: from every local branch, and
+    # from HEAD when it is detached. (Tags are left out: fetched tags often sit
+    # on commits no remote branch contains, and would flag every such clone.)
+    # An unborn HEAD (no commit yet) is fine; a HEAD that cannot be resolved
+    # otherwise is not.
+    local -a tips=()
+    if _prune_git "$phys" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
+        tips+=(HEAD)
+    else
+        local head_ref
+        if ! head_ref=$(_prune_git "$phys" symbolic-ref --quiet HEAD 2>/dev/null) \
+            || _prune_git "$phys" show-ref --verify --quiet "$head_ref" 2>/dev/null; then
+            printf 'error\tHEAD cannot be resolved\n'
+            return 0
+        fi
+    fi
+    local ahead
+    if ! ahead=$(_prune_git "$phys" rev-list --count ${tips[@]+"${tips[@]}"} --branches --not --remotes 2>/dev/null) \
+        || [[ ! "$ahead" =~ ^[0-9]+$ ]]; then
+        printf 'error\tcannot list commits\n'
+        return 0
+    fi
+    if ((ahead > 0)); then
+        local remotes
+        if ! remotes=$(_prune_git "$phys" remote 2>/dev/null); then
+            printf 'error\tcannot list remotes\n'
+            return 0
+        fi
+        if [[ -z "$remotes" ]]; then
+            printf 'unsaved\tno remote, %d local commit(s)\n' "$ahead"
+        else
+            printf 'unsaved\t%d commit(s) not on any remote branch\n' "$ahead"
+        fi
+    fi
+
+    # Linked worktrees live elsewhere but keep their metadata in this clone
+    if ! out=$(_prune_git "$phys" worktree list --porcelain 2>/dev/null); then
+        printf 'error\tgit worktree list failed\n'
+        return 0
+    fi
+    # Stale entries (folder already gone) are 'prunable' and do not count
+    local trees stale
+    trees=$(grep -c '^worktree ' <<< "$out")
+    stale=$(grep -c '^prunable' <<< "$out")
+    ((trees - stale > 1)) && printf 'unsaved\t%d linked worktree(s) depend on it\n' "$((trees - stale - 1))"
+    return 0
+}
+
 # cmd_prune: Find and manage orphan repositories
 #------------------------------------------------------------------------------
 cmd_prune() {
     local archive_mode="false"
     local delete_mode="false"
+    local force_mode="false"
 
     # Parse arguments
     for arg in "${ARGS[@]}"; do
         case "$arg" in
             --archive) archive_mode="true" ;;
             --delete) delete_mode="true" ;;
+            --force) force_mode="true" ;;
             -*)
                 log_error "Unknown prune option: $arg"
                 exit 4
@@ -9976,6 +10175,9 @@ cmd_prune() {
     local -a unresolved_specs=() unreadable_lists=()
     local spec list_file
     local repos_dir="${RU_CONFIG_DIR}/repos.d"
+    # Configured repos by remote (see _prune_url_key), to recognise an orphan
+    # that is really a configured repo's clone left at an old path
+    local -A configured_by_url=()
     # A missing or unlistable repos.d hides every list in it (the glob below
     # then matches nothing), so every configured clone would look like an
     # orphan; e.g. 'sudo ru prune --delete' reads root's config dir.
@@ -9999,6 +10201,11 @@ cmd_prune() {
             local url branch custom_name local_path repo_id
             if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
                 echo "$local_path" >> "$configured_paths"
+                local url_host url_owner url_repo url_key
+                if parse_repo_url "$url" url_host url_owner url_repo; then
+                    url_key="${url_host,,}/${url_owner,,}/${url_repo,,}"
+                    [[ -z "${configured_by_url[$url_key]:-}" ]] && configured_by_url["$url_key"]="$repo_id (configured at $local_path)"
+                fi
             else
                 unresolved_specs+=("$spec")
             fi
@@ -10226,6 +10433,54 @@ cmd_prune() {
         return 0
     fi
 
+    # Check each orphan before anything touches it. A clone whose origin is a
+    # configured repo is that repo left at an old path (layout change, 'as'
+    # rename): kept by --archive and --delete. Work that exists only in the
+    # clone (uncommitted or untracked files, stashes, unpushed commits) is
+    # kept by --delete; --archive only moves the folder, so it loses nothing.
+    # Either can be overridden with --force. An inspection error never counts
+    # as clean. --archive needs only the origin check.
+    local inspect_depth="full"
+    [[ "$archive_mode" == "true" ]] && inspect_depth="origin"
+    local -A orphan_clone_of=() orphan_unsaved=() orphan_error=() orphan_blockers=()
+    local orphan kind detail
+    for orphan in "${orphans[@]}"; do
+        while IFS=$'\t' read -r kind detail; do
+            [[ -z "$detail" ]] && continue
+            case "$kind" in
+                origin)
+                    if [[ -n "${configured_by_url[$detail]:-}" && -z "${orphan_clone_of[$orphan]:-}" ]]; then
+                        orphan_clone_of["$orphan"]="${configured_by_url[$detail]}"
+                    fi
+                    ;;
+                unsaved)
+                    orphan_unsaved["$orphan"]+="${orphan_unsaved[$orphan]:+$'\n'}$detail"
+                    ;;
+                *)
+                    orphan_error["$orphan"]="$detail"
+                    ;;
+            esac
+        done < <(_prune_inspect_orphan "$orphan" "$inspect_depth")
+
+        # What keeps it from the requested mode (for the listing: from --delete)
+        local why=""
+        if [[ -n "${orphan_clone_of[$orphan]:-}" ]]; then
+            why="clone of configured repo ${orphan_clone_of[$orphan]} at an old path"
+        fi
+        if [[ -n "${orphan_error[$orphan]:-}" ]]; then
+            if [[ "$inspect_depth" == "origin" ]]; then
+                why+="${why:+; }cannot read its origin (${orphan_error[$orphan]})"
+            else
+                why+="${why:+; }cannot check it for unsaved work (${orphan_error[$orphan]})"
+            fi
+        fi
+        if [[ -n "${orphan_unsaved[$orphan]:-}" ]]; then
+            why+="${why:+; }unsaved work: ${orphan_unsaved[$orphan]//$'\n'/, }"
+        fi
+        orphan_blockers["$orphan"]="$why"
+    done
+
+    local path blockers
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         # JSON output
         local json_array="["
@@ -10238,7 +10493,24 @@ cmd_prune() {
             fi
             local safe_path
             safe_path=$(json_escape "$path")
-            json_array+="{\"path\":\"$safe_path\"}"
+            json_array+="{\"path\":\"$safe_path\""
+            if [[ -n "${orphan_clone_of[$path]:-}" ]]; then
+                json_array+=",\"clone_of\":\"$(json_escape "${orphan_clone_of[$path]}")\""
+            fi
+            if [[ -n "${orphan_error[$path]:-}" ]]; then
+                json_array+=",\"check_error\":\"$(json_escape "${orphan_error[$path]}")\""
+            fi
+            if [[ -n "${orphan_unsaved[$path]:-}" ]]; then
+                local item item_first="true"
+                json_array+=",\"unsaved_work\":["
+                while IFS= read -r item; do
+                    [[ "$item_first" == "true" ]] || json_array+=","
+                    item_first="false"
+                    json_array+="\"$(json_escape "$item")\""
+                done <<< "${orphan_unsaved[$path]}"
+                json_array+="]"
+            fi
+            json_array+="}"
         done
         json_array+="]"
         echo "$json_array"
@@ -10246,7 +10518,35 @@ cmd_prune() {
         log_info "Found ${#orphans[@]} orphan repository(s):"
         for path in "${orphans[@]}"; do
             echo "  $path" >&2
+            # Action modes explain each kept orphan below instead
+            if [[ "$archive_mode" != "true" && "$delete_mode" != "true" && -n "${orphan_blockers[$path]}" ]]; then
+                echo "      ${orphan_blockers[$path]}" >&2
+            fi
         done
+    fi
+
+    # Split into the orphans the requested mode acts on and those it keeps
+    local -a targets=() kept=()
+    if [[ "$archive_mode" == "true" || "$delete_mode" == "true" ]]; then
+        for path in "${orphans[@]}"; do
+            blockers="${orphan_blockers[$path]}"
+            if [[ -z "$blockers" ]]; then
+                targets+=("$path")
+            elif [[ "$force_mode" == "true" ]]; then
+                log_warn "--force: including $path despite: $blockers"
+                targets+=("$path")
+            else
+                log_warn "Skipping $path: $blockers"
+                kept+=("$path")
+            fi
+        done
+        if [[ ${#kept[@]} -gt 0 ]]; then
+            log_info "Kept ${#kept[@]} orphan(s) listed above; check them, then re-run with --force to include them."
+        fi
+        if [[ ${#targets[@]} -eq 0 ]]; then
+            log_warn "Nothing to prune: every orphan was kept"
+            return 1
+        fi
     fi
 
     # Handle archive mode
@@ -10254,9 +10554,9 @@ cmd_prune() {
         local archive_dir="${RU_STATE_DIR}/archived"
         mkdir -p "$archive_dir"
 
-        log_info "Archiving ${#orphans[@]} orphan(s) to $archive_dir"
+        log_info "Archiving ${#targets[@]} orphan(s) to $archive_dir"
         local archived=0
-        for path in "${orphans[@]}"; do
+        for path in "${targets[@]}"; do
             local name
             name=$(basename "$path")
             local timestamp
@@ -10279,6 +10579,7 @@ cmd_prune() {
             fi
         done
         log_success "Archived $archived orphan(s)"
+        [[ $archived -eq ${#targets[@]} && ${#kept[@]} -eq 0 ]] || return 1
         return 0
     fi
 
@@ -10293,9 +10594,9 @@ cmd_prune() {
                 exit 3
             fi
 
-            log_warn "This will permanently delete ${#orphans[@]} repository(s)!"
+            log_warn "This will permanently delete ${#targets[@]} repository(s)!"
             echo "" >&2
-            for path in "${orphans[@]}"; do
+            for path in "${targets[@]}"; do
                 echo "  $path" >&2
             done
             echo "" >&2
@@ -10317,7 +10618,7 @@ cmd_prune() {
         fi
 
         local deleted=0
-        for path in "${orphans[@]}"; do
+        for path in "${targets[@]}"; do
             local name
             name=$(basename "$path")
             if rm -rf -- "$path" 2>/dev/null; then
@@ -10328,12 +10629,20 @@ cmd_prune() {
             fi
         done
         log_success "Deleted $deleted orphan(s)"
+        [[ $deleted -eq ${#targets[@]} && ${#kept[@]} -eq 0 ]] || return 1
         return 0
     fi
 
     # Default: just list (dry run)
     echo "" >&2
     log_info "Use --archive to move to archive or --delete to remove"
+    local flagged=0
+    for path in "${orphans[@]}"; do
+        [[ -n "${orphan_blockers[$path]}" ]] && ((flagged++))
+    done
+    if [[ $flagged -gt 0 ]]; then
+        log_info "$flagged orphan(s) have notes above: a clone of a configured repo is kept by --archive and --delete, unsaved work by --delete, unless --force is given"
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -22759,7 +23068,8 @@ _robot_docs_commands() {
       "description": "Find and manage orphan repositories not in config",
       "flags": [
         {"flag": "--archive", "description": "Move orphans to archive directory"},
-        {"flag": "--delete", "description": "Delete orphans (requires confirmation)"}
+        {"flag": "--delete", "description": "Delete orphans (requires confirmation)"},
+        {"flag": "--force", "description": "Also archive/delete orphans that are clones of a configured repo or (for --delete) hold unsaved work"}
       ]
     },
     {

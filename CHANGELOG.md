@@ -8,6 +8,20 @@ Links point to individual commits on GitHub. Version headers link to comparison 
 
 ---
 
+## [Unreleased](https://github.com/Dicklesworthstone/repo_updater/compare/v1.4.0...HEAD)
+
+### Changed
+
+- **`ru prune --delete` keeps orphans that hold work found nowhere else**: uncommitted changes, untracked files that are not ignored, stashes, commits not on any remote-tracking branch (including a detached HEAD and repos with no remote at all), files marked assume-unchanged or skip-worktree, and linked worktrees. Each kept orphan is named with the reason. A clone git cannot open (corrupted, bare-ish, owned by another user) is kept too: an inspection error never counts as clean. `--archive` still moves such orphans, since archiving loses nothing.
+- **`ru prune --archive` and `--delete` keep an orphan whose `origin` is a configured repo** (compared across https, ssh and scp-style URLs, `.git`, ports and letter case). That is a configured repo's clone left at an old path by a layout change or an `as` rename, and prune reports it as `clone of configured repo X ... at an old path`.
+- New `ru prune --force` includes both kinds of kept orphan. The dry-run listing and `--json` output show the same notes (`clone_of`, `unsaved_work`, `check_error`).
+
+### Upgrade notes
+
+- `ru prune --archive` / `--delete` now exit 1 when any orphan was kept or failed to archive or delete (before: 0).
+
+---
+
 ## [v1.4.0](https://github.com/Dicklesworthstone/repo_updater/compare/v1.3.1...v1.4.0) -- 2026-09-29
 
 Repo lists can now group related repos under a subfolder, and `ru prune` no longer treats a configured repo as an orphan when its path is spelled differently or its list cannot be read. Also fixes the stash-and-pull hint that could pop an unrelated older stash.

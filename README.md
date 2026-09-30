@@ -583,6 +583,7 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | (none) | List orphan repos (dry run, default) |
 | `--archive` | Move orphan repos to archive directory |
 | `--delete` | Permanently delete orphan repos (requires confirmation) |
+| `--force` | Also archive/delete clones of configured repos at old paths and (with `--delete`) orphans with unsaved work |
 
 **`ru review`**
 | Flag | Description |
@@ -1196,6 +1197,10 @@ ru prune --delete
 
 # Non-interactive (CI-safe, no prompts)
 ru --non-interactive prune --delete
+
+# Output when an orphan still holds work:
+# ⚠ Skipping /data/projects/old-experiment: unsaved work: 2 uncommitted change(s), 1 stash(es)
+# ℹ Kept 1 orphan(s) listed above; check them, then re-run with --force to include them.
 ```
 
 **Safety measures:**
@@ -1204,6 +1209,9 @@ ru --non-interactive prune --delete
 - Only git repositories with a `.git` directory are considered (plain directories, and worktrees or submodules whose `.git` is a file, are ignored)
 - Paths are compared physically, so a configured repo reached through a symlinked folder, spelled with different letter case or Unicode normalization on a case-insensitive filesystem, or under a `PROJECTS_DIR` with a trailing slash is never an orphan
 - `--archive` and `--delete` refuse to run while any repo line in your config cannot be parsed, any list file (or `repos.d` itself) is missing or unreadable, or no repo is configured at all, since those clones would otherwise look like orphans
+- `--delete` keeps (and names) any orphan with work that exists only there: uncommitted changes, untracked files that are not ignored, stashes, commits not on any remote branch (including a detached HEAD or a repo with no remote), files marked assume-unchanged/skip-worktree, or linked worktrees. A repo git cannot inspect (corrupted, bare-ish, owned by another user) is kept too. `--archive` only moves folders, so it still archives these
+- `--archive` and `--delete` keep any orphan whose `origin` is one of your configured repos (https, ssh and `git@host:` spellings, `.git` and letter case are ignored). That is a configured repo's clone left at an old path after a layout change or an `as` rename; prune reports it as `clone of configured repo owner/repo (configured at ...) at an old path`
+- `--force` includes the kept orphans above. Without it, `--archive`/`--delete` exit 1 when any orphan was kept, so scripts notice
 
 ### Layout Awareness
 
