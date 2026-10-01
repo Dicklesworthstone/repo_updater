@@ -8,18 +8,21 @@ Links point to individual commits on GitHub. Version headers link to comparison 
 
 ---
 
-## [Unreleased](https://github.com/Dicklesworthstone/repo_updater/compare/v1.4.0...HEAD)
+## [v1.5.0](https://github.com/Dicklesworthstone/repo_updater/compare/v1.4.0...v1.5.0) -- 2026-10-01
+
+`ru prune --delete` no longer deletes an orphan that holds work found nowhere else, and `--archive` / `--delete` no longer touch an orphan that is a configured repo's clone left at an old path. `--force` overrides both. `ru prune --archive` / `--delete` now exit 1 when they keep an orphan; see the upgrade notes.
 
 ### Changed
 
-- **`ru prune --delete` keeps orphans that hold work found nowhere else**: uncommitted changes, untracked files that are not ignored, stashes, commits not on any remote-tracking branch (including a detached HEAD and repos with no remote at all), files marked assume-unchanged or skip-worktree, and linked worktrees. Each kept orphan is named with the reason. A clone git cannot open (corrupted, bare-ish, owned by another user) is kept too: an inspection error never counts as clean. `--archive` still moves such orphans, since archiving loses nothing.
-- **`ru prune --archive` and `--delete` keep an orphan whose `origin` is a configured repo** (compared across https, ssh and scp-style URLs, `.git`, ports and letter case). That is a configured repo's clone left at an old path by a layout change or an `as` rename, and prune reports it as `clone of configured repo X ... at an old path`.
-- The unsaved-work check also covers every repository inside an orphan: submodules (whose unpushed commits the outer `git status` does not show), the repository a deinitialized submodule leaves in `.git/modules`, and nested or bare repos the outer repo ignores. Notes and other local refs count as unsaved commits; files outside a sparse checkout's cone no longer count as hidden changes. Ignored files named like secrets or local state (`.env`, keys, `*.tfstate`) are listed (`ignored_precious` in `--json`) and warned about before deletion, but do not block it. Prune does not fetch, so stale remote-tracking refs can make commits look pushed; LFS objects and reflog-only commits are not checked.
-- New `ru prune --force` includes both kinds of kept orphan. The dry-run listing and `--json` output show the same notes (`clone_of`, `unsaved_work`, `check_error`).
+- **`ru prune --delete` keeps orphans that hold work found nowhere else**: uncommitted changes, untracked files that are not ignored, stashes, commits not on any remote-tracking branch (including a detached HEAD and repos with no remote at all), files marked assume-unchanged or skip-worktree, and linked worktrees. Each kept orphan is named with the reason. A clone git cannot open (corrupted, bare-ish, owned by another user) is kept too: an inspection error never counts as clean. `--archive` still moves such orphans, since archiving loses nothing ([8bb734c](https://github.com/Dicklesworthstone/repo_updater/commit/8bb734cc0c529ca5451a6d9287c9dfd6e2e9b207)).
+- **`ru prune --archive` and `--delete` keep an orphan whose `origin` is a configured repo** (compared across https, ssh and scp-style URLs, `.git`, ports and letter case). That is a configured repo's clone left at an old path by a layout change or an `as` rename, and prune reports it as `clone of configured repo X ... at an old path` ([8bb734c](https://github.com/Dicklesworthstone/repo_updater/commit/8bb734cc0c529ca5451a6d9287c9dfd6e2e9b207)).
+- The unsaved-work check also covers every repository inside an orphan: submodules (whose unpushed commits the outer `git status` does not show), the repository a deinitialized submodule leaves in `.git/modules`, and nested or bare repos the outer repo ignores. Notes and other local refs count as unsaved commits; files outside a sparse checkout's cone no longer count as hidden changes. Ignored files named like secrets or local state (`.env`, keys, `*.tfstate`) are listed (`ignored_precious` in `--json`) and warned about before deletion, but do not block it. Prune does not fetch, so stale remote-tracking refs can make commits look pushed; LFS objects and reflog-only commits are not checked ([a24d79a](https://github.com/Dicklesworthstone/repo_updater/commit/a24d79a9b87df55dce90e46866a439fa017a886c)).
+- New `ru prune --force` includes both kinds of kept orphan. The dry-run listing and `--json` output show the same notes (`clone_of`, `unsaved_work`, `check_error`) ([8bb734c](https://github.com/Dicklesworthstone/repo_updater/commit/8bb734cc0c529ca5451a6d9287c9dfd6e2e9b207)).
 
 ### Upgrade notes
 
-- `ru prune --archive` / `--delete` now exit 1 when any orphan was kept or failed to archive or delete (before: 0).
+- **Exit code change:** `ru prune --archive` / `--delete` now exit 1 when any orphan was kept or failed to archive or delete (before: 0). Scripts that treat a nonzero exit as fatal should check the kept-orphan report, or pass `--force` to archive or delete every orphan as before (an orphan that fails to archive or delete still makes the run exit 1).
+- `ru prune --delete` that used to remove every orphan now keeps the ones with unsaved work or that are clones of configured repos. The plain `ru prune` listing shows which orphans would be kept and why.
 
 ---
 
