@@ -1704,3 +1704,231 @@ $ ru sync
 ---
 
 *This revised plan incorporates critical fixes for packaging, error handling, and automation support while maintaining the original giil-like polish goals.*
+
+---
+
+## 2026-10-13 Reality Check and Evidence-Based Bridge
+
+This section records the current assessment and the executable bridge backlog.
+The original plan above remains historical design context; its unchecked boxes,
+old versions and pseudocode are not a statement of current implementation status.
+
+### Verdict and assessment boundary
+
+**ru delivers its basic repository synchronization value, but does not yet deliver
+the full reliability and automation contract advertised by the README.** There
+is substantial functioning software here: real Git clone/pull/status handling,
+configuration and layout parsing, parallel/state machinery, conservative prune
+protections, review discovery and drivers, quality-gate helpers and structured
+output helpers. Several workflows nevertheless report success without satisfying
+their promised result, and some documented operations cannot be invoked.
+
+Assessment baseline: `main` at
+`73846ab9300af58d436f9d82c32eb1ab2096acd7`, `VERSION=1.5.0`.
+The full 849-line local AGENTS.md, 539-line suite AGENTS.md and 3,864-line README
+were read. The original synchronization plan, automated-review plan, NTM plan,
+testing guidance, research findings and agent guidance were compared with actual
+code. Source, CLI probes, tracker records and test evidence take precedence over
+old completion claims.
+
+The production script and installer were unchanged during this assessment:
+
+| File | SHA256 |
+|---|---|
+| `ru` | `df405927d525ae6c17cd81365672dbf00c8628f70b7e030476eb55f415541b86` |
+| `install.sh` | `4af6f6fc31979c775553fdb50da73f34395762eca8c769dea9ab6de77535dc94` |
+
+GitHub's latest published release was v1.5.0, published 2026-10-01. Its downloaded
+`ru` asset matched both the manifest and the script above. These findings therefore
+apply to the published script, rather than only an unreleased local change.
+Actual installation on a clean machine and live AI orchestration were not proven
+by this download comparison.
+
+Local evidence is retained under `/tmp/ru-reality-check-73846ab/`. In particular:
+`probes.sh` and `probes.log`, per-command stdout/stderr, `core-probes.sh` and
+`core-probes.log`, `gate-exit42.json`, `fork-clean-details.log`, lint/full-suite
+logs, tracker snapshots and release/CI metadata. The two probe scripts are
+standalone, inspectable reproductions. Temporary Git fixtures remain outside the
+managed projects directory.
+
+### Vision checklist
+
+Status describes the exact proof available. WORKING is scoped to demonstrated
+behavior; PARTIAL identifies a concrete limitation; UNPROVEN means implementation
+exists without sufficient qualification. Existing explicitly deferred future
+ideas remain deferred rather than being silently turned into release requirements.
+
+| # | Promised outcome | Current reality and evidence | Bridge Beads |
+|---|---|---|---|
+| V1 | Release installation with mandatory checksum verification | PARTIAL. Live v1.5.0 download matches the manifest. Missing checksum tooling is accepted, and no-release detection automatically falls back to mutable main. | `.23`, `.24` |
+| V2 | XDG configuration, init/add/remove/list and precedence | WORKING for tested valid forms; PARTIAL for documented `config --set KEY=VALUE`, which exits 4. Full CLI init/add and actual `--set=KEY=VALUE` work. | `.17`, `.18` |
+| V3 | URL/spec parsing, layouts, custom names, groups and path protections | Implemented and exercised by existing parsing/spec/prune tests. Branch pins have a confirmed success-reporting gap. | `.19`, `.20`, `.27` |
+| V4 | Clone missing repos, pull remote updates, preserve dirty work | WORKING in the independent full CLI exercise with real local Git storage: clone and pull exit 0, dirty sync exits 2 and preserves the file. GitHub transport/auth were fixture-controlled. | `.19`, `.20`, `.27` |
+| V5 | Trustworthy freshness, conflicts, network failures and timeout semantics | PARTIAL. Requested fetch failures are suppressed in status; HTTP low-speed settings are not an overall command deadline. | `.19`, `.20` |
+| V6 | Parallel synchronization and reliable interrupted resume | Real implementation and extensive tests exist. Full-suite/platform qualification is distinct from reading those helpers. | `.27` |
+| V7 | Conservative orphan detection, archive and deletion protections | Substantial implementation. Existing prune E2E file passed in this audit; documented stale-ref/LFS/reflog limits remain. No destructive operation was run against the user's fleet. | `.27` |
+| V8 | Meaningful failure codes and honest recovery state | PARTIAL. A review orchestration failure becomes exit 0 and clears its checkpoint; failed/missing session artifacts can be counted as completed. | `.9`, `.10` |
+| V9 | Consistent JSON/TOON output, schemas and data-only stdout | PARTIAL. Populated sync/status/list use the envelope. Empty commands, doctor/config, review, sweep, AI sync and ad-hoc sync do not share that complete contract. | `.15`, `.16` |
+| V10 | All documented commands, filters and parallel flags work | PARTIAL. `--set`, import stars/org/user modes, sweep debug/denylist and wildcard filters are absent or ineffective; sweep short parallel flags miss its local scheduling value. | `.17`, `.18` |
+| V11 | Discover and prioritize all open review work | PARTIAL. Discovery caps newest issues at 50, PRs at 20 and labels at 10 without pagination. Natural scores never reach the CRITICAL threshold. | `.21`, `.22` |
+| V12 | Isolated reviews, questions, approval and plan/apply policy | Real drivers/worktrees/questions exist. PARTIAL: plan identity/schema and approval enforcement are incomplete; advertised policy JSON is not read by the actual policy loader. | `.3`, `.4`, `.9`, `.10` |
+| V13 | Quality gates prevent publishing broken changes | FAIL for demonstrated nonzero exits: actual `exit 42` yields `tests.ok=false` but `overall_ok=true` and return 0. Runtime test detection differs from its unit-tested earlier definition. | `.1`, `.2` |
+| V14 | Agent sweep commits exactly validated, allowed files | PARTIAL. A supplied one-file plan committed a pre-staged unrelated file too. Untracked candidates evade heuristic scanning; heuristic findings are not blocked by block mode. | `.5`, `.6` |
+| V15 | AI sync verifies logical commits and optional pushes | UNPROVEN as a live workflow, with a confirmed source defect: idle/stale or vanished sessions are accepted without proving requested Git outcomes. | `.11`, `.12` |
+| V16 | Dependency updates across all configured repos and eight managers | FAIL in default mode: an undefined listing helper produces a successful empty run. The wrapper's success result is rejected by the consumer; Maven/Gradle have no effective outdated discovery. | `.13`, `.14` |
+| V17 | Deterministic version bump, changelog, tag, release and checks | PARTIAL. Tag/GitHub-release operations exist; version-file/changelog execution and complete remote CI/artifact validation promised by the NTM plan are missing. | `.7`, `.8` |
+| V18 | Dashboard application/pause and trustworthy metrics | PARTIAL. The enhanced `run_dashboard` has no production caller; apply/bulk-apply keys only log requests. Scheduler controls and completion metrics need integrated outcome proof. | `.9`, `.10` |
+| V19 | Safe fork maintenance and accurate cleanup reporting | PARTIAL. Explicit reset/force works; default ff-only preserves local commits but reports removal. An existing test incorrectly expects default removal. | `.25`, `.26` |
+| V20 | Bash 4.0+, Linux/macOS, optional-tool fallbacks and current CI proof | UNPROVEN across the declared matrix. This audit ran GNU Bash 5.3.9 on Linux. A newer Bash syntax pass does not establish minimum-runtime or macOS support. | `.27` |
+| V21 | Correct privacy, dependency and agent documentation | PARTIAL. README's GitHub-only/local-processing privacy statement omits optional AI-provider processing. Version/LOC/default/policy/output examples drift across documents. | `.17`, `.18`, `.27` |
+
+All shorthand IDs in this table are children of `bd-tr5y`, for example `.1` is
+`bd-tr5y.1`. The original plan's v2 manifests/tags/skip rules, mirrors/object cache
+and modular build, and the review plan's future web/team/learning/plugin ideas,
+are explicitly deferred design ideas. They are not demonstrated implemented
+features and were not added to this corrective release graph as scope expansion.
+
+### What the probes establish
+
+1. **Core value is real.** The independent CLI exercise initialized configuration,
+   added a repo, cloned real local Git storage, pulled a new remote commit and
+   detected dirty work with exit 2. Existing E2E checks additionally exercise the
+   production command dispatch for pruning, review/apply, drivers and state.
+   Fixture-controlled external endpoints are not live GitHub/provider proof.
+2. **Quality gates admit failed commands.** `run_quality_gates` recognizes only
+   exit 1 as failure, although the test/lint helpers return actual process codes.
+   The captured result contains `tests.exit_code=42`, `tests.ok=false` and
+   `overall_ok=true`. Exit 2 can also be confused with an absent runner, and a
+   timeout/missing executable can be misreported. This is an execution-contract
+   defect, not an argument for weakening tests.
+3. **Review success is unreliable.** The negated-command branch captures `$?`
+   after `!`, losing the failing orchestration code. A controlled failure of 3
+   produced `checkpoint-cleared`, reported orchestration 0 and final review 0.
+   The orchestration loop and missing-plan completion paths also need honest
+   per-session aggregation and recovery.
+4. **Dependency update is disconnected.** `_list_local_repos` has no definition.
+   Default `dep-update --dry-run --json` reported no configured repos despite a
+   valid configured repo. Separately, injecting `spawn_ai_session`'s actual
+   `{status:"success"}` contract produced one failed update; the consumer accepts
+   `completed|idle` instead. Registry/tool failures cannot be counted as current.
+5. **The staged index bypasses the plan.** A real Git fixture pre-staged
+   `unrelated.txt`; a plan naming only `planned.txt` committed both. The executor
+   must preserve the existing index while committing only approved candidate
+   content. Heuristic scanning called a harmless untracked password assignment
+   clean, then returned warning 2 once staged; block mode only blocks code 1.
+6. **Documented CLI choices fail.** `config --set KEY=VALUE`, `import --stars`,
+   `agent-sweep --show-denylist` and `agent-sweep --debug` return 4. A wildcard
+   sweep filter selects no matching dirty repo; an AI-sync wildcard exclusion
+   does not exclude it. These are full-dispatch observations.
+7. **Machine output is incomplete.** Empty list/status/prune and doctor/config
+   JSON invocations emitted zero data bytes. AI-sync dry-run produced an array,
+   review status another object shape, and missing-pin ad-hoc sync no JSON.
+   Documentation/schema text alone cannot prove output conformance.
+8. **Branch pins are not enforced at success.** Syncing a nonexistent requested
+   branch warned, left the clone on main and returned 0. Preserve the partial
+   clone for inspection, but make failure visible and resumable.
+9. **Review prioritization misses its stated target.** An old security issue
+   scored 125/HIGH. The maximum natural issue/PR scores are 125/135, below the
+   CRITICAL threshold 150. Paginated discovery must also find old security items
+   beyond the newest 50/20 and relevant labels beyond the first ten.
+10. **The broad gate remains authoritative.** The focused fork-clean reproduction
+    produced 7 passed / 1 failed, with one failing assertion in
+    `test_resets_main_to_upstream`. It expects default cleanup to remove commits,
+    whereas code requires explicit reset/force. Retain the safe default, correct
+    reporting, and document the old/new acceptance split for a legitimate test
+    correction. Do not make the default destructive to obtain a green number.
+
+Driver-interface fallback functions are overridden by loaded real drivers; their
+stub comments are not evidence that all review commands are placeholders. Similarly,
+the old SECTION 13 "COMMAND STUBS" heading is stale labeling, not a reliable
+description of its substantial command bodies. The actionable dashboard apply
+TODO and missing manager behavior are actual implementation gaps.
+
+### Verification ledger
+
+| Check | Result and scope |
+|---|---|
+| `shellcheck -s bash -S warning ru install.sh` | PASS, exit 0, ShellCheck 0.11.0 |
+| `bash -n ru`, `bash -n install.sh`, all `scripts/*.sh` | PASS; all 98 script files parse |
+| `bash scripts/run_all_tests.sh` | The slower duplicate sequential attempt was stopped after the complete parallel run finished. Its partial log is retained and is not counted as a completed gate. |
+| `bash scripts/run_all_tests.sh -j 4` | FAIL, exit 1: all 95 test files ran, 94 passed / 1 failed, 1,026 seconds. The only failed file is `test_e2e_fork_clean.sh`. These are file counts, not an assertion count or proof that every gated inner scenario ran. |
+| Independent CLI/core/adversarial probes | Completed; failures and successes above are retained rather than normalized into a green verdict |
+| Focused fork-clean file | FAIL, 7 passed / 1 failed, 21 assertions passed / 1 failed |
+| Live release download/manifest | PASS for v1.5.0 ru byte identity and checksum |
+| Live CI visibility | Latest visible CI workflow run was July 23 and failed ShellCheck; test/install jobs skipped. It does not qualify this October revision. Recent green Dependabot runs are not CLI quality gates. |
+| UBS on changed Markdown/JSONL | UNSCANNED, exit 3: no supported language; this is not a scanner pass. Ledger JSON parsing, unique IDs, append-only original records and `git diff --check` were checked separately. |
+| UBS on unchanged `ru`/`install.sh` | PARTIAL, exit 2: its embedded ShellCheck hit a hardcoded 120-second timeout. The Bash module reports 11 critical-pattern findings and 131 warnings; the combined summary's 0 critical is not reliable for this partial run. Findings are scanner observations, not 11 independently proven vulnerabilities. |
+| UBS environment diagnosis | `ubs doctor` passes. Seven critical patterns are variable-name-guarded array helpers, four are quoted installer instructions, and all 131 warnings concern post-increment under `set -e`, which these scripts explicitly avoid. This contextual review does not turn the partial scanner run into a clean scan. |
+| Bash 4.0/macOS/live AI and external apply/release | UNPROVEN in this audit; explicitly required by final qualification |
+
+### Beads coverage and bridge ordering
+
+Before this assessment there were **525 closed, 1 open and 0 in-progress Beads**.
+The only open issue, `bd-ri2v`, covers preserved fleet maintenance. Completing it
+would not repair any of the confirmed product gaps above. Historical closed
+implementation/test issues provide context, not an active correction plan or
+current end-to-end qualification.
+
+The new epic is **`bd-tr5y`**, with 13 implementation/verification pairs and one
+final qualification task: **28 new Beads total**, all left open. Every task embeds
+the baseline, observed defect, intended result, edit surface, concrete acceptance,
+adversarial cases and evidence requirements. Implementation tasks must include
+meaningful regressions in the same change; companion tasks independently verify
+the full workflow. Existing issue criteria and `bd-ri2v` remain unchanged.
+
+| Work package | Implementation | Independent verification | Dependencies and intended result |
+|---|---|---|---|
+| Test/lint gates and runtime test detection | `.1` | `.2` | Reject executed failures and missing required proof; remove runtime/test divergence |
+| Review-plan identity, approval and policy | `.3` | `.4` | Bind approved content to exact run/repo/worktree/commits before application |
+| Exact sweep candidate and secret scanning | `.5` | `.6` | Preserve peer staging; scan the complete publishable candidate; verification also requires `.2` |
+| Deterministic version/changelog/release outcome | `.7` | `.8` | Implementation depends on `.1` and `.5`; verify actual tagged and remote outcome |
+| Review failures/checkpoints/dashboard controls | `.9` | `.10` | Verification also requires `.2` and `.4`; route all application through the shared gates |
+| AI session work-result contract | `.11` | `.12` | Distinguish idle/death from verified requested commits/push; preserve artifacts |
+| Dependency update repo/manager wiring | `.13` | `.14` | Implementation depends on `.11`; consume actual shared results and real manager outcomes |
+| Structured outputs and schema conformance | `.15` | `.16` | Verification also requires `.12`, `.14`, `.18`; all empty/dry-run/failure paths have useful data |
+| Advertised flags, filtering and documentation | `.17` | `.18` | Make the documented features invocable and controls observable |
+| Sync pins, freshness and deadlines | `.19` | `.20` | Preserve incomplete work while making unmet requests visible |
+| Complete review discovery and priorities | `.21` | `.22` | Find old/beyond-page critical work and make critical scheduling reachable |
+| Installer integrity and explicit unsafe opt-in | `.23` | `.24` | Fail required verification clearly and make pipeline options effective |
+| Fork preservation contract and test diagnostics | `.25` | `.26` | Correct the defective gate with retained evidence; report actual changes and assertions |
+| Integrated qualification | `.27` | — | Blocked by every verification task; one exact revision, full matrix and current real evidence |
+
+Start with the P1 execution failures: gates, approval/plan identity, candidate
+isolation and review recovery. Independent parser/output/discovery work can proceed
+without serializing unrelated changes; reserve narrow paths because the main Bash
+file is shared. Complete the common session contract before its dependency-update
+consumer. Release automation depends on validated candidate isolation and gates.
+The final task cannot be closed on isolated helper tests, unavailable platforms,
+mock-only AI results or an old GitHub badge.
+
+### Ambition and refinement record
+
+Three scope-expansion rounds tested the plan against increasingly complete user
+outcomes: (1) move from helper existence to actual CLI selection/results; (2) bind
+plans, staging, approvals, recovery and publication to the requested candidate;
+(3) require supported-platform and real-tool proof, including release bytes and
+failure behavior. These rounds retained the existing functionality rather than
+introducing unrelated speculative features.
+
+Five plan-space checks were applied: coverage against the vision and old tracker;
+safe ordering and shared contracts; discriminative unit/full-CLI adversarial cases;
+negative outcomes, artifact logging and qualification boundaries; and final graph
+and criteria review. The fork-contract and final qualification tasks were added
+when coverage checks exposed omissions. Cross-package dependencies and acceptance
+criteria were strengthened in place. The final dependency-cycle check was empty.
+
+The skill's frozen bead-generation and refinement requirements were followed:
+tasks are self-contained, changes use `br`, features are retained, tests and logs
+are explicit, and completion remains gated on observed behavior. Proposed work is
+not implemented work. No implementation or qualification Bead was closed by this
+assessment.
+
+Two policy references in local AGENTS.md are stale: "Named Reward-Hacking Patterns"
+and "Work-Graph Discipline" are not present in the current suite AGENTS.md. This
+does not authorize weakening gates or ignoring the local preservation/graph rules.
+The documented policy/reference drift belongs in `.17`/`.18`; no suite policy
+file was rewritten during this assessment.
+
+Completing the new graph would address the known gaps and require proof of the
+advertised workflows. It is an evidence-backed bridge, not a guarantee that an
+untested external tool, platform or future failure mode is already handled.
