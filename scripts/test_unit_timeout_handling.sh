@@ -37,6 +37,7 @@ GIT_LOW_SPEED_LIMIT="${GIT_LOW_SPEED_LIMIT:-1000}"
 # Extract the timeout functions
 eval "$(sed -n '/^setup_git_timeout()/,/^}/p' "$RU_SCRIPT")"
 eval "$(sed -n '/^is_timeout_error()/,/^}/p' "$RU_SCRIPT")"
+source_ru_function "run_network_command"
 
 #==============================================================================
 # Tests: setup_git_timeout
@@ -296,6 +297,45 @@ test_default_values_exist() {
 # Run Tests
 #==============================================================================
 
+test_network_command_preserves_exit_status() {
+    local GIT_TIMEOUT=5 rc=0 output
+    output=$(run_network_command bash -c 'printf "command ran\n"; exit 42') || rc=$?
+    assert_equals 42 "$rc" "Network wrapper preserves non-timeout failure"
+    assert_equals 'command ran' "$output" "Command output is retained"
+    rc=0
+    run_network_command true || rc=$?
+    assert_equals 0 "$rc" "Passing network command succeeds"
+}
+
+test_network_command_deadline_and_bash_fallback() {
+    local env_root marker mode rc output started elapsed
+    env_root=$(create_temp_dir)
+    for mode in native bash; do
+        marker="$env_root/survived-$mode"
+        rc=0
+        started=$SECONDS
+        output=$(
+            GIT_TIMEOUT=1
+            if [[ "$mode" == bash ]]; then
+                # Hide only optional timeout utilities to exercise portable code.
+                command() {
+                    if [[ "${1:-}" == -v && ( "${2:-}" == timeout || "${2:-}" == gtimeout ) ]]; then
+                        return 1
+                    fi
+                    builtin command "$@"
+                }
+            fi
+            run_network_command bash -c 'sleep 3; printf "survived\n" > "$1"' bash "$marker"
+        ) 2>&1 || rc=$?
+        elapsed=$((SECONDS - started))
+        assert_equals 124 "$rc" "$mode wrapper actually enforces a deadline"
+        assert_true "[[ $elapsed -le 4 ]]" "$mode deadline is bounded"
+        sleep 2
+        assert_file_not_exists "$marker" "$mode terminates the command process group"
+        assert_empty "$output" "$mode does not contaminate stdout"
+    done
+}
+
 echo "============================================"
 echo "Unit Tests: Timeout Handling"
 echo "============================================"
@@ -324,6 +364,8 @@ run_test test_is_timeout_error_multiline
 # Integration tests
 run_test test_timeout_functions_defined
 run_test test_default_values_exist
+run_test test_network_command_preserves_exit_status
+run_test test_network_command_deadline_and_bash_fallback
 
 print_results
 exit "$(get_exit_code)"

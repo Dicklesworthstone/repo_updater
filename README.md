@@ -445,17 +445,28 @@ source ~/.zshrc
 
 ```bash
 # Custom install directory
-DEST=/opt/bin curl -fsSL .../install.sh | bash
+curl -fsSL .../install.sh | DEST=/opt/bin bash
 
 # System-wide installation (requires sudo)
-RU_SYSTEM=1 curl -fsSL .../install.sh | bash
+curl -fsSL .../install.sh | RU_SYSTEM=1 bash
 
 # Install specific version
-RU_VERSION=1.0.0 curl -fsSL .../install.sh | bash
+curl -fsSL .../install.sh | RU_VERSION=1.0.0 bash
 
 # Install from main branch (not recommended for production)
-RU_UNSAFE_MAIN=1 curl -fsSL .../install.sh | bash
+curl -fsSL .../install.sh | RU_UNSAFE_MAIN=1 bash
 ```
+
+Release installation requires a matching SHA256 entry and either `sha256sum`
+or `shasum`. Missing assets, checksums, or verification tools fail installation;
+they never select mutable `main` automatically. `RU_UNSAFE_MAIN=1` explicitly
+opts into an unverified development script.
+
+The curl-to-Bash bootstrap trusts the HTTPS installer download. Its optional
+self-refresh also downloads the installer from mutable `main`; that installer
+is not authenticated by the release checksum. Release checksum verification
+applies to the installed `ru` asset. Set `RU_INSTALLER_NO_SELF_REFRESH=1` to
+keep the installer bytes you downloaded.
 
 </details>
 
@@ -1782,26 +1793,37 @@ owner/repo/pull/5 → repo: owner/repo, type: pr, number: 5
 
 Configure review behavior with policy files:
 
-```bash
-# ~/.config/ru/review/policy.json
-{
-  "REVIEW_LINT_REQUIRED": true,
-  "REVIEW_SECRET_SCAN": true,
-  "REVIEW_ALLOW_PUSH": false,
-  "REVIEW_REQUIRE_APPROVAL": true,
-  "REVIEW_SKIP_PRS": false,
-  "REVIEW_DEEP_MODE": false
-}
+```ini
+# ~/.config/ru/review-policies.d/_default
+REQUIRE_TESTS=true
+REQUIRE_LINT=true
+REVIEW_ALLOW_PUSH=false
+REVIEW_REQUIRE_APPROVAL=true
+TEST_COMMAND=make test
+LINT_COMMAND=make lint
 ```
+
+Policies use `KEY=VALUE` lines. Copy the generated `_default.example` to
+`_default` to activate it. Repository policies such as `owner_repo` override
+defaults; glob filenames such as `owner_*` apply between defaults and exact
+matches. Test and lint commands override automatic detection. Every executed
+nonzero command blocks application, including exit 2 and timeout exits; absent
+optional runners report `ran: false`. `REQUIRE_TESTS` and `REQUIRE_LINT` also
+block application when the corresponding runner is absent. Secret scanning
+always runs during application.
 
 | Policy | Default | Description |
 |--------|---------|-------------|
-| `REVIEW_LINT_REQUIRED` | `true` | Run linters before applying |
-| `REVIEW_SECRET_SCAN` | `true` | Scan for secrets in changes |
-| `REVIEW_ALLOW_PUSH` | `false` | Allow pushing without `--push` |
+| `REQUIRE_TESTS` | `false` | Require a configured or detected test runner |
+| `REQUIRE_LINT` | `false` | Require a configured or detected linter |
+| `TEST_COMMAND` | auto-detect | Override the test command |
+| `LINT_COMMAND` | auto-detect | Override the lint command |
+| `REVIEW_ALLOW_PUSH` | `false` | Permit pushing when `--push` is also supplied |
 | `REVIEW_REQUIRE_APPROVAL` | `true` | Require explicit approval |
-| `REVIEW_SKIP_PRS` | `false` | Skip PRs (issues only) |
-| `REVIEW_DEEP_MODE` | `false` | Enable deep analysis |
+| `BASE_PRIORITY` | `0` | Adjust repository priority |
+| `LABEL_PRIORITY_BOOST` | empty | Comma-separated label priority adjustments |
+| `MAX_PARALLEL_AGENTS` | `4` | Repository session limit |
+| `SKIP_PATTERNS` | empty | File patterns for automated review to skip |
 
 ### GraphQL Batch Querying
 

@@ -22,13 +22,13 @@
 #   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 #
 #   # Install specific version
-#   RU_VERSION=1.0.0 curl -fsSL .../install.sh | bash
+#   curl -fsSL .../install.sh | RU_VERSION=1.0.0 bash
 #
 #   # System-wide installation
-#   RU_SYSTEM=1 curl -fsSL .../install.sh | bash
+#   curl -fsSL .../install.sh | RU_SYSTEM=1 bash
 #
 #   # Custom directory
-#   DEST=/opt/bin curl -fsSL .../install.sh | bash
+#   curl -fsSL .../install.sh | DEST=/opt/bin bash
 #
 # Security:
 #   - Default: Downloads from GitHub Release with SHA256 checksum verification
@@ -493,13 +493,24 @@ verify_checksum() {
     local expected="$2"
     local actual
 
+    if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        log_error "Invalid or missing SHA256 checksum"
+        return 1
+    fi
+
     if command_exists sha256sum; then
-        actual=$(sha256sum "$file" | cut -d' ' -f1)
+        if ! actual=$(sha256sum "$file" | cut -d' ' -f1); then
+            log_error "Could not compute SHA256 checksum"
+            return 1
+        fi
     elif command_exists shasum; then
-        actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
+        if ! actual=$(shasum -a 256 "$file" | cut -d' ' -f1); then
+            log_error "Could not compute SHA256 checksum"
+            return 1
+        fi
     else
-        log_warn "No checksum tool found (sha256sum or shasum). Skipping verification."
-        return 0
+        log_error "Checksum verification requires sha256sum or shasum"
+        return 1
     fi
 
     if [[ "$actual" != "$expected" ]]; then
@@ -540,24 +551,22 @@ install_from_latest_release() {
 
     log_step "Downloading ru (latest release)..."
     if ! download_file "$script_url" "$temp_dir/$SCRIPT_NAME"; then
-        # Download failed - either no releases exist OR the release doesn't have the artifact.
-        # In either case, fall back to main branch.
-        log_warn "Could not download ru from latest release (artifact may not be uploaded yet)"
-        cleanup_temp_dir
-        RU_INSTALLER_TEMP_DIR=""
-        return 2
+        local release_status=0
+        get_latest_release_from_redirect >/dev/null || release_status=$?
+        if [[ "$release_status" -eq 1 ]]; then
+            log_error "No releases found for this repository"
+            return 2
+        fi
+        log_error "Could not download ru release asset (network or asset error)"
+        return 1
     fi
 
     # Sanity check: ensure we downloaded a Bash script, not an HTML error page.
     local first_line=""
     IFS= read -r first_line < "$temp_dir/$SCRIPT_NAME" 2>/dev/null || true
     if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
-        # Downloaded something but it's not the script (likely HTML error page).
-        # Fall back to main branch.
-        log_warn "Downloaded unexpected content from release (not a bash script)"
-        cleanup_temp_dir
-        RU_INSTALLER_TEMP_DIR=""
-        return 2
+        log_error "Downloaded unexpected release content (not a bash script)"
+        return 1
     fi
 
     log_step "Downloading checksums..."
@@ -572,10 +581,12 @@ install_from_latest_release() {
             fi
             log_success "Checksum verified"
         else
-            log_warn "No checksum found for $SCRIPT_NAME in checksums.txt"
+            log_error "No valid checksum found for $SCRIPT_NAME in checksums.txt"
+            return 1
         fi
     else
-        log_warn "Could not download checksums.txt. Proceeding without verification."
+        log_error "Could not download required checksums.txt"
+        return 1
     fi
 
     install_script "$temp_dir/$SCRIPT_NAME" "$install_dir"
@@ -617,10 +628,12 @@ install_from_release() {
             fi
             log_success "Checksum verified"
         else
-            log_warn "No checksum found for $SCRIPT_NAME in checksums.txt"
+            log_error "No valid checksum found for $SCRIPT_NAME in checksums.txt"
+            return 1
         fi
     else
-        log_warn "Could not download checksums.txt. Proceeding without verification."
+        log_error "Could not download required checksums.txt"
+        return 1
     fi
 
     # Install
@@ -783,15 +796,10 @@ main() {
             local rc=$?
             if [[ "$rc" -ne 0 ]]; then
                 if [[ "$rc" -eq 2 ]]; then
-                    log_warn "No releases found for this repository."
-                    log_warn "Falling back to installation from main branch."
-                    log_warn "This is equivalent to RU_UNSAFE_MAIN=1."
-                    log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
-                    printf '\n' >&2
-                    install_from_main "$install_dir" || exit 1
-                else
-                    exit 1
+                    log_error "Installation requires a verified release."
+                    log_info "To explicitly install unverified development code, set RU_UNSAFE_MAIN=1 on the bash installer."
                 fi
+                exit 1
             fi
         fi
     fi

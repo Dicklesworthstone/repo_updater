@@ -149,6 +149,8 @@ LABEL_PRIORITY_BOOST=security=2,bug=1,documentation=-1
 SKIP_PATTERNS=*.generated.go,vendor/*
 TEST_COMMAND=make test
 LINT_COMMAND=golangci-lint run
+REQUIRE_TESTS=true
+REQUIRE_LINT=false
 EOF
 
     local output
@@ -515,6 +517,23 @@ EOF
     assert_equals "golangci-lint run" "$(echo "$output" | jq -r '.lint_command')" "Strips single quotes"
 
     log_test_pass "$test_name"
+}
+
+test_load_policy_required_gates_merge() {
+    local env_root policy_dir output
+    env_root=$(create_test_env)
+    export RU_CONFIG_DIR="$env_root/config/ru"
+    policy_dir=$(get_review_policy_dir)
+    mkdir -p "$policy_dir"
+    printf 'REQUIRE_TESTS=true\nREQUIRE_LINT=false\n' > "$policy_dir/_default"
+    printf 'REQUIRE_LINT=true\n' > "$policy_dir/owner_*"
+    printf 'REQUIRE_TESTS=false\n' > "$policy_dir/owner_repo"
+    output=$(load_policy_for_repo owner/repo)
+    assert_equals false "$(jq -r '.require_tests' <<< "$output")" "Exact policy overrides required tests"
+    assert_equals true "$(jq -r '.require_lint' <<< "$output")" "Glob policy enables required lint"
+    output=$(load_policy_for_repo other/repo)
+    assert_equals true "$(jq -r '.require_tests' <<< "$output")" "Unmatched repo inherits required tests"
+    assert_equals false "$(jq -r '.require_lint' <<< "$output")" "Unmatched repo inherits optional lint"
 }
 
 test_load_policy_merge_order() {
@@ -1013,6 +1032,7 @@ run_test test_load_policy_from_default_file
 run_test test_load_policy_exact_repo_match
 run_test test_load_policy_skips_example_files
 run_test test_load_policy_strips_quotes
+run_test test_load_policy_required_gates_merge
 run_test test_load_policy_merge_order
 run_test test_load_policy_policies_loaded_list
 

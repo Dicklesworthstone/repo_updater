@@ -92,7 +92,7 @@ test_creates_rescue_branch() {
     e2e_cleanup
 }
 
-test_resets_main_to_upstream() {
+test_default_preserves_local_commits() {
     e2e_setup
     mkdir -p "$E2E_TEMP_DIR/remotes"
 
@@ -101,8 +101,8 @@ test_resets_main_to_upstream() {
 
     add_local_commit "$LOCAL_DIR" "pollution"
 
-    local upstream_rev
-    upstream_rev=$(git -C "$LOCAL_DIR" rev-parse upstream/main)
+    local before_rev
+    before_rev=$(git -C "$LOCAL_DIR" rev-parse main)
 
     init_fork_config "test_owner/resetrepo"
 
@@ -110,12 +110,13 @@ test_resets_main_to_upstream() {
     output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch 2>&1) || exit_code=$?
 
     assert_equals "0" "$exit_code" "fork-clean exits 0"
-    assert_contains "$output" "cleaned" "Reports clean success"
+    assert_contains "$output" "preserved 1 local commit(s)" "Reports actual preservation"
+    assert_contains "$output" "0 cleaned" "Does not claim removal when main is unchanged"
 
-    # Verify main now matches upstream
     local current_rev
     current_rev=$(git -C "$LOCAL_DIR" rev-parse main)
-    assert_equals "$upstream_rev" "$current_rev" "Main matches upstream after clean"
+    assert_equals "$before_rev" "$current_rev" "Default cleanup preserves original main"
+    assert_equals 1 "$(git -C "$LOCAL_DIR" rev-list --count upstream/main..main)" "Every local commit remains reachable"
 
     e2e_cleanup
 }
@@ -135,7 +136,7 @@ test_no_rescue_flag() {
     output=$("$E2E_RU_SCRIPT" fork-clean --no-rescue --no-fetch 2>&1) || exit_code=$?
 
     assert_equals "0" "$exit_code" "fork-clean --no-rescue exits 0"
-    assert_contains "$output" "cleaned" "Reports clean success"
+    assert_contains "$output" "preserved 1 local commit(s)" "Reports preservation with --no-rescue"
 
     # Verify no rescue branch exists
     local rescue_branches
@@ -235,6 +236,8 @@ test_reset_with_force() {
 
     local upstream_rev
     upstream_rev=$(git -C "$LOCAL_DIR" rev-parse upstream/main)
+    local original_rev
+    original_rev=$(git -C "$LOCAL_DIR" rev-parse main)
 
     init_fork_config "test_owner/resetforcerepo"
 
@@ -247,6 +250,10 @@ test_reset_with_force() {
     local current_rev
     current_rev=$(git -C "$LOCAL_DIR" rev-parse main)
     assert_equals "$upstream_rev" "$current_rev" "Main reset to upstream"
+    assert_contains "$output" "removed 1 local commit(s); preserved 0" "Reports revision-derived removal"
+    local rescue_ref
+    rescue_ref=$(git -C "$LOCAL_DIR" for-each-ref --format='%(refname)' refs/heads/rescue/)
+    assert_equals "$original_rev" "$(git -C "$LOCAL_DIR" rev-parse "$rescue_ref")" "Rescue branch retains original history"
 
     e2e_cleanup
 }
@@ -260,6 +267,10 @@ test_dirty_working_tree_skipped() {
 
     add_local_commit "$LOCAL_DIR" "pollution"
     echo "uncommitted" > "$LOCAL_DIR/dirty.txt"
+    printf 'unstaged\n' >> "$LOCAL_DIR/README.md"
+    local before_rev before_diff
+    before_rev=$(git -C "$LOCAL_DIR" rev-parse main)
+    before_diff=$(git -C "$LOCAL_DIR" diff)
 
     init_fork_config "test_owner/dirtyrepo"
 
@@ -268,7 +279,52 @@ test_dirty_working_tree_skipped() {
 
     assert_contains "$output" "uncommitted changes" "Notes dirty working tree"
     assert_contains "$output" "0 cleaned" "Does not clean dirty repo"
+    assert_equals "$before_rev" "$(git -C "$LOCAL_DIR" rev-parse main)" "Dirty main is preserved"
+    assert_equals "$before_diff" "$(git -C "$LOCAL_DIR" diff)" "Tracked dirty bytes are preserved"
+    assert_file_contains "$LOCAL_DIR/dirty.txt" uncommitted "Untracked work is preserved"
 
+    e2e_cleanup
+}
+
+test_diverged_default_preserves_history() {
+    e2e_setup
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    local UPSTREAM_DIR ORIGIN_DIR LOCAL_DIR
+    setup_fork_env divergedrepo
+    add_local_commit "$LOCAL_DIR" local-change
+    local upstream_clone="$E2E_TEMP_DIR/tmp_clone_divergedrepo"
+    printf 'upstream change\n' > "$upstream_clone/upstream.txt"
+    git -C "$upstream_clone" add upstream.txt
+    git -C "$upstream_clone" commit -q -m upstream-change
+    git -C "$upstream_clone" push -q origin main
+    git -C "$LOCAL_DIR" fetch -q upstream
+    local before_rev output rc=0
+    before_rev=$(git -C "$LOCAL_DIR" rev-parse main)
+    init_fork_config test_owner/divergedrepo
+    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch 2>&1) || rc=$?
+    assert_equals 1 "$rc" "Diverged default reports refusal"
+    assert_equals "$before_rev" "$(git -C "$LOCAL_DIR" rev-parse main)" "Diverged history remains intact"
+    assert_contains "$output" 'local commits preserved' "Refusal explains preservation"
+    assert_contains "$output" '0 cleaned' "Refusal does not claim cleanup"
+    assert_file_contains "$LOCAL_DIR/local_file.txt" local-change "Local commit contents survive"
+    e2e_cleanup
+}
+
+test_push_failure_is_not_success() {
+    e2e_setup
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    local UPSTREAM_DIR ORIGIN_DIR LOCAL_DIR
+    setup_fork_env pushfailrepo
+    add_local_commit "$LOCAL_DIR" local-change
+    local before_rev output rc=0
+    before_rev=$(git -C "$LOCAL_DIR" rev-parse main)
+    git -C "$LOCAL_DIR" remote set-url origin "$E2E_TEMP_DIR/missing-origin.git"
+    init_fork_config test_owner/pushfailrepo
+    output=$("$E2E_RU_SCRIPT" fork-clean --push --no-fetch 2>&1) || rc=$?
+    assert_equals 1 "$rc" "Requested failed push makes command fail"
+    assert_contains "$output" 'Failed to push' "Push failure is visible"
+    assert_contains "$output" '1 failed' "Failure counted in summary"
+    assert_equals "$before_rev" "$(git -C "$LOCAL_DIR" rev-parse main)" "Failed push retains local work"
     e2e_cleanup
 }
 
@@ -279,13 +335,15 @@ test_dirty_working_tree_skipped() {
 log_suite_start "E2E Tests: ru fork-clean"
 
 run_test test_creates_rescue_branch
-run_test test_resets_main_to_upstream
+run_test test_default_preserves_local_commits
 run_test test_no_rescue_flag
 run_test test_clean_repo_skipped
 run_test test_dry_run_no_changes
 run_test test_reset_requires_force
 run_test test_reset_with_force
 run_test test_dirty_working_tree_skipped
+run_test test_diverged_default_preserves_history
+run_test test_push_failure_is_not_success
 
 print_results
 exit "$(get_exit_code)"

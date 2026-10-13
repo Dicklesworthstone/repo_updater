@@ -96,6 +96,7 @@ module test-project
 
 go 1.21
 EOF
+            printf 'package main\n' > "$project_dir/main_test.go"
             ;;
         shell)
             mkdir -p "$project_dir/scripts"
@@ -964,6 +965,110 @@ EOF
 # Main
 #==============================================================================
 
+test_run_quality_gates_execution_status_matrix() {
+    local env_root wt_path plan_file result rc gate code
+    env_root=$(create_test_env)
+    wt_path="$env_root/worktree"
+    plan_file="$env_root/review-plan.json"
+    mkdir -p "$wt_path"
+    git -C "$wt_path" init -q
+    git -C "$wt_path" -c user.name=Gate -c user.email=gate@example.invalid commit -q --allow-empty -m Initial
+    printf '{"repo":"test/repo"}\n' > "$plan_file"
+    export RU_CONFIG_DIR="$env_root/config"
+    mkdir -p "$RU_CONFIG_DIR/review-policies.d"
+
+    for gate in TEST LINT; do
+        for code in 0 1 2 42 124 127; do
+            printf 'TEST_COMMAND=exit 0\nLINT_COMMAND=exit 0\n%s_COMMAND=exit %s\n' "$gate" "$code" > "$RU_CONFIG_DIR/review-policies.d/test_repo"
+            rc=0
+            result=$(run_quality_gates "$wt_path" "$plan_file") || rc=$?
+            if [[ "$code" == 0 ]]; then
+                assert_equals 0 "$rc" "$gate exit 0 succeeds"
+                assert_equals true "$(jq -r '.overall_ok' <<< "$result")" "$gate passing result"
+            else
+                assert_equals 1 "$rc" "$gate exit $code blocks"
+                assert_equals false "$(jq -r '.overall_ok' <<< "$result")" "$gate failure cannot claim success"
+            fi
+            local field=tests
+            [[ "$gate" == LINT ]] && field=lint
+            assert_equals "$code" "$(jq -r --arg field "$field" '.[$field].exit_code' <<< "$result")" "Actual exit code retained"
+            assert_equals true "$(jq -r --arg field "$field" '.[$field].ran' <<< "$result")" "Exit 2 still represents an executed command"
+        done
+    done
+}
+
+test_run_test_gate_real_timeout_and_missing_command() {
+    local env_root result rc
+    env_root=$(create_test_env)
+    rc=0
+    result=$(run_test_gate "$env_root" 'sleep 5' 1) || rc=$?
+    assert_equals 124 "$rc" "Actual timeout is returned"
+    assert_equals false "$(jq -r '.ok' <<< "$result")" "Timed-out command did not pass"
+    assert_equals 124 "$(jq -r '.exit_code' <<< "$result")" "Timeout JSON retains actual process status"
+    rc=0
+    result=$(run_test_gate "$env_root" 'ru_nonexistent_gate_command_20261013' 10) || rc=$?
+    assert_equals 127 "$rc" "Actual missing executable is returned"
+    assert_equals false "$(jq -r '.ok' <<< "$result")" "Missing executable did not pass"
+}
+
+test_run_quality_gates_required_runner() {
+    local env_root wt_path plan_file result rc gate
+    env_root=$(create_test_env)
+    wt_path="$env_root/worktree"
+    plan_file="$env_root/review-plan.json"
+    mkdir -p "$wt_path"
+    git -C "$wt_path" init -q
+    printf '{"repo":"test/repo"}\n' > "$plan_file"
+    export RU_CONFIG_DIR="$env_root/config"
+    mkdir -p "$RU_CONFIG_DIR/review-policies.d"
+    printf 'REQUIRE_TESTS=false\nREQUIRE_LINT=false\n' > "$RU_CONFIG_DIR/review-policies.d/test_repo"
+    rc=0
+    result=$(run_quality_gates "$wt_path" "$plan_file") || rc=$?
+    assert_equals 0 "$rc" "Absent optional runners are permitted"
+    assert_equals false "$(jq -r '.tests.ran' <<< "$result")" "Absence is never reported as executed proof"
+    for gate in TESTS LINT; do
+        printf 'REQUIRE_%s=true\n' "$gate" > "$RU_CONFIG_DIR/review-policies.d/test_repo"
+        rc=0
+        result=$(run_quality_gates "$wt_path" "$plan_file") || rc=$?
+        assert_equals 1 "$rc" "Absent required $gate blocks"
+        assert_equals false "$(jq -r '.overall_ok' <<< "$result")" "Required proof cannot be missing"
+        printf 'REQUIRE_%s=invalid\n' "$gate" > "$RU_CONFIG_DIR/review-policies.d/test_repo"
+        rc=0
+        result=$(run_quality_gates "$wt_path" "$plan_file") || rc=$?
+        assert_equals 1 "$rc" "Malformed required policy fails closed"
+        assert_equals invalid_policy "$(jq -r '.error' <<< "$result")" "Policy failure is explicit"
+    done
+}
+
+test_run_quality_gates_invalid_result() {
+    local env_root wt_path plan_file result rc payload gate
+    env_root=$(create_test_env)
+    wt_path="$env_root/worktree"
+    plan_file="$env_root/review-plan.json"
+    mkdir -p "$wt_path"
+    git -C "$wt_path" init -q
+    printf '{"repo":"test/repo"}\n' > "$plan_file"
+    export RU_CONFIG_DIR="$env_root/config"
+    mkdir -p "$RU_CONFIG_DIR/review-policies.d"
+    printf 'TEST_COMMAND=exit 0\nLINT_COMMAND=exit 0\n' > "$RU_CONFIG_DIR/review-policies.d/test_repo"
+    for gate in tests lint secrets; do
+        for payload in '' 'garbage' '{}' '{"ran":true,"ok":true}' '{"ran":true,"ok":true,"exit_code":42}' '{"ran":true,"ok":true,"exit_code":0} {"ran":true,"ok":true,"exit_code":0}'; do
+            rc=0
+            # Only the protocol result is fault-injected; the combined gate is real.
+            result=$(
+                case "$gate" in
+                    tests) run_test_gate() { printf '%s\n' "$payload"; return 0; } ;;
+                    lint) run_lint_gate() { printf '%s\n' "$payload"; return 0; } ;;
+                    secrets) run_secret_scan() { printf '%s\n' "$payload"; return 0; } ;;
+                esac
+                run_quality_gates "$wt_path" "$plan_file"
+            ) || rc=$?
+            assert_equals 1 "$rc" "$gate malformed/missing/contradictory result blocks"
+            assert_equals false "$(jq -r '.overall_ok' <<< "$result")" "Invalid result produces parseable refusal"
+        done
+    done
+}
+
 run_all_tests() {
     log_suite_start "Quality Gates"
 
@@ -1003,6 +1108,10 @@ run_all_tests() {
     run_test test_run_quality_gates_test_failure
     run_test test_run_quality_gates_lint_failure
     run_test test_run_quality_gates_uses_policy_commands
+    run_test test_run_quality_gates_execution_status_matrix
+    run_test test_run_test_gate_real_timeout_and_missing_command
+    run_test test_run_quality_gates_required_runner
+    run_test test_run_quality_gates_invalid_result
 
     print_results
     return "$(get_exit_code)"

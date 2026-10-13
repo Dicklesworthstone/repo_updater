@@ -767,6 +767,11 @@ detect_test_command() {
         echo "pytest"
         return 0
     fi
+    if [[ -f "$repo_path/pyproject.toml" || -f "$repo_path/setup.py" ]] &&
+       [[ -d "$repo_path/tests" || -d "$repo_path/test" ]]; then
+        echo "pytest"
+        return 0
+    fi
 
     # 5. Ruby - bundler/rake
     if [[ -f "$repo_path/Gemfile" ]]; then
@@ -796,12 +801,10 @@ detect_test_command() {
         return 0
     fi
 
-    # 8. Makefile with test target (fallback)
-    if [[ -f "$repo_path/Makefile" ]]; then
-        if grep -qE "^test:" "$repo_path/Makefile" 2>/dev/null; then
-            echo "make test"
-            return 0
-        fi
+    # 8. Makefile fallback after language-specific runners
+    if [[ -f "$repo_path/Makefile" ]] && grep -qE '^test[[:space:]]*:' "$repo_path/Makefile"; then
+        echo "make test"
+        return 0
     fi
 
     # 9. PHP Composer
@@ -816,6 +819,11 @@ detect_test_command() {
             echo "vendor/bin/phpunit"
             return 0
         fi
+    fi
+
+    if [[ -x "$repo_path/scripts/run_all_tests.sh" ]]; then
+        echo "./scripts/run_all_tests.sh"
+        return 0
     fi
 
     # No test command detected
@@ -6787,9 +6795,14 @@ get_repo_status() {
         return 1
     fi
 
-    # Fetch if requested
+    local freshness=cached
+    # A failed requested fetch cannot certify cached refs as current.
     if [[ "$do_fetch" == "true" ]]; then
-        git -C "$repo_path" fetch --quiet 2>/dev/null || true
+        if run_network_command git -C "$repo_path" fetch --quiet; then
+            freshness=fetched
+        else
+            freshness=failed
+        fi
     fi
 
     # Check dirty status using plumbing (no status parsing)
@@ -6802,9 +6815,14 @@ get_repo_status() {
     local branch
     branch=$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
 
+    if [[ "$freshness" == failed ]]; then
+        echo "STATUS=fetch_failed AHEAD=-1 BEHIND=-1 DIRTY=$dirty FRESHNESS=failed BRANCH=$branch"
+        return 1
+    fi
+
     # Check for upstream tracking branch
     if ! git -C "$repo_path" rev-parse --verify '@{u}' &>/dev/null; then
-        echo "STATUS=no_upstream AHEAD=0 BEHIND=0 DIRTY=$dirty BRANCH=$branch"
+        echo "STATUS=no_upstream AHEAD=0 BEHIND=0 DIRTY=$dirty FRESHNESS=$freshness BRANCH=$branch"
         return 0
     fi
 
@@ -6814,7 +6832,7 @@ get_repo_status() {
     if ! output=$(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null); then
         # If rev-list fails (e.g. unrelated histories), use -1 to indicate unknown
         # (must be numeric for JSON output compatibility, ? would break printf %d)
-        echo "STATUS=diverged AHEAD=-1 BEHIND=-1 DIRTY=$dirty BRANCH=$branch"
+        echo "STATUS=diverged AHEAD=-1 BEHIND=-1 DIRTY=$dirty FRESHNESS=$freshness BRANCH=$branch"
         return 0
     fi
     read -r ahead behind <<< "$output"
@@ -6831,14 +6849,15 @@ get_repo_status() {
         status="diverged"
     fi
 
-    echo "STATUS=$status AHEAD=$ahead BEHIND=$behind DIRTY=$dirty BRANCH=$branch"
+    echo "STATUS=$status AHEAD=$ahead BEHIND=$behind DIRTY=$dirty FRESHNESS=$freshness BRANCH=$branch"
 }
 
 # Get the remote URL for a repository
 get_remote_url() {
     local repo_path="$1"
     local remote="${2:-origin}"
-    git -C "$repo_path" remote get-url "$remote" 2>/dev/null
+    # Compare configured identity, before url.*.insteadOf transport rewriting.
+    git -C "$repo_path" config --get "remote.$remote.url" 2>/dev/null
 }
 
 # Check if local repo's remote matches expected URL
@@ -6873,6 +6892,57 @@ check_remote_mismatch() {
 setup_git_timeout() {
     export GIT_HTTP_LOW_SPEED_LIMIT="$GIT_LOW_SPEED_LIMIT"
     export GIT_HTTP_LOW_SPEED_TIME="$GIT_TIMEOUT"
+}
+
+# Bound the entire network command, including SSH and stalled subprocesses.
+# The Bash fallback gives this invocation its own process group; it never
+# signals the caller or an unrelated agent's process group.
+run_network_command() {
+    local seconds="${GIT_TIMEOUT:-30}"
+    if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "GIT_TIMEOUT must be a positive integer"
+        return 4
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=2 "$seconds" "$@"
+        return $?
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout --kill-after=2 "$seconds" "$@"
+        return $?
+    fi
+    (
+        set -m
+        "$@" &
+        local command_pid=$! deadline=$((SECONDS + seconds)) rc=0
+        while kill -0 "$command_pid" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+                log_error "Network command exceeded ${seconds}s"
+                kill -TERM -- "-$command_pid" 2>/dev/null || true
+                sleep 1
+                kill -KILL -- "-$command_pid" 2>/dev/null || true
+                wait "$command_pid" 2>/dev/null || true
+                return 124
+            fi
+            sleep 0.1
+        done
+        wait "$command_pid" || rc=$?
+        return "$rc"
+    )
+}
+
+# Check the configured pin without changing the working tree.
+repo_matches_requested_ref() {
+    local repo_path="$1" requested="${2:-}"
+    [[ -z "$requested" ]] && return 0
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$requested" ||
+       git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$requested"; then
+        [[ "$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null)" == "$requested" ]]
+        return $?
+    fi
+    local tag_sha head_sha
+    tag_sha=$(git -C "$repo_path" rev-parse --verify "refs/tags/$requested^{commit}" 2>/dev/null) || return 1
+    head_sha=$(git -C "$repo_path" rev-parse HEAD) || return 1
+    [[ "$head_sha" == "$tag_sha" ]]
 }
 
 # Check if a git error indicates a timeout
@@ -6935,6 +7005,11 @@ do_clone() {
     local target_dir="$2"
     local repo_name="$3"
     local branch="${4:-}"
+    if [[ -n "$branch" ]] && { [[ "$branch" == -* ]] || ! git check-ref-format "refs/heads/$branch"; }; then
+        log_error "Invalid requested branch/tag: $branch"
+        write_result "$repo_name" "clone" "failed" "0" "invalid requested ref" "$target_dir"
+        return 1
+    fi
 
     # Never clone into another repository's working tree (e.g. a group folder
     # that is also the path of a configured repo).
@@ -6974,7 +7049,7 @@ do_clone() {
     setup_git_timeout
 
     local output
-    if output=$(gh repo clone "$clone_target" "$target_dir" -- --quiet 2>&1); then
+    if output=$(run_network_command gh repo clone "$clone_target" "$target_dir" -- --quiet 2>&1); then
         local duration=$(($(date +%s) - start_time))
 
         # If a specific branch was requested, check it out
@@ -6983,10 +7058,10 @@ do_clone() {
             if ! checkout_output=$(git -C "$target_dir" checkout "$branch" 2>&1); then
                 # Branch might be a remote branch, try fetching and checking out
                 if ! checkout_output=$(git -C "$target_dir" checkout -b "$branch" "origin/$branch" 2>&1); then
-                    log_warn "Cloned $repo_name but could not checkout branch '$branch'"
+                    log_error "Cloned $repo_name but could not checkout requested ref '$branch'; clone preserved at $target_dir"
                     log_verbose "  $checkout_output"
-                    write_result "$repo_name" "clone" "ok" "$duration" "branch checkout failed: $checkout_output" "$target_dir"
-                    return 0
+                    write_result "$repo_name" "clone" "failed" "$duration" "requested ref checkout failed: $checkout_output" "$target_dir"
+                    return 1
                 fi
             fi
             log_success "Cloned: $repo_name@$branch (${duration}s)"
@@ -6997,7 +7072,7 @@ do_clone() {
         return 0
     else
         local exit_code=$?
-        if is_timeout_error "$output"; then
+        if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]] || is_timeout_error "$output"; then
             log_error "Timeout: $repo_name (network too slow)"
             write_result "$repo_name" "clone" "timeout" "0" "$output" "$target_dir"
         else
@@ -7018,6 +7093,11 @@ do_pull() {
     local strategy="${3:-ff-only}"
     local autostash="${4:-false}"
     local branch="${5:-}"
+    if [[ -n "$branch" ]] && { [[ "$branch" == -* ]] || ! git check-ref-format "refs/heads/$branch"; }; then
+        log_error "Invalid requested branch/tag: $branch"
+        write_result "$repo_name" "pull" "failed" "0" "invalid requested ref" "$repo_path"
+        return 1
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         local branch_info=""
@@ -7052,6 +7132,15 @@ do_pull() {
     # Set up timeout environment
     setup_git_timeout
 
+    # A pinned tag is a fixed commit, so pulling on its detached HEAD is wrong.
+    if [[ -n "$branch" ]] &&
+       ! git -C "$repo_path" symbolic-ref --quiet HEAD >/dev/null 2>&1 &&
+       repo_matches_requested_ref "$repo_path" "$branch"; then
+        write_result "$repo_name" "pull" "current" "0" "pinned tag $branch" "$repo_path"
+        log_info "Current: $repo_name@$branch (pinned tag)"
+        return 0
+    fi
+
     # Build pull arguments based on strategy
     local pull_args=()
     case "$strategy" in
@@ -7067,7 +7156,7 @@ do_pull() {
     old_head=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || echo "")
 
     local output
-    if output=$(git -C "$repo_path" pull "${pull_args[@]}" 2>&1); then
+    if output=$(run_network_command git -C "$repo_path" pull "${pull_args[@]}" 2>&1); then
         local duration=$(($(date +%s) - start_time))
         local new_head
         new_head=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || echo "")
@@ -7086,7 +7175,7 @@ do_pull() {
         local reason="failed"
 
         # Categorize the failure
-        if is_timeout_error "$output"; then
+        if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]] || is_timeout_error "$output"; then
             reason="timeout"
             log_error "Timeout: $repo_name (network too slow)"
         elif [[ "$output" =~ (divergent|cannot\ be\ fast-forwarded) ]]; then
@@ -7108,7 +7197,7 @@ do_pull() {
 # Fetch remote without merging (for status checks)
 do_fetch() {
     local repo_path="$1"
-    git -C "$repo_path" fetch --quiet 2>/dev/null
+    run_network_command git -C "$repo_path" fetch --quiet
 }
 
 #==============================================================================
@@ -7334,13 +7423,19 @@ process_single_repo_worker() {
         status=$(echo "$status_info" | sed 's/.*STATUS=\([^ ]*\).*/\1/')
         dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
+        if [[ "$status" == fetch_failed ]]; then
+            write_result "$repo_label" "pull" "failed" "0" "requested fetch failed" "$local_path"
+            echo "FAIL:failed:$repo_label"
+            return 0
+        fi
+
         if [[ "$dirty" == "true" && "$autostash" != "true" ]]; then
             write_result "$repo_label" "pull" "dirty" "0" "" "$local_path"
             echo "CONFLICT:dirty:$repo_label"
             return 0
         fi
 
-        if [[ "$status" == "current" ]]; then
+        if [[ "$status" == "current" ]] && repo_matches_requested_ref "$local_path" "$branch"; then
             write_result "$repo_label" "pull" "current" "0" "" "$local_path"
             echo "OK:current:$repo_label"
             return 0
@@ -7349,6 +7444,12 @@ process_single_repo_worker() {
         if [[ "$status" == "diverged" ]]; then
             write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
             echo "CONFLICT:diverged:$repo_label"
+            return 0
+        fi
+        if [[ "$status" == no_upstream && -n "$branch" ]] && repo_matches_requested_ref "$local_path" "$branch" &&
+           ! git -C "$local_path" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+            do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1
+            echo "OK:current:$repo_label"
             return 0
         fi
         if [[ "$status" == "no_upstream" ]]; then
@@ -8491,6 +8592,7 @@ cmd_sync() {
                 ((cloned++))
             else
                 ((failed++))
+                continue
             fi
         else
             if [[ "$CLONE_ONLY" == "true" ]]; then
@@ -8519,6 +8621,13 @@ cmd_sync() {
             status=$(echo "$status_info" | sed 's/.*STATUS=\([^ ]*\).*/\1/')
             dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
+            if [[ "$status" == fetch_failed ]]; then
+                log_error "Requested fetch failed: $repo_label"
+                ((failed++))
+                write_result "$repo_label" "pull" "failed" "0" "requested fetch failed" "$local_path"
+                continue
+            fi
+
             if [[ "$dirty" == "true" && "$AUTOSTASH" != "true" ]]; then
                 log_warn "Dirty: $repo_label (uncommitted changes)"
                 ((conflicts++))
@@ -8526,7 +8635,7 @@ cmd_sync() {
                 continue
             fi
 
-            if [[ "$status" == "current" ]]; then
+            if [[ "$status" == "current" ]] && repo_matches_requested_ref "$local_path" "$branch"; then
                 log_info "Current: $repo_label"
                 ((skipped++))
                 write_result "$repo_label" "pull" "current" "0" "" "$local_path"
@@ -8537,6 +8646,15 @@ cmd_sync() {
                 log_warn "Diverged: $repo_label"
                 ((conflicts++))
                 write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
+                continue
+            fi
+            if [[ "$status" == no_upstream && -n "$branch" ]] && repo_matches_requested_ref "$local_path" "$branch" &&
+               ! git -C "$local_path" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+                if do_pull "$local_path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
+                    ((skipped++))
+                else
+                    ((failed++))
+                fi
                 continue
             fi
             if [[ "$status" == "no_upstream" ]]; then
@@ -8550,6 +8668,7 @@ cmd_sync() {
                 ((updated++))
             else
                 ((failed++))
+                continue
             fi
         fi
 
@@ -8573,9 +8692,6 @@ cmd_sync() {
 
     echo "" >&2
 
-    # Sync completed successfully - clean up state file
-    cleanup_sync_state
-
     # Reset trap to normal cleanup
     trap cleanup EXIT
 
@@ -8597,6 +8713,15 @@ cmd_sync() {
     compute_exit_code "$FAILED" "$CONFLICTS" "$SYSTEM_ERRORS"
     local rc=$?
 
+    if [[ "$rc" -eq 0 ]]; then
+        cleanup_sync_state
+    else
+        # The original pending set is retained in parallel mode. Sequential
+        # failures never enter SYNC_COMPLETED and remain in pending_names.
+        save_sync_state "failed" SYNC_COMPLETED pending_names
+        log_warn "Incomplete sync retained; use ru sync --resume after resolving failures"
+    fi
+
     # Output JSON report if --json flag is set
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         local data_json meta_json
@@ -8609,6 +8734,7 @@ cmd_sync() {
 }
 
 cmd_status() {
+    local status_exit=0
     # Ensure config exists
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_info "No configuration found. Run: ru init"
@@ -8640,7 +8766,7 @@ cmd_status() {
                 if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
                     continue
                 fi
-                local status="missing" ahead=0 behind=0 dirty="false" mismatch="false" branch_name=""
+                local status="missing" ahead=0 behind=0 dirty="false" mismatch="false" branch_name="" freshness="unavailable"
                 if [[ -d "$local_path" ]] && is_git_repo "$local_path"; then
                     local status_info
                     status_info=$(get_repo_status "$local_path" "$FETCH_REMOTES")
@@ -8649,6 +8775,7 @@ cmd_status() {
                     behind=$(echo "$status_info" | sed 's/.*BEHIND=\([^ ]*\).*/\1/')
                     dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
                     branch_name=$(echo "$status_info" | sed 's/.*BRANCH=\([^ ]*\).*/\1/')
+                    freshness=$(echo "$status_info" | sed 's/.*FRESHNESS=\([^ ]*\).*/\1/')
                     # Check for remote URL mismatch
                     if check_remote_mismatch "$local_path" "$url"; then
                         mismatch="true"
@@ -8664,15 +8791,18 @@ cmd_status() {
                 safe_branch=$(json_escape "$branch_name")
                 safe_repo_id=$(json_escape "$repo_id")
                 safe_status=$(json_escape "$status")
-                printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s,"mismatch":%s}' \
-                    "$safe_repo_id" "$safe_path" "$safe_status" "$safe_branch" "$ahead" "$behind" "$dirty" "$mismatch"
+                printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s,"mismatch":%s,"freshness":"%s"}' \
+                    "$safe_repo_id" "$safe_path" "$safe_status" "$safe_branch" "$ahead" "$behind" "$dirty" "$mismatch" "$freshness"
             done
             echo "]"
         )"
 
         local data_json
         data_json="$(printf '{"total":%d,"repos":%s}' "$total" "$repos_array")"
-        emit_structured "$(build_json_envelope "status" "$data_json")"
+        if jq -e 'any(.repos[]; .status == "fetch_failed")' <<< "$data_json" >/dev/null; then
+            status_exit=1
+        fi
+        emit_structured "$(build_json_envelope "status" "$data_json" "{\"exit_code\":$status_exit}")"
     else
         # Human-readable output
         log_info "Repository Status ($total repos)"
@@ -8700,7 +8830,7 @@ cmd_status() {
             local status="missing" ahead=0 behind=0 dirty="false" mismatch="false" branch_name="" status_display
             if [[ -d "$local_path" ]] && is_git_repo "$local_path"; then
                 local status_info
-                status_info=$(get_repo_status "$local_path" "$FETCH_REMOTES")
+                status_info=$(get_repo_status "$local_path" "$FETCH_REMOTES") || status_exit=1
                 status=$(echo "$status_info" | sed 's/.*STATUS=\([^ ]*\).*/\1/')
                 ahead=$(echo "$status_info" | sed 's/.*AHEAD=\([^ ]*\).*/\1/')
                 behind=$(echo "$status_info" | sed 's/.*BEHIND=\([^ ]*\).*/\1/')
@@ -8734,6 +8864,7 @@ cmd_status() {
         echo "" >&2
         log_info "Legend: * = uncommitted changes, mismatch = remote URL differs from config"
     fi
+    return "$status_exit"
 }
 
 cmd_init() {
@@ -18778,9 +18909,7 @@ resolve_review_apply_run_id() {
         [[ -d "$dir" ]] || continue
 
         local mtime
-        if stat --version 2>/dev/null | grep -q GNU; then
-            mtime=$(stat -c %Y "$dir" 2>/dev/null || echo 0)
-        else
+        if ! mtime=$(stat -c %Y "$dir" 2>/dev/null); then
             mtime=$(stat -f %m "$dir" 2>/dev/null || echo 0)
         fi
         [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
@@ -19560,6 +19689,10 @@ init_review_policies() {
 
 # Custom lint command (overrides auto-detection)
 # LINT_COMMAND=""
+
+# Refuse application when the corresponding runner is absent
+# REQUIRE_TESTS=false
+# REQUIRE_LINT=false
 EOF
 
     [[ "$quiet" != "quiet" ]] && log_info "Created policy directory with example: $policy_dir"
@@ -19610,7 +19743,7 @@ validate_policy_file() {
                     errors+=("Line $line_num: BASE_PRIORITY must be an integer: $value")
                 fi
                 ;;
-            REVIEW_ALLOW_PUSH|REVIEW_REQUIRE_APPROVAL)
+            REVIEW_ALLOW_PUSH|REVIEW_REQUIRE_APPROVAL|REQUIRE_TESTS|REQUIRE_LINT)
                 if [[ ! "$value" =~ ^(true|false)$ ]]; then
                     errors+=("Line $line_num: $key must be true or false: $value")
                 fi
@@ -19675,6 +19808,8 @@ load_policy_for_repo() {
     local skip_patterns=""
     local test_command=""
     local lint_command=""
+    local require_tests="false"
+    local require_lint="false"
     local policies_loaded=()
 
     # Helper to load a policy file
@@ -19708,6 +19843,8 @@ load_policy_for_repo() {
                 SKIP_PATTERNS) skip_patterns="$value" ;;
                 TEST_COMMAND) test_command="$value" ;;
                 LINT_COMMAND) lint_command="$value" ;;
+                REQUIRE_TESTS) require_tests="$value" ;;
+                REQUIRE_LINT) require_lint="$value" ;;
             esac
         done < "$file"
     }
@@ -19752,8 +19889,11 @@ load_policy_for_repo() {
         --arg skip_patterns "$skip_patterns" \
         --arg test_cmd "$test_command" \
         --arg lint_cmd "$lint_command" \
+        --arg require_tests "$require_tests" \
+        --arg require_lint "$require_lint" \
         --arg policies_loaded "$(IFS=,; echo "${policies_loaded[*]}")" \
-        '{
+        'if (($require_tests == "true" or $require_tests == "false") and
+             ($require_lint == "true" or $require_lint == "false")) then {
             base_priority: ($base_priority | tonumber),
             label_priority_boost: $label_boost,
             allow_push: ($allow_push == "true"),
@@ -19762,8 +19902,10 @@ load_policy_for_repo() {
             skip_patterns: $skip_patterns,
             test_command: $test_cmd,
             lint_command: $lint_cmd,
+            require_tests: ($require_tests == "true"),
+            require_lint: ($require_lint == "true"),
             policies_loaded: ($policies_loaded | split(",") | map(select(. != "")))
-        }'
+        } else error("REQUIRE_TESTS and REQUIRE_LINT must be true or false") end'
 }
 
 #------------------------------------------------------------------------------
@@ -20568,13 +20710,19 @@ cmd_fork_clean() {
 
         local ahead
         ahead=$(git -C "$local_path" rev-list --count "${upstream_remote}/${up_branch}..${up_branch}" 2>/dev/null || echo "?")
+        local before_sha
+        if ! before_sha=$(git -C "$local_path" rev-parse "$up_branch"); then
+            failed=$((failed + 1))
+            write_result "$repo_id" "fork-clean" "failed" "0" "cannot inspect original branch" "$local_path"
+            continue
+        fi
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            local action_desc="ff-only reset"
+            local action_desc="fast-forward while preserving local commits"
             [[ "$do_reset" == "true" ]] && action_desc="hard reset"
             log_step "[dry-run] Would clean $repo_id ($up_branch): $ahead local commit(s), $action_desc to ${upstream_remote}/${up_branch}"
             [[ "$no_rescue" != "true" ]] && log_step "[dry-run] Would create rescue branch for $repo_id"
-            write_result "$repo_id" "fork-clean" "dry-run" "0" "would clean $ahead commit(s)" "$local_path"
+            write_result "$repo_id" "fork-clean" "dry-run" "0" "$ahead local commit(s); $action_desc" "$local_path"
             continue
         fi
 
@@ -20624,21 +20772,39 @@ cmd_fork_clean() {
         fi
 
         if [[ "$clean_ok" == "true" ]]; then
-            log_success "$repo_id: cleaned $up_branch ($ahead local commit(s) removed)"
-            cleaned=$((cleaned + 1))
-            write_result "$repo_id" "fork-clean" "cleaned" "0" "removed $ahead local commit(s)" "$local_path"
+            local after_sha removed retained
+            if ! after_sha=$(git -C "$local_path" rev-parse "$up_branch") ||
+               ! removed=$(git -C "$local_path" rev-list --count "$after_sha..$before_sha") ||
+               ! retained=$(git -C "$local_path" rev-list --count "${upstream_remote}/${up_branch}..$after_sha"); then
+                failed=$((failed + 1))
+                write_result "$repo_id" "fork-clean" "failed" "0" "cannot verify resulting branch" "$local_path"
+                continue
+            fi
 
             if [[ "$do_push" == "true" ]]; then
-                if git -C "$local_path" push origin "$up_branch" --force-with-lease --quiet 2>/dev/null; then
-                    log_verbose "Pushed $repo_id to origin/$up_branch"
-                else
+                local -a push_options=()
+                [[ "$do_reset" == "true" ]] && push_options+=(--force-with-lease)
+                if ! git -C "$local_path" push origin "$up_branch" ${push_options[@]+"${push_options[@]}"} --quiet; then
                     log_warn "Failed to push $repo_id to origin"
+                    failed=$((failed + 1))
+                    write_result "$repo_id" "fork-clean" "failed" "0" "local operation completed; push failed" "$local_path"
+                    continue
                 fi
+                log_verbose "Pushed $repo_id to origin/$up_branch"
+            fi
+            if [[ "$after_sha" == "$before_sha" ]]; then
+                log_info "$repo_id: preserved $retained local commit(s); $up_branch unchanged"
+                skipped=$((skipped + 1))
+                write_result "$repo_id" "fork-clean" "preserved" "0" "removed $removed local commit(s); preserved $retained; branch unchanged" "$local_path"
+            else
+                log_success "$repo_id: cleaned $up_branch (removed $removed local commit(s); preserved $retained)"
+                cleaned=$((cleaned + 1))
+                write_result "$repo_id" "fork-clean" "cleaned" "0" "removed $removed local commit(s); preserved $retained" "$local_path"
             fi
         else
-            log_error "Failed to clean $repo_id"
+            log_error "Failed to clean $repo_id; local commits preserved"
             failed=$((failed + 1))
-            write_result "$repo_id" "fork-clean" "failed" "0" "reset failed" "$local_path"
+            write_result "$repo_id" "fork-clean" "failed" "0" "branch operation failed; local commits preserved" "$local_path"
         fi
     done
 
@@ -21018,64 +21184,6 @@ cmd_commit_sweep() {
 #==============================================================================
 
 #------------------------------------------------------------------------------
-# detect_test_command: Auto-detect the test command for a project
-#
-# Args:
-#   $1 - Project directory path
-#
-# Returns:
-#   0 if command detected, 1 if no test framework found
-#
-# Outputs:
-#   Test command to stdout
-#------------------------------------------------------------------------------
-detect_test_command() {
-    local project_dir="$1"
-
-    # Check Makefile for test target
-    if [[ -f "$project_dir/Makefile" ]] && grep -q "^test:" "$project_dir/Makefile" 2>/dev/null; then
-        echo "make test"
-        return 0
-    fi
-
-    # Check for package.json (npm/node)
-    if [[ -f "$project_dir/package.json" ]]; then
-        if jq -e '.scripts.test' "$project_dir/package.json" >/dev/null 2>&1; then
-            echo "npm test"
-            return 0
-        fi
-    fi
-
-    # Check for Cargo.toml (Rust)
-    if [[ -f "$project_dir/Cargo.toml" ]]; then
-        echo "cargo test"
-        return 0
-    fi
-
-    # Check for Python projects
-    if [[ -f "$project_dir/pyproject.toml" ]] || [[ -f "$project_dir/setup.py" ]]; then
-        if [[ -d "$project_dir/tests" ]] || [[ -d "$project_dir/test" ]]; then
-            echo "pytest"
-            return 0
-        fi
-    fi
-
-    # Check for Go projects
-    if [[ -f "$project_dir/go.mod" ]]; then
-        echo "go test ./..."
-        return 0
-    fi
-
-    # Check for shell test scripts
-    if [[ -x "$project_dir/scripts/run_all_tests.sh" ]]; then
-        echo "./scripts/run_all_tests.sh"
-        return 0
-    fi
-
-    return 1
-}
-
-#------------------------------------------------------------------------------
 # detect_lint_command: Auto-detect the lint command for a project
 #
 # Args:
@@ -21137,7 +21245,7 @@ detect_lint_command() {
 #   $3 - Optional: Timeout in seconds (default: 300)
 #
 # Returns:
-#   0 on success, 1 on failure, 2 if no tests found
+#   Actual command exit status, or 2 with ran=false if no tests found
 #
 # Outputs:
 #   JSON result object to stdout
@@ -21222,7 +21330,7 @@ run_test_gate() {
 #   $2 - Optional: Lint command override
 #
 # Returns:
-#   0 on success, 1 on failure, 2 if no linter found
+#   Actual command exit status, or 2 with ran=false if no linter found
 #
 # Outputs:
 #   JSON result object to stdout
@@ -21468,7 +21576,12 @@ run_quality_gates() {
 
     # Load policy for this repo
     local policy_json
-    policy_json=$(load_policy_for_repo "$repo_id")
+    if ! policy_json=$(load_policy_for_repo "$repo_id") ||
+       ! jq -e -s 'length == 1 and (.[0] | type == "object")' <<< "$policy_json" >/dev/null; then
+        log_error "Cannot load quality-gate policy"
+        printf '{"overall_ok":false,"has_warning":false,"error":"invalid_policy","tests":null,"lint":null,"secrets":null}\n'
+        return 1
+    fi
 
     local test_cmd lint_cmd
     test_cmd=$(echo "$policy_json" | jq -r '.test_command // ""')
@@ -21480,11 +21593,24 @@ run_quality_gates() {
     lint_result=$(run_lint_gate "$wt_path" "$lint_cmd")
     local lint_exit=$?
 
-    if [[ $lint_exit -eq 1 ]]; then
+    if ! jq -e -s 'length == 1 and (.[0] |
+        type == "object" and
+        ((.ran == true and (.ok | type == "boolean") and
+          (.exit_code | type == "number" and floor == . and . >= 0 and . <= 255)) or
+         (.ran == false and .ok == null and .reason == "no_linter_found")))' <<< "$lint_result" >/dev/null; then
+        lint_result=$(jq -n --argjson exit_code "$lint_exit" '{ran:false,ok:false,reason:"invalid_gate_result",exit_code:$exit_code}')
+        overall_ok=false
+        log_error "Lint gate returned an invalid result"
+    elif [[ $lint_exit -eq 2 ]] && jq -e '.ran == false' <<< "$lint_result" >/dev/null; then
+        if jq -e '.require_lint == true' <<< "$policy_json" >/dev/null; then
+            overall_ok=false
+            log_error "Required linter is not configured"
+        else
+            log_verbose "No optional linter configured"
+        fi
+    elif [[ $lint_exit -ne 0 ]] || ! jq -e '.ran == true and .ok == true and .exit_code == 0' <<< "$lint_result" >/dev/null; then
         overall_ok=false
         log_error "Lint gate failed"
-    elif [[ $lint_exit -eq 2 ]]; then
-        log_verbose "No linter configured"
     else
         log_info "Lint gate passed"
     fi
@@ -21494,11 +21620,24 @@ run_quality_gates() {
     test_result=$(run_test_gate "$wt_path" "$test_cmd")
     local test_exit=$?
 
-    if [[ $test_exit -eq 1 ]]; then
+    if ! jq -e -s 'length == 1 and (.[0] |
+        type == "object" and
+        ((.ran == true and (.ok | type == "boolean") and
+          (.exit_code | type == "number" and floor == . and . >= 0 and . <= 255)) or
+         (.ran == false and .ok == null and .reason == "no_tests_found")))' <<< "$test_result" >/dev/null; then
+        test_result=$(jq -n --argjson exit_code "$test_exit" '{ran:false,ok:false,reason:"invalid_gate_result",exit_code:$exit_code}')
+        overall_ok=false
+        log_error "Test gate returned an invalid result"
+    elif [[ $test_exit -eq 2 ]] && jq -e '.ran == false' <<< "$test_result" >/dev/null; then
+        if jq -e '.require_tests == true' <<< "$policy_json" >/dev/null; then
+            overall_ok=false
+            log_error "Required tests are not configured"
+        else
+            log_verbose "No optional tests configured"
+        fi
+    elif [[ $test_exit -ne 0 ]] || ! jq -e '.ran == true and .ok == true and .exit_code == 0' <<< "$test_result" >/dev/null; then
         overall_ok=false
         log_error "Test gate failed"
-    elif [[ $test_exit -eq 2 ]]; then
-        log_verbose "No tests configured"
     else
         log_info "Test gate passed"
     fi
@@ -21508,12 +21647,18 @@ run_quality_gates() {
     secret_result=$(run_secret_scan "$wt_path")
     local secret_exit=$?
 
-    if [[ $secret_exit -eq 1 ]]; then
+    if ! jq -e -s 'length == 1 and (.[0] | type == "object" and .ran == true and
+        (.ok | type == "boolean") and (.warning | type == "boolean") and
+        (.findings | type == "array"))' <<< "$secret_result" >/dev/null; then
+        secret_result=$(jq -n --argjson exit_code "$secret_exit" '{ran:false,ok:false,warning:false,reason:"invalid_gate_result",exit_code:$exit_code,findings:[]}')
         overall_ok=false
-        log_error "Secret scan failed - secrets detected"
-    elif [[ $secret_exit -eq 2 ]]; then
+        log_error "Secret scan returned an invalid result"
+    elif [[ $secret_exit -eq 2 ]] && jq -e '.warning == true' <<< "$secret_result" >/dev/null; then
         has_warning=true
         log_warn "Secret scan warning - potential secrets detected"
+    elif [[ $secret_exit -ne 0 ]] || ! jq -e '.ok == true and .warning == false' <<< "$secret_result" >/dev/null; then
+        overall_ok=false
+        log_error "Secret scan failed - secrets detected"
     else
         log_info "Secret scan passed"
     fi

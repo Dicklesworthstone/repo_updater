@@ -178,6 +178,40 @@ test_log_test_lifecycle() {
 # Run Tests
 #==============================================================================
 
+test_master_runner_retains_multiline_failures() {
+    local fixture
+    fixture=$(create_temp_dir)
+    mkdir -p "$fixture/scripts"
+    cp "$SCRIPT_DIR/run_all_tests.sh" "$fixture/scripts/run_all_tests.sh"
+    cat > "$fixture/scripts/test_failure.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '\nfirst diagnostic\nExpected: original|value\nActual: wrong value\n' >&2
+exit 42
+EOF
+    cat > "$fixture/scripts/test_success.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'positive fixture executed\n'
+exit 0
+EOF
+    chmod +x "$fixture/scripts/test_failure.sh" "$fixture/scripts/test_success.sh"
+    local mode rc output logs
+    for mode in sequential parallel tap; do
+        local -a options=()
+        [[ "$mode" == parallel ]] && options=(-j 2)
+        [[ "$mode" == tap ]] && options=(--tap)
+        rc=0
+        output=$(bash "$fixture/scripts/run_all_tests.sh" ${options[@]+"${options[@]}"} 2>&1) || rc=$?
+        assert_equals 1 "$rc" "$mode runner rejects a failed test file"
+        assert_contains "$output" 'exit code 42' "$mode runner retains actual failure code"
+        assert_contains "$output" 'Expected: original|value' "$mode runner keeps second diagnostic and pipe characters"
+        assert_contains "$output" 'Actual: wrong value' "$mode runner keeps multiline failure detail"
+        logs=$(printf '%s\n' "$output" | sed -n 's/^Full test logs: //p')
+        assert_dir_exists "$logs" "$mode full logs are retained"
+        assert_file_contains "$logs/output_1.log" 'first diagnostic' "$mode full diagnostic is retained"
+        assert_file_contains "$logs/output_2.log" 'positive fixture executed' "$mode passing test really executes"
+    done
+}
+
 echo "============================================"
 echo "Test Framework Self-Test"
 echo "============================================"
@@ -204,6 +238,7 @@ run_test test_bare_repo_creation
 run_test test_create_test_env
 run_test test_structured_logging
 run_test test_log_test_lifecycle
+run_test test_master_runner_retains_multiline_failures
 
 print_results
 exit "$(get_exit_code)"

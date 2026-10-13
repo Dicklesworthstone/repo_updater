@@ -320,13 +320,9 @@ test_incremental_sync_with_existing() {
     bare_commits=$(git -C "${REMOTE_REGISTRY[testowner/inc-repo]}" rev-list --count HEAD 2>/dev/null)
     assert_equals "3" "$bare_commits" "Remote has 3 commits after add"
 
-    # Second sync - test that we can manually pull
-    # Note: ru sync detects "remote mismatch" because git remote get-url returns
-    # the insteadOf-rewritten URL. This is a mock limitation, not a ru bug.
-    # We verify the git operations work directly.
-    local pull_result=0
-    git -C "$E2E_TEMP_DIR/projects/inc-repo" pull --ff-only 2>/dev/null || pull_result=$?
-    assert_equals "0" "$pull_result" "Manual git pull succeeds"
+    # Exercise the actual CLI with a configured Git transport rewrite.
+    run_ru_sync
+    assert_equals "0" "$RU_EXIT_CODE" "Incremental CLI sync succeeds with insteadOf transport"
 
     local final_commits
     final_commits=$(git -C "$E2E_TEMP_DIR/projects/inc-repo" rev-list --count HEAD 2>/dev/null)
@@ -545,8 +541,7 @@ test_sync_clone_with_branch() {
 
     # Configure ru with branch specification
     "$RU_SCRIPT" init >/dev/null 2>&1
-    # Add repo with branch spec (owner/repo@branch format if supported, or we test manual checkout)
-    "$RU_SCRIPT" add testowner/branch-repo >/dev/null 2>&1
+    "$RU_SCRIPT" add testowner/branch-repo@feature-branch >/dev/null 2>&1
     sync_test_finalize_mock
 
     # First sync to clone
@@ -555,16 +550,50 @@ test_sync_clone_with_branch() {
     assert_equals "0" "$RU_EXIT_CODE" "Clone succeeds"
     assert_true "test -d '$E2E_TEMP_DIR/projects/branch-repo'" "Repo cloned"
 
-    # Verify the repo can checkout the feature branch
-    local checkout_result=0
-    git -C "$E2E_TEMP_DIR/projects/branch-repo" fetch -q origin feature-branch 2>/dev/null
-    git -C "$E2E_TEMP_DIR/projects/branch-repo" checkout -q feature-branch 2>/dev/null || checkout_result=$?
-
-    assert_equals "0" "$checkout_result" "Can checkout feature branch"
+    assert_equals feature-branch "$(git -C "$E2E_TEMP_DIR/projects/branch-repo" symbolic-ref --short HEAD)" "CLI actually checks out the requested branch"
     assert_true "test -f '$E2E_TEMP_DIR/projects/branch-repo/feature.txt'" "Feature branch file exists"
 
     e2e_cleanup
     log_test_pass "$test_name"
+}
+
+test_sync_missing_ref_preserves_clone_and_checkpoint() {
+    sync_test_setup
+    create_test_remote pins missing-ref 1
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add pins/missing-ref@does-not-exist >/dev/null 2>&1
+    sync_test_finalize_mock
+    run_ru_sync --json
+    assert_equals 1 "$RU_EXIT_CODE" "Missing requested ref makes sync fail"
+    assert_equals 1 "$(jq -r '.data.summary.failed' <<< "$RU_STDOUT")" "Missing pin is counted as failed"
+    assert_equals failed "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Incomplete clone is never successful"
+    assert_true "git -C '$E2E_TEMP_DIR/projects/missing-ref' rev-parse HEAD >/dev/null" "Incomplete clone is preserved"
+    assert_file_exists "$XDG_STATE_HOME/ru/sync_state.json" "Incomplete sync retains recovery state"
+    assert_contains "$(cat "$XDG_STATE_HOME/ru/sync_state.json")" missing-ref "Failed repository remains in checkpoint"
+    run_ru_sync --resume --json
+    assert_equals 2 "$RU_EXIT_CODE" "Resume reports the unresolved branch conflict"
+    assert_file_exists "$XDG_STATE_HOME/ru/sync_state.json" "Refused resume retains recovery state"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
+test_sync_pinned_tag_is_stable() {
+    sync_test_setup
+    create_test_remote pins tag-repo 2
+    local remote="${REMOTE_REGISTRY[pins/tag-repo]}" tag_sha
+    tag_sha=$(git -C "$remote" rev-parse HEAD^)
+    git -C "$remote" tag pinned-version "$tag_sha"
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add pins/tag-repo@pinned-version >/dev/null 2>&1
+    sync_test_finalize_mock
+    run_ru_sync
+    assert_equals 0 "$RU_EXIT_CODE" "Valid pinned tag clones successfully"
+    assert_equals "$tag_sha" "$(git -C "$E2E_TEMP_DIR/projects/tag-repo" rev-parse HEAD)" "Tag pin selects the exact commit"
+    run_ru_sync
+    assert_equals 0 "$RU_EXIT_CODE" "Repeated tag sync succeeds without pulling detached HEAD"
+    assert_equals "$tag_sha" "$(git -C "$E2E_TEMP_DIR/projects/tag-repo" rev-parse HEAD)" "Tag pin remains stable"
+    e2e_preserve_on_failure
+    e2e_cleanup
 }
 
 #==============================================================================
@@ -716,6 +745,10 @@ test_sync_clone_parallel() {
     assert_true "test -d '$E2E_TEMP_DIR/projects/repo-c'" "Repo C cloned"
     assert_true "test -d '$E2E_TEMP_DIR/projects/repo-d'" "Repo D cloned"
 
+    if [[ "$RU_EXIT_CODE" -ne 0 ]]; then
+        printf 'Parallel sync stdout:\n%s\nParallel sync stderr:\n%s\n' "$RU_STDOUT" "$RU_STDERR"
+        e2e_preserve_on_failure
+    fi
     e2e_cleanup
     log_test_pass "$test_name"
 }
@@ -735,6 +768,8 @@ run_test test_sync_json_output
 
 # Clone Driver Tests (bd-mlgr)
 run_test test_sync_clone_with_branch
+run_test test_sync_missing_ref_preserves_clone_and_checkpoint
+run_test test_sync_pinned_tag_is_stable
 run_test test_sync_clone_failure
 run_test test_sync_clone_timeout_handling
 run_test test_sync_clone_dry_run_paths

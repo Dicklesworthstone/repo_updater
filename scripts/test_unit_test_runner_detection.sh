@@ -35,28 +35,8 @@ log_debug() { :; }
 log_success() { :; }
 log_warn() { :; }
 
-# Extract functions using awk with brace counting
-extract_function() {
-    local func_name="$1"
-    local file="$2"
-    awk -v fn="$func_name" '
-        $0 ~ "^"fn"\\(\\)" {
-            printing=1
-            depth=0
-        }
-        printing {
-            print
-            for(i=1; i<=length($0); i++) {
-                c = substr($0, i, 1)
-                if(c == "{") depth++
-                if(c == "}") depth--
-            }
-            if(depth == 0 && /}/) exit
-        }
-    ' "$file"
-}
-
-source <(extract_function "detect_test_command" "$PROJECT_DIR/ru")
+# Load every definition, in runtime order, rather than stopping at the first.
+source_ru_function "detect_test_command"
 
 #==============================================================================
 # Test Setup/Teardown

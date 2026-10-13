@@ -163,14 +163,15 @@ discover_tests() {
 
 run_single_test() {
     local test_file="$1"
+    local output_file="$2"
     local test_name
     test_name=$(basename "$test_file" .sh)
 
     local start_time end_time duration
     start_time=$(date +%s)
 
-    local output exit_code
-    if output=$("$test_file" 2>&1); then
+    local exit_code
+    if "$test_file" > "$output_file" 2>&1; then
         exit_code=0
     else
         exit_code=$?
@@ -179,8 +180,8 @@ run_single_test() {
     end_time=$(date +%s)
     duration=$((end_time - start_time))
 
-    # Return result as: exit_code|duration|test_name|output
-    printf '%d|%d|%s|%s' "$exit_code" "$duration" "$test_name" "$output"
+    # Keep multiline diagnostics out of the metadata protocol.
+    printf '%d|%d|%s\n' "$exit_code" "$duration" "$test_name"
 }
 
 #==============================================================================
@@ -204,27 +205,29 @@ print_test_result() {
     local exit_code="$2"
     local duration="$3"
     local test_name="$4"
-    local output="$5"
+    local output_file="$5"
 
     if [[ "$TAP_MODE" == "true" ]]; then
         if [[ "$exit_code" -eq 0 ]]; then
             echo "ok $test_num - $test_name (${duration}s)"
         else
-            echo "not ok $test_num - $test_name (${duration}s)"
+            echo "not ok $test_num - $test_name (${duration}s, exit code $exit_code)"
             # Print output as TAP diagnostics (indent with #)
-            printf '%s\n' "$output" | head -20 | while IFS= read -r line; do
+            tail -80 "$output_file" | while IFS= read -r line; do
                 echo "# $line"
             done
+            echo "# Full output: $output_file"
         fi
     else
         if [[ "$exit_code" -eq 0 ]]; then
             printf "  ${GREEN}PASS${RESET} %s (%ds)\n" "$test_name" "$duration"
         else
             printf "  ${RED}FAIL${RESET} %s (%ds, exit code %d)\n" "$test_name" "$duration" "$exit_code"
-            # Show first few lines of output for failures
-            printf '%s\n' "$output" | head -10 | while IFS= read -r line; do
+            # The final assertions and summary are usually at the end.
+            tail -80 "$output_file" | while IFS= read -r line; do
                 echo "    $line"
             done
+            echo "    Full output: $output_file"
             echo ""
         fi
     fi
@@ -304,12 +307,13 @@ main() {
     local total_start_time
     total_start_time=$(date +%s)
     local test_num=0
+    local tmpdir
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ru-test-results.XXXXXXXX") || exit 1
+    echo "Full test logs: $tmpdir" >&2
 
     if [[ "$PARALLEL_MODE" == "true" ]]; then
         # Parallel execution with job limiting and proper cleanup
         local pids=()
-        local tmpdir
-        tmpdir=$(mktemp -d)
         local running_jobs=0
         local max_jobs="${MAX_JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
@@ -322,7 +326,7 @@ main() {
             for pid in "${pids[@]}"; do
                 kill "$pid" 2>/dev/null || true
             done
-            rm -rf "$tmpdir"
+            echo "Test logs retained: $tmpdir" >&2
             exit 130
         }
         trap cleanup_parallel INT TERM
@@ -350,7 +354,7 @@ main() {
             done
 
             (
-                run_single_test "$test_file" > "$result_file"
+                run_single_test "$test_file" "$tmpdir/output_$test_num.log" > "$result_file"
             ) &
             pids+=($!)
             ((running_jobs++))
@@ -372,8 +376,8 @@ main() {
             if [[ -f "$result_file" ]]; then
                 local result
                 result=$(cat "$result_file")
-                IFS='|' read -r exit_code duration test_name output <<< "$result"
-                print_test_result "$test_num" "$exit_code" "$duration" "$test_name" "$output"
+                IFS='|' read -r exit_code duration test_name <<< "$result"
+                print_test_result "$test_num" "$exit_code" "$duration" "$test_name" "$tmpdir/output_$test_num.log"
                 if [[ "$exit_code" -eq 0 ]]; then
                     ((total_passed++))
                 else
@@ -383,20 +387,20 @@ main() {
                 # Result file missing - report as failure
                 local test_name
                 test_name=$(basename "$test_file" .sh)
-                print_test_result "$test_num" "1" "0" "$test_name" "No result file (test may have crashed)"
+                printf 'No result file (test may have crashed)\n' >> "$tmpdir/output_$test_num.log"
+                print_test_result "$test_num" "1" "0" "$test_name" "$tmpdir/output_$test_num.log"
                 ((total_failed++))
             fi
         done
 
-        rm -rf "$tmpdir"
     else
         # Sequential execution
         for test_file in "${tests[@]}"; do
             ((test_num++))
             local result
-            result=$(run_single_test "$test_file")
-            IFS='|' read -r exit_code duration test_name output <<< "$result"
-            print_test_result "$test_num" "$exit_code" "$duration" "$test_name" "$output"
+            result=$(run_single_test "$test_file" "$tmpdir/output_$test_num.log")
+            IFS='|' read -r exit_code duration test_name <<< "$result"
+            print_test_result "$test_num" "$exit_code" "$duration" "$test_name" "$tmpdir/output_$test_num.log"
             if [[ "$exit_code" -eq 0 ]]; then
                 ((total_passed++))
             else

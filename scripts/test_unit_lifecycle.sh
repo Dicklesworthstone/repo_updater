@@ -904,15 +904,15 @@ test_quality_gates_all_pass() {
         echo '{"test_command":"","lint_command":""}'
     }
     run_lint_gate() {
-        echo '{"ran":true,"ok":true,"output":"clean"}'
+        echo '{"ran":true,"ok":true,"exit_code":0,"output":"clean"}'
         return 0
     }
     run_test_gate() {
-        echo '{"ran":true,"ok":true,"output":"all passed"}'
+        echo '{"ran":true,"ok":true,"exit_code":0,"output":"all passed"}'
         return 0
     }
     run_secret_scan() {
-        echo '{"scanned":true,"ok":true,"findings":[]}'
+        echo '{"ran":true,"ok":true,"warning":false,"findings":[]}'
         return 0
     }
 
@@ -945,15 +945,15 @@ test_quality_gates_lint_failure() {
         echo '{"test_command":"","lint_command":"eslint ."}'
     }
     run_lint_gate() {
-        echo '{"ran":true,"ok":false,"output":"2 errors"}'
+        echo '{"ran":true,"ok":false,"exit_code":1,"output":"2 errors"}'
         return 1
     }
     run_test_gate() {
-        echo '{"ran":true,"ok":true,"output":"ok"}'
+        echo '{"ran":true,"ok":true,"exit_code":0,"output":"ok"}'
         return 0
     }
     run_secret_scan() {
-        echo '{"scanned":true,"ok":true,"findings":[]}'
+        echo '{"ran":true,"ok":true,"warning":false,"findings":[]}'
         return 0
     }
 
@@ -986,15 +986,15 @@ test_quality_gates_secret_warning() {
         echo '{"test_command":"","lint_command":""}'
     }
     run_lint_gate() {
-        echo '{"ran":false,"ok":true,"output":""}'
+        echo '{"ran":false,"ok":null,"reason":"no_linter_found"}'
         return 2
     }
     run_test_gate() {
-        echo '{"ran":false,"ok":true,"output":""}'
+        echo '{"ran":false,"ok":null,"reason":"no_tests_found"}'
         return 2
     }
     run_secret_scan() {
-        echo '{"scanned":true,"ok":false,"findings":["possible_key"]}'
+        echo '{"ran":true,"ok":false,"warning":true,"findings":["possible_key"]}'
         return 2
     }
 

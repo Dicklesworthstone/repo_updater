@@ -325,6 +325,28 @@ test_status_no_fetch_uses_cache() {
     e2e_cleanup
 }
 
+test_status_requested_fetch_failure_is_visible() {
+    setup_status_env
+    local remote repo output rc=0 before
+    remote=$(create_remote_repo fetch-error)
+    repo=$(clone_to_projects "$remote" fetch-error)
+    git -C "$repo" remote set-url origin "$E2E_TEMP_DIR/missing-remote.git"
+    before=$(git -C "$repo" rev-parse HEAD)
+    init_test_config
+    add_repo_to_config fetch-error
+    output=$("$E2E_RU_SCRIPT" status --fetch --json --non-interactive 2> "$E2E_LOG_DIR/fetch-failure.stderr") || rc=$?
+    assert_equals 1 "$rc" "Failed requested fetch makes status fail"
+    assert_equals fetch_failed "$(jq -r '.data.repos[0].status' <<< "$output")" "Failure is typed in JSON"
+    assert_equals failed "$(jq -r '.data.repos[0].freshness' <<< "$output")" "Cached refs are not certified as fresh"
+    assert_equals "$before" "$(git -C "$repo" rev-parse HEAD)" "Status failure preserves HEAD"
+    rc=0
+    output=$("$E2E_RU_SCRIPT" status --no-fetch --json --non-interactive 2> "$E2E_LOG_DIR/cached-status.stderr") || rc=$?
+    assert_equals 0 "$rc" "Explicit cached status succeeds without fetching"
+    assert_equals cached "$(jq -r '.data.repos[0].freshness' <<< "$output")" "No-fetch data is labeled cached"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 test_status_fetch_updates_refs() {
     setup_status_env
 
@@ -484,6 +506,7 @@ run_test test_status_shows_diverged
 run_test test_status_shows_dirty
 run_test test_status_multiple_repos
 run_test test_status_no_fetch_uses_cache
+run_test test_status_requested_fetch_failure_is_visible
 run_test test_status_fetch_updates_refs
 run_test test_status_shows_missing
 run_test test_status_json_output

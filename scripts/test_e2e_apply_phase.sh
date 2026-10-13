@@ -40,6 +40,9 @@ source_ru_function "parse_gh_action_target"
 source_ru_function "record_gh_action_log"
 source_ru_function "gh_action_already_executed"
 source_ru_function "load_policy_for_repo"
+source_ru_function "get_review_policy_dir"
+source_ru_function "detect_test_command"
+source_ru_function "detect_lint_command"
 source_ru_function "run_lint_gate"
 source_ru_function "run_test_gate"
 source_ru_function "run_secret_scan"
@@ -151,30 +154,82 @@ test_apply_with_quality_failure() {
 }
 PLAN_JSON
 
-    # Create a file that would fail secret scan (contains API key pattern)
-    mkdir -p "$wt_path/src"
-    echo 'API_KEY="sk_test_1234567890abcdef"' > "$wt_path/src/config.js"
+    # Execute a real test command with a nonstandard failure code.
+    mkdir -p "$RU_CONFIG_DIR/review-policies.d"
+    printf 'TEST_COMMAND=exit 42\nLINT_COMMAND=exit 0\n' > "$RU_CONFIG_DIR/review-policies.d/owner_test-repo"
 
-    # Run quality gates (may or may not detect depending on implementation)
     local exit_code=0
     local gates_result
-    gates_result=$(run_quality_gates "$wt_path" "$plan_file" 2>/dev/null) || exit_code=$?
-
-    # The test verifies the gate runs - actual detection depends on secret scanner config
-    if [[ -n "$gates_result" ]]; then
-        local overall_ok
-        overall_ok=$(echo "$gates_result" | jq -r '.overall_ok // true')
-        if [[ "$overall_ok" == "false" ]]; then
-            pass "Quality gates detected failure (secrets or other)"
-        else
-            pass "Quality gates ran (no scanner configured or no findings)"
-        fi
-    else
-        pass "Quality gates executed (minimal output)"
-    fi
+    gates_result=$(run_quality_gates "$wt_path" "$plan_file") || exit_code=$?
+    assert_equals 1 "$exit_code" "Failed executed test blocks the combined gate"
+    assert_equals false "$(jq -r '.overall_ok' <<< "$gates_result")" "Failure cannot claim overall success"
+    assert_equals 42 "$(jq -r '.tests.exit_code' <<< "$gates_result")" "Real execution exit is retained"
 
     e2e_cleanup
     log_test_pass "e2e: quality gate failure blocks apply"
+}
+
+test_cli_apply_failed_gates_prevent_mutations() {
+    e2e_setup
+    export RU_STATE_DIR="$E2E_TEMP_DIR/state"
+    local wt_path="$E2E_TEMP_DIR/worktree"
+    local plan_file="$wt_path/.ru/review-plan.json"
+    local mapping_dir="$RU_STATE_DIR/worktrees/gate-test"
+    local gh_calls="$E2E_TEMP_DIR/gh-calls"
+    local gate code rc before after
+    mkdir -p "$wt_path/.ru" "$mapping_dir" "$RU_CONFIG_DIR/review-policies.d"
+    git -C "$wt_path" init -q
+    git -C "$wt_path" -c user.name=Gate -c user.email=gate@example.invalid commit -q --allow-empty -m Initial
+    before=$(git -C "$wt_path" rev-parse HEAD)
+    jq -n --arg path "$wt_path" '{"owner/test-repo":{worktree_path:$path}}' > "$mapping_dir/mapping.json"
+    e2e_create_mock_gh_custom "
+case \"\$*\" in
+    *'api '*|*'issue '*|*'pr '*) printf '%s\\n' \"\$*\" >> '$gh_calls' ;;
+esac
+exit 0
+"
+    for gate in TEST LINT; do
+        for code in 1 2 42 124 127; do
+            jq -n --arg sha "$before" '{schema_version:"1",repo:"owner/test-repo",items:[],git:{commits:[{sha:$sha,message:"candidate"}]},gh_actions:[{op:"comment",target:"issue#42",body:"must not publish"}]}' > "$plan_file"
+            printf 'TEST_COMMAND=exit 0\nLINT_COMMAND=exit 0\nREVIEW_ALLOW_PUSH=true\n%s_COMMAND=exit %s\n' "$gate" "$code" > "$RU_CONFIG_DIR/review-policies.d/owner_test-repo"
+            rc=0
+            "$E2E_RU_SCRIPT" review --apply --push --non-interactive > "$E2E_LOG_DIR/apply-$gate-$code.stdout" 2> "$E2E_LOG_DIR/apply-$gate-$code.stderr" || rc=$?
+            e2e_log_command "ru review --apply --push --non-interactive ($gate exit $code)" "$rc" "$E2E_LOG_DIR/apply-$gate-$code.stdout" "$E2E_LOG_DIR/apply-$gate-$code.stderr"
+            assert_equals 2 "$rc" "Full CLI $gate exit $code blocks apply"
+            assert_equals false "$(jq -r '.git.quality_gates_ok' "$plan_file")" "Failure persisted in plan"
+            assert_file_not_exists "$gh_calls" "No GitHub mutation is attempted"
+            after=$(git -C "$wt_path" rev-parse HEAD)
+            assert_equals "$before" "$after" "Candidate HEAD is unchanged"
+        done
+    done
+    # A passing command reaches the existing action executor, proving reachability.
+    printf 'TEST_COMMAND=exit 0\nLINT_COMMAND=exit 0\n' > "$RU_CONFIG_DIR/review-policies.d/owner_test-repo"
+    printf '{"schema_version":"1","repo":"owner/test-repo","items":[],"git":{"commits":[]},"gh_actions":[{"op":"comment","target":"issue#42","body":"passing action"}]}\n' > "$plan_file"
+    rc=0
+    "$E2E_RU_SCRIPT" review --apply --non-interactive > "$E2E_LOG_DIR/apply-pass.stdout" 2> "$E2E_LOG_DIR/apply-pass.stderr" || rc=$?
+    assert_equals 0 "$rc" "Passing gates allow application"
+    assert_file_exists "$gh_calls" "Passing gates reach the controlled GitHub endpoint"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
+test_fully_loaded_runtime_detects_ruby_and_shell() {
+    e2e_setup
+    local ruby="$E2E_TEMP_DIR/ruby" shell="$E2E_TEMP_DIR/shell"
+    mkdir -p "$ruby" "$shell/scripts"
+    printf "gem 'rspec'\n" > "$ruby/Gemfile"
+    printf '#!/usr/bin/env bash\nprintf "real shell test executed\\n"\n' > "$shell/scripts/run_all_tests.sh"
+    chmod +x "$shell/scripts/run_all_tests.sh"
+    local result rc=0
+    # Source the complete entry point, including its normal robot-docs dispatch,
+    # then inspect the effective definitions left loaded by that invocation.
+    result=$(bash -c 'source "$1" robot-docs exit-codes > "$2"; detect_test_command "$3"' bash "$E2E_RU_SCRIPT" "$E2E_LOG_DIR/runtime-docs.json" "$ruby") || rc=$?
+    assert_equals 0 "$rc" "Full entry point loads successfully"
+    assert_equals 'bundle exec rspec' "$result" "Effective runtime retains Ruby detection"
+    result=$(bash -c 'source "$1" robot-docs exit-codes > "$2"; run_test_gate "$3" "" 10' bash "$E2E_RU_SCRIPT" "$E2E_LOG_DIR/runtime-docs.json" "$shell")
+    assert_equals true "$(jq -r '.ok' <<< "$result")" "Effective runtime executes detected shell tests"
+    assert_contains "$(jq -r '.output_summary' <<< "$result")" 'real shell test executed' "Execution output proves the shell runner ran"
+    e2e_cleanup
 }
 
 test_apply_dry_run() {
@@ -237,6 +292,8 @@ log_suite_start "E2E Tests: apply phase"
 
 run_test test_full_apply_cycle
 run_test test_apply_with_quality_failure
+run_test test_cli_apply_failed_gates_prevent_mutations
+run_test test_fully_loaded_runtime_detects_ruby_and_shell
 run_test test_apply_dry_run
 
 print_results

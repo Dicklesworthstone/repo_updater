@@ -129,7 +129,7 @@ EOF
     chmod +x "$E2E_MOCK_BIN/curl"
 }
 
-test_installer_falls_back_to_main_when_no_releases() {
+test_installer_requires_explicit_main_when_no_releases() {
     e2e_setup
 
     create_mock_curl_installer_no_releases
@@ -140,14 +140,114 @@ test_installer_falls_back_to_main_when_no_releases() {
     local output exit_code=0
     output=$(DEST="$install_dir" RU_CACHE_BUST=1 bash "$INSTALL_SCRIPT" </dev/null 2>&1) || exit_code=$?
 
-    assert_equals "0" "$exit_code" "install.sh exits 0 with no releases"
+    assert_equals "1" "$exit_code" "Missing release fails verified installation"
     assert_contains "$output" "No releases found" "installer reports missing releases"
-    if [[ -x "$install_dir/ru" ]]; then
-        pass "fallback installed ru is executable"
-    else
-        fail "fallback installed ru is executable"
-    fi
+    assert_contains "$output" "RU_UNSAFE_MAIN=1" "Unsafe opt-in is explained"
+    assert_file_not_exists "$install_dir/ru" "Default does not install mutable main"
 
+    exit_code=0
+    output=$(DEST="$install_dir" RU_UNSAFE_MAIN=1 RU_CACHE_BUST=1 bash "$INSTALL_SCRIPT" </dev/null 2>&1) || exit_code=$?
+    assert_equals "0" "$exit_code" "Explicit main opt-in remains available"
+    assert_contains "$output" "RU_UNSAFE_MAIN=1" "Unsafe source is visible"
+    assert_file_exists "$install_dir/ru" "Explicit unsafe installation succeeds"
+
+    e2e_cleanup
+}
+
+create_mock_curl_installer_release() {
+    export INSTALL_TEST_RU="$E2E_PROJECT_DIR/ru"
+    export INSTALL_TEST_SHA
+    INSTALL_TEST_SHA=$(sha256sum "$INSTALL_TEST_RU" | cut -d' ' -f1)
+    cat > "$E2E_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+dest="" url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) dest="$2"; shift 2 ;;
+        -w) shift 2 ;;
+        -*) shift ;;
+        *) url="${1%%\?*}"; shift ;;
+    esac
+done
+case "$url" in
+    */releases/latest)
+        printf 'https://github.com/Dicklesworthstone/repo_updater/releases/tag/v1.5.0'
+        ;;
+    */download/ru|*/download/v1.5.0/ru)
+        [[ "$INSTALL_TEST_MODE" == asset-error ]] && exit 22
+        if [[ "$INSTALL_TEST_MODE" == html ]]; then
+            printf '<html>bad download</html>\n' > "$dest"
+        else
+            cp "$INSTALL_TEST_RU" "$dest"
+        fi
+        ;;
+    */checksums.txt)
+        [[ "$INSTALL_TEST_MODE" == missing ]] && exit 22
+        case "$INSTALL_TEST_MODE" in
+            corrupt) printf '%064d  ru\n' 0 > "$dest" ;;
+            absent-entry) printf '%s  other-file\n' "$INSTALL_TEST_SHA" > "$dest" ;;
+            *) printf '%s  ru\n' "$INSTALL_TEST_SHA" > "$dest" ;;
+        esac
+        ;;
+    *) printf 'Unexpected installer request: %s\n' "$url" >&2; exit 22 ;;
+esac
+EOF
+    chmod +x "$E2E_MOCK_BIN/curl"
+}
+
+test_installer_release_integrity_matrix() {
+    e2e_setup
+    create_mock_curl_installer_release
+    local version mode output rc destination
+    for version in '' 1.5.0; do
+        for mode in valid missing corrupt absent-entry html asset-error; do
+            destination="$E2E_TEMP_DIR/install-${version:-latest}-$mode"
+            mkdir -p "$destination"
+            rc=0
+            output=$(DEST="$destination" RU_VERSION="$version" RU_UNSAFE_MAIN=0 INSTALL_TEST_MODE="$mode" bash "$INSTALL_SCRIPT" </dev/null 2>&1) || rc=$?
+            if [[ "$mode" == valid ]]; then
+                assert_equals 0 "$rc" "${version:-latest} verified installation succeeds"
+                assert_contains "$output" 'Checksum verified' "Verified success is explicit"
+                assert_success "Installed bytes exactly match manifest candidate" cmp -s "$INSTALL_TEST_RU" "$destination/ru"
+            else
+                assert_equals 1 "$rc" "${version:-latest} $mode refuses installation"
+                assert_file_not_exists "$destination/ru" "${version:-latest} $mode never publishes unchecked bytes"
+                assert_not_contains "$output" 'Installing from main branch' "Failure never selects main implicitly"
+            fi
+        done
+    done
+    unset INSTALL_TEST_RU INSTALL_TEST_SHA
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
+test_installer_checksum_tool_absence() {
+    e2e_setup
+    local output rc=0
+    # Load the actual verifier while fault-injecting only tool discovery.
+    output=$(
+        # shellcheck source=../install.sh
+        source <(sed -n '/^verify_checksum()/,/^}/p' "$INSTALL_SCRIPT")
+        command_exists() { return 1; }
+        log_error() { printf '%s\n' "$*" >&2; }
+        verify_checksum "$INSTALL_SCRIPT" "$(printf '%064d' 0)" 2>&1
+    ) || rc=$?
+    assert_equals 1 "$rc" "Missing SHA256 tools refuse verification"
+    assert_contains "$output" 'requires sha256sum or shasum' "Missing dependency is actionable"
+    e2e_cleanup
+}
+
+test_pipeline_env_reaches_installer() {
+    e2e_setup
+    create_mock_curl_installer_release
+    local destination="$E2E_TEMP_DIR/pipeline-bin" output rc=0
+    mkdir -p "$destination"
+    output=$(cat "$INSTALL_SCRIPT" | DEST="$destination" RU_VERSION=1.5.0 RU_UNSAFE_MAIN=0 RU_INSTALLER_NO_SELF_REFRESH=1 INSTALL_TEST_MODE=valid bash 2>&1) || rc=$?
+    assert_equals 0 "$rc" "Documented environment placement works through a pipe"
+    assert_contains "$output" 'Installing version: 1.5.0' "Requested version reaches bash"
+    assert_file_exists "$destination/ru" "Requested destination reaches bash"
+    unset INSTALL_TEST_RU INSTALL_TEST_SHA
     e2e_cleanup
 }
 
@@ -230,7 +330,10 @@ test_install_script_syntax() {
 #==============================================================================
 
 run_test test_install_to_custom_dir
-run_test test_installer_falls_back_to_main_when_no_releases
+run_test test_installer_requires_explicit_main_when_no_releases
+run_test test_installer_release_integrity_matrix
+run_test test_installer_checksum_tool_absence
+run_test test_pipeline_env_reaches_installer
 run_test test_version_output
 run_test test_help_output
 run_test test_init_command
@@ -238,3 +341,4 @@ run_test test_script_syntax
 run_test test_install_script_syntax
 
 print_results
+exit "$(get_exit_code)"
