@@ -241,6 +241,8 @@ INIT_EXAMPLE="false"
 GUM_AVAILABLE="false"
 
 # Network timeout configuration (abort if transfer rate drops below threshold)
+GIT_TIMEOUT_CLI=""
+GIT_TIMEOUT_ENV="${GIT_TIMEOUT:-}"
 GIT_TIMEOUT="${GIT_TIMEOUT:-30}"  # Seconds before aborting slow operations
 GIT_LOW_SPEED_LIMIT="${GIT_LOW_SPEED_LIMIT:-1000}"  # Bytes/second threshold
 
@@ -1405,16 +1407,399 @@ get_dirty_repos() {
 # Wrapper for spawning AI coding sessions via ntm (Named Tmux Manager)
 #------------------------------------------------------------------------------
 
-# Spawn an ntm session for AI-assisted operations on a repository.
-# Usage: spawn_ai_session <repo_path> <prompt_file> [timeout_seconds] [--agent=claude|codex|gemini]
-# Output: JSON status to stdout {"session":"name","status":"success|timeout|failed","duration_seconds":N}
-# Returns: 0 on success, 1 on timeout, 2 on failure
+# Retain the original index and raw working files before a provider starts.
+# The private index describes the original working version, including literal
+# untracked paths, deletions and modes. Partial staging is recovery evidence;
+# it does not require an extra commit of the staged intermediate version.
+capture_ai_requested_content() {
+    local repo_path="$1" before_head="$2" artifact_dir="$3"
+    local original_index path parent snapshot_tree metadata mode sha _old_mode _old_sha _change
+    local requests='[]' snapshot_index="$artifact_dir/requested.index"
+    local -A requested_seen=()
+    original_index=$(git -C "$repo_path" rev-parse --git-path index) || return 2
+    [[ "$original_index" == /* ]] || original_index="$repo_path/$original_index"
+    if [[ -f "$original_index" ]]; then
+        cp "$original_index" "$artifact_dir/before.index.raw" || return 2
+    fi
+    git -C "$repo_path" diff --cached --no-renames --name-only -z "$before_head" > "$artifact_dir/requested-paths" || return 2
+    git -C "$repo_path" diff --no-renames --name-only -z "$before_head" >> "$artifact_dir/requested-paths" || return 2
+    git -C "$repo_path" ls-files --others --exclude-standard -z >> "$artifact_dir/requested-paths" || return 2
+    GIT_INDEX_FILE="$snapshot_index" git -C "$repo_path" read-tree "$before_head" || return 2
+    mkdir -p "$artifact_dir/before-files" || return 2
+    while IFS= read -r -d '' path; do
+        # Cached and working diffs can name the same literal path. A repeated
+        # deletion no longer exists in the private index after its first add.
+        [[ ${requested_seen["$path"]:-false} != true ]] || continue
+        requested_seen["$path"]=true
+        if [[ -f "$repo_path/$path" || -L "$repo_path/$path" ]]; then
+            parent="${path%/*}"
+            [[ "$parent" == "$path" ]] || mkdir -p "$artifact_dir/before-files/$parent" || return 2
+            cp -pP -- "$repo_path/$path" "$artifact_dir/before-files/$path" || return 2
+        fi
+        GIT_INDEX_FILE="$snapshot_index" git --literal-pathspecs -C "$repo_path" add -A -- "$path" || return 2
+    done < "$artifact_dir/requested-paths"
+    snapshot_tree=$(GIT_INDEX_FILE="$snapshot_index" git -C "$repo_path" write-tree) || return 2
+    printf '%s\n' "$snapshot_tree" > "$artifact_dir/requested.tree" || return 2
+    git -C "$repo_path" diff-tree -r --no-commit-id --no-renames --no-abbrev --raw -z "$before_head" "$snapshot_tree" > "$artifact_dir/requested-entries" || return 2
+    while IFS= read -r -d '' metadata && IFS= read -r -d '' path; do
+        read -r _old_mode mode _old_sha sha _change <<< "$metadata"
+        requests=$(jq -c --arg path "$path" --arg mode "$mode" --arg sha "$sha" '. + [{path:$path,mode:$mode,sha:$sha}]' <<< "$requests") || return 2
+    done < "$artifact_dir/requested-entries"
+    printf '%s\n' "$requests" > "$artifact_dir/requested-content.json" || return 2
+    printf '%s\n' "$requests"
+}
+
+# ai-sync's commit-only request must retain the original working versions in
+# the final candidate. A commit followed by a revert is still incomplete work.
+unpreserved_ai_requested_content() {
+    local repo_path="$1" requests="$2" artifact_dir="$3" after_head="$4"
+    local request path mode sha entry metadata found missing='[]'
+    jq -e 'type == "array" and all(.[]; type == "object" and
+        (.path | type == "string" and length > 0) and
+        (.mode == "000000" or .mode == "100644" or .mode == "100755" or .mode == "120000" or .mode == "160000") and
+        (.sha | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$")))' <<< "$requests" >/dev/null || return 2
+    while IFS= read -r request; do
+        IFS= read -r -d '' path < <(jq -j '.path, "\u0000"' <<< "$request") || return 2
+        mode=$(jq -r '.mode' <<< "$request") || return 2
+        sha=$(jq -r '.sha' <<< "$request") || return 2
+        found=false
+        git --literal-pathspecs -C "$repo_path" ls-tree -z "$after_head" -- "$path" > "$artifact_dir/requested-candidate-entry" || return 2
+        if [[ "$mode" == 000000 ]]; then
+            [[ -s "$artifact_dir/requested-candidate-entry" ]] || found=true
+        elif IFS= read -r -d '' entry < "$artifact_dir/requested-candidate-entry"; then
+            metadata="${entry%%$'\t'*}"
+            [[ "${metadata%% *}" != "$mode" || "${metadata##* }" != "$sha" || "${entry#*$'\t'}" != "$path" ]] || found=true
+        fi
+        if [[ "$found" == false ]]; then
+            missing=$(jq -c --argjson request "$request" '. + [$request]' <<< "$missing") || return 2
+        fi
+    done < <(jq -c '.[]' <<< "$requests")
+    printf '%s\n' "$missing"
+}
+
+# Verify Git work separately from the transport's idle/completion signal.
+capture_ai_session_work() {
+    local repo_path="$1" before_head="$2" before_ref="$3" artifact_dir="$4"
+    local requested_content="${5:-[]}" unpreserved_requests='[]' requested_content_verified=false
+    local requested_content_policy="${6:-edit}" requested_tree="${7:-}"
+    local after_head after_ref after_tree commits='[]' remaining='[]' status=failed error='Git state could not be inspected'
+    after_head=$(git -C "$repo_path" rev-parse --verify HEAD) || after_head=""
+    after_ref=$(git -C "$repo_path" symbolic-ref --quiet HEAD) || after_ref=""
+    after_tree=$(git -C "$repo_path" rev-parse --verify "$after_head^{tree}") || after_tree=""
+    printf '%s\n' "$after_head" > "$artifact_dir/work-after.head" || return 2
+    printf '%s\n' "$after_ref" > "$artifact_dir/work-after.ref" || return 2
+    if [[ -n "$before_head" && -n "$after_head" ]]; then
+        if git -C "$repo_path" rev-list --reverse "$before_head..$after_head" > "$artifact_dir/commits" &&
+           git -C "$repo_path" diff --name-only -z HEAD > "$artifact_dir/remaining-paths" &&
+           git -C "$repo_path" ls-files --others --exclude-standard -z >> "$artifact_dir/remaining-paths"; then
+            commits=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$artifact_dir/commits") || return 2
+            remaining=$(jq -Rsc 'split("\u0000") | map(select(length > 0)) | unique' "$artifact_dir/remaining-paths") || return 2
+            if [[ "$before_ref" != "$after_ref" ]] || ! git -C "$repo_path" merge-base --is-ancestor "$before_head" "$after_head"; then
+                error='Repository identity or original history changed'
+            elif [[ "$commits" == '[]' ]]; then
+                error='Session made no requested commits'
+            elif [[ "$remaining" != '[]' ]]; then
+                error='Session left requested repository work incomplete'
+            else
+                local difference_exit=0
+                git -C "$repo_path" diff --quiet "$before_head" "$after_head" || difference_exit=$?
+                case "$difference_exit" in
+                    0) error='New commits contain no requested file changes' ;;
+                    1)
+                        if [[ "$requested_content_policy" == edit ]]; then
+                            status=success; error=""
+                        elif [[ "$requested_content_policy" != preserve ]]; then
+                            error='Unknown requested-content policy'
+                        elif [[ -z "$requested_tree" || -z "$after_tree" ]]; then
+                            error='Original requested tree or final candidate tree could not be inspected'
+                        elif ! unpreserved_requests=$(unpreserved_ai_requested_content "$repo_path" "$requested_content" "$artifact_dir" "$after_head"); then
+                            unpreserved_requests='[]'
+                            error='Original requested-content inspection failed'
+                        elif [[ "$unpreserved_requests" != '[]' ]]; then
+                            error='Original requested content is missing from the final candidate'
+                        elif [[ "$requested_tree" != "$after_tree" ]]; then
+                            error='Final candidate contains unrequested file changes'
+                        else
+                            requested_content_verified=true; status=success; error=""
+                        fi
+                        ;;
+                    *) error="Git change comparison failed with exit $difference_exit" ;;
+                esac
+            fi
+        fi
+    fi
+    jq -cen --arg status "$status" --arg error "$error" --arg before "$before_head" --arg after "$after_head" \
+        --arg before_ref "$before_ref" --arg after_ref "$after_ref" --argjson commits "$commits" --argjson remaining "$remaining" \
+        --argjson requested "$requested_content" --argjson unpreserved "$unpreserved_requests" --argjson content_verified "$requested_content_verified" --arg content_policy "$requested_content_policy" --arg requested_tree "$requested_tree" --arg after_tree "$after_tree" \
+        '{status:$status,error:$error,before_head:$before,after_head:$after,before_ref:$before_ref,after_ref:$after_ref,commits:$commits,remaining_paths:$remaining,requested_content:$requested,unpreserved_requests:$unpreserved,requested_content_verified:$content_verified,requested_content_policy:$content_policy,requested_tree:$requested_tree,after_tree:$after_tree}'
+    [[ "$status" == success ]]
+}
+
+# Publish verified AI work through the same frozen receiver transport as sweeps.
+publish_ai_session_work() {
+    local repo_path="$1" expected_head="$2" target="$3" target_ref remote destination remote_tip old_sha
+    local receivers='[]' receiver output exit_code
+    target_ref=$(jq -r '.ref' <<< "$target") || return 1
+    remote=$(jq -r '.remote' <<< "$target") || return 1
+    [[ "$(get_commit_publication_target "$repo_path")" == "$target" ]] || return 1
+    while IFS= read -r -d '' destination; do
+        remote_tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$target_ref") || return 1
+        old_sha="${remote_tip%%$'\t'*}"
+        if [[ -n "$old_sha" ]]; then
+            run_commit_publication_transport "$repo_path" "$remote" "$destination" fetch "$target_ref" || return 1
+            git -C "$repo_path" merge-base --is-ancestor "$old_sha" "$expected_head" || return 1
+        fi
+        scan_commit_publication "$repo_path" "$old_sha" "$expected_head" || return 1
+        receivers=$(jq -c --arg url "$destination" --arg sha "$old_sha" '. + [{url:$url,sha:$sha}]' <<< "$receivers") || return 1
+    done < <(jq -j '.urls[] | ., "\u0000"' <<< "$target")
+    if [[ "$(git -C "$repo_path" rev-parse HEAD)" != "$expected_head" ]] ||
+       [[ "$(get_commit_publication_target "$repo_path")" != "$target" ]] || repo_is_dirty "$repo_path"; then
+        log_error "Verified AI work or publication destination changed before publication"
+        return 1
+    fi
+    while IFS= read -r receiver; do
+        destination=$(jq -r '.url' <<< "$receiver") || return 1
+        old_sha=$(jq -r '.sha' <<< "$receiver") || return 1
+        if output=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" push "$target_ref" "$expected_head" "$old_sha" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+        if [[ "$exit_code" -ne 0 ]]; then
+            log_error "Requested AI publication failed: $output"
+            return "$exit_code"
+        fi
+        remote_tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$target_ref") || return 1
+        [[ "${remote_tip%%$'\t'*}" == "$expected_head" ]] || return 1
+    done < <(jq -c '.[]' <<< "$receivers")
+}
+
+validate_ai_session_result() {
+    local result="$1" actual_exit="$2" expected_repo="$3"
+    expected_repo=$(cd "$expected_repo" && pwd -P) || return 1
+    jq -es --argjson actual_exit "$actual_exit" --arg repo "$expected_repo" '
+        length == 1 and (.[0] as $r |
+            $r.schema_version == 1 and $r.repo == $repo and $r.exit_code == $actual_exit and
+            ($r.transport.status == "idle" or $r.transport.status == "failed" or $r.transport.status == "timeout") and
+            ($r.work.status == "success" or $r.work.status == "failed") and
+            ($r.work.commits | type == "array") and ($r.work.remaining_paths | type == "array") and
+            ($r.publication.no_push | type == "boolean") and
+            (if $r.status == "success" then
+                $actual_exit == 0 and $r.transport.status == "idle" and $r.work.status == "success" and
+                ($r.work.commits | length > 0) and ($r.work.remaining_paths | length == 0) and
+                ($r.work.unpreserved_requests | type == "array" and length == 0) and
+                (if $r.work.requested_content_policy == "preserve" then
+                    $r.work.requested_content_verified == true and
+                    ($r.work.requested_tree | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$")) and $r.work.requested_tree == $r.work.after_tree
+                 else $r.work.requested_content_policy == "edit" and $r.work.requested_content_verified == false end) and
+                (if $r.publication.no_push then $r.publication.status == "not_requested" else $r.publication.status == "success" end)
+             else $actual_exit != 0 and ($r.status == "failed" or $r.status == "timeout") end))
+    ' <<< "$result" >/dev/null
+}
+
+# Run an inherited Bash worker in its own process group under one absolute
+# deadline. The caller retains its group; ordinary worker children stay owned.
+run_inherited_ai_deadline() {
+    local deadline="$1" output_file="$2" error_file="$3"
+    shift 3
+    (
+        if (( SECONDS >= deadline )); then
+            : > "$output_file"
+            : > "$error_file"
+            return 124
+        fi
+        set -m
+        ( set +m; "$@" ) > "$output_file" 2> "$error_file" &
+        local ai_deadline_worker_pid="${!:-}" worker_exit=0 stop_exit=0 grace_deadline
+        [[ "$ai_deadline_worker_pid" =~ ^[1-9][0-9]*$ ]] || return 3
+        trap 'stop_exit=130' INT
+        trap 'stop_exit=143' TERM
+        while kill -0 "$ai_deadline_worker_pid" 2>/dev/null; do
+            if [[ "$stop_exit" -ne 0 ]]; then break; fi
+            if (( SECONDS >= deadline )); then stop_exit=124; break; fi
+            sleep 0.05
+        done
+        if [[ "$stop_exit" -ne 0 ]]; then
+            kill -TERM -- "-$ai_deadline_worker_pid" 2>/dev/null || true
+            grace_deadline=$((SECONDS + 1))
+            while kill -0 -- "-$ai_deadline_worker_pid" 2>/dev/null && (( SECONDS < grace_deadline )); do sleep 0.05; done
+            kill -KILL -- "-$ai_deadline_worker_pid" 2>/dev/null || true
+            wait "$ai_deadline_worker_pid" 2>/dev/null || true
+            return "$stop_exit"
+        fi
+        wait "$ai_deadline_worker_pid" || worker_exit=$?
+        if (( SECONDS >= deadline )); then return 124; fi
+        return "$worker_exit"
+    )
+}
+
+stop_owned_ai_session() {
+    local session_name="$1" artifact_dir="$2" probe_exit=0 stop_exit=0
+    ntm kill "$session_name" --force > "$artifact_dir/stop.stdout" 2> "$artifact_dir/stop.stderr" || stop_exit=$?
+    if [[ "$stop_exit" -ne 0 ]]; then
+        printf 'failed\n' > "$artifact_dir/cleanup.status"
+        return "$stop_exit"
+    fi
+    tmux has-session -t "=$session_name" > "$artifact_dir/stop-probe.stdout" 2> "$artifact_dir/stop-probe.stderr" || probe_exit=$?
+    if [[ "$probe_exit" -ne 1 ]]; then
+        printf 'failed\n' > "$artifact_dir/cleanup.status"
+        log_error "Owned NTM session absence could not be confirmed"
+        return 2
+    fi
+    printf 'confirmed\n' > "$artifact_dir/cleanup.status"
+}
+
+incomplete_ai_session_result() {
+    local operation_exit="$1" cleanup_status="$2" cleanup_exit="$3"
+    local status=failed transport=failed publication=blocked phase=preflight before="" before_ref="" after="" after_ref="" work='{}' commits='[]' remaining='[]'
+    local error='AI workflow ended without a valid completed result'
+    [[ "$operation_exit" -ne 124 ]] || { status=timeout; transport=timeout; error='Whole-operation AI deadline expired'; }
+    [[ "$no_push" != true ]] || publication=not_requested
+    [[ ! -f "$artifact_dir/publication.started" ]] || publication=uncertain
+    [[ ! -f "$artifact_dir/publication.confirmed" ]] || publication=success
+    [[ ! -f "$artifact_dir/phase" ]] || phase=$(cat "$artifact_dir/phase")
+    [[ ! -f "$artifact_dir/before.head" ]] || before=$(cat "$artifact_dir/before.head")
+    [[ ! -f "$artifact_dir/before.ref" ]] || before_ref=$(cat "$artifact_dir/before.ref")
+    [[ ! -f "$artifact_dir/work-after.head" ]] || after=$(cat "$artifact_dir/work-after.head")
+    [[ ! -f "$artifact_dir/work-after.ref" ]] || after_ref=$(cat "$artifact_dir/work-after.ref")
+    if [[ -f "$artifact_dir/work.json" ]] && jq -es 'length == 1 and (.[0].commits | type == "array") and (.[0].remaining_paths | type == "array")' "$artifact_dir/work.json" >/dev/null; then
+        work=$(jq -c '.observed_status=.status | .status="failed" | .verified=false | .error="Preserved work observation is not a completed-operation result"' "$artifact_dir/work.json") || return 2
+    else
+        [[ ! -f "$artifact_dir/commits" ]] || commits=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$artifact_dir/commits")
+        [[ ! -f "$artifact_dir/remaining-paths" ]] || remaining=$(jq -Rsc 'split("\u0000") | map(select(length > 0)) | unique' "$artifact_dir/remaining-paths")
+        work=$(jq -cen --arg before "$before" --arg before_ref "$before_ref" --arg after "$after" --arg after_ref "$after_ref" --argjson commits "$commits" --argjson remaining "$remaining" \
+            '{status:"failed",verified:false,error:"Work inspection did not complete",before_head:$before,before_ref:$before_ref,after_head:$after,after_ref:$after_ref,commits:$commits,remaining_paths:$remaining,remaining_paths_verified:false}') || return 2
+    fi
+    [[ "$cleanup_status" == confirmed || "$cleanup_status" == not_started ]] || error+='; owned-session cleanup remains uncertain'
+    jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg transport "$transport" \
+        --arg error "$error" --arg evidence "$artifact_dir" --arg phase "$phase" --arg cleanup "$cleanup_status" --arg publication "$publication" \
+        --argjson work "$work" --argjson operation_exit "$operation_exit" --argjson cleanup_exit "$cleanup_exit" --argjson no_push "$no_push" \
+        --argjson seconds "$timeout_seconds" --argjson duration "$((SECONDS - ai_operation_entry))" \
+        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:1,duration_seconds:$duration,transport:{status:$transport,exit_code:$operation_exit},work:$work,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit,budget_seconds:2},deadline:{seconds:$seconds,expired:($operation_exit==124),phase:$phase},evidence_dir:$evidence}'
+}
+
+run_ai_session_workflow() {
+    local ai_session_worker_active=true before_head before_ref publication_target=null requested_content requested_tree
+    local transport=failed transport_exit=2 status=failed result_exit=2 error='spawn failed' cleanup_status=not_started cleanup_exit=0
+    printf 'preflight\n' > "$artifact_dir/phase"
+    before_head=$(git -C "$repo_path" rev-parse --verify HEAD) || return 2
+    printf '%s\n' "$before_head" > "$artifact_dir/before.head"
+    before_ref=$(git -C "$repo_path" symbolic-ref --quiet HEAD) || return 2
+    printf '%s\n' "$before_ref" > "$artifact_dir/before.ref"
+    if [[ "$no_push" == false ]] && ! publication_target=$(get_commit_publication_target "$repo_path"); then
+        log_error "Requested AI publication has no valid destination"
+        return 4
+    fi
+    cp "$prompt_file" "$artifact_dir/prompt.txt" || return 2
+    printf '\n%s\n' 'Perform requested work locally. Do not run any push or publication command. ru owns publication after validating completed work.' >> "$artifact_dir/prompt.txt"
+    git -C "$repo_path" diff --binary HEAD > "$artifact_dir/before.diff" || return 2
+    requested_content=$(capture_ai_requested_content "$repo_path" "$before_head" "$artifact_dir") || return 2
+    requested_tree=$(cat "$artifact_dir/requested.tree") || return 2
+    local existing_exit=0
+    tmux has-session -t "=$session_name" > "$artifact_dir/ownership.stdout" 2> "$artifact_dir/ownership.stderr" || existing_exit=$?
+    [[ "$existing_exit" -eq 1 ]] || { log_error "Unique NTM session name is already occupied or could not be checked"; return 4; }
+    local -a spawn_args=(spawn "$repo_name" "--label=$session_label" "$agent_flag" --no-user --safety)
+    local spawn_exit=0
+    printf 'spawn\n' > "$artifact_dir/phase"
+    printf '%s\n' "$session_name" > "$artifact_dir/session.started"
+    log_info "Spawning $agent_type in $repo_path: $session_name"
+    GIT_ALLOW_PROTOCOL='' NTM_PROJECTS_BASE="$repo_parent" \
+        ntm "${spawn_args[@]}" --pane-env GIT_ALLOW_PROTOCOL= > "$artifact_dir/spawn.stdout" 2> "$artifact_dir/spawn.stderr" || spawn_exit=$?
+    transport_exit=$spawn_exit
+    if [[ "$spawn_exit" -eq 0 ]]; then
+        local prompt wait_exit=0 ready_exit=0
+        prompt=$(cat "$artifact_dir/prompt.txt") || return 2
+        printf 'readiness\n' > "$artifact_dir/phase"
+        ntm --robot-wait="$session_name" --condition=idle --wait-timeout="${timeout_seconds}s" --exit-on-error \
+            > "$artifact_dir/ready.stdout" 2> "$artifact_dir/ready.stderr" || ready_exit=$?
+        transport_exit=$ready_exit
+        if [[ "$ready_exit" -ne 0 ]] && jq -es 'length == 1 and .[0].success == false and .[0].error_code == "TIMEOUT"' "$artifact_dir/ready.stdout" >/dev/null; then
+            transport=timeout; status=timeout; result_exit=1; error='Session readiness timed out'
+        elif [[ "$ready_exit" -eq 0 ]] && jq -es 'length == 1 and .[0].success == true' "$artifact_dir/ready.stdout" >/dev/null; then
+            printf 'send\n' > "$artifact_dir/phase"
+            local send_exit=0
+            ntm --robot-send="$session_name" --type="$agent_type" --msg="$prompt" > "$artifact_dir/send.stdout" 2> "$artifact_dir/send.stderr" || send_exit=$?
+            if [[ "$send_exit" -eq 0 ]] && jq -es 'length == 1 and .[0].success == true' "$artifact_dir/send.stdout" >/dev/null; then
+                printf 'transition\n' > "$artifact_dir/phase"
+                ntm --robot-wait="$session_name" --condition=idle --wait-timeout="${timeout_seconds}s" --exit-on-error --transition \
+                    > "$artifact_dir/wait.stdout" 2> "$artifact_dir/wait.stderr" || wait_exit=$?
+                transport_exit=$wait_exit
+                if [[ "$wait_exit" -eq 0 ]] && jq -es 'length == 1 and .[0].success == true' "$artifact_dir/wait.stdout" >/dev/null; then
+                    transport=idle; error=""
+                elif [[ "$wait_exit" -ne 0 ]] && jq -es 'length == 1 and .[0].success == false and .[0].error_code == "TIMEOUT"' "$artifact_dir/wait.stdout" >/dev/null; then
+                    transport=timeout; status=timeout; result_exit=1; error='Session timed out'
+                else error='Session crashed or returned malformed completion data'; fi
+            else transport_exit=$send_exit; error='Prompt dispatch failed or returned malformed data'; fi
+        else error='Readiness failed or returned malformed data'; fi
+        printf 'tail\n' > "$artifact_dir/phase"
+        ntm --robot-tail="$session_name" --lines=200 > "$artifact_dir/tail.stdout" 2> "$artifact_dir/tail.stderr" || true
+    fi
+    # A failed spawn may already have created part of our uniquely owned session.
+    printf 'stop\n' > "$artifact_dir/phase"
+    if stop_owned_ai_session "$session_name" "$artifact_dir"; then cleanup_status=confirmed;
+    else cleanup_exit=$?; cleanup_status=failed; transport=failed; status=failed; error='Owned session could not be stopped; final state remains unstable'; fi
+    local work_json work_exit=0 publication_status=not_requested
+    [[ "$no_push" == true ]] || publication_status=blocked
+    printf 'inspection\n' > "$artifact_dir/phase"
+    if [[ "$cleanup_status" != confirmed ]]; then
+        work_json=$(jq -cen --arg before "$before_head" --arg before_ref "$before_ref" '{status:"failed",verified:false,error:"Owned-session cleanup is uncertain",before_head:$before,after_head:"",before_ref:$before_ref,after_ref:"",commits:[],remaining_paths:[],remaining_paths_verified:false}') || return 2
+        work_exit=1
+    else work_json=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir" "$requested_content" "$requested_content_policy" "$requested_tree") || work_exit=$?; fi
+    printf '%s\n' "$work_json" > "$artifact_dir/work.json"
+    if [[ "$transport" == idle && "$work_exit" -eq 0 && "$cleanup_status" == confirmed ]]; then
+        status=success; result_exit=0
+        if [[ "$no_push" == false ]]; then
+            printf 'publication\n' > "$artifact_dir/phase"
+            printf 'started\n' > "$artifact_dir/publication.started"
+            publication_status=failed
+            if publish_ai_session_work "$repo_path" "$(jq -r '.after_head' <<< "$work_json")" "$publication_target" > "$artifact_dir/publication.stdout" 2> "$artifact_dir/publication.stderr"; then
+                publication_status=success
+                printf 'confirmed\n' > "$artifact_dir/publication.confirmed"
+            else status=failed; result_exit=1; error='Requested publication failed; verified local commits are retained'; fi
+        fi
+    elif [[ "$transport" == idle ]]; then error=$(jq -r '.error' <<< "$work_json") || error='Invalid work result'; fi
+    jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg error "$error" \
+        --arg transport "$transport" --arg evidence "$artifact_dir" --arg cleanup "$cleanup_status" --arg publication "$publication_status" \
+        --argjson duration "$((SECONDS - ai_operation_entry))" --argjson exit_code "$result_exit" --argjson transport_exit "$transport_exit" \
+        --argjson work "$work_json" --argjson no_push "$no_push" --argjson seconds "$timeout_seconds" --argjson cleanup_exit "$cleanup_exit" \
+        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:$exit_code,duration_seconds:$duration,transport:{status:$transport,exit_code:$transport_exit},work:$work,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit},deadline:{seconds:$seconds,expired:false},evidence_dir:$evidence}'
+    return "$result_exit"
+}
+
+ai_session_preflight_failure() {
+    local failure_exit="$1" failure_error="$2" publication_status=blocked deadline_seconds=null
+    [[ "$no_push" != true ]] || publication_status=not_requested
+    if [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ && "${#timeout_seconds}" -le 5 && "$timeout_seconds" -le 86400 ]]; then
+        deadline_seconds="$timeout_seconds"
+    fi
+    local duration=$((SECONDS - ai_operation_entry))
+    if command -v jq >/dev/null; then
+        jq -cen --arg repo "$repo_path" --arg agent "$agent_type" --arg error "$failure_error" --arg session "$session_name" \
+            --arg evidence "$artifact_dir" --arg publication "$publication_status" --argjson no_push "$no_push" \
+            --argjson exit_code "$failure_exit" --argjson duration "$duration" --argjson seconds "$deadline_seconds" \
+            '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:"failed",error:$error,exit_code:$exit_code,duration_seconds:$duration,transport:{status:"failed",exit_code:$exit_code},work:{status:"failed",verified:false,error:"Work was not started",before_head:"",before_ref:"",after_head:"",after_ref:"",commits:[],remaining_paths:[],remaining_paths_verified:false},publication:{no_push:$no_push,status:$publication},cleanup:{status:"not_started",exit_code:0},deadline:{seconds:$seconds,expired:false,phase:"preflight"},evidence_dir:$evidence}'
+    else
+        # Dependency failure still has the same public contract without jq.
+        printf '{"schema_version":1,"session":"%s","repo":"%s","agent":"%s","status":"failed","error":"%s","exit_code":%s,"duration_seconds":%s,"transport":{"status":"failed","exit_code":%s},"work":{"status":"failed","verified":false,"error":"Work was not started","before_head":"","before_ref":"","after_head":"","after_ref":"","commits":[],"remaining_paths":[],"remaining_paths_verified":false},"publication":{"no_push":%s,"status":"%s"},"cleanup":{"status":"not_started","exit_code":0},"deadline":{"seconds":%s,"expired":false,"phase":"preflight"},"evidence_dir":"%s"}\n' \
+            "$(json_escape "$session_name")" "$(json_escape "$repo_path")" "$(json_escape "$agent_type")" "$(json_escape "$failure_error")" \
+            "$failure_exit" "$duration" "$failure_exit" "$no_push" "$publication_status" "$deadline_seconds" "$(json_escape "$artifact_dir")"
+    fi
+    return "$failure_exit"
+}
+
+# Spawn configured NTM/provider work with one deadline through verified work and
+# requested host publication. Typed failure preserves artifacts and uncertainty.
+# Usage: spawn_ai_session <repo_path> <prompt_file> [seconds] [--agent=claude|codex|gemini]
 spawn_ai_session() {
+    local ai_operation_entry=$SECONDS
     local repo_path=""
     local prompt_file=""
     local timeout_seconds=600
     local agent_type="claude"
     local session_prefix="ru-ai"
+    local no_push=true
+    local requested_content_policy=edit
+    local repo_name="" repo_parent="" artifact_dir="" session_label="" session_name="" resolved_repo=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -1431,8 +1816,21 @@ spawn_ai_session() {
                 session_prefix="${1#*=}"
                 shift
                 ;;
+            --no-push)
+                no_push=true
+                shift
+                ;;
+            --push)
+                no_push=false
+                shift
+                ;;
+            --preserve-requested-content)
+                requested_content_policy=preserve
+                shift
+                ;;
             -*)
                 log_error "spawn_ai_session: Unknown option: $1"
+                ai_session_preflight_failure 2 "Unknown option: $1"
                 return 2
                 ;;
             *)
@@ -1451,146 +1849,118 @@ spawn_ai_session() {
     # Validate arguments
     if [[ -z "$repo_path" ]]; then
         log_error "spawn_ai_session: repo_path is required"
-        echo '{"session":"","status":"failed","error":"repo_path required"}'
+        ai_session_preflight_failure 2 'repo_path required'
         return 2
     fi
 
     if [[ ! -d "$repo_path" ]]; then
         log_error "spawn_ai_session: repo not found: $repo_path"
-        echo '{"session":"","status":"failed","error":"repo not found"}'
+        ai_session_preflight_failure 2 "repo not found: $repo_path"
+        return 2
+    fi
+    if resolved_repo=$(cd "$repo_path" && pwd -P); then
+        repo_path="$resolved_repo"
+    else
+        ai_session_preflight_failure 2 'repo path could not be resolved'
         return 2
     fi
 
     if [[ -z "$prompt_file" ]]; then
         log_error "spawn_ai_session: prompt_file is required"
-        echo '{"session":"","status":"failed","error":"prompt_file required"}'
+        ai_session_preflight_failure 2 'prompt_file required'
         return 2
     fi
 
     if [[ ! -f "$prompt_file" ]]; then
         log_error "spawn_ai_session: prompt file not found: $prompt_file"
-        echo '{"session":"","status":"failed","error":"prompt file not found"}'
+        ai_session_preflight_failure 2 "prompt file not found: $prompt_file"
         return 2
+    fi
+
+    if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || [[ "${#timeout_seconds}" -gt 5 ]] || [[ "$timeout_seconds" -gt 86400 ]]; then
+        log_error "spawn_ai_session: timeout must be an integer from 1 to 86400 seconds"
+        ai_session_preflight_failure 4 'invalid timeout'
+        return 4
+    fi
+    if ! command -v jq >/dev/null; then
+        log_error "spawn_ai_session: jq is required"
+        ai_session_preflight_failure 3 'missing dependency: jq'
+        return 3
+    fi
+    if ! command -v tmux >/dev/null; then
+        log_error "spawn_ai_session: tmux is required"
+        ai_session_preflight_failure 3 'missing dependency: tmux'
+        return 3
     fi
 
     # Check ntm availability
     if ! command -v ntm &>/dev/null; then
         log_error "spawn_ai_session: ntm not installed"
-        echo '{"session":"","status":"failed","error":"ntm not installed"}'
+        ai_session_preflight_failure 2 'ntm not installed'
         return 2
     fi
 
     # Generate unique session name from repo path
-    local repo_name
-    repo_name=$(basename "$repo_path")
-    local timestamp
-    timestamp=$(date +%s)
-    local session_name="${session_prefix}-${repo_name}-${timestamp}"
+    repo_name=${repo_path##*/}
+    repo_parent=${repo_path%/*}
+    if [[ "$repo_name" == *--* ]]; then
+        log_error "NTM labeled sessions require a repository basename without --"
+        ai_session_preflight_failure 4 'unsupported NTM project name'
+        return 4
+    fi
+    if ! artifact_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-ai-session.XXXXXX"); then
+        ai_session_preflight_failure 2 'session artifacts could not be created'
+        return 2
+    fi
+    session_label="${session_prefix//[^a-zA-Z0-9_-]/_}-${BASHPID:-$$}-${RANDOM}"
+    session_name="${repo_name}--${session_label}"
 
     # Map agent type to ntm flags
-    # agent_flag is for spawn (--cc=1), send_flag is for send (--cc)
-    local agent_flag send_flag
+    local agent_flag provider
     case "$agent_type" in
-        claude|cc)  agent_flag="--cc=1"; send_flag="--cc" ;;
-        codex|cod)  agent_flag="--cod=1"; send_flag="--cod" ;;
-        antigravity|agy) agent_flag="--agy=1"; send_flag="--agy" ;;
-        gemini|gmi) agent_flag="--gmi=1"; send_flag="--gmi" ;;
+        claude|cc)  agent_flag="--cc=1"; agent_type=claude; provider=claude ;;
+        codex|cod)  agent_flag="--cod=1"; agent_type=codex; provider=codex ;;
+        antigravity|agy) agent_flag="--agy=1"; agent_type=antigravity; provider=agy ;;
+        gemini|gmi) agent_flag="--gmi=1"; agent_type=gemini; provider=gemini ;;
         *)
             log_error "spawn_ai_session: Unknown agent type: $agent_type"
-            echo '{"session":"","status":"failed","error":"unknown agent type"}'
+            ai_session_preflight_failure 2 "unknown agent type: $agent_type"
             return 2
             ;;
     esac
 
-    local start_time
-    start_time=$(date +%s)
-
-    # Spawn the session with initial prompt
-    log_info "Spawning ntm session: $session_name"
-    if ! ntm spawn "$session_name" $agent_flag --no-user 2>/dev/null; then
-        log_error "spawn_ai_session: Failed to spawn session"
-        echo '{"session":"'"$session_name"'","status":"failed","error":"spawn failed"}'
-        return 2
+    if ! command -v "$provider" >/dev/null; then
+        log_error "Selected AI provider is not installed: $provider"
+        ai_session_preflight_failure 3 "missing provider: $provider"
+        return 3
     fi
 
-    # Change to repo directory and send the prompt
-    # Use tmux to cd first, then send the prompt file contents
-    local pane_target="${session_name}:0.0"
-
-    # CD to repo directory
-    tmux send-keys -t "$pane_target" "cd $(printf '%q' "$repo_path")" Enter 2>/dev/null
-    sleep 1
-
-    # Send the prompt from file
-    if ! ntm send "$session_name" $send_flag --file "$prompt_file" 2>/dev/null; then
-        log_error "spawn_ai_session: Failed to send prompt"
-        ntm kill "$session_name" --force 2>/dev/null
-        echo '{"session":"'"$session_name"'","status":"failed","error":"send prompt failed"}'
-        return 2
-    fi
-
-    # Wait for completion with timeout
-    # Poll health status until agent shows as idle/completed or timeout
-    local elapsed=0
-    local poll_interval=10
-    local status="running"
-
-    log_info "Waiting for session completion (timeout: ${timeout_seconds}s)"
-
-    while [[ $elapsed -lt $timeout_seconds ]]; do
-        sleep "$poll_interval"
-        elapsed=$((elapsed + poll_interval))
-
-        # Check if session still exists
-        if ! tmux has-session -t "$session_name" 2>/dev/null; then
-            status="completed"
-            break
-        fi
-
-        # Check agent health
-        local health_output
-        health_output=$(ntm health "$session_name" --json 2>/dev/null)
-
-        if [[ -n "$health_output" ]]; then
-            # Check if agent is idle (no recent activity)
-            local activity
-            activity=$(echo "$health_output" | jq -r '.panes[0].activity // "unknown"' 2>/dev/null)
-
-            if [[ "$activity" == "idle" || "$activity" == "stale" ]]; then
-                # Agent appears to be done - give it a moment then check again
-                sleep 5
-                health_output=$(ntm health "$session_name" --json 2>/dev/null)
-                activity=$(echo "$health_output" | jq -r '.panes[0].activity // "unknown"' 2>/dev/null)
-
-                if [[ "$activity" == "idle" || "$activity" == "stale" ]]; then
-                    status="completed"
-                    break
-                fi
+    local operation_deadline=$((ai_operation_entry + timeout_seconds)) operation_exit=0 cleanup_exit=0 cleanup_status=not_started
+    run_inherited_ai_deadline "$operation_deadline" "$artifact_dir/result.stdout" "$artifact_dir/workflow.stderr" run_ai_session_workflow \
+        2> "$artifact_dir/watchdog.stderr" || operation_exit=$?
+    if [[ "$operation_exit" == 124 || "$operation_exit" == 130 || "$operation_exit" == 143 ]] ||
+       ! jq -es 'length == 1 and .[0].schema_version == 1' "$artifact_dir/result.stdout" >/dev/null; then
+        if [[ -f "$artifact_dir/session.started" ]]; then
+            if [[ -f "$artifact_dir/cleanup.status" && "$(cat "$artifact_dir/cleanup.status")" == confirmed ]]; then
+                cleanup_status=confirmed
+            else
+                run_inherited_ai_deadline "$((SECONDS + 2))" "$artifact_dir/cleanup.stdout" "$artifact_dir/cleanup.stderr" stop_owned_ai_session "$session_name" "$artifact_dir" \
+                    2> "$artifact_dir/cleanup-watchdog.stderr" || cleanup_exit=$?
+                if [[ "$cleanup_exit" -eq 0 ]]; then cleanup_status=confirmed;
+                elif [[ "$cleanup_exit" -eq 124 ]]; then cleanup_status=timeout; else cleanup_status=failed; fi
             fi
         fi
-
-        log_debug "Session $session_name still running (${elapsed}s/${timeout_seconds}s)"
-    done
-
-    local end_time
-    end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-
-    # Clean up the session
-    if tmux has-session -t "$session_name" 2>/dev/null; then
-        ntm kill "$session_name" --force 2>/dev/null
-    fi
-
-    # Return results
-    if [[ "$status" == "completed" ]]; then
-        log_success "Session completed in ${duration}s"
-        printf '{"session":"%s","status":"success","duration_seconds":%d}\n' "$session_name" "$duration"
-        return 0
+        incomplete_ai_session_result "$operation_exit" "$cleanup_status" "$cleanup_exit" > "$artifact_dir/final.json" || return 2
+        operation_exit=1
     else
-        log_warn "Session timed out after ${duration}s"
-        printf '{"session":"%s","status":"timeout","duration_seconds":%d}\n' "$session_name" "$duration"
-        return 1
+        cp "$artifact_dir/result.stdout" "$artifact_dir/final.json" || return 2
     fi
+    local diagnostic
+    for diagnostic in "$artifact_dir"/*.stderr; do
+        [[ -f "$diagnostic" ]] && cat "$diagnostic" >&2
+    done
+    cat "$artifact_dir/final.json"
+    return "$operation_exit"
 }
 
 # Check if an ntm session is still running.
@@ -2048,7 +2418,7 @@ cmd_ai_sync() {
                 json_array+="{\"path\":\"$safe_path\",\"status\":\"pending\"}"
             done
             json_array+="]"
-            echo "$json_array"
+            printf '{"mode":"dry-run","total":%d,"succeeded":0,"failed":0,"repos":%s}\n' "${#dirty_repos[@]}" "$json_array"
         fi
         return 0
     fi
@@ -2080,19 +2450,20 @@ cmd_ai_sync() {
             continue
         fi
 
-        # Spawn AI session and wait
-        local session_result
-        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" --timeout="$timeout_seconds" --agent="$agent_type")
-        local exit_code=$?
+        # The transport and work result must agree with the actual exit code.
+        local session_result exit_code=0 status=failed
+        local -a session_args=("--timeout=$timeout_seconds" "--agent=$agent_type" --preserve-requested-content)
+        if [[ "$no_push" == true ]]; then session_args+=(--no-push); else session_args+=(--push); fi
+        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" "${session_args[@]}") || exit_code=$?
+        if validate_ai_session_result "$session_result" "$exit_code" "$repo_path"; then
+            status=$(jq -r '.status' <<< "$session_result") || status=failed
+        else
+            status=failed
+            [[ "$exit_code" -ne 0 ]] || exit_code=2
+            session_result=$(jq -cen --arg repo "$repo_path" --argjson exit_code "$exit_code" '{repo:$repo,status:"failed",exit_code:$exit_code,error:"Invalid or incomplete AI session result"}') || return 3
+        fi
 
-        # Clean up prompt file
-        rm -f "$prompt_file" 2>/dev/null
-
-        # Parse result
-        local status
-        status=$(echo "$session_result" | jq -r '.status // "unknown"' 2>/dev/null)
-
-        if [[ "$status" == "success" ]]; then
+        if [[ "$status" == "success" && "$exit_code" -eq 0 ]]; then
             log_success "Completed: $repo_name"
             ((succeeded++))
             results+=("$session_result")
@@ -2145,7 +2516,9 @@ The AI agent will:
 1. Read AGENTS.md and README.md to understand each project
 2. Review all changes and group them logically
 3. Create detailed commit messages explaining the changes
-4. Push to the remote (unless --no-push specified)
+ru verifies the resulting commits and remaining files, then publishes the exact
+validated revision unless --no-push is specified. Idle alone is not completion.
+The timeout covers the entire session, inspection, and requested publication.
 
 Examples:
   ru ai-sync                        # Process all dirty repos
@@ -2369,13 +2742,14 @@ cmd_dep_update() {
         log_info "Processing $repo_name: $total_outdated outdated dependencies"
 
         if [[ "$dry_run" == "true" ]]; then
-            echo "Would update $total_outdated deps in: $repo_path"
+            printf 'Would update %s deps in: %s\n' "$total_outdated" "$repo_path" >&2
             echo "$outdated_json" | jq -r '
                 .results // [] | .[] |
                 "\(.manager):" as $mgr |
                 .outdated // [] | .[] |
                 "  \($mgr) \(.name): \(.current) -> \(.latest)"
-            ' 2>/dev/null || true
+            ' >&2 || true
+            results+=("$(jq -cen --arg repo "$repo_path" --argjson deps "$outdated_json" '{repo:$repo,status:"pending",outdated:$deps}')")
             continue
         fi
 
@@ -2416,52 +2790,40 @@ cmd_dep_update() {
 
         # Spawn AI session
         log_info "Spawning AI session for $repo_name..."
-        local session_result
-        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" \
-            "--timeout=$timeout_seconds" \
-            "--agent=$agent_type" \
-            "--prefix=dep-update")
-
-        # Clean up prompt file
-        rm -f "$prompt_file" 2>/dev/null
-
-        # Parse result
-        local status
-        status=$(echo "$session_result" | jq -r '.status // "unknown"')
+        local session_result session_exit=0 status=failed
+        local -a session_args=("--timeout=$timeout_seconds" "--agent=$agent_type" --prefix=dep-update)
+        if [[ "$no_push" == true ]]; then session_args+=(--no-push); else session_args+=(--push); fi
+        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" "${session_args[@]}") || session_exit=$?
+        if validate_ai_session_result "$session_result" "$session_exit" "$repo_path"; then
+            status=$(jq -r '.status' <<< "$session_result") || status=failed
+        else
+            [[ "$session_exit" -ne 0 ]] || session_exit=2
+            session_result=$(jq -cen --arg repo "$repo_path" --argjson exit_code "$session_exit" '{repo:$repo,status:"failed",exit_code:$exit_code,error:"Invalid or incomplete AI session result"}') || return 3
+        fi
 
         case "$status" in
-            completed|idle)
+            success)
                 log_success "Successfully updated dependencies in $repo_name"
                 ((updated++))
-                results+=("$(jq -n --arg repo "$repo_path" --argjson deps "$total_outdated" \
-                    '{repo: $repo, status: "success", deps_updated: $deps}')")
-
-                # Push if not --no-push
-                if [[ "$no_push" != "true" ]]; then
-                    log_info "Pushing changes for $repo_name..."
-                    if ! git -C "$repo_path" push 2>/dev/null; then
-                        log_warn "Failed to push $repo_name (changes are committed locally)"
-                    fi
-                fi
+                results+=("$(jq -cen --argjson session "$session_result" --argjson deps "$total_outdated" '$session + {deps_updated:$deps}')")
                 ;;
             timeout)
                 log_warn "Timeout while updating $repo_name"
                 ((failed++))
-                results+=("$(jq -n --arg repo "$repo_path" '{repo: $repo, status: "timeout"}')")
+                results+=("$session_result")
                 ;;
             error|*)
                 local error_msg
                 error_msg=$(echo "$session_result" | jq -r '.error // "Unknown error"')
                 log_error "Failed to update $repo_name: $error_msg"
                 ((failed++))
-                results+=("$(jq -n --arg repo "$repo_path" --arg err "$error_msg" \
-                    '{repo: $repo, status: "error", error: $err}')")
+                results+=("$session_result")
                 ;;
         esac
     done
 
     # Print summary
-    echo ""
+    printf '\n' >&2
     log_info "=== dep-update Summary ==="
     log_info "Processed: $processed repos"
     log_info "Updated:   $updated repos"
@@ -3611,6 +3973,10 @@ run_commit_publication_transport() {
             cat > "$guard_dir/hooks/pre-push" <<'HOOK'
 #!/usr/bin/env bash
 set -uo pipefail
+if [[ "${2:-}" != "$RU_PUBLICATION_EXPECTED_DESTINATION" ]]; then
+    printf '%s\n' 'ru: actual receiver differs from the scanned publication destination; refusing push' >&2
+    exit 1
+fi
 cat > "$RU_PUBLICATION_INPUT" || exit 1
 if [[ -x "$RU_PUBLICATION_ORIGINAL_HOOK" ]]; then
     "$RU_PUBLICATION_ORIGINAL_HOOK" "$@" < "$RU_PUBLICATION_INPUT" || exit $?
@@ -3635,7 +4001,7 @@ HOOK
             RU_PUBLICATION_INPUT="$guard_dir/advertised-updates" \
             RU_PUBLICATION_ORIGINAL_HOOK="$original_hooks/pre-push" \
             RU_PUBLICATION_EXPECTED_HEAD="$expected_head" RU_PUBLICATION_EXPECTED_REF="$target_ref" \
-            RU_PUBLICATION_EXPECTED_OLD="$expected_old" \
+            RU_PUBLICATION_EXPECTED_OLD="$expected_old" RU_PUBLICATION_EXPECTED_DESTINATION="$destination" \
                 run_network_command git -C "$repo_path" "${transport_config[@]}" \
                 -c core.hooksPath="$guard_dir/hooks" push "$remote" "$expected_head:$target_ref"
             ;;
@@ -5464,12 +5830,14 @@ emit_structured() {
 
     if ! declare -f toon_encode >/dev/null 2>&1; then
         log_warn "toon.sh not available; falling back to JSON"
+        json_str="${json_str/\"output_format\": \"toon\"/\"output_format\": \"json\"}"
         printf '%s\n' "$json_str"
         return 0
     fi
 
     if ! toon_available >/dev/null 2>&1; then
         log_warn "tru not available; falling back to JSON"
+        json_str="${json_str/\"output_format\": \"toon\"/\"output_format\": \"json\"}"
         printf '%s\n' "$json_str"
         return 0
     fi
@@ -5481,6 +5849,7 @@ emit_structured() {
     fi
 
     log_warn "TOON encode failed; falling back to JSON"
+    json_str="${json_str/\"output_format\": \"toon\"/\"output_format\": \"json\"}"
     printf '%s\n' "$json_str"
     return 0
 }
@@ -5505,7 +5874,100 @@ build_json_envelope() {
     fi
 
     printf '{\n  "generated_at": "%s",\n  "version": "%s",\n  "output_format": "%s",\n  "command": "%s",\n  "data": %s%s\n}\n' \
-        "$timestamp" "$VERSION" "${OUTPUT_FORMAT:-json}" "$cmd_name" "$data_json" "$meta_field"
+        "$timestamp" "$VERSION" "${OUTPUT_FORMAT:-json}" "$(json_escape "$cmd_name")" "$data_json" "$meta_field"
+}
+
+# Run an advanced workflow with one structured stdout document. Its existing
+# payload remains under data; conversion happens after the exit status is known.
+# Text mode keeps the direct command execution path.
+run_structured_workflow() {
+    local cmd_name="$1" workflow="$2"
+    if [[ "$JSON_OUTPUT" != true && "$cmd_name" != robot-docs ]]; then
+        "$workflow"
+        return $?
+    fi
+    [[ "$OUTPUT_FORMAT" != text ]] || OUTPUT_FORMAT=json
+    local payload code=0 requested_format="$OUTPUT_FORMAT" capture_file
+    if ! capture_file=$(mktemp_file); then
+        emit_structured "$(build_json_envelope "$cmd_name" '{"error":{"reason":"capture_failed"}}' '{"exit_code":3}')"
+        return 3
+    fi
+    local previous_int previous_term worker_pid interrupted=false
+    previous_int=$(trap -p INT)
+    previous_term=$(trap -p TERM)
+    # Explicit stdin preserves interactive approval under structured capture;
+    # Bash otherwise gives an asynchronous command /dev/null as standard input.
+    ( OUTPUT_FORMAT=json "$workflow" ) <&0 > "$capture_file" &
+    worker_pid="${!:-}"
+    if [[ ! "$worker_pid" =~ ^[1-9][0-9]*$ ]]; then
+        emit_structured "$(build_json_envelope "$cmd_name" '{"error":{"reason":"worker_identity_failed"}}' '{"exit_code":3}')"
+        return 3
+    fi
+    # Forward only to this dispatcher's child. Existing workflow handlers save
+    # checkpoints and clean up their own review/sweep sessions.
+    trap 'interrupted=true; kill -TERM "$worker_pid" 2>/dev/null || true' INT TERM
+    if wait "$worker_pid"; then code=0; else code=$?; fi
+    if [[ "$interrupted" == true ]]; then
+        wait "$worker_pid" || true
+        code=5
+    fi
+    trap - INT TERM
+    [[ -z "$previous_int" ]] || eval "$previous_int"
+    [[ -z "$previous_term" ]] || eval "$previous_term"
+    if ! payload=$(cat "$capture_file"); then
+        log_error "$cmd_name output capture could not be read"
+        payload='{"error":{"reason":"capture_read_failed"}}'
+        code=3
+    fi
+    rm -f -- "$capture_file"
+    if [[ -z "$payload" ]]; then
+        if [[ "$code" -eq 0 ]]; then
+            case "$cmd_name" in
+                ai-sync) payload='{"total":0,"succeeded":0,"failed":0,"repos":[]}' ;;
+                dep-update) payload='{"processed":0,"updated":0,"failed":0,"skipped":0,"results":[]}' ;;
+                *) payload='{"status":"success"}' ;;
+            esac
+        else
+            payload=$(printf '{"error":{"reason":"command_failed","code":%d}}' "$code")
+        fi
+    elif ! structured_payload_is_object "$payload"; then
+        log_error "$cmd_name produced invalid structured output"
+        payload=$(printf '{"error":{"reason":"invalid_structured_output","command_exit_code":%d}}' "$code")
+        [[ "$code" -ne 0 ]] || code=3
+    fi
+    # Preserve workflows that already emit an envelope, without nesting it.
+    local generated_at data_json meta_json
+    generated_at=$(json_get_field "$payload" generated_at)
+    if [[ -n "$generated_at" ]]; then
+        data_json=$(json_get_field "$payload" data)
+        meta_json=$(json_get_field "$payload" _meta)
+        if [[ -n "$meta_json" ]] && command -v jq >/dev/null 2>&1; then
+            meta_json=$(jq -c --argjson code "$code" '. + {exit_code:$code}' <<< "$meta_json")
+        elif [[ -n "$meta_json" ]] && command -v python3 >/dev/null 2>&1; then
+            meta_json=$(python3 -c 'import json,sys; meta=json.load(sys.stdin); meta["exit_code"]=int(sys.argv[1]); print(json.dumps(meta))' "$code" <<< "$meta_json")
+        else
+            meta_json="{\"exit_code\":$code}"
+        fi
+    else
+        data_json="$payload"
+        meta_json="{\"exit_code\":$code}"
+    fi
+    OUTPUT_FORMAT="$requested_format"
+    [[ "$OUTPUT_FORMAT" != text ]] || OUTPUT_FORMAT=json
+    emit_structured "$(build_json_envelope "$cmd_name" "$data_json" "$meta_json")"
+    return "$code"
+}
+
+structured_payload_is_object() {
+    local payload="$1"
+    if command -v jq >/dev/null 2>&1; then
+        jq -se 'length == 1 and (.[0] | type == "object")' <<< "$payload" >/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json,sys; sys.exit(0 if isinstance(json.load(sys.stdin), dict) else 1)' <<< "$payload"
+    else
+        log_error "Structured workflow output requires jq or python3"
+        return 1
+    fi
 }
 
 # Output JSON to stdout (only in --json mode)
@@ -6359,6 +6821,13 @@ resolve_config() {
     UPDATE_STRATEGY=$(get_config_value "UPDATE_STRATEGY" "$DEFAULT_UPDATE_STRATEGY" "$UPDATE_STRATEGY")
     AUTOSTASH=$(get_config_value "AUTOSTASH" "$DEFAULT_AUTOSTASH" "$AUTOSTASH")
     PARALLEL=$(get_config_value "PARALLEL" "$DEFAULT_PARALLEL" "$PARALLEL")
+    # Both documented environment settings outrank the file. Prefer RU_TIMEOUT
+    # when both are set; an explicit CLI value outranks either environment value.
+    local timeout_override="${GIT_TIMEOUT_CLI:-}"
+    if [[ -z "$timeout_override" && -z "${RU_TIMEOUT:-}" && -n "${GIT_TIMEOUT_ENV:-}" ]]; then
+        timeout_override="$GIT_TIMEOUT_ENV"
+    fi
+    GIT_TIMEOUT=$(get_config_value "TIMEOUT" 30 "$timeout_override")
 }
 
 # Set a configuration value in the config file
@@ -7398,6 +7867,12 @@ setup_git_timeout() {
 # The Bash fallback gives this invocation its own process group; it never
 # signals the caller or an unrelated agent's process group.
 run_network_command() {
+    # The AI operation's outer process group already owns this command's deadline.
+    # A nested timeout process would detach publication from that owned group.
+    if [[ "${ai_session_worker_active:-false}" == true ]]; then
+        "$@"
+        return $?
+    fi
     local seconds="${GIT_TIMEOUT:-30}"
     if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
         log_error "GIT_TIMEOUT must be a positive integer"
@@ -8102,6 +8577,20 @@ run_parallel_sync() {
 #==============================================================================
 
 cleanup() {
+    local process_code=$?
+    local initialization_format="${CLI_REQUESTED_FORMAT:-${OUTPUT_FORMAT:-${RU_OUTPUT_FORMAT:-${TOON_DEFAULT_FORMAT:-}}}}"
+    initialization_format="${initialization_format,,}"
+    if [[ "${COMMAND:-}" == robot-docs && ( -z "$initialization_format" || "$initialization_format" == text ) ]]; then
+        initialization_format=json
+    fi
+    if [[ "${CLI_INITIALIZING:-false}" == true && -n "$initialization_format" && "$initialization_format" != text ]]; then
+        case "$initialization_format" in toon) OUTPUT_FORMAT=toon ;; *) OUTPUT_FORMAT=json ;; esac
+        if [[ "$process_code" -eq 0 ]]; then
+            emit_structured "$(build_json_envelope "${COMMAND:-help}" '{"status":"help"}' '{"exit_code":0}')"
+        else
+            emit_structured "$(build_json_envelope "${COMMAND:-unknown}" "{\"error\":{\"reason\":\"initialization_failed\",\"code\":$process_code}}" "{\"exit_code\":$process_code}")"
+        fi
+    fi
     # If sync was interrupted, preserve state file
     if [[ "$SYNC_INTERRUPTED" == "true" ]]; then
         log_warn "Sync interrupted. Resume with: ru sync --resume"
@@ -8263,6 +8752,7 @@ parse_args() {
                     pending_global_args+=("--timeout=$2")
                 else
                     GIT_TIMEOUT="$2"
+                    GIT_TIMEOUT_CLI="$2"
                 fi
                 shift 2
                 ;;
@@ -8273,6 +8763,7 @@ parse_args() {
                     pending_global_args+=("$1")
                 else
                     GIT_TIMEOUT="${1#--timeout=}"
+                    GIT_TIMEOUT_CLI="$GIT_TIMEOUT"
                 fi
                 shift
                 ;;
@@ -8523,7 +9014,7 @@ parse_args() {
                     --resume)  RESUME="true" ;;
                     --restart) RESTART="true" ;;
                     --json)    ;; # Already set JSON_OUTPUT at first pass
-                    --timeout=*) GIT_TIMEOUT="${opt#--timeout=}" ;;
+                    --timeout=*) GIT_TIMEOUT="${opt#--timeout=}"; GIT_TIMEOUT_CLI="$GIT_TIMEOUT" ;;
                     --parallel=*) PARALLEL="${opt#--parallel=}" ;;
                     -j*) PARALLEL="${opt#-j}" ;;
                 esac
@@ -8811,34 +9302,23 @@ generate_json_report() {
         while IFS= read -r line; do
             [[ "$first" == "true" ]] || repos_json+=","
             first="false"
-            # Parse each field and rebuild with proper structure
-            local repo action status repo_duration path
-            [[ "$line" =~ \"repo\":\"([^\"]+)\" ]] && repo="${BASH_REMATCH[1]}"
-            [[ "$line" =~ \"action\":\"([^\"]+)\" ]] && action="${BASH_REMATCH[1]}"
-            [[ "$line" =~ \"status\":\"([^\"]+)\" ]] && status="${BASH_REMATCH[1]}"
-            [[ "$line" =~ \"duration\":([0-9]+) ]] && repo_duration="${BASH_REMATCH[1]}"
-            # Extract path from NDJSON (falls back to computed path for backwards compat)
-            local safe_path
-            if [[ "$line" =~ \"path\":\"([^\"]+)\" ]]; then
-                # Path from NDJSON is already JSON-escaped, use directly
-                safe_path="${BASH_REMATCH[1]}"
-            else
-                # Fallback path needs escaping
-                safe_path=$(json_escape "$PROJECTS_DIR/$repo")
-            fi
-
-            repos_json+="{\"name\":\"$repo\",\"path\":\"$safe_path\",\"action\":\"$action\",\"status\":\"$status\",\"duration\":${repo_duration:-0}}"
+            # write_result already encoded every field. Keep those exact bytes;
+            # regex reconstruction truncates escaped quotes and backslashes.
+            line="${line/#\{\"repo\":/\{\"name\":}"
+            repos_json+="$line"
         done < "$RESULTS_FILE"
         repos_json+="]"
     fi
 
     # Escape paths for JSON
-    local safe_projects_dir
+    local safe_projects_dir safe_layout safe_strategy
     safe_projects_dir=$(json_escape "$PROJECTS_DIR")
+    safe_layout=$(json_escape "$LAYOUT")
+    safe_strategy=$(json_escape "$UPDATE_STRATEGY")
 
     # Output data payload (envelope added by caller)
     cat << EOF
-{"config":{"projects_dir":"$safe_projects_dir","layout":"$LAYOUT","update_strategy":"$UPDATE_STRATEGY"},"summary":{"total":$total,"cloned":$cloned,"updated":$updated,"current":$current,"skipped":$skipped,"conflicts":$conflicts,"failed":$failed},"repos":$repos_json}
+{"config":{"projects_dir":"$safe_projects_dir","layout":"$safe_layout","update_strategy":"$safe_strategy"},"summary":{"total":$total,"cloned":$cloned,"updated":$updated,"current":$current,"skipped":$skipped,"conflicts":$conflicts,"failed":$failed},"repos":$repos_json}
 EOF
 }
 
@@ -8919,7 +9399,13 @@ cmd_sync() {
         # Aggregate results and compute proper exit code
         load_aggregate_results_globals
         compute_exit_code "$FAILED" "$CONFLICTS" "$SYSTEM_ERRORS"
-        exit $?
+        local adhoc_code=$?
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            local adhoc_data
+            adhoc_data=$(generate_json_report "$CLONED" "$UPDATED" "$CURRENT" "$SKIPPED" "$CONFLICTS" "$FAILED")
+            emit_structured "$(build_json_envelope sync "$adhoc_data" "{\"exit_code\":$adhoc_code}")"
+        fi
+        return "$adhoc_code"
     fi
 
     # Load all repos from config (checks all .txt files in repos.d/)
@@ -8936,7 +9422,10 @@ cmd_sync() {
         log_info "  ru add owner/repo              # Add to list"
         log_info "  ru sync owner/repo             # Sync directly (without adding)"
         log_info "  echo 'owner/repo' >> $RU_CONFIG_DIR/repos.d/public.txt  # Edit file directly"
-        exit 0
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            emit_structured "$(build_json_envelope sync "$(generate_json_report 0 0 0 0 0 0)" '{"exit_code":0}')"
+        fi
+        return 0
     fi
 
     local total=${#repos[@]}
@@ -9236,7 +9725,8 @@ cmd_status() {
     # Ensure config exists
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_info "No configuration found. Run: ru init"
-        exit 0
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope status '{"total":0,"repos":[]}' '{"exit_code":0}')"
+        return 0
     fi
 
     # Load all repos from config (reads from all *.txt files in repos.d/)
@@ -9251,7 +9741,8 @@ cmd_status() {
     if [[ "$total" -eq 0 ]]; then
         log_info "No repositories configured."
         log_info "Add repos with: ru add owner/repo"
-        exit 0
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope status '{"total":0,"repos":[]}' '{"exit_code":0}')"
+        return 0
     fi
 
     if [[ "$JSON_OUTPUT" == "true" ]]; then
@@ -9950,7 +10441,8 @@ cmd_list() {
     # Ensure config exists
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_info "No configuration found. Run: ru init"
-        exit 0
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"total":0,"repos":[]}' '{"exit_code":0}')"
+        return 0
     fi
 
     local show_paths="false"
@@ -9997,7 +10489,8 @@ cmd_list() {
     if [[ ${#repos[@]} -eq 0 ]]; then
         log_info "No repositories configured."
         log_info "Add repos with: ru add owner/repo"
-        exit 0
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"total":0,"repos":[]}' '{"exit_code":0}')"
+        return 0
     fi
 
     if [[ "$JSON_OUTPUT" == "true" ]]; then
@@ -10024,7 +10517,7 @@ cmd_list() {
 
         local data_json
         data_json="$(printf '{"total":%d,"repos":%s}' "${#repos[@]}" "$repos_array")"
-        emit_structured "$(build_json_envelope "list" "$data_json")"
+        emit_structured "$(build_json_envelope "list" "$data_json" '{"exit_code":0}')"
         return 0
     fi
 
@@ -10048,6 +10541,10 @@ cmd_list() {
 cmd_doctor() {
     local issues=0
     local review_flag="auto"
+    local git_present=false gh_present=false gh_authenticated=false
+    local git_version="" gh_version="" gh_user="" gum_version="" ntm_version="" claude_ver=""
+    local config_present=false projects_present=false projects_writable=false
+    local review_issues=0
 
     for arg in "${ARGS[@]}"; do
         case "$arg" in
@@ -10060,7 +10557,7 @@ cmd_doctor() {
 
     # Check git
     if command -v git &>/dev/null; then
-        local git_version
+        git_present=true
         git_version=$(git --version | sed 's/git version //')
         printf '%b\n' "${GREEN}[OK]${RESET} git: $git_version" >&2
     else
@@ -10070,9 +10567,10 @@ cmd_doctor() {
 
     # Check gh CLI
     if command -v gh &>/dev/null; then
-        local gh_version gh_user
+        gh_present=true
         gh_version=$(gh --version | head -1 | awk '{print $3}')
         if gh auth status &>/dev/null; then
+            gh_authenticated=true
             gh_user=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
             printf '%b\n' "${GREEN}[OK]${RESET} gh: $gh_version (authenticated as $gh_user)" >&2
         else
@@ -10085,6 +10583,7 @@ cmd_doctor() {
 
     # Check config directory
     if [[ -d "$RU_CONFIG_DIR" ]]; then
+        config_present=true
         printf '%b\n' "${GREEN}[OK]${RESET} Config: $RU_CONFIG_DIR" >&2
     else
         printf '%b\n' "${YELLOW}[??]${RESET} Config: not initialized (run: ru init)" >&2
@@ -10105,7 +10604,9 @@ cmd_doctor() {
 
     # Check projects directory
     if [[ -d "$PROJECTS_DIR" ]]; then
+        projects_present=true
         if [[ -w "$PROJECTS_DIR" ]]; then
+            projects_writable=true
             printf '%b\n' "${GREEN}[OK]${RESET} Projects: $PROJECTS_DIR (writable)" >&2
         else
             printf '%b\n' "${RED}[!!]${RESET} Projects: $PROJECTS_DIR (not writable)" >&2
@@ -10117,7 +10618,6 @@ cmd_doctor() {
 
     # Check gum (optional)
     if command -v gum &>/dev/null; then
-        local gum_version
         gum_version=$(gum --version 2>/dev/null | head -1 || echo "unknown")
         printf '%b\n' "${GREEN}[OK]${RESET} gum: $gum_version" >&2
     else
@@ -10126,7 +10626,6 @@ cmd_doctor() {
 
     # Check ntm (optional, for ai-sync and dep-update)
     if command -v ntm &>/dev/null; then
-        local ntm_version
         ntm_version=$(ntm --version 2>/dev/null | head -1 || echo "unknown")
         printf '%b\n' "${GREEN}[OK]${RESET} ntm: $ntm_version" >&2
     else
@@ -10135,7 +10634,6 @@ cmd_doctor() {
 
     # Check claude-code (optional, for ai-sync and dep-update)
     if command -v claude &>/dev/null; then
-        local claude_ver
         claude_ver=$(claude --version 2>/dev/null | head -1 || echo "unknown")
         printf '%b\n' "${GREEN}[OK]${RESET} claude-code: $claude_ver" >&2
     else
@@ -10171,8 +10669,6 @@ cmd_doctor() {
         echo "" >&2
         log_info "Review Prerequisites"
         echo "────────────────────────────────────────" >&2
-
-        local review_issues=0
 
         if command -v claude &>/dev/null; then
             local claude_version claude_help
@@ -10271,12 +10767,22 @@ cmd_doctor() {
 
     echo "" >&2
 
+    local doctor_code=0
     if [[ $issues -eq 0 ]]; then
         log_success "All checks passed!"
     else
         log_warn "$issues issue(s) found"
-        exit 3
+        doctor_code=3
     fi
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local doctor_data
+        doctor_data=$(printf '{"issues":%s,"tools":{"git":{"installed":%s,"version":"%s"},"gh":{"installed":%s,"version":"%s","authenticated":%s,"user":"%s"},"gum":{"version":"%s"},"ntm":{"version":"%s"},"claude":{"version":"%s"}},"config":{"path":"%s","exists":%s,"repo_count":%s},"projects":{"path":"%s","exists":%s,"writable":%s},"review":{"checked":%s,"issues":%s}}' \
+            "$issues" "$git_present" "$(json_escape "$git_version")" "$gh_present" "$(json_escape "$gh_version")" "$gh_authenticated" "$(json_escape "$gh_user")" \
+            "$(json_escape "$gum_version")" "$(json_escape "$ntm_version")" "$(json_escape "$claude_ver")" \
+            "$(json_escape "$RU_CONFIG_DIR")" "$config_present" "$repo_count" "$(json_escape "$PROJECTS_DIR")" "$projects_present" "$projects_writable" "$run_review_checks" "$review_issues")
+        emit_structured "$(build_json_envelope doctor "$doctor_data" "{\"exit_code\":$doctor_code}")"
+    fi
+    return "$doctor_code"
 }
 
 cmd_self_update() {
@@ -10477,11 +10983,23 @@ cmd_config() {
         local value="${set_value#*=}"
         if [[ "$key" == "$set_value" ]]; then
             log_error "Invalid format. Use: --set KEY=VALUE"
-            exit 4
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope config '{"error":{"reason":"invalid_assignment"}}' '{"exit_code":4}')"
+            return 4
         fi
-        set_config_value "$key" "$value"
+        local set_code=0
+        set_config_value "$key" "$value" || set_code=$?
+        if [[ "$set_code" != 0 ]]; then
+            log_error "Failed to set $key"
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope config '{"error":{"reason":"write_failed"}}' "{\"exit_code\":$set_code}")"
+            return "$set_code"
+        fi
         log_success "Set $key=$value"
-        return
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            local assignment_data
+            assignment_data=$(printf '{"set":{"key":"%s","value":"%s"},"config_file":"%s"}' "$(json_escape "$key")" "$(json_escape "$value")" "$(json_escape "$RU_CONFIG_DIR/config")")
+            emit_structured "$(build_json_envelope config "$assignment_data" '{"exit_code":0}')"
+        fi
+        return 0
     fi
 
     # Print configuration
@@ -10491,6 +11009,7 @@ cmd_config() {
     echo "  UPDATE_STRATEGY=$UPDATE_STRATEGY" >&2
     echo "  AUTOSTASH=$AUTOSTASH" >&2
     echo "  PARALLEL=$PARALLEL" >&2
+    echo "  TIMEOUT=$GIT_TIMEOUT" >&2
     echo "" >&2
     log_info "Config file: $RU_CONFIG_DIR/config"
     log_info "Repos file:  $RU_CONFIG_DIR/repos.d/public.txt (and private.txt)"
@@ -10500,6 +11019,19 @@ cmd_config() {
         log_info "Config file contents:"
         cat "$RU_CONFIG_DIR/config" >&2
     fi
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local config_data file_contents=""
+        if [[ "$print_mode" == true && -f "$RU_CONFIG_DIR/config" ]]; then
+            if ! file_contents=$(cat "$RU_CONFIG_DIR/config"); then
+                emit_structured "$(build_json_envelope config '{"error":{"reason":"read_failed"}}' '{"exit_code":3}')"
+                return 3
+            fi
+        fi
+        config_data=$(printf '{"resolved":{"PROJECTS_DIR":"%s","LAYOUT":"%s","UPDATE_STRATEGY":"%s","AUTOSTASH":"%s","PARALLEL":"%s","TIMEOUT":"%s"},"config_file":"%s","file_contents":"%s"}' \
+            "$(json_escape "$PROJECTS_DIR")" "$(json_escape "$LAYOUT")" "$(json_escape "$UPDATE_STRATEGY")" "$(json_escape "$AUTOSTASH")" "$(json_escape "$PARALLEL")" "$(json_escape "$GIT_TIMEOUT")" "$(json_escape "$RU_CONFIG_DIR/config")" "$(json_escape "$file_contents")")
+        emit_structured "$(build_json_envelope config "$config_data" '{"exit_code":0}')"
+    fi
+    return 0
 }
 
 #------------------------------------------------------------------------------
@@ -10908,6 +11440,24 @@ cmd_prune() {
     local archive_mode="false"
     local delete_mode="false"
     local force_mode="false"
+    local prune_json_array='[]' prune_operations='[]' prune_total=0
+    local prune_completed=0 prune_kept=0 prune_inventory_complete=false prune_aborted=false
+    emit_prune_result() {
+        [[ "$JSON_OUTPUT" == true ]] || return 0
+        local code="$1" reason="${2:-}" mode=list error=null data
+        [[ "$archive_mode" != true ]] || mode=archive
+        [[ "$delete_mode" != true ]] || mode=delete
+        [[ -z "$reason" ]] || error="{\"reason\":\"$(json_escape "$reason")\"}"
+        data=$(printf '{"mode":"%s","dry_run":%s,"total":%s,"orphans":%s,"inventory_complete":%s,"completed":%s,"kept":%s,"aborted":%s,"operations":%s,"error":%s}' \
+            "$mode" "${DRY_RUN:-false}" "$prune_total" "$prune_json_array" "$prune_inventory_complete" "$prune_completed" "$prune_kept" "$prune_aborted" "$prune_operations" "$error")
+        emit_structured "$(build_json_envelope prune "$data" "{\"exit_code\":$code}")"
+    }
+    record_prune_operation() {
+        local path="$1" status="$2" destination="${3:-}" row
+        row=$(printf '{"path":"%s","status":"%s","destination":"%s"}' "$(json_escape "$path")" "$status" "$(json_escape "$destination")")
+        if [[ "$prune_operations" == '[]' ]]; then prune_operations="[$row]";
+        else prune_operations="${prune_operations%]},$row]"; fi
+    }
 
     # Parse arguments
     for arg in "${ARGS[@]}"; do
@@ -10917,7 +11467,8 @@ cmd_prune() {
             --force) force_mode="true" ;;
             -*)
                 log_error "Unknown prune option: $arg"
-                exit 4
+                emit_prune_result 4 unknown_option
+                return 4
                 ;;
         esac
     done
@@ -10925,18 +11476,21 @@ cmd_prune() {
     # Check for conflicting options
     if [[ "$archive_mode" == "true" && "$delete_mode" == "true" ]]; then
         log_error "Cannot use both --archive and --delete"
-        exit 4
+        emit_prune_result 4 conflicting_modes
+        return 4
     fi
 
     # Check projects directory exists
     if [[ ! -d "$PROJECTS_DIR" ]]; then
         log_warn "Projects directory does not exist: $PROJECTS_DIR"
+        prune_inventory_complete=true
+        emit_prune_result 0
         return 0
     fi
 
     # Build list of expected paths from config
     local configured_paths
-    configured_paths=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    configured_paths=$(mktemp_file) || { log_error "Failed to create temp file"; emit_prune_result 3 temporary_file_failed; return 3; }
     # shellcheck disable=SC2064  # Immediate expansion is intentional - path is already known
     trap "rm -f \"$configured_paths\"" RETURN
 
@@ -11004,7 +11558,8 @@ cmd_prune() {
                 log_error "Refusing to archive or delete while ${#unreadable_lists[@]} repo list file(s) cannot be read"
                 log_info "Check that the list exists and is readable (ru init creates it), then re-run prune."
             fi
-            exit 4
+            emit_prune_result 4 unresolved_configuration
+            return 4
         fi
     fi
 
@@ -11014,7 +11569,8 @@ cmd_prune() {
     if [[ ! -s "$configured_paths" && ( "$archive_mode" == "true" || "$delete_mode" == "true" ) ]]; then
         log_error "Refusing to archive or delete: no repos are configured in ${repos_dir}"
         log_info "Add repos (ru add) or check which config ru is reading, then re-run prune."
-        exit 4
+        emit_prune_result 4 no_configured_repositories
+        return 4
     fi
 
     # Find all git repositories in projects directory
@@ -11204,6 +11760,8 @@ cmd_prune() {
     # Report results
     if [[ ${#orphans[@]} -eq 0 ]]; then
         log_success "No orphan repositories found"
+        prune_inventory_complete=true
+        emit_prune_result 0
         return 0
     fi
 
@@ -11315,7 +11873,7 @@ cmd_prune() {
             json_array+="}"
         done
         json_array+="]"
-        echo "$json_array"
+        prune_json_array="$json_array"
     else
         log_info "Found ${#orphans[@]} orphan repository(s):"
         for path in "${orphans[@]}"; do
@@ -11330,6 +11888,9 @@ cmd_prune() {
         done
     fi
 
+    prune_total=${#orphans[@]}
+    prune_inventory_complete=true
+
     # Split into the orphans the requested mode acts on and those it keeps
     local -a targets=() kept=()
     if [[ "$archive_mode" == "true" || "$delete_mode" == "true" ]]; then
@@ -11343,6 +11904,7 @@ cmd_prune() {
             else
                 log_warn "Skipping $path: $blockers"
                 kept+=("$path")
+                record_prune_operation "$path" kept
             fi
         done
         if [[ "$delete_mode" == "true" ]]; then
@@ -11353,18 +11915,33 @@ cmd_prune() {
             done
         fi
         if [[ ${#kept[@]} -gt 0 ]]; then
+            prune_kept=${#kept[@]}
             log_info "Kept ${#kept[@]} orphan(s) listed above; check them, then re-run with --force to include them."
         fi
         if [[ ${#targets[@]} -eq 0 ]]; then
             log_warn "Nothing to prune: every orphan was kept"
+            emit_prune_result 1 all_orphans_kept
             return 1
         fi
+    fi
+
+    # A globally parsed --dry-run must never reach either mutation branch.
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        local preview_mode=archive
+        [[ "$delete_mode" != true ]] || preview_mode=delete
+        log_info "Dry run: would $preview_mode ${#targets[@]} orphan(s)"
+        emit_prune_result 0
+        return 0
     fi
 
     # Handle archive mode
     if [[ "$archive_mode" == "true" ]]; then
         local archive_dir="${RU_STATE_DIR}/archived"
-        mkdir -p "$archive_dir"
+        if ! mkdir -p "$archive_dir"; then
+            log_error "Failed to create archive directory: $archive_dir"
+            emit_prune_result 3 archive_directory_failed
+            return 3
+        fi
 
         log_info "Archiving ${#targets[@]} orphan(s) to $archive_dir"
         local archived=0
@@ -11386,13 +11963,18 @@ cmd_prune() {
             if mv -- "$path" "$dest" 2>/dev/null; then
                 log_step "Archived: $name -> $dest"
                 ((archived++))
+                record_prune_operation "$path" archived "$dest"
             else
                 log_error "Failed to archive: $path"
+                record_prune_operation "$path" failed "$dest"
             fi
         done
         log_success "Archived $archived orphan(s)"
-        [[ $archived -eq ${#targets[@]} && ${#kept[@]} -eq 0 ]] || return 1
-        return 0
+        prune_completed=$archived
+        local archive_code=0
+        [[ $archived -eq ${#targets[@]} && ${#kept[@]} -eq 0 ]] || archive_code=1
+        emit_prune_result "$archive_code"
+        return "$archive_code"
     fi
 
     # Handle delete mode
@@ -11403,7 +11985,8 @@ cmd_prune() {
             if [[ ! -t 0 ]]; then
                 log_error "Cannot prompt for prune deletion confirmation (stdin is not a TTY)"
                 log_info "Re-run with --non-interactive to proceed without prompts."
-                exit 3
+                emit_prune_result 3 confirmation_requires_terminal
+                return 3
             fi
 
             log_warn "This will permanently delete ${#targets[@]} repository(s)!"
@@ -11417,6 +12000,8 @@ cmd_prune() {
             if [[ "$GUM_AVAILABLE" == "true" && -t 1 ]]; then
                 if ! gum confirm "Delete these repositories?"; then
                     log_info "Aborted"
+                    prune_aborted=true
+                    emit_prune_result 0
                     return 0
                 fi
             else
@@ -11424,6 +12009,8 @@ cmd_prune() {
                 IFS= read -r confirm
                 if [[ "$confirm" != "delete" ]]; then
                     log_info "Aborted"
+                    prune_aborted=true
+                    emit_prune_result 0
                     return 0
                 fi
             fi
@@ -11436,13 +12023,18 @@ cmd_prune() {
             if rm -rf -- "$path" 2>/dev/null; then
                 log_step "Deleted: $name"
                 ((deleted++))
+                record_prune_operation "$path" deleted
             else
                 log_error "Failed to delete: $path"
+                record_prune_operation "$path" failed
             fi
         done
         log_success "Deleted $deleted orphan(s)"
-        [[ $deleted -eq ${#targets[@]} && ${#kept[@]} -eq 0 ]] || return 1
-        return 0
+        prune_completed=$deleted
+        local delete_code=0
+        [[ $deleted -eq ${#targets[@]} && ${#kept[@]} -eq 0 ]] || delete_code=1
+        emit_prune_result "$delete_code"
+        return "$delete_code"
     fi
 
     # Default: just list (dry run)
@@ -11455,6 +12047,8 @@ cmd_prune() {
     if [[ $flagged -gt 0 ]]; then
         log_info "$flagged orphan(s) have notes above: a clone of a configured repo is kept by --archive and --delete, unsaved work by --delete, unless --force is given"
     fi
+    emit_prune_result 0
+    return 0
 }
 
 #------------------------------------------------------------------------------
@@ -17580,11 +18174,14 @@ cmd_review_analytics() {
 
     if [[ ! -f "$metrics_file" ]]; then
         log_warn "No metrics found for period $period"
+        [[ "$JSON_OUTPUT" != true ]] || printf '{"mode":"analytics","period":"%s","metrics":null}\n' "$period"
         return 0
     fi
 
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        cat "$metrics_file"
+        local metrics_json
+        if ! metrics_json=$(cat "$metrics_file"); then return 3; fi
+        printf '{"mode":"analytics","period":"%s","metrics":%s}\n' "$period" "$metrics_json"
         return 0
     fi
 
@@ -23373,7 +23970,7 @@ cmd_agent_sweep() {
     local attach_on_fail=false
     local execution_mode="agent"
     local secret_scan_mode="warn"
-    local json_output=false
+    local json_output="${JSON_OUTPUT:-false}"
     local max_file_mb_override=""
     local phase1_timeout="${AGENT_SWEEP_PHASE1_TIMEOUT:-300}"
     local phase2_timeout="${AGENT_SWEEP_PHASE2_TIMEOUT:-600}"
@@ -23399,9 +23996,10 @@ cmd_agent_sweep() {
             --phase1-timeout=*) phase1_timeout="${arg#--phase1-timeout=}" ;;
             --phase2-timeout=*) phase2_timeout="${arg#--phase2-timeout=}" ;;
             --phase3-timeout=*) phase3_timeout="${arg#--phase3-timeout=}" ;;
-            --json) json_output=true ;;
+            --json) ;;  # Resolved global format decides JSON/TOON/text precedence.
             --verbose|-v) VERBOSE=true; LOG_LEVEL=1 ;;
             --debug|-d) DEBUG=true; VERBOSE=true; LOG_LEVEL=2 ;;
+            *) log_error "Unknown agent-sweep option: $arg"; return 4 ;;
         esac
     done
 
@@ -24685,16 +25283,36 @@ FMJSON
 _robot_docs_schemas() {
     cat << 'SCJSON'
 {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "JSON Schema definitions for ru command outputs. All JSON outputs share the same envelope wrapper.",
+  "allOf": [
+    {"$ref":"#/envelope"},
+    {"anyOf":[
+      {"properties":{"data":{"type":"object","required":["status"],"properties":{"status":{"const":"help"}},"maxProperties":1}}},
+      {"allOf":[
+        {"if":{"properties":{"command":{"const":"sync"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/sync/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"status"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/status/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"list"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/list/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"doctor"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/doctor/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"config"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/config/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"prune"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/prune/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"review"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/review/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"agent-sweep"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/agent-sweep/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"ai-sync"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/ai-sync/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"dep-update"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/dep-update/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"robot-docs"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/robot-docs/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}}
+      ]}
+    ]}
+  ],
   "envelope": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "required": ["generated_at", "version", "output_format", "command", "data"],
     "properties": {
       "generated_at": {"type": "string", "format": "date-time", "description": "ISO 8601 UTC timestamp"},
-      "version": {"type": "string", "description": "ru version (semver)"},
+      "version": {"type": "string", "minLength": 1, "description": "ru version (semver)"},
       "output_format": {"type": "string", "enum": ["json", "toon"], "description": "Output format used"},
-      "command": {"type": "string", "description": "Command that produced the output"},
+      "command": {"type": "string", "minLength": 1, "description": "Command that produced the output"},
       "data": {"type": "object", "description": "Command-specific payload (see per-command schemas)"},
       "_meta": {
         "type": "object",
@@ -24721,7 +25339,7 @@ _robot_docs_schemas() {
               "properties": {
                 "repo": {"type": "string", "description": "Repository identifier (owner/name)"},
                 "path": {"type": "string", "description": "Local filesystem path"},
-                "status": {"type": "string", "enum": ["current", "behind", "ahead", "diverged", "missing", "not_git", "no_upstream"], "description": "Sync status relative to remote"},
+                "status": {"type": "string", "enum": ["current", "behind", "ahead", "diverged", "missing", "not_git", "no_upstream", "fetch_failed"], "description": "Sync status relative to remote"},
                 "branch": {"type": "string", "description": "Current branch name"},
                 "ahead": {"type": "integer", "description": "Commits ahead of remote"},
                 "behind": {"type": "integer", "description": "Commits behind remote"},
@@ -24789,16 +25407,108 @@ _robot_docs_schemas() {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["repo", "status"],
+              "required": ["name", "action", "status", "duration", "message", "path"],
               "properties": {
-                "repo": {"type": "string"},
-                "status": {"type": "string", "enum": ["cloned", "pulled", "up-to-date", "skipped", "failed", "dirty"]},
-                "detail": {"type": "string", "description": "Additional context for the status"},
-                "duration_ms": {"type": "integer"}
+                "name": {"type": "string"},
+                "action": {"type": "string"},
+                "status": {"type": "string"},
+                "message": {"type": "string", "description": "Additional context for the status"},
+                "duration": {"type": "integer", "minimum": 0},
+                "path": {"type": "string"}
               }
             }
           }
         }
+      }
+    },
+    "doctor": {
+      "description":"Output of ru doctor --json, including diagnostics with exit 3",
+      "data_schema":{
+        "type":"object","required":["issues","tools","config","projects","review"],
+        "properties":{
+          "issues":{"type":"integer","minimum":0},
+          "tools":{"type":"object","required":["git","gh","gum","ntm","claude"]},
+          "config":{"type":"object","required":["path","exists","repo_count"],"properties":{"path":{"type":"string"},"exists":{"type":"boolean"},"repo_count":{"type":"integer","minimum":0}}},
+          "projects":{"type":"object","required":["path","exists","writable"],"properties":{"path":{"type":"string"},"exists":{"type":"boolean"},"writable":{"type":"boolean"}}},
+          "review":{"type":"object","required":["checked","issues"],"properties":{"checked":{"type":"boolean"},"issues":{"type":"integer","minimum":0}}}
+        }
+      }
+    },
+    "config": {
+      "description":"Resolved configuration or the actual assignment made by ru config --json",
+      "data_schema":{
+        "type":"object","required":["config_file"],"properties":{"config_file":{"type":"string"}},
+        "oneOf":[
+          {"required":["resolved","file_contents"],"properties":{"resolved":{"type":"object","required":["PROJECTS_DIR","LAYOUT","UPDATE_STRATEGY","AUTOSTASH","PARALLEL"],"additionalProperties":{"type":"string"}},"file_contents":{"type":"string"}}},
+          {"required":["set"],"properties":{"set":{"type":"object","required":["key","value"],"properties":{"key":{"type":"string"},"value":{"type":"string"}}}}}
+        ]
+      }
+    },
+    "prune": {
+      "description":"Inventory and actual prune operations, including dry runs and refusals",
+      "data_schema":{
+        "type":"object","required":["mode","total","orphans","inventory_complete","completed","kept","aborted","operations","error"],
+        "properties":{
+          "mode":{"enum":["list","archive","delete"]},"dry_run":{"type":"boolean"},"total":{"type":"integer","minimum":0},
+          "orphans":{"type":"array","items":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}},
+          "inventory_complete":{"type":"boolean"},"completed":{"type":"integer","minimum":0},"kept":{"type":"integer","minimum":0},"aborted":{"type":"boolean"},
+          "operations":{"type":"array","items":{"type":"object","required":["path","status","destination"],"properties":{"path":{"type":"string"},"status":{"type":"string"},"destination":{"type":"string"}}}},
+          "error":{"type":["object","null"]}
+        }
+      }
+    },
+    "review": {
+      "description":"Status, discovery, analytics, orchestration and application payloads",
+      "data_schema":{
+        "type":"object",
+        "oneOf":[
+          {"required":["mode","lock","checkpoint","state"],"properties":{"mode":{"const":"status"},"lock":{"type":"object","required":["supported","held","info_file_exists","info"],"properties":{"supported":{"type":"boolean"},"held":{"type":["boolean","null"]},"info_file_exists":{"type":"boolean"},"info":{"type":"object"}}},"checkpoint":{"type":"object","required":["exists","repos_total","repos_completed","repos_pending","questions_pending"],"properties":{"exists":{"type":"boolean"},"repos_total":{"type":["integer","null"]},"repos_completed":{"type":["integer","null"]},"repos_pending":{"type":["integer","null"]},"questions_pending":{"type":["integer","null"]}}},"state":{"type":"object","required":["exists"],"properties":{"exists":{"type":"boolean"}}}}},
+          {"required":["mode","run_id","summary","items"],"properties":{"mode":{"const":"discovery"},"run_id":{"type":"string"},"summary":{"type":"object","required":["items_found","by_type"],"properties":{"items_found":{"type":"integer","minimum":0},"by_type":{"type":"object"}}},"items":{"type":"array","items":{"type":"object"}}}},
+          {"required":["mode","period","metrics"],"properties":{"mode":{"const":"analytics"},"period":{"type":"string"},"metrics":{"type":["object","null"]}}},
+          {"required":["mode","run_id","dry_run","summary","results","error"],"properties":{"mode":{"const":"apply"},"run_id":{"type":"string"},"dry_run":{"type":"boolean"},"summary":{"type":"object","required":["total","succeeded","failed"]},"results":{"type":"array"},"error":{"type":["string","null"]}}},
+          {"required":["mode","run_id","status","exit_code","summary","repos"],"properties":{"mode":{"enum":["plan","apply"]},"run_id":{"type":"string"},"status":{"type":"string"},"exit_code":{"type":"integer"},"summary":{"type":"object"},"repos":{"type":"object"}}},
+          {"required":["status"],"properties":{"status":{"const":"success"}},"maxProperties":1}
+        ]
+      }
+    },
+    "agent-sweep": {
+      "description":"Dirty-repository preview, empty inventory, or the completed sweep summary",
+      "data_schema":{
+        "type":"object",
+        "oneOf":[
+          {"required":["mode","repos"],"properties":{"mode":{"const":"dry-run"},"repos":{"type":"array","items":{"type":"string"}}}},
+          {"required":["status","message","repos_processed"],"properties":{"status":{"const":"success"},"message":{"type":"string"},"repos_processed":{"const":0}}},
+          {"required":["timestamp","run_id","duration_seconds","summary","artifacts_dir","repos"],"properties":{
+            "timestamp":{"type":"string"},"run_id":{"type":"string"},"duration_seconds":{"type":"integer","minimum":0},
+            "summary":{"type":"object","required":["total","succeeded","failed","skipped"]},"artifacts_dir":{"type":"string"},
+            "repos":{"type":"array","items":{"type":"object","required":["name","status","duration","error","session"],"properties":{
+              "name":{"type":"string"},"status":{"type":"string"},"duration":{"type":"integer","minimum":0},"error":{"type":"string"},"session":{"type":"string"}
+            }}}
+          }},
+          {"required":["status"],"properties":{"status":{"const":"success"}},"maxProperties":1}
+        ]
+      }
+    },
+    "ai-sync": {
+      "description":"Per-repository AI sync outcomes or pending dry-run paths",
+      "data_schema":{
+        "type":"object","required":["total","succeeded","failed","repos"],
+        "properties":{"mode":{"const":"dry-run"},"total":{"type":"integer","minimum":0},"succeeded":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"repos":{"type":"array","items":{"type":"object","required":["status"],"properties":{"repo":{"type":"string"},"path":{"type":"string"},"status":{"type":"string"}},"anyOf":[{"required":["repo"]},{"required":["path"]}]}}}
+      }
+    },
+    "dep-update": {
+      "description":"Actual update outcomes, pending dependency previews, and skipped counts",
+      "data_schema":{
+        "type":"object","required":["processed","updated","failed","skipped","results"],
+        "properties":{"processed":{"type":"integer","minimum":0},"updated":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"results":{"type":"array","items":{"type":"object","required":["repo","status"],"properties":{"repo":{"type":"string"},"status":{"type":"string"},"outdated":{"type":"object","required":["total_outdated","results"]},"deps_updated":{"type":"integer","minimum":0},"error":{"type":"string"}}}}}
+      }
+    },
+    "robot-docs": {
+      "description":"Machine documentation topic with its schema version and content",
+      "data_schema":{
+        "type":"object","required":["schema_version","topic"],
+        "properties":{"schema_version":{"const":"1.0.0"},"topic":{"enum":["quickstart","commands","examples","exit-codes","formats","schemas","all"]}},
+        "oneOf":[{"required":["content"],"properties":{"topic":{"not":{"const":"all"}},"content":{"type":"object"}}},{"required":["quickstart","commands","examples","exit_codes","formats","schemas"],"properties":{"topic":{"const":"all"}}}]
       }
     },
     "error": {
@@ -24807,7 +25517,7 @@ _robot_docs_schemas() {
         "type": "object",
         "required": ["error"],
         "properties": {
-          "error": {"type": "string", "description": "Human-readable error message"},
+          "error": {"oneOf":[{"type":"string","minLength":1},{"type":"object","required":["reason"],"properties":{"reason":{"type":"string","minLength":1},"code":{"type":"integer"},"command_exit_code":{"type":"integer"}}}], "description": "Failure string or typed diagnostic"},
           "code": {"type": "integer", "description": "Exit code"},
           "command": {"type": "string", "description": "Command that failed"},
           "details": {"type": "string", "description": "Additional error context"}
@@ -24824,11 +25534,29 @@ SCJSON
 #==============================================================================
 
 main() {
+    CLI_INITIALIZING=true
     # Show quick menu if run with no arguments
     if [[ $# -eq 0 ]]; then
         show_quick_menu
         exit 0
     fi
+
+    # Remember the requested transport for errors that stop parsing before a
+    # later format flag. Normal parsing still determines ordinary precedence.
+    CLI_REQUESTED_FORMAT=""
+    local format_arg format_value_pending=false
+    for format_arg in "$@"; do
+        if [[ "$format_value_pending" == true ]]; then
+            CLI_REQUESTED_FORMAT="$format_arg"
+            format_value_pending=false
+            continue
+        fi
+        case "$format_arg" in
+            --json) CLI_REQUESTED_FORMAT=json ;;
+            --format) format_value_pending=true ;;
+            --format=*) CLI_REQUESTED_FORMAT="${format_arg#--format=}" ;;
+        esac
+    done
 
     # Initialize
     ARGS=()
@@ -24840,6 +25568,7 @@ main() {
     # Create results file for this run
     RESULTS_FILE=$(mktemp_file) || { log_error "Failed to create temp file"; exit 3; }
     RESULTS_LOCK_DIR="${RESULTS_FILE}.lock.d"
+    CLI_INITIALIZING=false
 
     # Dispatch to command
     case "$COMMAND" in
@@ -24854,11 +25583,11 @@ main() {
         config)     cmd_config ;;
         prune)      cmd_prune ;;
         import)     cmd_import ;;
-        review)     cmd_review ;;
-        agent-sweep) cmd_agent_sweep ;;
-        ai-sync)    cmd_ai_sync ;;
-        dep-update) cmd_dep_update ;;
-        robot-docs) cmd_robot_docs ;;
+        review)     run_structured_workflow review cmd_review ;;
+        agent-sweep) run_structured_workflow agent-sweep cmd_agent_sweep ;;
+        ai-sync)    run_structured_workflow ai-sync cmd_ai_sync ;;
+        dep-update) run_structured_workflow dep-update cmd_dep_update ;;
+        robot-docs) run_structured_workflow robot-docs cmd_robot_docs ;;
         fork-status) cmd_fork_status ;;
         fork-sync)   cmd_fork_sync ;;
         fork-clean)  cmd_fork_clean ;;
@@ -24866,6 +25595,7 @@ main() {
         *)
             log_error "Unknown command: $COMMAND"
             show_help
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope "$COMMAND" '{"error":{"reason":"unknown_command"}}' '{"exit_code":4}')"
             exit 4
             ;;
     esac

@@ -77,7 +77,7 @@ test_agent_sweep_json_dry_run() {
     create_dirty_repo "testrepo" >/dev/null
     e2e_add_repo "example/testrepo"
 
-    e2e_assert_ru_json "agent-sweep --dry-run --json" ".mode" "dry-run" "json mode is dry-run"
+    e2e_assert_ru_json "agent-sweep --dry-run --json" ".data.mode" "dry-run" "json mode is dry-run"
 
     e2e_cleanup
     log_test_pass "$test_name"

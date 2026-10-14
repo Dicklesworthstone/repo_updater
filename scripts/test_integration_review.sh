@@ -394,6 +394,14 @@ test_integration_review_session_ids_recorded() {
 # Test Runner
 #------------------------------------------------------------------------------
 
+review_completion_matches_process_exit() {
+    local file="$1" expected="$2"
+    jq -e -s --argjson expected "$expected" '
+        length == 1 and (.[0] | .command == "review" and .output_format == "json" and
+            .data.command == "review" and .data.exit_code == $expected and ._meta.exit_code == $expected)
+    ' "$file" >/dev/null
+}
+
 test_integration_review_preparation_failure_is_not_success() {
     require_tools || return 0
     setup_integration_env 1
@@ -402,7 +410,24 @@ test_integration_review_preparation_failure_is_not_success() {
     before=$(git -C "$RU_PROJECTS_DIR/repo0" rev-parse HEAD)
     "$E2E_RU_SCRIPT" review --mode=local --plan --json --non-interactive > "$E2E_LOG_DIR/prepare-failed.stdout" 2> "$E2E_LOG_DIR/prepare-failed.stderr" || rc=$?
     assert_equals 1 "$rc" "Failed preparation propagates the actual orchestration exit"
-    assert_equals 1 "$(jq -r '.exit_code' "$E2E_LOG_DIR/prepare-failed.stdout")" "Structured completion reports the same failure"
+    assert_equals 1 "$(jq -r '.data.exit_code' "$E2E_LOG_DIR/prepare-failed.stdout")" "Structured completion payload reports the same failure"
+    assert_equals 1 "$(jq -r '._meta.exit_code' "$E2E_LOG_DIR/prepare-failed.stdout")" "Envelope metadata reports the same actual failure"
+    assert_success "One normalized review result agrees with the actual process exit" \
+        review_completion_matches_process_exit "$E2E_LOG_DIR/prepare-failed.stdout" "$rc"
+    local mutation mutant_rc
+    for mutation in payload metadata both command; do
+        case "$mutation" in
+            payload) jq '.data.exit_code = 0' "$E2E_LOG_DIR/prepare-failed.stdout" ;;
+            metadata) jq '._meta.exit_code = 0' "$E2E_LOG_DIR/prepare-failed.stdout" ;;
+            both) jq '.data.exit_code = 0 | ._meta.exit_code = 0' "$E2E_LOG_DIR/prepare-failed.stdout" ;;
+            command) jq '.command = "sync"' "$E2E_LOG_DIR/prepare-failed.stdout" ;;
+        esac > "$E2E_LOG_DIR/prepare-failed-$mutation.json" || return 1
+        mutant_rc=0
+        review_completion_matches_process_exit "$E2E_LOG_DIR/prepare-failed-$mutation.json" "$rc" \
+            > "$E2E_LOG_DIR/prepare-failed-$mutation.check.stdout" \
+            2> "$E2E_LOG_DIR/prepare-failed-$mutation.check.stderr" || mutant_rc=$?
+        assert_equals 1 "$mutant_rc" "$mutation false-success or wrong-command control must be rejected"
+    done
     assert_contains "$(cat "$E2E_LOG_DIR/prepare-failed.stderr")" 'Cannot resolve requested review pin' "Missing pin diagnostics remain visible"
     assert_equals "$before" "$(git -C "$RU_PROJECTS_DIR/repo0" rev-parse HEAD)" "Preparation failure preserves repository HEAD"
     assert_file_exists "$RU_STATE_DIR/review/review-checkpoint.json" "Failed orchestration retains resumable state"

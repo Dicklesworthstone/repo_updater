@@ -990,6 +990,10 @@ TIMEOUT=60
 export RU_TIMEOUT=60
 ```
 
+Timeout precedence is CLI `--timeout`, then `RU_TIMEOUT`, then `GIT_TIMEOUT`,
+then the config file's `TIMEOUT`, then the 30-second default. The selected value
+bounds the entire clone, fetch, or pull command, including a stalled subprocess.
+
 **Advanced tuning via git environment:**
 
 | Variable | Default | Purpose |
@@ -2557,12 +2561,13 @@ git rebase origin/main  # Or merge
 
 ## 🤖 AI Sync
 
-The `ai-sync` subcommand automatically commits uncommitted changes across repositories using AI agents. It scans for dirty repos, launches an AI agent per repo (via ntm), and the agent reads project context, reviews changes, creates logical commits, and pushes.
+The `ai-sync` subcommand scans for dirty repositories and launches the selected AI agent through ntm to read project context and create logical commits. ru then inspects the resulting Git state and publishes the validated revision when publication is requested.
 
 ### Prerequisites
 
 - **ntm** (Named Tmux Manager) - for session orchestration
 - **claude-code**, **codex**, or **gemini** CLI - for AI agent execution
+- **tmux** and **jq** - for session ownership checks and typed results
 
 ### Usage
 
@@ -2584,7 +2589,16 @@ ru ai-sync --no-untracked         # Ignore untracked files
 3. The agent reads `AGENTS.md` and `README.md` to understand the project
 4. Reviews all changes and groups them into logical commits
 5. Creates detailed commit messages explaining the changes
-6. Pushes to the remote (unless `--no-push` is specified)
+6. ru confirms that the original branch and history were preserved, the final candidate retains the original dirty working versions, and no tracked or untracked work remains
+7. Unless `--no-push` is specified, ru scans the unpublished history, pushes the exact validated revision through the captured destination, and verifies the receiver's ref
+
+An idle or disappearing session does not prove that work succeeded. Each result records the transport status, actual before and after revisions, commit SHAs, remaining paths, publication status, process exit code, and an `evidence_dir` containing the prompt and tool diagnostics. A publication failure returns nonzero and preserves completed local commits.
+
+Before starting the agent, ru retains the original index and raw dirty files. AI sync asks the agent to commit existing work without editing it, so ru checks that the final Git tree matches the original working snapshot, including additions, deletions, renames and file modes. A single commit of the working version is valid for partially staged files; the original staged version remains recovery evidence. Discarded, rewritten, subsequently reverted or additional unrequested changes fail validation, retain useful local commits and snapshots, and block host publication. Dependency updates retain the same recovery snapshots but use an editing policy, which does not claim original-content preservation.
+
+`--timeout` covers the entire operation, including readiness, prompt delivery, completion, Git inspection, and requested publication. Cleanup after interruption has a separate two-second budget and termination grace. An unfinished inspection or uncertain publication is reported explicitly.
+
+`--no-push` makes no host publication or receiver-inspection calls. The prompt directs the agent to work locally, and NTM panes receive an empty `GIT_ALLOW_PROTOCOL` restriction. This is a transport restriction, not a sandbox: provider tools, scripts, and project hooks can still attempt publication. Preventing every provider-side push attempt remains an open qualification requirement.
 
 ---
 
@@ -3521,6 +3535,25 @@ for f in scripts/test_e2e_*.sh; do "$f"; done
 - `jq` for JSON-oriented tests (skips when missing)
 - `gh` for tests that exercise GitHub auth behavior (skips when missing or unauthenticated)
 - `ntm`/`tmux` only for agent-sweep tests (mocked by default in E2E)
+
+The structured-output conformance tests require Python 3 with `jsonschema==4.19.2`
+and `rfc3339-validator==0.1.4`, plus the actual `tru` encoder and a Bash helper
+selected by `TOON_SH_PATH` (default: `~/.local/lib/toon.sh`). Missing prerequisites
+fail this conformance check. They are test dependencies; ordinary ru commands do
+not require Python or jsonschema. CI installs them explicitly, verifies the pinned
+TOON release archive, and uses a test adapter that calls the real encoder.
+
+Install the Python validators in an isolated environment before running the suite:
+
+```bash
+python3 -m venv /tmp/ru-test-venv
+/tmp/ru-test-venv/bin/python -m pip install 'jsonschema==4.19.2' 'rfc3339-validator==0.1.4'
+PATH="/tmp/ru-test-venv/bin:$PATH" bash scripts/run_all_tests.sh
+```
+
+Once these tools are installed, schema and TOON checks run offline against actual
+CLI output and local Git repositories. Controlled provider and GitHub endpoints
+exercise failure behavior; they do not qualify live services.
 
 ### Logging and Artifacts
 

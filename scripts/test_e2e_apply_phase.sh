@@ -715,7 +715,7 @@ exit 0
 
 test_cli_publication_freezes_receiver_at_push() {
     local scenario
-    for scenario in stable late-config; do
+    for scenario in stable late-config alias-rewrite; do
         e2e_setup
         setup_real_review_candidate
         local calls="$E2E_TEMP_DIR/late-calls" foreign="$E2E_TEMP_DIR/foreign.git"
@@ -736,6 +736,24 @@ exit 0
         mkdir -p "$E2E_TEMP_DIR/late-bin"
         export RU_LATE_REAL_GIT="$real_git" RU_LATE_MAIN="$APPLY_MAIN" RU_LATE_FOREIGN="$foreign"
         export RU_LATE_SCENARIO="$scenario" RU_LATE_MARKER="$E2E_TEMP_DIR/actual-push.json"
+        export RU_LATE_HOOK_MARKER="$E2E_TEMP_DIR/original-hook"
+        cat > "$APPLY_MAIN/.git/hooks/pre-push" <<'HOOK'
+#!/usr/bin/env bash
+set -uo pipefail
+jq -nc --args '$ARGS.positional' -- "$@" > "$RU_LATE_HOOK_MARKER.argv" || exit 3
+cat > "$RU_LATE_HOOK_MARKER.updates"
+HOOK
+        chmod +x "$APPLY_MAIN/.git/hooks/pre-push"
+        local receiver
+        for receiver in "$E2E_TEMP_DIR/remote.git" "$foreign"; do
+            cat > "$receiver/hooks/pre-receive" <<'HOOK'
+#!/usr/bin/env bash
+set -uo pipefail
+git_dir=$(git rev-parse --absolute-git-dir) || exit 3
+cat >> "$git_dir/received-updates"
+HOOK
+            chmod +x "$receiver/hooks/pre-receive"
+        done
         cat > "$E2E_TEMP_DIR/late-bin/git" <<'GIT'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -745,6 +763,13 @@ if [[ "${1:-}" == -C && "${2:-}" == "$RU_LATE_MAIN" ]]; then
             jq -nc --args '$ARGS.positional' -- "$@" > "$RU_LATE_MARKER" || exit 3
             if [[ "$RU_LATE_SCENARIO" == late-config ]]; then
                 "$RU_LATE_REAL_GIT" -C "$RU_LATE_MAIN" config remote.origin.pushurl "$RU_LATE_FOREIGN" || exit 3
+            elif [[ "$RU_LATE_SCENARIO" == alias-rewrite ]]; then
+                transport_alias=""
+                for transport_argument in "$@"; do
+                    [[ "$transport_argument" != url.*.insteadOf=ru-publication-* ]] || transport_alias="${transport_argument##*.insteadOf=}"
+                done
+                [[ -n "$transport_alias" ]] || { printf 'No private alias at actual native push\n' >&2; exit 3; }
+                "$RU_LATE_REAL_GIT" -C "$RU_LATE_MAIN" config "url.$RU_LATE_FOREIGN.insteadOf" "$transport_alias" || exit 3
             fi
             break
         fi
@@ -757,16 +782,31 @@ GIT
         "$E2E_RU_SCRIPT" review --apply --push --non-interactive --json > "$E2E_LOG_DIR/late-$scenario.stdout" 2> "$E2E_LOG_DIR/late-$scenario.stderr" || rc=$?
         export PATH="$old_path"
         assert_file_exists "$RU_LATE_MARKER" "Paired $scenario fixture reaches the actual Git push invocation"
-        assert_equals "$candidate" "$(git -C "$E2E_TEMP_DIR/remote.git" rev-parse main)" "$scenario publishes only to the prepared receiver"
+        if [[ "$scenario" == alias-rewrite ]]; then
+            assert_equals "$APPLY_BASE" "$(git -C "$E2E_TEMP_DIR/remote.git" rev-parse main)" "Alias rewrite is refused before either receiver advances"
+            assert_file_not_exists "$E2E_TEMP_DIR/remote.git/received-updates" "Alias refusal never enters the intended receiver hook"
+            assert_file_not_exists "$foreign/received-updates" "Alias refusal never transfers updates to the foreign receiver hook"
+            assert_file_not_exists "$RU_LATE_HOOK_MARKER.argv" "Wrong actual destination is refused before running the original project hook"
+        else
+            assert_equals "$candidate" "$(git -C "$E2E_TEMP_DIR/remote.git" rev-parse main)" "$scenario publishes only to the prepared receiver"
+            assert_equals "$(jq -nc --arg url "$E2E_TEMP_DIR/remote.git" '["origin",$url]')" "$(cat "$RU_LATE_HOOK_MARKER.argv")" "$scenario preserves the actual original hook name and destination"
+            assert_contains "$(cat "$RU_LATE_HOOK_MARKER.updates")" "$candidate refs/heads/main $APPLY_BASE" "$scenario preserves the exact original hook update tuple"
+            assert_file_exists "$E2E_TEMP_DIR/remote.git/received-updates" "$scenario exercises the actual intended receiver hook"
+        fi
         assert_equals "$APPLY_BASE" "$(git -C "$foreign" rev-parse main)" "$scenario preserves the foreign receiver"
         assert_equals "$candidate" "$(git -C "$APPLY_WT" rev-parse HEAD)" "$scenario preserves the approved worktree commit"
         if [[ "$scenario" == stable ]]; then
             assert_equals 0 "$rc" "Stable publication succeeds"
             assert_equals 1 "$(wc -l < "$calls" | tr -d ' ')" "Stable publication runs its approved action"
-        else
+        elif [[ "$scenario" == late-config ]]; then
             assert_equals "$foreign" "$(git -C "$APPLY_MAIN" config remote.origin.pushurl)" "Late fixture really changed remote configuration"
             assert_equals 2 "$rc" "Changed identity stops later actions after the safe frozen push"
             assert_file_not_exists "$calls" "Late configuration change executes no GitHub action"
+        else
+            assert_success "Late fixture keyed an actual config rewrite to the generated alias" git -C "$APPLY_MAIN" config --get "url.$foreign.insteadOf"
+            assert_equals 2 "$rc" "Actual foreign destination is refused before publication"
+            assert_file_not_exists "$calls" "Alias rewrite executes no GitHub action"
+            assert_contains "$(cat "$E2E_LOG_DIR/late-$scenario.stderr")" 'actual receiver differs' "Refusal names the actual hook destination mismatch"
         fi
         assert_equals "$rc" "$(jq -r '._meta.exit_code' "$E2E_LOG_DIR/late-$scenario.stdout")" "Publication metadata matches actual $scenario exit"
         e2e_preserve_on_failure

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bash -l
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Exercise this checkout with a populated isolated configuration, independent
