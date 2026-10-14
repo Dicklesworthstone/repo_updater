@@ -107,11 +107,17 @@ test_default_preserves_local_commits() {
     init_fork_config "test_owner/resetrepo"
 
     local output exit_code=0
-    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch 2>&1) || exit_code=$?
+    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch --non-interactive --json 2> "$E2E_LOG_DIR/default.stderr") || exit_code=$?
 
     assert_equals "0" "$exit_code" "fork-clean exits 0"
-    assert_contains "$output" "preserved 1 local commit(s)" "Reports actual preservation"
-    assert_contains "$output" "0 cleaned" "Does not claim removal when main is unchanged"
+    assert_contains "$(cat "$E2E_LOG_DIR/default.stderr")" "preserved 1 local commit(s)" "Reports actual preservation"
+    assert_contains "$(cat "$E2E_LOG_DIR/default.stderr")" "0 cleaned" "Does not claim removal when main is unchanged"
+    assert_equals fork-clean "$(jq -r '.command' <<< "$output")" "JSON identifies the command"
+    assert_equals 0 "$(jq -r '.data.summary.removed_commits' <<< "$output")" "JSON reports no removal"
+    assert_equals 1 "$(jq -r '.data.summary.retained_commits' <<< "$output")" "JSON reports preserved history"
+    assert_equals "$before_rev" "$(jq -r '.data.results[0].before_sha' <<< "$output")" "JSON binds original revision"
+    assert_equals "$before_rev" "$(jq -r '.data.results[0].after_sha' <<< "$output")" "JSON binds actual resulting revision"
+    assert_equals preserved "$(jq -r '.data.results[0].status' <<< "$output")" "JSON makes the actual outcome explicit"
 
     local current_rev
     current_rev=$(git -C "$LOCAL_DIR" rev-parse main)
@@ -216,11 +222,18 @@ test_reset_requires_force() {
 
     init_fork_config "test_owner/forcerepo"
 
-    local output exit_code=0
-    output=$("$E2E_RU_SCRIPT" fork-clean --reset --no-fetch 2>&1) || exit_code=$?
+    local output exit_code=0 before_head before_bytes
+    before_head=$(git -C "$LOCAL_DIR" rev-parse HEAD)
+    before_bytes=$(git hash-object "$LOCAL_DIR/local_file.txt")
+    output=$("$E2E_RU_SCRIPT" fork-clean --reset --no-fetch --json 2> "$E2E_LOG_DIR/reset-refused.stderr") || exit_code=$?
 
     assert_equals "4" "$exit_code" "fork-clean --reset without --force exits 4"
-    assert_contains "$output" "requires --force" "Error mentions --force requirement"
+    assert_contains "$(cat "$E2E_LOG_DIR/reset-refused.stderr")" "requires --force" "Error mentions --force requirement"
+    assert_equals fork-clean "$(jq -r '.command' <<< "$output")" "Refused reset still emits the common command envelope"
+    assert_equals 4 "$(jq -r '._meta.exit_code' <<< "$output")" "JSON preserves the actual invalid-argument exit"
+    assert_equals reset_requires_force "$(jq -r '.data.error' <<< "$output")" "JSON identifies the exact refusal"
+    assert_equals "$before_head" "$(git -C "$LOCAL_DIR" rev-parse HEAD)" "Refused reset preserves original commits"
+    assert_equals "$before_bytes" "$(git hash-object "$LOCAL_DIR/local_file.txt")" "Refused reset preserves original file bytes"
 
     e2e_cleanup
 }
@@ -242,15 +255,18 @@ test_reset_with_force() {
     init_fork_config "test_owner/resetforcerepo"
 
     local output exit_code=0
-    output=$("$E2E_RU_SCRIPT" fork-clean --reset --force --no-fetch 2>&1) || exit_code=$?
+    output=$("$E2E_RU_SCRIPT" fork-clean --reset --force --no-fetch --json 2> "$E2E_LOG_DIR/reset.stderr") || exit_code=$?
 
     assert_equals "0" "$exit_code" "fork-clean --reset --force exits 0"
-    assert_contains "$output" "cleaned" "Reports clean success"
+    assert_contains "$(cat "$E2E_LOG_DIR/reset.stderr")" "cleaned" "Reports clean success"
 
     local current_rev
     current_rev=$(git -C "$LOCAL_DIR" rev-parse main)
     assert_equals "$upstream_rev" "$current_rev" "Main reset to upstream"
-    assert_contains "$output" "removed 1 local commit(s); preserved 0" "Reports revision-derived removal"
+    assert_contains "$(cat "$E2E_LOG_DIR/reset.stderr")" "removed 1 local commit(s); preserved 0" "Reports revision-derived removal"
+    assert_equals 1 "$(jq -r '.data.summary.removed_commits' <<< "$output")" "Reset JSON reports actual removal"
+    assert_equals 0 "$(jq -r '.data.summary.retained_commits' <<< "$output")" "Reset JSON reports no remaining pollution"
+    assert_equals "$upstream_rev" "$(jq -r '.data.results[0].after_sha' <<< "$output")" "Reset JSON binds resulting upstream revision"
     local rescue_ref
     rescue_ref=$(git -C "$LOCAL_DIR" for-each-ref --format='%(refname)' refs/heads/rescue/)
     assert_equals "$original_rev" "$(git -C "$LOCAL_DIR" rev-parse "$rescue_ref")" "Rescue branch retains original history"
@@ -275,10 +291,13 @@ test_dirty_working_tree_skipped() {
     init_fork_config "test_owner/dirtyrepo"
 
     local output exit_code=0
-    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch 2>&1) || exit_code=$?
+    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch --json 2> "$E2E_LOG_DIR/dirty.stderr") || exit_code=$?
 
-    assert_contains "$output" "uncommitted changes" "Notes dirty working tree"
-    assert_contains "$output" "0 cleaned" "Does not clean dirty repo"
+    assert_contains "$(cat "$E2E_LOG_DIR/dirty.stderr")" "uncommitted changes" "Notes dirty working tree"
+    assert_contains "$(cat "$E2E_LOG_DIR/dirty.stderr")" "0 cleaned" "Does not clean dirty repo"
+    assert_equals 1 "$(jq -r '.data.summary.retained_commits' <<< "$output")" "Dirty skip counts preserved local commit"
+    assert_equals "$before_rev" "$(jq -r '.data.results[0].before_sha' <<< "$output")" "Dirty skip binds actual original revision"
+    assert_equals "$before_rev" "$(jq -r '.data.results[0].after_sha' <<< "$output")" "Dirty skip binds preserved revision"
     assert_equals "$before_rev" "$(git -C "$LOCAL_DIR" rev-parse main)" "Dirty main is preserved"
     assert_equals "$before_diff" "$(git -C "$LOCAL_DIR" diff)" "Tracked dirty bytes are preserved"
     assert_file_contains "$LOCAL_DIR/dirty.txt" uncommitted "Untracked work is preserved"
@@ -301,11 +320,14 @@ test_diverged_default_preserves_history() {
     local before_rev output rc=0
     before_rev=$(git -C "$LOCAL_DIR" rev-parse main)
     init_fork_config test_owner/divergedrepo
-    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch 2>&1) || rc=$?
+    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch --json 2> "$E2E_LOG_DIR/diverged.stderr") || rc=$?
     assert_equals 1 "$rc" "Diverged default reports refusal"
     assert_equals "$before_rev" "$(git -C "$LOCAL_DIR" rev-parse main)" "Diverged history remains intact"
-    assert_contains "$output" 'local commits preserved' "Refusal explains preservation"
-    assert_contains "$output" '0 cleaned' "Refusal does not claim cleanup"
+    assert_contains "$(cat "$E2E_LOG_DIR/diverged.stderr")" 'local commits preserved' "Refusal explains preservation"
+    assert_contains "$(cat "$E2E_LOG_DIR/diverged.stderr")" '0 cleaned' "Refusal does not claim cleanup"
+    assert_equals 1 "$(jq -r '.data.summary.retained_commits' <<< "$output")" "Refused divergence counts actual preserved commit"
+    assert_equals 0 "$(jq -r '.data.summary.removed_commits' <<< "$output")" "Refusal removes no commits"
+    assert_equals "$before_rev" "$(jq -r '.data.results[0].after_sha' <<< "$output")" "Refusal reports preserved revision"
     assert_file_contains "$LOCAL_DIR/local_file.txt" local-change "Local commit contents survive"
     e2e_cleanup
 }
@@ -320,10 +342,12 @@ test_push_failure_is_not_success() {
     before_rev=$(git -C "$LOCAL_DIR" rev-parse main)
     git -C "$LOCAL_DIR" remote set-url origin "$E2E_TEMP_DIR/missing-origin.git"
     init_fork_config test_owner/pushfailrepo
-    output=$("$E2E_RU_SCRIPT" fork-clean --push --no-fetch 2>&1) || rc=$?
+    output=$("$E2E_RU_SCRIPT" fork-clean --push --no-fetch --json 2> "$E2E_LOG_DIR/push.stderr") || rc=$?
     assert_equals 1 "$rc" "Requested failed push makes command fail"
-    assert_contains "$output" 'Failed to push' "Push failure is visible"
-    assert_contains "$output" '1 failed' "Failure counted in summary"
+    assert_contains "$(cat "$E2E_LOG_DIR/push.stderr")" 'Failed to push' "Push failure is visible"
+    assert_contains "$(cat "$E2E_LOG_DIR/push.stderr")" '1 failed' "Failure counted in summary"
+    assert_equals 1 "$(jq -r '.data.summary.retained_commits' <<< "$output")" "Push failure still counts local preserved commit"
+    assert_equals 1 "$(jq -r '._meta.exit_code' <<< "$output")" "Structured failed push reports nonzero outcome"
     assert_equals "$before_rev" "$(git -C "$LOCAL_DIR" rev-parse main)" "Failed push retains local work"
     e2e_cleanup
 }
@@ -331,6 +355,37 @@ test_push_failure_is_not_success() {
 #==============================================================================
 # Run Tests
 #==============================================================================
+
+test_empty_and_uninitialized_json_results() {
+    local mode output rc
+    for mode in empty uninitialized; do
+        e2e_setup
+        if [[ "$mode" == uninitialized ]]; then
+            export RU_CONFIG_DIR="$E2E_TEMP_DIR/not-created-config"
+        else
+            mkdir -p "$XDG_CONFIG_HOME/ru/repos.d"
+            printf '# Empty fixture\n' > "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+        fi
+        rc=0
+        output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch --non-interactive --json 2> "$E2E_LOG_DIR/empty-$mode.stderr") || rc=$?
+        assert_equals 0 "$rc" "Zero configured repositories is a successful no-op: $mode"
+        assert_success "Zero-item result is one actual envelope with truthful counts: $mode" jq -e -s 'length == 1 and (.[0] | .command == "fork-clean" and ._meta.exit_code == 0 and .data.results == [] and .data.summary.configured == 0 and .data.summary.removed_commits == 0 and .data.summary.retained_commits == 0)' <<< "$output"
+        unset RU_CONFIG_DIR
+        e2e_cleanup
+    done
+}
+
+test_missing_repository_reports_unknown_counts() {
+    e2e_setup
+    mkdir -p "$XDG_CONFIG_HOME/ru/repos.d" "$RU_PROJECTS_DIR"
+    printf 'test_owner/not-cloned\n' > "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    local output rc=0
+    output=$("$E2E_RU_SCRIPT" fork-clean --no-fetch --json 2> "$E2E_LOG_DIR/missing.stderr") || rc=$?
+    assert_equals 0 "$rc" "An uncloned configured repository is skipped"
+    assert_success "Missing repository remains visible with unavailable counts" jq -e '.data.summary.skipped == 1 and .data.summary.counts_complete == false and .data.results[0].status == "skipped" and .data.results[0].counts_available == false and .data.results[0].removed_commits == null and .data.results[0].retained_commits == null' <<< "$output"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/not-cloned" "Reporting an unavailable repository creates no clone"
+    e2e_cleanup
+}
 
 log_suite_start "E2E Tests: ru fork-clean"
 
@@ -344,6 +399,8 @@ run_test test_reset_with_force
 run_test test_dirty_working_tree_skipped
 run_test test_diverged_default_preserves_history
 run_test test_push_failure_is_not_success
+run_test test_empty_and_uninitialized_json_results
+run_test test_missing_repository_reports_unknown_counts
 
 print_results
 exit "$(get_exit_code)"

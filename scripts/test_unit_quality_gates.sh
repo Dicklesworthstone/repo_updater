@@ -641,7 +641,8 @@ test_run_secret_scan_clean_project() {
     git -C "$project_dir" init -q
     echo "# Clean file" > "$project_dir/README.md"
     git -C "$project_dir" add .
-    git -C "$project_dir" commit -q -m "Initial"
+    git -C "$project_dir" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Clean scan fixture has an actual initial commit" git -C "$project_dir" rev-parse --verify HEAD
 
     local result
     result=$(run_secret_scan "$project_dir")
@@ -680,7 +681,8 @@ test_run_secret_scan_detects_potential_secret() {
     git -C "$project_dir" init -q
     echo "Clean initial" > "$project_dir/README.md"
     git -C "$project_dir" add .
-    git -C "$project_dir" commit -q -m "Initial"
+    git -C "$project_dir" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Finding fixture has an actual clean initial commit" git -C "$project_dir" rev-parse --verify HEAD
 
     # Add a file with potential secret pattern
     echo 'API_KEY = "sk-abc123"' > "$project_dir/config.txt"
@@ -722,7 +724,8 @@ test_run_secret_scan_reports_tool_used() {
     git -C "$project_dir" init -q
     echo "Clean" > "$project_dir/README.md"
     git -C "$project_dir" add .
-    git -C "$project_dir" commit -q -m "Initial"
+    git -C "$project_dir" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Tool reporting fixture has an actual initial commit" git -C "$project_dir" rev-parse --verify HEAD
 
     local result
     result=$(run_secret_scan "$project_dir")
@@ -761,7 +764,8 @@ test_run_quality_gates_all_pass() {
     git -C "$wt_path" init -q
     echo "Clean" > "$wt_path/README.md"
     git -C "$wt_path" add .
-    git -C "$wt_path" commit -q -m "Initial"
+    git -C "$wt_path" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Passing gate fixture has an actual initial commit" git -C "$wt_path" rev-parse --verify HEAD
 
     _create_passing_test "$wt_path"
     _create_passing_lint "$wt_path"
@@ -821,7 +825,8 @@ test_run_quality_gates_test_failure() {
     git -C "$wt_path" init -q
     echo "Clean" > "$wt_path/README.md"
     git -C "$wt_path" add .
-    git -C "$wt_path" commit -q -m "Initial"
+    git -C "$wt_path" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Failed test gate fixture has an actual initial commit" git -C "$wt_path" rev-parse --verify HEAD
 
     _create_failing_test "$wt_path"
     _create_passing_lint "$wt_path"
@@ -869,7 +874,8 @@ test_run_quality_gates_lint_failure() {
     git -C "$wt_path" init -q
     echo "Clean" > "$wt_path/README.md"
     git -C "$wt_path" add .
-    git -C "$wt_path" commit -q -m "Initial"
+    git -C "$wt_path" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Failed lint gate fixture has an actual initial commit" git -C "$wt_path" rev-parse --verify HEAD
 
     _create_passing_test "$wt_path"
     _create_failing_lint "$wt_path"
@@ -917,7 +923,8 @@ test_run_quality_gates_uses_policy_commands() {
     git -C "$wt_path" init -q
     echo "Clean" > "$wt_path/README.md"
     git -C "$wt_path" add .
-    git -C "$wt_path" commit -q -m "Initial"
+    git -C "$wt_path" -c user.name=Gate -c user.email=gate@example.invalid commit -q -m "Initial" || return 3
+    assert_success "Configured gate fixture has an actual initial commit" git -C "$wt_path" rev-parse --verify HEAD
 
     # Create custom test/lint scripts
     cat > "$wt_path/custom_test.sh" <<'EOF'

@@ -8,6 +8,8 @@
 #   - GitHub action execution (comment, close, label)
 #   - Push flag behavior
 #   - Dry-run mode
+# Plan fixtures below cover schema and stored fields. They do not establish
+# physical identity, approval, live GitHub mutations or CLI application proof.
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
 # shellcheck disable=SC1091  # Sourced files checked separately
@@ -86,13 +88,16 @@ test_plan_validation_required() {
     setup_apply_test
 
     # Test missing file
-    local result
-    result=$(validate_review_plan "$TEST_DIR/nonexistent.json")
+    local result rc=0
+    result=$(validate_review_plan "$TEST_DIR/nonexistent.json") || rc=$?
+    assert_equals "1" "$rc" "Missing plan must fail validation"
     assert_contains "$result" "not found" "Should reject missing file"
 
     # Test invalid JSON
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" "not json"
-    result=$(validate_review_plan "$TEST_DIR/worktree/.ru/review-plan.json")
+    rc=0
+    result=$(validate_review_plan "$TEST_DIR/worktree/.ru/review-plan.json") || rc=$?
+    assert_equals "1" "$rc" "Malformed JSON must fail validation"
     if [[ "$result" != "Valid" ]]; then
         pass "Rejected invalid JSON"
     else
@@ -101,9 +106,10 @@ test_plan_validation_required() {
 
     # Test missing required fields
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{"version":"1"}'
-    result=$(validate_review_plan "$TEST_DIR/worktree/.ru/review-plan.json")
-    # Plans need minimal structure - this may or may not be valid depending on implementation
-    pass "Plan validation executed"
+    rc=0
+    result=$(validate_review_plan "$TEST_DIR/worktree/.ru/review-plan.json") || rc=$?
+    assert_equals "1" "$rc" "Missing required fields must fail validation"
+    assert_contains "$result" "Missing required fields" "Missing contract fields are reported"
 
     log_test_pass "$test_name"
 }
@@ -115,15 +121,19 @@ test_plan_validation_accepts_valid() {
 
     # Create valid plan with all required fields
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
-        "schema_version": "1",
+        "schema_version": 1,
+        "run_id": "run-apply-valid",
         "repo": "owner/repo",
-        "items": [{"type": "issue", "number": 42, "decision": "fix"}],
+        "worktree_path": "/tmp/test-worktree",
+        "items": [{"type": "issue", "number": 42, "title": "Fix auth", "priority": "high", "decision": "fix"}],
         "gh_actions": [],
-        "git": {"commits": [], "tests": {"ran": false}}
+        "git": {"commits": [], "tests": {"ran": false}},
+        "metadata": {"started_at":"2025-01-04T10:30:00Z","completed_at":"2025-01-04T10:45:00Z","model":"claude-sonnet-4","driver":"local"}
     }'
 
-    local result
-    result=$(validate_review_plan "$TEST_DIR/worktree/.ru/review-plan.json")
+    local result rc=0
+    result=$(validate_review_plan "$TEST_DIR/worktree/.ru/review-plan.json") || rc=$?
+    assert_equals "0" "$rc" "Complete plan must pass schema validation"
     assert_equals "Valid" "$result" "Should accept valid plan"
 
     log_test_pass "$test_name"
@@ -140,9 +150,13 @@ test_quality_gate_test_failure() {
 
     # Create plan with failed tests
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
+        "schema_version": 1,
+        "run_id": "run-test-failure",
         "repo": "owner/repo",
+        "worktree_path": "/tmp/test-worktree",
         "items": [],
-        "git": {"tests": {"ran": true, "ok": false, "output": "FAILED"}}
+        "git": {"tests": {"ran": true, "ok": false, "output": "FAILED"}},
+        "metadata": {"started_at":"2025-01-04T10:30:00Z","completed_at":"2025-01-04T10:45:00Z","model":"claude-sonnet-4","driver":"local"}
     }'
 
     # Test failure should be captured in plan
@@ -161,10 +175,13 @@ test_quality_gate_lint_failure() {
     # Verify lint gate detection
     # This tests the plan structure for lint results
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
-        "schema_version": "1",
+        "schema_version": 1,
+        "run_id": "run-lint-failure",
         "repo": "owner/repo",
+        "worktree_path": "/tmp/test-worktree",
         "items": [],
-        "git": {"lint": {"ran": true, "ok": false, "output": "errors found"}}
+        "git": {"lint": {"ran": true, "ok": false, "output": "errors found"}},
+        "metadata": {"started_at":"2025-01-04T10:30:00Z","completed_at":"2025-01-04T10:45:00Z","model":"claude-sonnet-4","driver":"local"}
     }'
 
     local lint_ok
@@ -181,10 +198,13 @@ test_quality_gate_secret_failure() {
 
     # Verify secret scan detection structure
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
-        "schema_version": "1",
+        "schema_version": 1,
+        "run_id": "run-secret-failure",
         "repo": "owner/repo",
+        "worktree_path": "/tmp/test-worktree",
         "items": [],
-        "git": {"secrets": {"scanned": true, "ok": false, "findings": ["API_KEY"]}}
+        "git": {"secrets": {"scanned": true, "ok": false, "findings": ["API_KEY"]}},
+        "metadata": {"started_at":"2025-01-04T10:30:00Z","completed_at":"2025-01-04T10:45:00Z","model":"claude-sonnet-4","driver":"local"}
     }'
 
     local secrets_ok
@@ -251,7 +271,7 @@ test_gh_action_label() {
     setup_apply_test
 
     # Test canonicalize_gh_action with label (target format: issue#N or pr#N)
-    local action_json='{"op":"label","target":"issue#42","add":["bug","urgent"]}'
+    local action_json='{"op":"label","target":"issue#42","labels":["bug","urgent"]}'
     local canonical
     canonical=$(canonicalize_gh_action "$action_json")
 
@@ -278,9 +298,13 @@ test_dry_run_no_mutations() {
 
     # Create plan with actions
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
+        "schema_version": 1,
+        "run_id": "run-dry-run",
         "repo": "owner/repo",
+        "worktree_path": "/tmp/test-worktree",
         "items": [],
-        "gh_actions": [{"op":"comment","target":"issue#1","body":"test"}]
+        "gh_actions": [{"op":"comment","target":"issue#1","body":"test"}],
+        "metadata": {"started_at":"2025-01-04T10:30:00Z","completed_at":"2025-01-04T10:45:00Z","model":"claude-sonnet-4","driver":"local"}
     }'
 
     # In dry-run mode, actions should be logged but not executed
@@ -328,9 +352,13 @@ test_merge_ff_only() {
     # The actual merge happens in push_worktree_changes which uses --ff-only
     # We verify this by checking the plan records merge strategy
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
+        "schema_version": 1,
+        "run_id": "run-merge",
         "repo": "owner/repo",
+        "worktree_path": "/tmp/test-worktree",
         "items": [],
-        "git": {"commits": [{"sha":"abc123","message":"test"}]}
+        "git": {"commits": [{"sha":"abc123","message":"test"}]},
+        "metadata": {"started_at":"2025-01-04T10:30:00Z","completed_at":"2025-01-04T10:45:00Z","model":"claude-sonnet-4","driver":"local"}
     }'
 
     local commits_count

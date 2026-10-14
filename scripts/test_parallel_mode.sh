@@ -81,12 +81,105 @@ test_dir_lock_contention_timeout() {
     local lock_dir
     lock_dir="$(create_temp_dir)/queue.lock"
     mkdir -p "$lock_dir"
-    printf '%s:%s\n' "$$" "$(date +%s)" > "$lock_dir/owner"
+    printf '%s\n' "${BASHPID:-$$}" > "$lock_dir/owner"
 
     assert_fails "acquire lock while held" dir_lock_acquire "$lock_dir" 1
     assert_success "release held lock" dir_lock_release "$lock_dir"
 
     log_test_pass "$test_name"
+}
+
+test_dir_lock_rejects_false_mkdir_success() {
+    local lock_dir owner_before
+    lock_dir="$(create_temp_dir)/queue.lock"
+    # Reproduce mkdir implementations that turn a racing EEXIST into success.
+    # The actual directory and owner file still use real filesystem operations.
+    (
+        mkdir() { command mkdir "$@" 2>/dev/null || [[ -d "$1" ]]; }
+        assert_success "First holder acquires the lock" dir_lock_try_acquire "$lock_dir"
+        owner_before=$(cat "$lock_dir/owner")
+        assert_fails "False mkdir success cannot admit another holder" dir_lock_try_acquire "$lock_dir"
+        assert_equals "$owner_before" "$(cat "$lock_dir/owner")" "Rejected contender preserves owner"
+        assert_success "Holder releases directory and owner" dir_lock_release "$lock_dir"
+        assert_false "[[ -e \"$lock_dir\" ]]" "Release leaves no held lock"
+        assert_success "A subsequent holder can acquire" dir_lock_try_acquire "$lock_dir"
+        dir_lock_release "$lock_dir"
+        exit "$(get_exit_code)"
+    )
+    assert_equals 0 "$?" "Exclusive ownership survives false mkdir success"
+}
+
+test_dir_lock_preserves_live_foreign_owner() {
+    local temp_dir lock_dir holder_pid attempt
+    temp_dir=$(create_temp_dir)
+    lock_dir="$temp_dir/queue.lock"
+    (
+        dir_lock_try_acquire "$lock_dir" || exit 1
+        : > "$temp_dir/ready"
+        sleep 2
+        dir_lock_release "$lock_dir"
+    ) &
+    holder_pid=$!
+    for ((attempt=0; attempt<100; attempt++)); do
+        [[ -f "$temp_dir/ready" ]] && break
+        sleep 0.01
+    done
+    assert_file_exists "$temp_dir/ready" "Concurrent holder acquired the real lock"
+    assert_fails "A foreign live holder cannot be released" dir_lock_release "$lock_dir"
+    assert_file_exists "$lock_dir/owner" "Foreign holder sentinel remains intact"
+    wait "$holder_pid"
+    assert_equals 0 "$?" "Actual holder releases successfully"
+    assert_false "[[ -e \"$lock_dir\" ]]" "Actual holder removes its own lock"
+}
+
+test_stale_release_cannot_remove_new_holder() {
+    local temp_dir lock_dir dead_pid cleanup_pid second_pid attempt
+    temp_dir=$(create_temp_dir)
+    lock_dir="$temp_dir/queue.lock"
+    (exit 0) &
+    dead_pid=$!
+    wait "$dead_pid"
+    mkdir "$lock_dir"
+    printf '%s\n' "$dead_pid" > "$lock_dir/owner"
+    (
+        # Delay only the real unlink operation after stale-owner inspection.
+        rm() {
+            if [[ "${2:-}" == "$lock_dir/owner" ]]; then
+                : > "$temp_dir/cleanup-ready"
+                for ((attempt=0; attempt<500; attempt++)); do
+                    [[ -f "$temp_dir/resume-cleanup" ]] && break
+                    sleep 0.01
+                done
+            fi
+            command rm "$@"
+        }
+        dir_lock_release "$lock_dir"
+    ) &
+    cleanup_pid=$!
+    for ((attempt=0; attempt<200; attempt++)); do
+        [[ -f "$temp_dir/cleanup-ready" ]] && break
+        sleep 0.01
+    done
+    assert_file_exists "$temp_dir/cleanup-ready" "Stale cleanup reached the actual unlink boundary"
+    (
+        : > "$temp_dir/second-started"
+        dir_lock_release "$lock_dir" || exit 1
+        : > "$temp_dir/second-finished"
+    ) &
+    second_pid=$!
+    for ((attempt=0; attempt<100; attempt++)); do
+        [[ -f "$temp_dir/second-finished" ]] && break
+        sleep 0.01
+    done
+    assert_fails "New holder cannot enter while stale cleanup is delayed" dir_lock_try_acquire "$lock_dir"
+    : > "$temp_dir/resume-cleanup"
+    wait "$cleanup_pid"
+    assert_equals 0 "$?" "First stale cleanup completes"
+    wait "$second_pid"
+    assert_equals 0 "$?" "Second cleanup completes without removing a live owner"
+    assert_success "New holder enters after stale cleanup completes" dir_lock_try_acquire "$lock_dir"
+    assert_fails "Additional holder remains excluded" dir_lock_try_acquire "$lock_dir"
+    assert_success "New holder releases normally" dir_lock_release "$lock_dir"
 }
 
 test_dir_lock_stale_cleanup() {
@@ -103,7 +196,7 @@ test_dir_lock_stale_cleanup() {
     local lock_dir
     lock_dir="$(create_temp_dir)/queue.lock"
     mkdir -p "$lock_dir"
-    printf '%s:%s\n' "99999" "$(( $(date +%s) - 400 ))" > "$lock_dir/owner"
+    printf '%s\n' "99999" > "$lock_dir/owner"
 
     # NOTE: Stale lock cleanup is not yet implemented in dir_lock_acquire.
     # This test will pass once the feature is added. For now, we skip
@@ -469,6 +562,9 @@ test_sequential_agent_sweep_function_exists() {
 setup_cleanup_trap
 run_test test_dir_lock_acquire_release
 run_test test_dir_lock_contention_timeout
+run_test test_dir_lock_rejects_false_mkdir_success
+run_test test_dir_lock_preserves_live_foreign_owner
+run_test test_stale_release_cannot_remove_new_holder
 run_test test_dir_lock_stale_cleanup
 run_test test_backoff_trigger_creates_state
 run_test test_backoff_trigger_writes_reason

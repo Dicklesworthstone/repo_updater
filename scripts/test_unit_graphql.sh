@@ -34,6 +34,46 @@ source_ru_function "log_verbose"
 log_warn() { :; }
 log_verbose() { :; }
 
+test_retry_preserves_process_outcomes() {
+    log_test_start "retry_with_backoff: real exits and capture streams"
+    local env_root mode expected output actual attempts
+    env_root=$(create_test_env)
+    for mode in all stdout; do
+        for expected in 1 2 42 124 127; do
+            attempts="$env_root/attempts-$mode-$expected"
+            : > "$attempts"
+            actual=0
+            output=$(retry_with_backoff "--capture=$mode" 3 0 -- bash -c '
+                printf "attempt\n" >> "$1"
+                printf "command output\n"
+                printf "command diagnostic\n" >&2
+                exit "$2"
+            ' _ "$attempts" "$expected" 2> "$env_root/stderr-$mode-$expected") || actual=$?
+            assert_equals "$expected" "$actual" "Exhausted $mode retry preserves exit $expected"
+            assert_equals 3 "$(wc -l < "$attempts" | tr -d ' ')" "All requested attempts execute"
+            assert_contains "$output" 'command output' "Last command stdout is retained"
+            if [[ "$mode" == stdout ]]; then
+                assert_equals 'command output' "$output" "Structured stdout excludes human diagnostics"
+                assert_contains "$(cat "$env_root/stderr-$mode-$expected")" 'command diagnostic' "stderr diagnostics remain visible"
+            else
+                assert_contains "$output" 'command diagnostic' "Combined capture retains stderr"
+            fi
+        done
+        attempts="$env_root/recovered-$mode"
+        : > "$attempts"
+        actual=0
+        output=$(retry_with_backoff "--capture=$mode" 3 0 -- bash -c '
+            count=$(wc -l < "$1")
+            printf "attempt\n" >> "$1"
+            if [[ "$count" -eq 0 ]]; then exit 42; fi
+            printf "recovered\n"
+        ' _ "$attempts") || actual=$?
+        assert_equals 0 "$actual" "Successful $mode retry recovers"
+        assert_equals 2 "$(wc -l < "$attempts" | tr -d ' ')" "Recovery stops further retries"
+        assert_equals recovered "$output" "Successful output is retained"
+    done
+}
+
 test_graphql_injection_protection() {
     local test_name="gh_api_graphql_repo_batch: protects against injection"
     log_test_start "$test_name"
@@ -146,6 +186,7 @@ EOF
     cleanup_temp_dirs
 }
 
+run_test test_retry_preserves_process_outcomes
 run_test test_graphql_injection_protection
 run_test test_discover_work_items_pipe_sanitization
 

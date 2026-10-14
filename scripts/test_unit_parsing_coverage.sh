@@ -573,27 +573,25 @@ FORK_TEMP=$(mktemp -d)
 trap 'rm -rf "$FORK_TEMP"; cleanup_test_env' EXIT
 
 # Step 1: Create "upstream" as a normal repo with a commit on main
-git init "$FORK_TEMP/upstream" >/dev/null 2>&1
-(
-    cd "$FORK_TEMP/upstream" || exit
-    git checkout -b main 2>/dev/null
-    echo "upstream content" > file.txt
-    git add file.txt
-    git commit -m "Upstream initial commit" >/dev/null 2>&1
-)
+git init -q "$FORK_TEMP/upstream" || exit 3
+git -C "$FORK_TEMP/upstream" config user.name 'Parsing Test' || exit 3
+git -C "$FORK_TEMP/upstream" config user.email parsing-test@example.invalid || exit 3
+git -C "$FORK_TEMP/upstream" checkout -q -b main || exit 3
+echo "upstream content" > "$FORK_TEMP/upstream/file.txt"
+git -C "$FORK_TEMP/upstream" add file.txt || exit 3
+git -C "$FORK_TEMP/upstream" commit -q -m "Upstream initial commit" || exit 3
 
 # Step 2: Create "origin" as a clone of upstream (simulates GitHub fork)
-git clone "$FORK_TEMP/upstream" "$FORK_TEMP/origin" --bare >/dev/null 2>&1
+git clone -q "$FORK_TEMP/upstream" "$FORK_TEMP/origin" --bare || exit 3
 
 # Step 3: Create the working copy (local fork checkout)
-git clone "$FORK_TEMP/origin" "$FORK_TEMP/fork" >/dev/null 2>&1
-(
-    cd "$FORK_TEMP/fork" || exit
-    git checkout main 2>/dev/null || git checkout -b main origin/main 2>/dev/null
-    # Add upstream remote pointing to the "upstream" repo
-    git remote add upstream "$FORK_TEMP/upstream"
-    git fetch upstream >/dev/null 2>&1
-)
+git clone -q "$FORK_TEMP/origin" "$FORK_TEMP/fork" || exit 3
+git -C "$FORK_TEMP/fork" config user.name 'Parsing Test' || exit 3
+git -C "$FORK_TEMP/fork" config user.email parsing-test@example.invalid || exit 3
+git -C "$FORK_TEMP/fork" checkout -q main || exit 3
+# Add upstream remote pointing to the "upstream" repo.
+git -C "$FORK_TEMP/fork" remote add upstream "$FORK_TEMP/upstream" || exit 3
+git -C "$FORK_TEMP/fork" fetch -q upstream || exit 3
 
 # Test: has_upstream_remote returns 0 when upstream exists
 if has_upstream_remote "$FORK_TEMP/fork" "upstream"; then
@@ -644,10 +642,7 @@ fi
 section "get_fork_status"
 
 # Ensure fork is synced with upstream (upstream already has the same commit)
-(
-    cd "$FORK_TEMP/fork" || exit
-    git fetch upstream >/dev/null 2>&1
-)
+git -C "$FORK_TEMP/fork" fetch -q upstream || exit 3
 
 # Test: synced state
 result=$(get_fork_status "$FORK_TEMP/fork" "upstream" "main")
@@ -659,12 +654,9 @@ else
 fi
 
 # Test: ahead state (local commits not in upstream)
-(
-    cd "$FORK_TEMP/fork" || exit
-    echo "local change" >> file.txt
-    git add file.txt
-    git commit -m "Local commit" >/dev/null 2>&1
-)
+echo "local change" >> "$FORK_TEMP/fork/file.txt"
+git -C "$FORK_TEMP/fork" add file.txt || exit 3
+git -C "$FORK_TEMP/fork" commit -q -m "Local commit" || exit 3
 
 result=$(get_fork_status "$FORK_TEMP/fork" "upstream" "main")
 IFS=$'\t' read -r ahead behind status has_changes <<< "$result"
@@ -723,8 +715,8 @@ section "create_rescue_branch"
 
 # Add a local commit to create something worth rescuing
 echo "work to rescue" >> "$FORK_TEMP/fork/file.txt"
-git -C "$FORK_TEMP/fork" add file.txt >/dev/null 2>&1
-git -C "$FORK_TEMP/fork" commit -m "Work to rescue" >/dev/null 2>&1
+git -C "$FORK_TEMP/fork" add file.txt || exit 3
+git -C "$FORK_TEMP/fork" commit -q -m "Work to rescue" || exit 3
 
 # Test: creates rescue branch with expected name pattern
 rescue_name=$(create_rescue_branch "$FORK_TEMP/fork" "main")

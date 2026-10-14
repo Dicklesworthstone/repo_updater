@@ -53,6 +53,9 @@ reset_governor_state() {
     )
 }
 
+source_ru_function "is_positive_int"
+source_ru_function "retry_with_backoff"
+source_ru_function "get_target_parallelism"
 source_ru_function "update_github_rate_limit"
 source_ru_function "check_model_rate_limit"
 source_ru_function "adjust_parallelism"
@@ -79,6 +82,11 @@ JSON
 fi
 exit 0
 '
+
+    governor_update
+    assert_equals "4000" "${GOVERNOR_STATE[github_remaining]}" "Governor records the actual controlled API remaining count"
+    assert_equals "1704067200" "${GOVERNOR_STATE[github_reset]}" "Governor records the actual controlled API reset epoch"
+    assert_equals "4" "${GOVERNOR_STATE[target_parallelism]}" "Governor loads the actual configured target"
 
     local lock_file="$E2E_TEMP_DIR/review.lock"
     : > "$lock_file"

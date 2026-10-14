@@ -171,6 +171,38 @@ EOF
     log_test_pass "$test_name"
 }
 
+test_close_reason_native_arguments() {
+    local env_root old_path="$PATH" reason before
+    env_root=$(create_test_env)
+    export GH_LOG="$env_root/close-arguments.jsonl"
+    mkdir -p "$env_root/bin"
+    cat > "$env_root/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+jq -nc --args '$ARGS.positional' -- "$@" >> "$GH_LOG"
+EOF
+    chmod +x "$env_root/bin/gh"
+    export PATH="$env_root/bin:$PATH"
+    for reason in completed not_planned 'not planned'; do
+        assert_exit_code 0 "Supported close reason $reason executes" execute_gh_action_close owner/repo issue 42 "$reason"
+    done
+    assert_equals 3 "$(jq -s 'length' "$GH_LOG")" "All supported reasons reach the controlled CLI"
+    assert_equals '["issue","close","42","-R","owner/repo","--reason","completed"]' "$(jq -sc '.[0]' "$GH_LOG")" "Completed remains a single native argument"
+    assert_equals '["issue","close","42","-R","owner/repo","--reason","not planned"]' "$(jq -sc '.[1]' "$GH_LOG")" "Plan state reason becomes one spaced native argument"
+    assert_equals '["issue","close","42","-R","owner/repo","--reason","not planned"]' "$(jq -sc '.[2]' "$GH_LOG")" "Native CLI spelling is preserved"
+    export RU_STATE_DIR="$env_root/state/ru"
+    cat > "$env_root/pr-plan.json" <<'PLAN'
+{"gh_actions":[{"op":"close","target":"pr#15","reason":"Outside contribution declined: adds an unwanted dependency"},{"op":"label","target":"pr#15","labels":["reviewed","closed"]}]}
+PLAN
+    assert_exit_code 1 "PR close remains supported while issue-only label policy refuses" execute_gh_actions owner/repo "$env_root/pr-plan.json"
+    assert_equals '["pr","close","15","-R","owner/repo","--comment","Closing: Outside contribution declined: adds an unwanted dependency"]' "$(jq -sc '.[3]' "$GH_LOG")" "PR reason remains one descriptive comment argument"
+    assert_equals 4 "$(jq -s 'length' "$GH_LOG")" "Unsupported PR labels invoke no controlled mutation"
+    before=$(cat "$GH_LOG")
+    assert_exit_code 4 "Unsupported reason refuses before invoking gh" execute_gh_action_close owner/repo issue 42 invented_reason
+    assert_equals "$before" "$(cat "$GH_LOG")" "Invalid close reason invokes no controlled endpoint"
+    export PATH="$old_path"
+}
+
 test_execute_gh_actions_runs_commands() {
     local test_name="execute_gh_actions: runs commands from plan"
     log_test_start "$test_name"
@@ -575,6 +607,7 @@ test_canonicalize_gh_action_compact() {
 # execute_gh_actions tests
 run_test test_execute_gh_actions_happy_path_and_idempotent
 run_test test_execute_gh_actions_continues_on_failure
+run_test test_close_reason_native_arguments
 run_test test_execute_gh_actions_runs_commands
 run_test test_execute_gh_actions_handles_errors
 

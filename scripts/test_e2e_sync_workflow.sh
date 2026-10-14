@@ -745,6 +745,12 @@ test_sync_clone_parallel() {
     assert_true "test -d '$E2E_TEMP_DIR/projects/repo-c'" "Repo C cloned"
     assert_true "test -d '$E2E_TEMP_DIR/projects/repo-d'" "Repo D cloned"
 
+    local repo clone_count
+    for repo in repo-a repo-b repo-c repo-d; do
+        clone_count=$(awk -v spec="parallel/$repo" '$2 == "gh" && $3 == "repo" && $4 == "clone" && $5 == spec { n++ } END { print n+0 }' "$E2E_LOG_DIR/gh_calls.log")
+        assert_equals 1 "$clone_count" "Each configured repo is dispatched exactly once: $repo"
+    done
+
     if [[ "$RU_EXIT_CODE" -ne 0 ]]; then
         printf 'Parallel sync stdout:\n%s\nParallel sync stderr:\n%s\n' "$RU_STDOUT" "$RU_STDERR"
         e2e_preserve_on_failure

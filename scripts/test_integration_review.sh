@@ -127,6 +127,17 @@ wait_for_pid_exit() {
     return $?
 }
 
+wait_for_mapping() {
+    local file="$1" count="${2:-1}" timeout="${3:-10}" start
+    start=$(date +%s)
+    while ! jq -e --argjson count "$count" 'type == "object" and length >= $count and all(.[]; (.worktree_path | type == "string" and length > 0))' "$file" >/dev/null 2>&1; do
+        if (( $(date +%s) - start >= timeout )); then
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
 get_run_id() {
     local info_file="$1"
     if command -v jq &>/dev/null; then
@@ -145,9 +156,12 @@ inject_plan_files() {
         wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // empty' "$mapping_file" 2>/dev/null)
         if [[ -n "$wt_path" ]]; then
             mkdir -p "$wt_path/.ru"
-            cat > "$wt_path/.ru/review-plan.json" <<EOF
-{"schema_version":"1","repo":"$repo_id","items":[]}
-EOF
+            jq -n --arg run "$run_id" --arg repo "$repo_id" --arg path "$wt_path" \
+                --argjson mapping "$(jq --arg repo "$repo_id" '.[$repo]' "$mapping_file")" '
+                {schema_version:1,run_id:$run,repo:$repo,worktree_path:$path,items:[],
+                 git:{branch:$mapping.branch,base_ref:$mapping.base_ref,base_sha:$mapping.base_sha,commits:[]},
+                 metadata:{started_at:"2026-10-13T10:00:00Z",completed_at:"2026-10-13T10:01:00Z",model:"controlled",driver:"local"}}
+            ' > "$wt_path/.ru/review-plan.json"
         fi
     done
 }
@@ -197,7 +211,7 @@ test_integration_review_plan_completes() {
     assert_not_empty "$run_id" "captured run id"
 
     local mapping_file="$RU_STATE_DIR/worktrees/$run_id/mapping.json"
-    wait_for_file "$mapping_file" 10 || true
+    wait_for_mapping "$mapping_file" 2 10 || true
     assert_file_exists "$mapping_file" "worktree mapping created"
 
     inject_plan_files "$run_id"
@@ -238,7 +252,7 @@ test_integration_review_max_repos_budget() {
     assert_not_empty "$run_id" "captured run id"
 
     local mapping_file="$RU_STATE_DIR/worktrees/$run_id/mapping.json"
-    wait_for_file "$mapping_file" 10 || true
+    wait_for_mapping "$mapping_file" 1 10 || true
     assert_file_exists "$mapping_file" "worktree mapping created"
 
     inject_plan_files "$run_id"
@@ -270,17 +284,22 @@ test_integration_review_checkpoint_created_and_cleared() {
 
     start_review_background --mode=local --parallel=1
 
+    local info_file="$RU_STATE_DIR/review.lock.info"
+    wait_for_file "$info_file" 10 || true
+    assert_file_exists "$info_file" "review acquired its lock before checkpoint observation"
+    local run_id
+    run_id=$(get_run_id "$info_file")
+    assert_not_empty "$run_id" "checkpoint belongs to the observed run"
+
+    # Checkpoint lifecycle begins after startup acquired the run lock. Keep
+    # each existing bounded wait; this is not a ten-second startup benchmark.
     local checkpoint_file="$RU_STATE_DIR/review/review-checkpoint.json"
     wait_for_file "$checkpoint_file" 10 || true
     assert_file_exists "$checkpoint_file" "checkpoint created"
-
-    local info_file="$RU_STATE_DIR/review.lock.info"
-    wait_for_file "$info_file" 10 || true
-    local run_id
-    run_id=$(get_run_id "$info_file")
+    assert_equals "$run_id" "$(jq -r '.run_id' "$checkpoint_file")" "checkpoint records the actual run"
 
     local mapping_file="$RU_STATE_DIR/worktrees/$run_id/mapping.json"
-    wait_for_file "$mapping_file" 10 || true
+    wait_for_mapping "$mapping_file" 1 10 || true
 
     inject_plan_files "$run_id"
     inject_pipe_logs "$run_id"
@@ -291,6 +310,7 @@ test_integration_review_checkpoint_created_and_cleared() {
 
     assert_file_not_exists "$checkpoint_file" "checkpoint cleared on success"
 
+    e2e_preserve_on_failure
     e2e_cleanup
     log_test_pass "$test_name"
 }
@@ -316,7 +336,7 @@ test_integration_review_lock_released() {
     run_id=$(get_run_id "$info_file")
 
     local mapping_file="$RU_STATE_DIR/worktrees/$run_id/mapping.json"
-    wait_for_file "$mapping_file" 10 || true
+    wait_for_mapping "$mapping_file" 1 10 || true
 
     inject_plan_files "$run_id"
     inject_pipe_logs "$run_id"
@@ -351,7 +371,7 @@ test_integration_review_session_ids_recorded() {
     assert_not_empty "$run_id" "captured run id"
 
     local mapping_file="$RU_STATE_DIR/worktrees/$run_id/mapping.json"
-    wait_for_file "$mapping_file" 10 || true
+    wait_for_mapping "$mapping_file" 1 10 || true
 
     inject_plan_files "$run_id"
     inject_pipe_logs "$run_id"
@@ -374,10 +394,27 @@ test_integration_review_session_ids_recorded() {
 # Test Runner
 #------------------------------------------------------------------------------
 
+test_integration_review_preparation_failure_is_not_success() {
+    require_tools || return 0
+    setup_integration_env 1
+    printf 'owner/repo0@missing-review-pin\n' > "$RU_CONFIG_DIR/repos.d/public.txt"
+    local rc=0 before
+    before=$(git -C "$RU_PROJECTS_DIR/repo0" rev-parse HEAD)
+    "$E2E_RU_SCRIPT" review --mode=local --plan --json --non-interactive > "$E2E_LOG_DIR/prepare-failed.stdout" 2> "$E2E_LOG_DIR/prepare-failed.stderr" || rc=$?
+    assert_equals 1 "$rc" "Failed preparation propagates the actual orchestration exit"
+    assert_equals 1 "$(jq -r '.exit_code' "$E2E_LOG_DIR/prepare-failed.stdout")" "Structured completion reports the same failure"
+    assert_contains "$(cat "$E2E_LOG_DIR/prepare-failed.stderr")" 'Cannot resolve requested review pin' "Missing pin diagnostics remain visible"
+    assert_equals "$before" "$(git -C "$RU_PROJECTS_DIR/repo0" rev-parse HEAD)" "Preparation failure preserves repository HEAD"
+    assert_file_exists "$RU_STATE_DIR/review/review-checkpoint.json" "Failed orchestration retains resumable state"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 run_test test_integration_review_plan_completes
 run_test test_integration_review_max_repos_budget
 run_test test_integration_review_checkpoint_created_and_cleared
 run_test test_integration_review_lock_released
 run_test test_integration_review_session_ids_recorded
+run_test test_integration_review_preparation_failure_is_not_success
 
 print_results
