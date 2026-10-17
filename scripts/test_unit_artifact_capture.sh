@@ -246,7 +246,7 @@ test_capture_git_state_contains_timestamp() {
 }
 
 test_capture_git_state_fails_invalid_repo() {
-    ! capture_git_state "/nonexistent" "$TEST_TMP/out.txt" 2>/dev/null
+    ! capture_git_state "$TEST_TMP/not-created" "$TEST_TMP/out.txt" 2>/dev/null
 }
 
 test_capture_git_state_fails_empty_output() {

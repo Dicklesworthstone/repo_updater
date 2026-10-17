@@ -6,6 +6,8 @@
 # - parse_graphql_work_items
 # - calculate_item_priority_score
 # - validate_review_plan
+# Schema fixtures are unit evidence; they do not establish approval, physical
+# worktree identity, CLI application or external publication.
 #
 # shellcheck disable=SC1091  # Sourced files checked separately
 # shellcheck disable=SC2034  # STATE_LOCK_FD used by sourced lock helpers
@@ -17,6 +19,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/test_framework.sh"
+
+review_test_script_dir="$SCRIPT_DIR"
+review_test_project_dir="$PROJECT_DIR"
+# shellcheck source=../ru
+source "$PROJECT_DIR/ru"
+SCRIPT_DIR="$review_test_script_dir"
+PROJECT_DIR="$review_test_project_dir"
 
 source_ru_function "parse_graphql_work_items"
 source_ru_function "calculate_item_priority_score"
@@ -35,6 +44,9 @@ source_ru_function "release_state_lock"
 source_ru_function "with_state_lock"
 source_ru_function "write_json_atomic"
 source_ru_function "get_review_state_dir"
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_array"
+source_ru_function "run_parallel_sync"
 
 # Required global for state locking (normally set in ru)
 STATE_LOCK_FD=201
@@ -418,8 +430,9 @@ test_validate_review_plan_unanswered_questions_structurally_valid() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/unanswered-questions.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "0" "$rc" "Unanswered questions must not invalidate the schema"
 
     # Plan with unanswered questions should still be valid structurally
     # but the questions field should be present
@@ -440,8 +453,9 @@ test_validate_review_plan_accepts_valid() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "0" "$rc" "Valid plan must return success"
     assert_equals "Valid" "$result" "Valid plan should pass"
 
     log_test_pass "$test_name"
@@ -455,8 +469,9 @@ test_validate_review_plan_rejects_missing_fields() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/missing-fields.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "1" "$rc" "Missing required fields must return failure"
 
     assert_contains "$result" "Missing required fields" "Missing repo should be rejected"
 
@@ -471,8 +486,9 @@ test_validate_review_plan_rejects_invalid_decision() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/invalid-decision.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "1" "$rc" "Invalid decision must return failure"
 
     assert_contains "$result" "Invalid decision values" "Invalid decision should be rejected"
 
@@ -487,8 +503,9 @@ test_validate_review_plan_rejects_invalid_gh_target() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/invalid-gh-target.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "1" "$rc" "Invalid target must return failure"
 
     assert_contains "$result" "Invalid gh_action target format" "Invalid gh target should be rejected"
 
@@ -504,8 +521,9 @@ test_validate_review_plan_rejects_invalid_schema_version() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/invalid-schema-version.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "1" "$rc" "Unsupported schema version must return failure"
 
     assert_contains "$result" "Unsupported schema version" "Invalid schema version should be rejected"
 
@@ -521,8 +539,9 @@ test_validate_review_plan_accepts_large_plan() {
     local plan_file="$PROJECT_DIR/test/fixtures/plans/large-plan.json"
     assert_file_exists "$plan_file" "Fixture should exist"
 
-    local result
-    result=$(validate_review_plan "$plan_file")
+    local result rc=0
+    result=$(validate_review_plan "$plan_file") || rc=$?
+    assert_equals "0" "$rc" "Large plan must return success"
     assert_equals "Valid" "$result" "Large plan should validate"
 
     log_test_pass "$test_name"
@@ -650,6 +669,42 @@ test_write_json_atomic_with_lock() {
 # Run tests
 #------------------------------------------------------------------------------
 
+test_output_array_preserves_values_and_caller_scope() {
+    local -a result=(old stale)
+    local literal='$(printf unexpected-command)'
+    assert_success "Array output assigns to the actual caller variable" _set_out_array result 'space value' '' $'line\nbreak' "$literal"
+    assert_equals 4 "${#result[@]}" "All four exact values remain present"
+    assert_equals 'space value' "${result[0]}" "Spaces remain data"
+    assert_equals '' "${result[1]}" "An explicit empty value remains present"
+    assert_equals $'line\nbreak' "${result[2]}" "Newlines remain data"
+    assert_equals "$literal" "${result[3]}" "Shell-looking bytes remain literal data"
+    assert_fails "Invalid output-variable syntax is refused" _set_out_array 'result[1+2]' changed
+    assert_equals 4 "${#result[@]}" "Rejected variable name preserves the caller array"
+    assert_success "An empty output clears earlier values" _set_out_array result
+    assert_equals 0 "${#result[@]}" "Empty output does not invent an empty-string item"
+}
+
+test_parallel_sync_empty_array_is_actually_empty() {
+    local -a empty_repos=()
+    # A zero-item run needs no result locks, clone helpers or worker state.
+    assert_success "Empty declared input returns without dispatching any worker" run_parallel_sync empty_repos 2
+    assert_success "Unset input likewise contains no phantom repository" run_parallel_sync not_declared 2
+    assert_exit_code 4 "Invalid worker count still refuses even on empty input" run_parallel_sync empty_repos 0
+    assert_fails "Invalid array-reference syntax is refused" run_parallel_sync 'empty_repos[0]' 2
+}
+
+test_discovery_summary_empty_and_sparse_arrays() {
+    local -a empty_items=() sparse_items=([2]='octo/repo1|issue|42|First actual item|bug|created|updated|false' [7]='octo/repo2|pr|9|Second actual item|enhancement|created|updated|false')
+    local output rc=0
+    output=$(show_discovery_summary_json 0 0 0 0 0 0 0 5 empty_items) || rc=$?
+    assert_equals 0 "$rc" "Declared empty input has a successful JSON summary"
+    assert_success "Empty JSON contains zero actual items" jq -e '.total == 0 and .top_items == []' <<< "$output"
+    output=$(show_discovery_summary_json 2 1 1 0 0 2 0 5 sparse_items)
+    assert_success "Sparse caller input preserves both actual items in order" jq -e '[.top_items[].number] == [42,9] and [.top_items[].repo] == ["octo/repo1","octo/repo2"]' <<< "$output"
+    assert_success "ANSI summary accepts the actual empty caller input" show_discovery_summary_ansi 0 0 0 0 0 0 0 5 empty_items
+    assert_fails "Malformed reference refuses before summary output" show_discovery_summary_json 0 0 0 0 0 0 0 5 'empty_items[0]'
+}
+
 run_test test_parse_graphql_work_items_filters_archived_and_fork
 run_test test_parse_graphql_work_items_empty_response_returns_empty
 run_test test_discover_work_items_builds_items_from_fixture
@@ -677,6 +732,9 @@ run_test test_get_review_plan_json_summary_is_parseable
 run_test test_get_review_plan_json_summary_reports_error_for_invalid_plan
 run_test test_archive_review_plan_copies_into_state_dir
 run_test test_write_json_atomic_with_lock
+run_test test_output_array_preserves_values_and_caller_scope
+run_test test_parallel_sync_empty_array_is_actually_empty
+run_test test_discovery_summary_empty_and_sparse_arrays
 
 print_results
 exit "$(get_exit_code)"

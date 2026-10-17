@@ -18,22 +18,19 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Source the test framework
 source "$SCRIPT_DIR/test_framework.sh"
 
-# Source the specific functions we need to test
-source_ru_function "ensure_dir"
-source_ru_function "get_config_value"
-source_ru_function "set_config_value"
-source_ru_function "ensure_config_exists"
-source_ru_function "log_verbose"
-source_ru_function "is_valid_config_key"
-source_ru_function "expand_tilde"
-source_ru_function "resolve_config"
-
 # Set XDG defaults for sourcing (we override in tests anyway)
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/ru-test-config}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-/tmp/ru-test-state}"
 
-# Source defaults from ru (we need DEFAULT_* variables)
-eval "$(grep -E '^DEFAULT_' "$PROJECT_DIR/ru" | head -20)"
+# Import actual defaults and functions through ru's Bash source API. Parsing
+# selected source lines with eval can execute an unintended expression and
+# silently omit defaults after the arbitrary line limit.
+CONFIG_TEST_SCRIPT_DIR="$SCRIPT_DIR"
+CONFIG_TEST_PROJECT_DIR="$PROJECT_DIR"
+# shellcheck source=../ru
+source "$PROJECT_DIR/ru"
+SCRIPT_DIR="$CONFIG_TEST_SCRIPT_DIR"
+PROJECT_DIR="$CONFIG_TEST_PROJECT_DIR"
 
 # These will be overridden in each test
 RU_CONFIG_DIR="$XDG_CONFIG_HOME/ru"
@@ -910,6 +907,35 @@ EOF
     log_test_pass "$test_name"
 }
 
+test_resolved_network_timeout_precedence() {
+    local test_env scenario actual expected file_timeout ru_timeout git_timeout
+    local -a timeout_args=()
+    test_env=$(create_test_env) || return 1
+    mkdir -p "$test_env/config/ru" || return 1
+    for scenario in default file quoted-file ru-env git-env both-env cli cli-before-command; do
+        file_timeout=7 ru_timeout="" git_timeout="" expected=7
+        timeout_args=(sync)
+        case "$scenario" in
+            default) file_timeout=""; expected=30 ;;
+            quoted-file) file_timeout='"4"'; expected=4 ;;
+            ru-env) ru_timeout=9; expected=9 ;;
+            git-env) git_timeout=8; expected=8 ;;
+            both-env) ru_timeout=9; git_timeout=8; expected=9 ;;
+            cli) ru_timeout=9; git_timeout=8; timeout_args=(sync --timeout=11); expected=11 ;;
+            cli-before-command) ru_timeout=9; git_timeout=8; timeout_args=(--timeout 12 sync); expected=12 ;;
+        esac
+        printf 'TIMEOUT=%s\n' "$file_timeout" > "$test_env/config/ru/config"
+        actual=$(env RU_CONFIG_DIR="$test_env/config/ru" RU_TIMEOUT="$ru_timeout" GIT_TIMEOUT="$git_timeout" \
+            bash -c 'source "$1"; shift; ARGS=(); parse_args "$@"; resolve_config; printf "%s\n" "$GIT_TIMEOUT"' \
+            _ "$PROJECT_DIR/ru" "${timeout_args[@]}") || { fail "Actual timeout resolution failed for $scenario"; continue; }
+        assert_equals "$expected" "$actual" "Actual source API resolves $scenario timeout with documented precedence"
+    done
+    actual=$(env RU_CONFIG_DIR="$test_env/config/ru" RU_TIMEOUT=9 GIT_TIMEOUT=8 \
+        bash "$PROJECT_DIR/ru" config --json) || { fail "Actual config CLI failed to report the resolved timeout"; return; }
+    assert_equals 9 "$(jq -r '.data.resolved.TIMEOUT' <<< "$actual")" "Config JSON exposes the actual resolved timeout"
+    assert_equals 0 "$(jq -r '._meta.exit_code' <<< "$actual")" "Config metadata preserves successful timeout reporting"
+}
+
 #==============================================================================
 # Run All Tests
 #==============================================================================
@@ -959,6 +985,7 @@ run_test test_resolve_config_expands_tilde
 run_test test_resolve_config_uses_env_vars
 run_test test_resolve_config_uses_cli_args
 run_test test_resolve_config_partial_config
+run_test test_resolved_network_timeout_precedence
 
 print_results
 exit "$(get_exit_code)"

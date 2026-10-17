@@ -124,6 +124,60 @@ jobs:
           echo "BASH_5: $BASH_5"
           "$BASH_5" --version | head -1
 
+      - name: Install conformance test dependencies
+        run: |
+          if [[ "$(uname -s)" == Darwin ]]; then
+            brew install jq tmux
+          else
+            sudo apt-get update
+            sudo apt-get install -y jq tmux
+          fi
+          python3 -m venv "$RUNNER_TEMP/ru-schema-venv"
+          "$RUNNER_TEMP/ru-schema-venv/bin/python" -m pip install \
+            --disable-pip-version-check 'jsonschema==4.19.2' 'rfc3339-validator==0.1.4'
+          echo "$RUNNER_TEMP/ru-schema-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install verified TOON encoder for actual round trips
+        run: |
+          # Pin the encoder version used by the conformance probes. These
+          # SHA256 digests are the published v0.1.1 release asset digests.
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) target=linux-amd64; digest=a155e50383ca8388d3e84615776a70deb7ef6415f775879253cbcba6548dd5c9 ;;
+            Linux/aarch64) target=linux-arm64; digest=ff7b25b10358ad96eaa204632b746033a014cffb8b71352132e9768678457acf ;;
+            Darwin/x86_64) target=darwin-amd64; digest=12733939163d71ef321da2cd9924eb994d51d3000200415d3370f8a194b6c7b6 ;;
+            Darwin/arm64) target=darwin-arm64; digest=047394c0457e6a134bb1e953c91e39d1e4ec85996a8ddc9924332fce525d9d6c ;;
+            *) echo "Unsupported TOON test platform" >&2; exit 1 ;;
+          esac
+          tools_dir="$RUNNER_TEMP/ru-toon-tools"
+          mkdir -p "$tools_dir"
+          archive="$tools_dir/tru-$target.tar.xz"
+          curl -fL --retry 2 \
+            "https://github.com/Dicklesworthstone/toon_rust/releases/download/v0.1.1/tru-$target.tar.xz" \
+            -o "$archive"
+          python3 - "$archive" "$digest" <<'PY'
+          import hashlib, pathlib, sys
+          actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
+          if actual != sys.argv[2]:
+              raise SystemExit("TOON test archive SHA256 mismatch")
+          PY
+          tar -xJf "$archive" -C "$tools_dir"
+          test -x "$tools_dir/tru"
+          "$tools_dir/tru" --version
+          echo "$tools_dir" >> "$GITHUB_PATH"
+          # A test adapter invokes the real encoder. No personal toon.sh
+          # installation or synthetic encoded responses are required in CI.
+          cat > "$tools_dir/toon.sh" <<'BASH'
+          toon_available() { command -v tru >/dev/null 2>&1; }
+          toon_encode() {
+              local -a args=(--encode)
+              [[ -z "${TOON_STATS:-}" ]] || args+=(--stats)
+              [[ -z "${TOON_INDENT:-}" ]] || args+=(--indent "$TOON_INDENT")
+              [[ "${TOON_KEY_FOLDING:-}" != safe ]] || args+=(--key-folding safe)
+              tru "${args[@]}"
+          }
+          BASH
+          echo "TOON_SH_PATH=$tools_dir/toon.sh" >> "$GITHUB_ENV"
+
       - name: Create test output directory
         run: mkdir -p test-results
 

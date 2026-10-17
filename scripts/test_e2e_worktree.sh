@@ -198,6 +198,7 @@ test_worktree_create_from_specific_commit() {
         local mapped_base=""
         mapped_base=$(jq -r --arg r "$repo_id" '.[$r].base_ref // ""' "$mapping_file")
         assert_equals "$first_commit" "$mapped_base" "Mapping stores pinned base_ref"
+        assert_equals "$first_commit" "$(jq -r --arg r "$repo_id" '.[$r].base_ref_full' "$mapping_file")" "Commit pin retains the immutable full object identity"
     fi
 
     cleanup_review_worktrees "$REVIEW_RUN_ID" >/dev/null 2>&1 || true

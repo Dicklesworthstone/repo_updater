@@ -990,6 +990,10 @@ TIMEOUT=60
 export RU_TIMEOUT=60
 ```
 
+Timeout precedence is CLI `--timeout`, then `RU_TIMEOUT`, then `GIT_TIMEOUT`,
+then the config file's `TIMEOUT`, then the 30-second default. The selected value
+bounds the entire clone, fetch, or pull command, including a stalled subprocess.
+
 **Advanced tuning via git environment:**
 
 | Variable | Default | Purpose |
@@ -1812,6 +1816,46 @@ optional runners report `ran: false`. `REQUIRE_TESTS` and `REQUIRE_LINT` also
 block application when the corresponding runner is absent. Secret scanning
 always runs during application.
 
+Application checks the plan against the selected run's saved mapping and the
+physical worktree. A plan with code changes must include the original
+`git.base_sha`, branch, base ref, and every full candidate commit SHA in reverse
+topological order. A comment-only plan may omit the optional `git` section;
+any supplied identity fields must still match, and unreported commits are refused.
+Changed base branches, missing commits, foreign worktrees and malformed plans
+are refused before test commands or publication.
+Preparation also stores the original mapping as a Git object referenced under
+`refs/ru/review-mappings/`; editing the JSON mapping cannot redirect that run.
+The mapping binds a fully qualified branch or tag ref, or a resolved commit pin,
+and the effective origin push URLs. Tag and commit pins support comment-only
+reviews; code publication requires a branch base and preserves immutable pins.
+Changing a push URL or its rewrite rules requires a newly prepared review.
+Publication explicitly pushes only the validated candidate to its base branch
+on `origin`, regardless of `push.default` or `remote.origin.push` settings.
+Each prepared receiver uses a frozen transport destination. Its unpublished
+history is scanned, its advertised branch tip is checked before transfer, and
+the actual receiver is verified afterward. A late remote configuration change
+cannot redirect that push; changed identity still blocks subsequent actions.
+Issue close actions accept `completed` or `not_planned`; `ru` supplies the
+corresponding native CLI argument. PR close reasons remain descriptive comments,
+and label actions remain limited to issues. Application rejects PR labels and
+merges before running gates or any GitHub action.
+
+`REVIEW_REQUIRE_APPROVAL=true` is enforced for application, including GitHub
+actions without code changes. Interactive `ru review --apply` displays the
+plan and asks for approval; the decision is saved in
+`.ru/review-approval.json` and bound to the plan content and candidate HEAD.
+Changing either requires fresh approval. `--push` does not grant approval.
+Approval fingerprints require `sha256sum` or `shasum` and use SHA-256.
+Non-interactive application requires an existing matching approval or an
+explicit applicable `REVIEW_REQUIRE_APPROVAL=false` policy. Recomputed gate
+reports do not invalidate approval; edits to reviewed actions or decisions do.
+Application rechecks identity and approval before each GitHub action. If the
+plan changes mid-application, remaining actions stop and the run reports failure;
+already completed actions retain their idempotence records.
+`review --apply --dry-run` validates identity without running gates or mutations.
+`review --apply --json` emits the common envelope with per-repository exit codes,
+the run ID and a summary; refused applications include their actual nonzero result.
+
 | Policy | Default | Description |
 |--------|---------|-------------|
 | `REQUIRE_TESTS` | `false` | Require a configured or detected test runner |
@@ -2293,12 +2337,40 @@ Before executing any commit or release plan, ru validates the AI-generated JSON 
 
 **Validation checks for commit plans:**
 
+Commit plans use a private Git index containing only the named paths. Unrelated
+staged changes and worktree bytes survive successful commits; conflicting staging
+on a planned path is refused. Validation binds the complete candidate tree and
+HEAD, and is repeated before each commit and publication. Normal project hooks
+still run; a pre-commit hook that changes the candidate stops the commit.
+
+`commit-sweep --execute` uses the same executor and leaves existing staged work
+alone. `--respect-staging` explicitly adds a staged group using its exact index
+blobs; a different unstaged version stays in the worktree. In JSON mode, dry runs
+count planned commits and executed runs count commits actually created.
+
+File policies and secret scans inspect the exact Git blobs, including planned
+untracked files. Publication scans every unpublished commit, so removing a secret
+from the final tree does not hide it in earlier history. `--secret-scan=block`
+stops findings, malformed scanner responses and execution errors; `warn` permits
+them with diagnostics, while `none` explicitly skips secret scanning.
+Ranges are derived from each effective push URL, including a separate `pushurl`;
+all receivers must pass before the first push. Changed destinations or receiver
+heads revoke the publication check, and successful pushes are verified at the
+actual receivers.
+Commit publication honors `branch.<name>.pushRemote` and `remote.pushDefault`
+before the fetch remote. A triangular workflow publishes the current branch to
+its push remote. Central plans explicitly publish their configured upstream
+branch; `push.default=current` selects the current branch instead.
+Repeated effective push URLs are checked and published once without changing
+the repository configuration. Matching or multi-ref settings cannot include
+unrelated branches in the planned publication.
+
 | Check | Validation | Failure Behavior |
 |-------|------------|------------------|
 | JSON structure | Valid JSON between `---PLAN-START---` and `---PLAN-END---` markers | Reject plan |
-| Required fields | `files` array, `commit_message` string | Reject plan |
-| File existence | Each file in `files[]` exists in working tree | Warn, filter out missing |
-| Denylist compliance | No file matches denylist patterns | Block file, continue with rest |
+| Required fields | Nonempty `commits` array with `message` and `files`; optional boolean `push` and per-commit `source` (`worktree` or `index`) | Reject plan |
+| File existence | Each planned path exists or represents a tracked deletion | Reject missing paths |
+| Denylist compliance | No planned file matches denylist patterns | Reject plan |
 | Commit message format | Non-empty, reasonable length | Reject if empty |
 
 **Validation checks for release plans:**
@@ -2489,12 +2561,13 @@ git rebase origin/main  # Or merge
 
 ## 🤖 AI Sync
 
-The `ai-sync` subcommand automatically commits uncommitted changes across repositories using AI agents. It scans for dirty repos, launches an AI agent per repo (via ntm), and the agent reads project context, reviews changes, creates logical commits, and pushes.
+The `ai-sync` subcommand scans for dirty repositories and launches the selected AI agent through ntm to read project context and create logical commits. ru then inspects the resulting Git state and publishes the validated revision when publication is requested.
 
 ### Prerequisites
 
 - **ntm** (Named Tmux Manager) - for session orchestration
 - **claude-code**, **codex**, or **gemini** CLI - for AI agent execution
+- **tmux** and **jq** - for session ownership checks and typed results
 
 ### Usage
 
@@ -2516,7 +2589,16 @@ ru ai-sync --no-untracked         # Ignore untracked files
 3. The agent reads `AGENTS.md` and `README.md` to understand the project
 4. Reviews all changes and groups them into logical commits
 5. Creates detailed commit messages explaining the changes
-6. Pushes to the remote (unless `--no-push` is specified)
+6. ru confirms that the original branch and history were preserved, the final candidate retains the original dirty working versions, and no tracked or untracked work remains
+7. Unless `--no-push` is specified, ru scans the unpublished history, pushes the exact validated revision through the captured destination, and verifies the receiver's ref
+
+An idle or disappearing session does not prove that work succeeded. Each result records the transport status, actual before and after revisions, commit SHAs, remaining paths, publication status, process exit code, and an `evidence_dir` containing the prompt and tool diagnostics. A publication failure returns nonzero and preserves completed local commits.
+
+Before starting the agent, ru retains the original index and raw dirty files. AI sync asks the agent to commit existing work without editing it, so ru checks that the final Git tree matches the original working snapshot, including additions, deletions, renames and file modes. A single commit of the working version is valid for partially staged files; the original staged version remains recovery evidence. Discarded, rewritten, subsequently reverted or additional unrequested changes fail validation, retain useful local commits and snapshots, and block host publication. Dependency updates retain the same recovery snapshots but use an editing policy, which does not claim original-content preservation.
+
+`--timeout` covers the entire operation, including readiness, prompt delivery, completion, Git inspection, and requested publication. Cleanup after interruption has a separate two-second budget and termination grace. An unfinished inspection or uncertain publication is reported explicitly.
+
+`--no-push` makes no host publication or receiver-inspection calls. The prompt directs the agent to work locally, and NTM panes receive an empty `GIT_ALLOW_PROTOCOL` restriction. This is a transport restriction, not a sandbox: provider tools, scripts, and project hooks can still attempt publication. Preventing every provider-side push attempt remains an open qualification requirement.
 
 ---
 
@@ -3453,6 +3535,25 @@ for f in scripts/test_e2e_*.sh; do "$f"; done
 - `jq` for JSON-oriented tests (skips when missing)
 - `gh` for tests that exercise GitHub auth behavior (skips when missing or unauthenticated)
 - `ntm`/`tmux` only for agent-sweep tests (mocked by default in E2E)
+
+The structured-output conformance tests require Python 3 with `jsonschema==4.19.2`
+and `rfc3339-validator==0.1.4`, plus the actual `tru` encoder and a Bash helper
+selected by `TOON_SH_PATH` (default: `~/.local/lib/toon.sh`). Missing prerequisites
+fail this conformance check. They are test dependencies; ordinary ru commands do
+not require Python or jsonschema. CI installs them explicitly, verifies the pinned
+TOON release archive, and uses a test adapter that calls the real encoder.
+
+Install the Python validators in an isolated environment before running the suite:
+
+```bash
+python3 -m venv /tmp/ru-test-venv
+/tmp/ru-test-venv/bin/python -m pip install 'jsonschema==4.19.2' 'rfc3339-validator==0.1.4'
+PATH="/tmp/ru-test-venv/bin:$PATH" bash scripts/run_all_tests.sh
+```
+
+Once these tools are installed, schema and TOON checks run offline against actual
+CLI output and local Git repositories. Controlled provider and GitHub endpoints
+exercise failure behavior; they do not qualify live services.
 
 ### Logging and Artifacts
 

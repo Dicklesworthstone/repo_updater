@@ -1,5 +1,17 @@
-#!/usr/bin/env -S bash -l
+#!/usr/bin/env bash
 set -euo pipefail
+
+# Exercise this checkout with a populated isolated configuration, independent
+# of the operator's installed ru version or personal repository inventory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PATH="$PROJECT_DIR:$PATH"
+TOON_TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ru-toon-e2e.XXXXXX")
+export RU_CONFIG_DIR="$TOON_TEST_ROOT/config" RU_STATE_DIR="$TOON_TEST_ROOT/state"
+export RU_CACHE_DIR="$TOON_TEST_ROOT/cache" RU_PROJECTS_DIR="$TOON_TEST_ROOT/projects"
+export RU_CHECK_UPDATES=false RU_LAYOUT=flat
+mkdir -p "$RU_CONFIG_DIR/repos.d" "$RU_STATE_DIR" "$RU_CACHE_DIR" "$RU_PROJECTS_DIR"
+printf '%s\n' 'fixture-owner/first-repo' 'fixture-owner/second-repo' > "$RU_CONFIG_DIR/repos.d/public.txt"
 
 # RU TOON E2E Test Script
 # Tests TOON format support across ru commands
@@ -98,6 +110,11 @@ if [[ -n "${json_output:-}" && -n "${toon_output:-}" ]]; then
             # Just verify it decodes to valid JSON
             if echo "$decoded" | jq . >/dev/null 2>&1; then
                 record_pass "Round-trip produces valid JSON"
+                if jq -ne --argjson original "$json_output" --argjson decoded "$decoded" '$original.data == $decoded.data' >/dev/null; then
+                    record_pass "Round-trip preserves actual populated command data"
+                else
+                    record_fail "Round-trip changed actual command data"
+                fi
             else
                 record_fail "Round-trip decode invalid"
             fi
@@ -111,6 +128,16 @@ else
     record_skip "Round-trip (no valid outputs)"
 fi
 log ""
+
+# Compare JSON values rather than number spellings: 2 and 2.0 are equivalent,
+# while a numeric string or an omitted field changes the actual payload.
+if jq -ne '{total:2,repos:[{repo:"fixture",path:"/tmp/fixture"}]} == {total:2.0,repos:[{repo:"fixture",path:"/tmp/fixture"}]}' >/dev/null &&
+   jq -ne '{total:2,repos:[{repo:"fixture",path:"/tmp/fixture"}]} != {total:"2",repos:[{repo:"fixture",path:"/tmp/fixture"}]}' >/dev/null &&
+   jq -ne '{total:2,repos:[{repo:"fixture",path:"/tmp/fixture"}]} != {total:2,repos:[{repo:"fixture"}]}' >/dev/null; then
+    record_pass "Payload comparison accepts equivalent numbers and rejects changed values or missing fields"
+else
+    record_fail "Payload comparison failed its paired equality and inequality controls"
+fi
 
 # Phase 4: Environment Variables
 log "--- Phase 4: Environment Variables ---"

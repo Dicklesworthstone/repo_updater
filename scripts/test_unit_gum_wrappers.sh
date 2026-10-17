@@ -256,6 +256,30 @@ test_gum_confirm_fallback_shows_yn_prompt() {
     log_test_pass "$test_name"
 }
 
+test_gum_confirm_passes_explicit_default_to_tool() {
+    local env_root original_path="${PATH:-}" rc=0
+    env_root=$(create_test_env)
+    mkdir -p "$env_root/bin"
+    cat > "$env_root/bin/gum" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$GUM_CONFIRM_ARGS"
+[[ "$2" == "--default=true" ]]
+EOF
+    chmod +x "$env_root/bin/gum"
+    export GUM_CONFIRM_ARGS="$env_root/confirm.args"
+    export PATH="$env_root/bin:$original_path"
+    GUM_AVAILABLE=true
+    gum_confirm "Approve candidate?" false || rc=$?
+    assert_equals 1 "$rc" "False default reaches the tool as refusal"
+    assert_contains "$(cat "$GUM_CONFIRM_ARGS")" '--default=false' "Review approval defaults to no"
+    rc=0
+    gum_confirm "Approve candidate?" true || rc=$?
+    assert_equals 0 "$rc" "Explicit true default is retained for other callers"
+    assert_contains "$(cat "$GUM_CONFIRM_ARGS")" '--default=true' "Affirmative defaults are explicit too"
+    export PATH="$original_path"
+    unset GUM_CONFIRM_ARGS
+}
+
 #==============================================================================
 # Tests: print_banner
 #==============================================================================
@@ -398,6 +422,7 @@ run_test test_gum_spin_with_complex_command
 run_test test_gum_confirm_function_exists
 run_test test_gum_confirm_has_default_parameter
 run_test test_gum_confirm_fallback_shows_yn_prompt
+run_test test_gum_confirm_passes_explicit_default_to_tool
 
 # print_banner tests
 run_test test_print_banner_quiet_mode_no_output

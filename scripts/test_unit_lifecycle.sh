@@ -19,39 +19,18 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Source the test framework
 source "$SCRIPT_DIR/test_framework.sh"
 
-# Source required functions from ru
-source_ru_function "_is_valid_var_name"
-source_ru_function "_set_out_var"
-source_ru_function "_set_out_array"
-source_ru_function "ensure_dir"
-source_ru_function "json_get_field"
-source_ru_function "json_validate"
-source_ru_function "json_escape"
-source_ru_function "validate_commit_plan"
-source_ru_function "execute_commit_plan"
-source_ru_function "validate_release_plan"
-source_ru_function "execute_release_plan"
-source_ru_function "get_release_strategy"
-source_ru_function "has_release_workflow"
-source_ru_function "canonicalize_gh_action"
-source_ru_function "parse_gh_action_target"
-source_ru_function "get_gh_actions_log_file"
-source_ru_function "gh_action_already_executed"
-source_ru_function "record_gh_action_log"
-source_ru_function "execute_gh_action_comment"
-source_ru_function "execute_gh_action_close"
-source_ru_function "execute_gh_action_label"
-source_ru_function "execute_gh_actions"
-source_ru_function "run_quality_gates"
-source_ru_function "update_plan_with_gates"
-source_ru_function "get_file_size_mb"
-source_ru_function "is_file_too_large"
-source_ru_function "is_binary_file"
-source_ru_function "is_binary_allowed"
+# Import runtime defaults and the complete helper graph through the source API.
+lifecycle_script_dir="$SCRIPT_DIR"
+lifecycle_project_dir="$PROJECT_DIR"
+# shellcheck source=../ru
+source "$PROJECT_DIR/ru"
+SCRIPT_DIR="$lifecycle_script_dir"
+PROJECT_DIR="$lifecycle_project_dir"
 
 # Suppress log output during tests
 log_warn() { :; }
@@ -228,7 +207,7 @@ test_commit_plan_invalid_repo() {
         pass "Rejected empty repo path"
     fi
 
-    if execute_commit_plan "$plan" "/nonexistent/path" 2>/dev/null; then
+    if execute_commit_plan "$plan" "$TEST_DIR/not-created" 2>/dev/null; then
         fail "Should reject nonexistent repo path"
     else
         pass "Rejected nonexistent repo path"
@@ -284,16 +263,18 @@ test_commit_plan_valid_execution() {
     echo "new content" > "$repo_dir/changed.txt"
     git -C "$repo_dir" add "changed.txt" >/dev/null 2>&1
 
-    # Mock commit_plan_stage_and_commit to succeed
-    commit_plan_stage_and_commit() { return 0; }
-
     local plan='{"commits":[{"message":"Test commit","files":["changed.txt"]}]}'
+    local before_head
+    before_head=$(git -C "$repo_dir" rev-parse HEAD)
 
     if execute_commit_plan "$plan" "$repo_dir" 2>/dev/null; then
         pass "Executed valid commit plan"
     else
         fail "Should execute valid commit plan"
     fi
+    assert_not_equals "$before_head" "$(git -C "$repo_dir" rev-parse HEAD)" "Valid execution creates an actual commit"
+    assert_equals 'new content' "$(git -C "$repo_dir" show HEAD:changed.txt)" "Actual commit contains the selected fully staged bytes"
+    assert_success "Selected fully staged path is reconciled after commit" git -C "$repo_dir" diff --cached --quiet -- changed.txt
 
     log_test_pass "execute_commit_plan: executes valid plan"
 }
@@ -326,7 +307,7 @@ test_release_plan_invalid_repo() {
         pass "Rejected empty repo path"
     fi
 
-    if execute_release_plan "$plan" "/nonexistent/path" 2>/dev/null; then
+    if execute_release_plan "$plan" "$TEST_DIR/not-created" 2>/dev/null; then
         fail "Should reject nonexistent repo path"
     else
         pass "Rejected nonexistent repo path"
@@ -445,7 +426,7 @@ test_gh_actions_missing_plan_file() {
     log_test_start "execute_gh_actions: rejects missing plan file"
     setup_lifecycle_test
 
-    if execute_gh_actions "owner/repo" "/nonexistent/plan.json" 2>/dev/null; then
+    if execute_gh_actions "owner/repo" "$TEST_DIR/not-created/plan.json" 2>/dev/null; then
         fail "Should reject missing plan file"
     else
         pass "Rejected missing plan file"
@@ -796,7 +777,7 @@ test_update_plan_missing_file() {
 
     local gates_result='{"overall_ok":true,"has_warning":false,"tests":{},"lint":{},"secrets":{}}'
 
-    if update_plan_with_gates "/nonexistent/plan.json" "$gates_result" 2>/dev/null; then
+    if update_plan_with_gates "$TEST_DIR/not-created/plan.json" "$gates_result" 2>/dev/null; then
         fail "Should reject missing plan file"
     else
         pass "Rejected missing plan file"
@@ -880,7 +861,7 @@ test_release_strategy_invalid_repo() {
     strategy=$(get_release_strategy "")
     assert_equals "never" "$strategy" "Should return 'never' for empty path"
 
-    strategy=$(get_release_strategy "/nonexistent/path")
+    strategy=$(get_release_strategy "$TEST_DIR/not-created")
     assert_equals "never" "$strategy" "Should return 'never' for nonexistent path"
 
     log_test_pass "get_release_strategy: returns never for invalid repo"
@@ -1122,7 +1103,15 @@ test_validate_commit_plan_valid() {
     log_test_start "validate_commit_plan: accepts valid plan"
     setup_lifecycle_test
 
-    # Create files in the repo so validation passes file existence check
+    # A valid commit candidate requires real HEAD/index identity. Restore the
+    # actual scanner after the independent gate-protocol fixture cases above.
+    source_ru_function "run_secret_scan"
+    git -C "$TEST_DIR/repo" init -q -b main
+    git -C "$TEST_DIR/repo" config user.name 'Test User'
+    git -C "$TEST_DIR/repo" config user.email test@example.invalid
+    printf 'baseline content\n' > "$TEST_DIR/repo/baseline.txt"
+    git -C "$TEST_DIR/repo" add baseline.txt
+    git -C "$TEST_DIR/repo" commit -qm Baseline
     echo "content" > "$TEST_DIR/repo/main.rs"
 
     local plan='{"commits":[{"message":"Fix bug","files":["main.rs"]}]}'
@@ -1275,7 +1264,7 @@ test_execute_gh_action_label() {
     setup_lifecycle_test
 
     MOCK_GH_EXIT_CODE=0
-    if execute_gh_action_label "owner/repo" "5" "bug,urgent" 2>/dev/null; then
+    if execute_gh_action_label "owner/repo" "5" "bug,urgent"; then
         pass "Add labels succeeded"
     else
         fail "Add labels should succeed"

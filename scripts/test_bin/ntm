@@ -29,6 +29,17 @@ session_from_state() {
     echo "$session"
 }
 
+delay_controlled_stage() {
+    local stage="$1" seconds="${NTM_MOCK_DELAY_SECONDS:-0}"
+    if [[ ",${NTM_MOCK_DELAY_STAGE:-}," == *",$stage,"* ]]; then
+        [[ "$stage" != transition ]] || seconds="${NTM_MOCK_TRANSITION_DELAY_SECONDS:-$seconds}"
+        if [[ -n "${NTM_MOCK_DELAY_LOG:-}" ]]; then
+            printf '%s %s %s\n' "$stage" "$BASHPID" "$seconds" >> "$NTM_MOCK_DELAY_LOG"
+        fi
+        sleep "$seconds"
+    fi
+}
+
 handle_spawn() {
     local session="${1:-}"
     if [[ "$scenario" == "resource_busy" ]]; then
@@ -41,6 +52,11 @@ handle_spawn() {
     fi
     [[ -z "$session" ]] && session="test"
     save_session "$session"
+    delay_controlled_stage spawn
+    if [[ "$scenario" == partial_spawn ]]; then
+        echo '{"success":false,"error_code":"INTERNAL_ERROR","error":"controlled partial session creation failed"}'
+        exit 3
+    fi
     echo "{\"success\":true,\"session\":\"$session\",\"agents\":[{\"pane\":\"0.1\",\"type\":\"claude\",\"ready\":true}],\"panes\":[\"0.1\"]}"
 }
 
@@ -60,6 +76,7 @@ extract_msg_arg() {
 }
 
 handle_send() {
+    delay_controlled_stage send
     if [[ "$scenario" == "agent_error" ]]; then
         echo '{"success":false,"error_code":"AGENT_ERROR","error":"Agent crashed"}'
         exit 3
@@ -73,6 +90,11 @@ handle_send() {
 }
 
 handle_wait() {
+    if [[ " $* " == *' --transition '* ]]; then
+        delay_controlled_stage transition
+    else
+        delay_controlled_stage readiness
+    fi
     if [[ "$scenario" == "timeout" ]]; then
         echo '{"success":false,"error_code":"TIMEOUT","error":"Timeout waiting for condition"}'
         exit 1
@@ -80,6 +102,50 @@ handle_wait() {
     if [[ "$scenario" == "agent_error" ]]; then
         echo '{"success":false,"error_code":"AGENT_ERROR","error":"Agent crashed or rate limited"}'
         exit 3
+    fi
+    if [[ " $* " == *' --transition '* ]]; then
+        case "$scenario" in
+            session_dead)
+                echo '{"success":false,"error_code":"SESSION_GONE","error":"owned session disappeared"}'
+                exit 3
+                ;;
+            session_work|session_dirty|session_extra_requested)
+                if [[ -n "${NTM_MOCK_PACKAGE_NAME:-}" ]]; then
+                    jq --arg name "$NTM_MOCK_PACKAGE_NAME" --arg version "$NTM_MOCK_PACKAGE_VERSION" \
+                        '.dependencies[$name]=$version' "$NTM_MOCK_REPO/package.json" > "$state_file.package" || exit 2
+                    mv "$state_file.package" "$NTM_MOCK_REPO/package.json" || exit 2
+                fi
+                git -C "$NTM_MOCK_REPO" add -- "${NTM_MOCK_WORK_FILE:-planned.txt}" || exit 2
+                if [[ "$scenario" == session_extra_requested ]]; then
+                    printf 'unrequested extra controlled provider work\n' > "$NTM_MOCK_REPO/unrelated.txt"
+                    git -C "$NTM_MOCK_REPO" add -- unrelated.txt || exit 2
+                fi
+                git -C "$NTM_MOCK_REPO" commit -qm 'Controlled provider fixture work' || exit 2
+                if [[ -n "${NTM_MOCK_FSMONITOR_HOOK:-}" ]]; then
+                    git -C "$NTM_MOCK_REPO" config core.fsmonitor "$NTM_MOCK_FSMONITOR_HOOK" || exit 2
+                fi
+                if [[ "$scenario" == session_dirty ]]; then
+                    printf 'remaining fixture work\n' > "$NTM_MOCK_REPO/unfinished.txt"
+                fi
+                ;;
+            session_discard_requested|session_revert_requested)
+                # Controlled provider discards tracked request bytes, then
+                # makes an actual useful but unrelated clean Git commit.
+                work_file="${NTM_MOCK_WORK_FILE:-planned.txt}"
+                original_head=$(git -C "$NTM_MOCK_REPO" rev-parse HEAD) || exit 2
+                if [[ "$scenario" == session_revert_requested ]]; then
+                    git --literal-pathspecs -C "$NTM_MOCK_REPO" add -- "$work_file" || exit 2
+                    git -C "$NTM_MOCK_REPO" commit -qm 'Commit original controlled requested content' || exit 2
+                fi
+                git -C "$NTM_MOCK_REPO" show "$original_head:$work_file" > "$NTM_MOCK_REPO/$work_file" || exit 2
+                printf 'useful unrelated controlled provider work\n' > "$NTM_MOCK_REPO/unrelated.txt"
+                git --literal-pathspecs -C "$NTM_MOCK_REPO" add -- "$work_file" unrelated.txt || exit 2
+                git -C "$NTM_MOCK_REPO" commit -qm 'Useful unrelated controlled provider commit' || exit 2
+                ;;
+            malformed_wait)
+                printf 'unstructured external tool chatter\n'
+                ;;
+        esac
     fi
     echo '{"success":true,"condition":"idle","waited_seconds":45.2}'
 }
@@ -99,7 +165,22 @@ handle_activity() {
 }
 
 cmd="${1:-}"
+if [[ -n "${NTM_MOCK_ARGS_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$NTM_MOCK_ARGS_LOG"
+fi
 case "$cmd" in
+    spawn)
+        shift
+        session="${1:-test}"
+        for arg in "$@"; do
+            [[ "$arg" != --label=* ]] || session="${session}--${arg#*=}"
+        done
+        if [[ -n "${NTM_MOCK_ENV_LOG:-}" ]]; then
+            printf 'project_base=%s\ngit_allow_protocol=%s\n' "${NTM_PROJECTS_BASE:-unset}" "${GIT_ALLOW_PROTOCOL-unset}" > "$NTM_MOCK_ENV_LOG"
+        fi
+        printf 'external spawn progress output\n'
+        handle_spawn "$session"
+        ;;
     --robot-status)
         session="$(session_from_state)"
         cat <<EOF
@@ -123,10 +204,14 @@ EOF
         handle_send "$@"
         ;;
     --robot-wait=*)
-        handle_wait
+        handle_wait "$@"
         ;;
     --robot-wait)
-        handle_wait
+        handle_wait "$@"
+        ;;
+    --robot-tail=*)
+        delay_controlled_stage tail
+        echo '{"success":true,"content":"controlled endpoint tail fixture"}'
         ;;
     --robot-activity=*)
         handle_activity
@@ -147,6 +232,12 @@ EOF
         echo '{"success":true}'
         ;;
     kill)
+        if [[ "${2:-}" != "$(load_session)" ]]; then
+            printf 'Controlled endpoint refuses cleanup of an unowned session\n' >&2
+            exit 2
+        fi
+        delay_controlled_stage stop
+        printf '%s\n' "$2" > "$state_file.stopped"
         echo "killed"
         ;;
     *)

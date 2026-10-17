@@ -134,6 +134,13 @@ fi
 
 # Handle repo clone: gh repo clone owner/repo [destination] [-- git-args]
 if [[ "\$cmd" == "repo" && "\$sub" == "clone" ]]; then
+    # Only the deadline matrix enables this controlled delay. The actual clone
+    # and resulting repository still use native Git and the real local remote.
+    if [[ -n "\${RU_TEST_CLONE_DELAY_LOG:-}" ]]; then
+        printf 'entered clone delay\\n' >> "\$RU_TEST_CLONE_DELAY_LOG"
+        sleep "\${RU_TEST_CLONE_DELAY_SECONDS:-0}" || exit \$?
+        printf 'completed clone delay\\n' >> "\$RU_TEST_CLONE_DELAY_LOG"
+    fi
     repo_spec="\${3:-}"
 
     # Find destination (either arg 4 or derive from repo name)
@@ -745,12 +752,59 @@ test_sync_clone_parallel() {
     assert_true "test -d '$E2E_TEMP_DIR/projects/repo-c'" "Repo C cloned"
     assert_true "test -d '$E2E_TEMP_DIR/projects/repo-d'" "Repo D cloned"
 
+    local repo clone_count
+    for repo in repo-a repo-b repo-c repo-d; do
+        clone_count=$(awk -v spec="parallel/$repo" '$2 == "gh" && $3 == "repo" && $4 == "clone" && $5 == spec { n++ } END { print n+0 }' "$E2E_LOG_DIR/gh_calls.log")
+        assert_equals 1 "$clone_count" "Each configured repo is dispatched exactly once: $repo"
+    done
+
     if [[ "$RU_EXIT_CODE" -ne 0 ]]; then
         printf 'Parallel sync stdout:\n%s\nParallel sync stderr:\n%s\n' "$RU_STDOUT" "$RU_STDERR"
         e2e_preserve_on_failure
     fi
     e2e_cleanup
     log_test_pass "$test_name"
+}
+
+test_documented_timeout_settings_bound_actual_clone() {
+    local scenario expected_head
+    for scenario in control file ru-env git-env cli cli-overrides; do
+        sync_test_setup
+        create_test_remote timeout requested 1
+        configure_ru_repos timeout/requested
+        sync_test_finalize_mock
+        expected_head=$(git -C "${REMOTE_REGISTRY[timeout/requested]}" rev-parse HEAD) || return 1
+        export RU_TEST_CLONE_DELAY_LOG="$E2E_TEMP_DIR/actual-clone-delay.log" RU_TEST_CLONE_DELAY_SECONDS=3
+        local -a timeout_args=(--json)
+        local ru_timeout="" git_timeout="" timeout_file=10
+        case "$scenario" in
+            file) timeout_file=1 ;;
+            ru-env) ru_timeout=1 ;;
+            git-env) git_timeout=1 ;;
+            cli) timeout_args+=(--timeout=1) ;;
+            cli-overrides) timeout_file=1; ru_timeout=1; git_timeout=1; timeout_args+=(--timeout 10) ;;
+        esac
+        printf 'TIMEOUT=%s\n' "$timeout_file" >> "$RU_CONFIG_DIR/config"
+        RU_TIMEOUT="$ru_timeout" GIT_TIMEOUT="$git_timeout" run_ru_sync "${timeout_args[@]}"
+        assert_file_contains "$RU_TEST_CLONE_DELAY_LOG" 'entered clone delay' "$scenario reaches the actual controlled delay before native cloning"
+        assert_success "$scenario keeps exactly one structured CLI result" jq -es 'length == 1' <<< "$RU_STDOUT"
+        assert_equals "$RU_EXIT_CODE" "$(jq -r '._meta.exit_code' <<< "$RU_STDOUT")" "$scenario retains the actual CLI exit in metadata"
+        if [[ "$scenario" == control || "$scenario" == cli-overrides ]]; then
+            assert_equals 0 "$RU_EXIT_CODE" "$scenario permits actual local cloning within its resolved budget"
+            assert_file_contains "$RU_TEST_CLONE_DELAY_LOG" 'completed clone delay' "$scenario actually finishes the same delay"
+            assert_equals "$expected_head" "$(git -C "$RU_PROJECTS_DIR/requested" rev-parse HEAD)" "$scenario clones the real remote HEAD"
+        else
+            assert_equals 1 "$RU_EXIT_CODE" "$scenario fails when the real command exceeds its one-second deadline"
+            assert_not_contains "$(cat "$RU_TEST_CLONE_DELAY_LOG")" 'completed clone delay' "$scenario terminates the delayed command before native cloning"
+            assert_contains "$RU_STDERR" 'Timeout' "$scenario retains the actual timeout diagnostic"
+            assert_equals 1 "$(jq -r '.data.summary.failed' <<< "$RU_STDOUT")" "$scenario reports the actual failed clone"
+            assert_file_exists "$XDG_STATE_HOME/ru/sync_state.json" "$scenario retains the incomplete sync checkpoint"
+            assert_contains "$(cat "$XDG_STATE_HOME/ru/sync_state.json")" requested "$scenario keeps the failed repository pending for resume"
+        fi
+        unset RU_TEST_CLONE_DELAY_LOG RU_TEST_CLONE_DELAY_SECONDS
+        e2e_preserve_on_failure
+        e2e_cleanup
+    done
 }
 
 #==============================================================================
@@ -774,6 +828,7 @@ run_test test_sync_clone_failure
 run_test test_sync_clone_timeout_handling
 run_test test_sync_clone_dry_run_paths
 run_test test_sync_clone_parallel
+run_test test_documented_timeout_settings_bound_actual_clone
 
 print_results
 exit "$(get_exit_code)"

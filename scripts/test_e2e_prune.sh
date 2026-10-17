@@ -1179,6 +1179,38 @@ test_prune_delete_keeps_deinitialized_submodule_repository() {
 
 log_suite_start "ru prune workflow"
 
+test_prune_structured_empty_refusal_and_archive() {
+    setup_initialized_env || return 1
+    local output actual=0
+    output=$("$E2E_RU_SCRIPT" prune --json 2> "$E2E_LOG_DIR/empty.stderr") || actual=$?
+    assert_equals 0 "$actual" "Empty prune succeeds"
+    assert_success "Empty prune emits one complete zero-item result" jq -se 'length == 1 and .[0].command == "prune" and .[0]._meta.exit_code == 0 and .[0].data.total == 0 and .[0].data.orphans == [] and .[0].data.inventory_complete == true' <<< "$output"
+    actual=0
+    output=$("$E2E_RU_SCRIPT" prune --json --archive --delete 2> "$E2E_LOG_DIR/conflict.stderr") || actual=$?
+    assert_equals 4 "$actual" "Conflicting modes retain refusal"
+    assert_success "Refusal result reports actual exit and unknown inventory" jq -se 'length == 1 and .[0]._meta.exit_code == 4 and .[0].data.error.reason == "conflicting_modes" and .[0].data.inventory_complete == false and .[0].data.completed == 0' <<< "$output"
+    configure_placeholder_repo || return 1
+    create_orphan_repo "preserved-json" || return 1
+    printf 'local bytes\n' > "$RU_PROJECTS_DIR/preserved-json/content.txt"
+    git -C "$RU_PROJECTS_DIR/preserved-json" add content.txt || return 1
+    git -C "$RU_PROJECTS_DIR/preserved-json" -c user.name=Test -c user.email=test@example.invalid commit -q -m Initial || return 1
+    local before destination original_blob
+    before=$(git -C "$RU_PROJECTS_DIR/preserved-json" rev-parse HEAD) || return 1
+    original_blob=$(git -C "$RU_PROJECTS_DIR/preserved-json" hash-object content.txt) || return 1
+    actual=0
+    output=$("$E2E_RU_SCRIPT" prune --json --archive 2> "$E2E_LOG_DIR/archive.stderr") || actual=$?
+    assert_equals 0 "$actual" "Actual archive succeeds"
+    assert_success "Result describes the actual completed operation" jq -se 'length == 1 and .[0].command == "prune" and .[0]._meta.exit_code == 0 and .[0].data.total == 1 and .[0].data.completed == 1 and .[0].data.kept == 0 and .[0].data.operations[0].status == "archived"' <<< "$output"
+    destination=$(jq -r '.data.operations[0].destination' <<< "$output") || return 1
+    assert_equals "$before" "$(git -C "$destination" rev-parse HEAD)" "Reported destination preserves exact repository HEAD"
+    assert_equals 'local bytes' "$(cat "$destination/content.txt")" "Archive preserves actual file content"
+    assert_equals "$original_blob" "$(git -C "$destination" hash-object content.txt)" "Archive preserves every byte including its trailing newline"
+    assert_dir_not_exists "$RU_PROJECTS_DIR/preserved-json" "Original location was actually archived"
+    e2e_cleanup
+    unset RU_LAYOUT
+}
+
+run_test test_prune_structured_empty_refusal_and_archive
 # Basic detection
 run_test test_prune_detects_orphans
 run_test test_prune_no_orphans

@@ -1,5 +1,13 @@
 {
   "schema_version": 2,
   "repo": "octo/repo1",
-  "items": [{ "type": "issue", "number": 42, "decision": "fix" }]
+  "run_id": "run-invalid-version",
+  "worktree_path": "/tmp/review-fixture-worktree",
+  "items": [{ "type": "issue", "number": 42, "title": "Fix auth", "priority": "high", "decision": "fix" }],
+  "metadata": {
+    "started_at": "2025-01-04T10:30:00Z",
+    "completed_at": "2025-01-04T10:45:00Z",
+    "model": "claude-sonnet-4",
+    "driver": "local"
+  }
 }

@@ -170,11 +170,11 @@ test_review_dry_run_json_outputs_items() {
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "review --dry-run exits 0"
-    assert_jq_filter "$out_json" '.mode' "discovery" "JSON mode is discovery"
+    assert_jq_filter "$out_json" '.data.mode' "discovery" "JSON mode is discovery"
     assert_jq_filter "$out_json" '.command' "review" "JSON command is review"
-    assert_jq_number "$out_json" '.summary.items_found' "2" "summary.items_found == 2"
-    assert_jq_number "$out_json" '.summary.by_type.issues' "1" "summary.by_type.issues == 1"
-    assert_jq_number "$out_json" '.summary.by_type.prs' "1" "summary.by_type.prs == 1"
+    assert_jq_number "$out_json" '.data.summary.items_found' "2" "summary.items_found == 2"
+    assert_jq_number "$out_json" '.data.summary.by_type.issues' "1" "summary.by_type.issues == 1"
+    assert_jq_number "$out_json" '.data.summary.by_type.prs' "1" "summary.by_type.prs == 1"
     assert_file_contains "$err_txt" "Dry run complete" "stderr reports dry run completion"
 
     e2e_cleanup
@@ -192,7 +192,7 @@ test_review_dry_run_json_outputs_empty() {
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "review --dry-run exits 0 (no items)"
-    assert_jq_number "$out_json" '.summary.items_found' "0" "summary.items_found == 0"
+    assert_jq_number "$out_json" '.data.summary.items_found' "0" "summary.items_found == 0"
     assert_file_contains "$err_txt" "No work items need review" "stderr reports no work items"
 
     e2e_cleanup
@@ -246,7 +246,7 @@ test_review_dry_run_succeeds_without_tmux_or_ntm() {
     PATH="$saved_path"
 
     assert_equals "0" "$exit_code" "review --dry-run exits 0 without drivers"
-    assert_jq_filter "$out_json" '.mode' "discovery" "JSON mode is discovery"
+    assert_jq_filter "$out_json" '.data.mode' "discovery" "JSON mode is discovery"
     assert_file_contains "$err_txt" "Dry run complete" "stderr reports dry run completion"
 
     e2e_cleanup
@@ -315,11 +315,11 @@ EOF
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "--json review --status exits 0"
-    assert_jq_filter "$out_json" '.mode' "status" "JSON mode is status"
+    assert_jq_filter "$out_json" '.data.mode' "status" "JSON mode is status"
     assert_jq_filter "$out_json" '.command' "review" "JSON command is review"
-    assert_jq_filter "$out_json" '.lock.held' "true" "lock.held == true"
-    assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
-    assert_jq_number "$out_json" '.checkpoint.repos_pending' "1" "checkpoint.repos_pending == 1"
+    assert_jq_filter "$out_json" '.data.lock.held' "true" "lock.held == true"
+    assert_jq_filter "$out_json" '.data.checkpoint.exists' "true" "checkpoint.exists == true"
+    assert_jq_number "$out_json" '.data.checkpoint.repos_pending' "1" "checkpoint.repos_pending == 1"
 
     e2e_cleanup
 }
@@ -441,9 +441,9 @@ EOF
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "multi-repo review --dry-run exits 0"
-    assert_jq_number "$out_json" '.summary.items_found' "4" "summary.items_found == 4 (across 3 repos)"
-    assert_jq_number "$out_json" '.summary.by_type.issues' "3" "summary.by_type.issues == 3"
-    assert_jq_number "$out_json" '.summary.by_type.prs' "1" "summary.by_type.prs == 1"
+    assert_jq_number "$out_json" '.data.summary.items_found' "4" "summary.items_found == 4 (across 3 repos)"
+    assert_jq_number "$out_json" '.data.summary.by_type.issues' "3" "summary.by_type.issues == 3"
+    assert_jq_number "$out_json" '.data.summary.by_type.prs' "1" "summary.by_type.prs == 1"
 
     e2e_cleanup
 }
@@ -483,10 +483,10 @@ EOF
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "review --status with checkpoint exits 0"
-    assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
-    assert_jq_filter "$out_json" '.checkpoint.run_id' "resume-test-123" "checkpoint has correct run_id"
-    assert_jq_number "$out_json" '.checkpoint.repos_completed' "1" "checkpoint.repos_completed == 1"
-    assert_jq_number "$out_json" '.checkpoint.repos_pending' "2" "checkpoint.repos_pending == 2"
+    assert_jq_filter "$out_json" '.data.checkpoint.exists' "true" "checkpoint.exists == true"
+    assert_jq_filter "$out_json" '.data.checkpoint.run_id' "resume-test-123" "checkpoint has correct run_id"
+    assert_jq_number "$out_json" '.data.checkpoint.repos_completed' "1" "checkpoint.repos_completed == 1"
+    assert_jq_number "$out_json" '.data.checkpoint.repos_pending' "2" "checkpoint.repos_pending == 2"
 
     e2e_cleanup
 }
@@ -523,8 +523,8 @@ EOF
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "review --status exits 0"
-    assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
-    assert_jq_filter "$out_json" '.checkpoint.config_hash' "stale_hash_should_not_match" "checkpoint has stale hash"
+    assert_jq_filter "$out_json" '.data.checkpoint.exists' "true" "checkpoint.exists == true"
+    assert_jq_filter "$out_json" '.data.checkpoint.config_hash' "stale_hash_should_not_match" "checkpoint has stale hash"
 
     e2e_cleanup
 }
@@ -561,9 +561,9 @@ EOF
     local exit_code=$?
 
     assert_equals "0" "$exit_code" "review --status exits 0"
-    assert_jq_filter "$out_json" '.lock.held' "true" "lock.held == true (orphaned)"
-    assert_jq_filter "$out_json" '.lock.info.pid' "999999999" "lock info has dead PID"
-    assert_jq_filter "$out_json" '.lock.info.pid_alive' "false" "PID detected as dead"
+    assert_jq_filter "$out_json" '.data.lock.held' "true" "lock.held == true (orphaned)"
+    assert_jq_filter "$out_json" '.data.lock.info.pid' "999999999" "lock info has dead PID"
+    assert_jq_filter "$out_json" '.data.lock.info.pid_alive' "false" "PID detected as dead"
 
     e2e_cleanup
 }
@@ -602,7 +602,7 @@ test_review_cleanup_releases_lock() {
     local out_json="$E2E_TEMP_DIR/out.json"
     "$E2E_RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
 
-    assert_jq_filter "$out_json" '.lock.held' "false" "lock.held == false after cleanup"
+    assert_jq_filter "$out_json" '.data.lock.held' "false" "lock.held == false after cleanup"
 
     e2e_cleanup
 }
@@ -775,7 +775,7 @@ EOF
 
     # Verify repos_queued respects the limit
     local repos_count
-    repos_count=$(jq -r '.repos | length' "$out_json" 2>/dev/null || echo "0")
+    repos_count=$(jq -r '.data.repos | length' "$out_json" 2>/dev/null || echo "0")
     if [[ "$repos_count" -le 2 ]]; then
         pass "repos_queued respects --max-repos=2 limit (got $repos_count)"
     else
