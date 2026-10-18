@@ -8,6 +8,33 @@ Links point to individual commits on GitHub. Version headers link to comparison 
 
 ---
 
+## [v1.6.0](https://github.com/Dicklesworthstone/repo_updater/compare/v1.5.0...v1.6.0) -- 2026-10-18
+
+The installer now refuses an unverified install instead of falling back to `main`. Commands that used to report success after a failed fetch, an unmet branch pin, a missing or invalid quality gate, or a changed candidate now fail and say why. `ru dep-update` without `--repo` finds the configured repos again (GH #17). See the upgrade notes.
+
+### Changed
+
+- **`install.sh` requires a verified release.** A missing or invalid checksum, a missing `checksums.txt`, no `sha256sum`/`shasum`, or a failed or non-script release download is now an error (before: a warning, or a silent fallback to installing `main`). Installing unverified development code needs an explicit `RU_UNSAFE_MAIN=1`. The documented form puts installer variables on the `bash` side of the pipe: `curl -fsSL .../install.sh | RU_VERSION=1.6.0 bash` ([f714b2f](https://github.com/Dicklesworthstone/repo_updater/commit/f714b2f0d90848fac967f2c1862a4cdd71f0b68f)).
+- **Quality gates and sync no longer report false success.** A test or lint gate that is required but not configured, or that returns an invalid result, fails. So does a secret scan that finds secrets or returns an invalid result. A requested fetch that fails, a branch or tag pin that cannot be checked out (the clone is kept), and network commands that exceed their deadline fail too. An incomplete sync is kept for `ru sync --resume` ([f714b2f](https://github.com/Dicklesworthstone/repo_updater/commit/f714b2f0d90848fac967f2c1862a4cdd71f0b68f)).
+- **Review plans and sweep commits are bound to verified Git state.** Applying a review checks that the plan belongs to the prepared run, checkout and candidate HEAD, and that approval covers exactly that plan and candidate. Publishing pushes to the origin destinations recorded at preparation, after scanning every commit each receiver has not seen, and verifies the receiver's refs afterwards. Commit-sweep commits only the planned paths through a private index and leaves unrelated staged and unstaged work alone ([85782a1](https://github.com/Dicklesworthstone/repo_updater/commit/85782a1759ed133eedbe4fc95156f736f64e76d1)).
+- **AI sync keeps the files it was given.** The final candidate must keep the working versions, modes and deletions of the files that were dirty at the start; discarded, reverted or extra unrequested content is refused, and recovery evidence is kept. Publication is bound to the receiver seen by the real pre-push hook, including late `insteadOf` rewrites. Network deadlines are resolved the same way from the CLI, the environment and config ([7909764](https://github.com/Dicklesworthstone/repo_updater/commit/7909764433ea0ca38179b0472c56c22e02f4bc68)).
+- **Structured output (`--json` / `--format`) is normalized for the first eleven command families** and matches the schemas published by `ru robot-docs schemas`. Terminal approval prompts still work through the structured dispatcher ([7909764](https://github.com/Dicklesworthstone/repo_updater/commit/7909764433ea0ca38179b0472c56c22e02f4bc68)).
+
+### Fixed
+
+- **`ru dep-update` without `--repo` always said "No repositories configured"** (GH #17). It called a helper that was never defined and hid the error. It now resolves configured repos the same way `ru list` and `ru ai-sync` do. A configured repo that is not cloned, cannot be resolved, or is not a Git repository is counted as skipped and reported with its reason, and `--json` results include `{repo, status: "skipped", reason}` for every skipped repo ([1b8145e](https://github.com/Dicklesworthstone/repo_updater/commit/1b8145e0cd1c25f4b025ba8ac717f924690e95dd)).
+
+### Upgrade notes
+
+- **Installer:** `curl ... | bash` no longer installs `main` when the release download or its checksum fails; it exits 1. Pass `RU_UNSAFE_MAIN=1` to the `bash` side of the pipe only if you deliberately want unverified code.
+- **Exit codes:** sync and review/sweep runs that previously exited 0 after a failed fetch, an unmet pin, a missing required gate, or a changed candidate now exit nonzero. Scripts that relied on the old success should read the reported reason.
+
+### Known limitations
+
+- `ru dep-update`'s per-manager scanners are unchanged: some check the ambient environment rather than the repo's manifests (for example pip), Maven and Gradle never report outdated dependencies, and a scanner failure still reads as "no outdated dependencies". Tracked in beads bd-tr5y.13.
+
+---
+
 ## [v1.5.0](https://github.com/Dicklesworthstone/repo_updater/compare/v1.4.0...v1.5.0) -- 2026-10-01
 
 `ru prune --delete` no longer deletes an orphan that holds work found nowhere else, and `--archive` / `--delete` no longer touch an orphan that is a configured repo's clone left at an old path. `--force` overrides both. `ru prune --archive` / `--delete` now exit 1 when they keep an orphan; see the upgrade notes.
