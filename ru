@@ -2647,6 +2647,13 @@ cmd_dep_update() {
             ;;
     esac
 
+    # Process each repo
+    local processed=0
+    local updated=0
+    local failed=0
+    local skipped=0
+    local -a results=()
+
     # Build list of repos to process
     local -a repos_to_process=()
     if [[ -n "$single_repo" ]]; then
@@ -2656,31 +2663,45 @@ cmd_dep_update() {
         fi
         repos_to_process+=("$single_repo")
     else
-        # Get all configured repos
-        local repo_list
-        repo_list=$(_list_local_repos 2>/dev/null) || repo_list=""
-        if [[ -z "$repo_list" ]]; then
+        # Resolve configured repos the same way list and ai-sync do. A
+        # configured repo that cannot be processed is counted as skipped
+        # with its reason, never reported as missing configuration.
+        local -a configured_specs=()
+        local spec
+        while IFS= read -r spec; do
+            [[ -n "$spec" ]] && configured_specs+=("$spec")
+        done < <(get_all_repos)
+        if [[ ${#configured_specs[@]} -eq 0 ]]; then
             log_warn "No repositories configured. Run 'ru add <repo>' first."
             return 0
         fi
-        while IFS= read -r repo; do
-            [[ -n "$repo" && -d "$repo" ]] && repos_to_process+=("$repo")
-        done <<< "$repo_list"
+        local url branch custom_name local_path repo_id skip_reason
+        for spec in "${configured_specs[@]}"; do
+            skip_reason=""
+            if ! resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                skip_reason="cannot resolve repo spec"
+                local_path="$spec"
+            elif [[ ! -d "$local_path" ]]; then
+                skip_reason="not cloned locally"
+            elif [[ ! -d "$local_path/.git" && ! -f "$local_path/.git" ]]; then
+                skip_reason="not a git repository"
+            fi
+            if [[ -n "$skip_reason" ]]; then
+                log_info "Skipping $local_path: $skip_reason"
+                ((skipped++))
+                results+=("$(_dep_update_skipped_json "$local_path" "$skip_reason")")
+                continue
+            fi
+            repos_to_process+=("$local_path")
+        done
     fi
 
     if [[ ${#repos_to_process[@]} -eq 0 ]]; then
         log_info "No repositories to process"
-        return 0
     fi
 
-    # Process each repo
-    local processed=0
-    local updated=0
-    local failed=0
-    local skipped=0
-    local -a results=()
-
-    for repo_path in "${repos_to_process[@]}"; do
+    # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    for repo_path in ${repos_to_process[@]+"${repos_to_process[@]}"}; do
         local repo_name
         repo_name=$(basename "$repo_path")
 
@@ -2692,6 +2713,7 @@ cmd_dep_update() {
         if [[ -z "$managers_array" || "$managers_array" == "[]" ]]; then
             log_debug "No package managers found in $repo_name, skipping"
             ((skipped++))
+            results+=("$(_dep_update_skipped_json "$repo_path" "no supported package manager")")
             continue
         fi
 
@@ -2700,6 +2722,7 @@ cmd_dep_update() {
             if ! echo "$managers_json" | jq -e ".managers[] | select(. == \"$manager_filter\")" &>/dev/null; then
                 log_debug "Repo $repo_name does not use manager '$manager_filter', skipping"
                 ((skipped++))
+                results+=("$(_dep_update_skipped_json "$repo_path" "does not use manager $manager_filter")")
                 continue
             fi
         fi
@@ -2713,6 +2736,7 @@ cmd_dep_update() {
         if [[ "$total_outdated" -eq 0 ]]; then
             log_debug "No outdated dependencies in $repo_name"
             ((skipped++))
+            results+=("$(_dep_update_skipped_json "$repo_path" "no outdated dependencies")")
             continue
         fi
 
@@ -2723,6 +2747,7 @@ cmd_dep_update() {
             if [[ "$total_outdated" -eq 0 ]]; then
                 log_debug "No matching dependencies after filtering in $repo_name"
                 ((skipped++))
+                results+=("$(_dep_update_skipped_json "$repo_path" "no dependencies match include/exclude filters")")
                 continue
             fi
         fi
@@ -2734,6 +2759,7 @@ cmd_dep_update() {
             if [[ "$total_outdated" -eq 0 ]]; then
                 log_debug "No non-major updates in $repo_name (use --major to include)"
                 ((skipped++))
+                results+=("$(_dep_update_skipped_json "$repo_path" "only major updates available (use --major)")")
                 continue
             fi
         fi
@@ -2828,12 +2854,12 @@ cmd_dep_update() {
     log_info "Processed: $processed repos"
     log_info "Updated:   $updated repos"
     log_info "Failed:    $failed repos"
-    log_info "Skipped:   $skipped repos (no outdated deps or filtered out)"
+    log_info "Skipped:   $skipped repos (not cloned, no outdated deps, or filtered out)"
 
     # JSON output if requested
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         local results_json
-        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.')
+        results_json=$(printf '%s\n' ${results[@]+"${results[@]}"} | jq -s '.')
         jq -n \
             --argjson results "$results_json" \
             --arg processed "$processed" \
@@ -2848,6 +2874,12 @@ cmd_dep_update() {
         return 1
     fi
     return 0
+}
+
+# Build the JSON result record for a repo that dep-update skipped.
+# Usage: _dep_update_skipped_json <repo_path> <reason>
+_dep_update_skipped_json() {
+    jq -cn --arg repo "$1" --arg reason "$2" '{repo:$repo,status:"skipped",reason:$reason}'
 }
 
 # Filter outdated deps JSON by include/exclude patterns.

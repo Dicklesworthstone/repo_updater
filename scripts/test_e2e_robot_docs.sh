@@ -380,6 +380,14 @@ MOCK
     assert_cli_schema dry-dep-update 0 dep-update dep-update --dry-run --repo="$repo" --format json
     assert_success "Dependency preview preserves actual controlled outdated result" jq -e '.data.processed == 1 and .data.updated == 0 and .data.results[0].status == "pending" and .data.results[0].outdated.results[0].outdated[0].name == "fixture"' "$E2E_LOG_DIR/dry-dep-update.stdout"
     assert_file_contains "$E2E_LOG_DIR/dry-dep-update.stderr" 'Would update 1 deps' "Dependency dry-run prose remains on stderr"
+    # Default discovery (no --repo) must reach the configured clone and report
+    # a configured but uncloned repo as skipped with its reason (issue #17).
+    printf 'owner/repo0\nowner/not-cloned\n' > "$RU_CONFIG_DIR/repos.d/public.txt"
+    assert_cli_schema default-dep-update 0 dep-update dep-update --dry-run --format json
+    assert_success "Default dependency discovery processes the configured clone" jq -e --arg repo "$repo" '.data.processed == 1 and ([.data.results[] | select(.status == "pending") | .repo] == [$repo])' "$E2E_LOG_DIR/default-dep-update.stdout"
+    assert_success "Default dependency discovery reports the uncloned repo as skipped" jq -e --arg missing "$RU_PROJECTS_DIR/not-cloned" '.data.skipped == 1 and ([.data.results[] | select(.status == "skipped")] == [{repo:$missing,status:"skipped",reason:"not cloned locally"}])' "$E2E_LOG_DIR/default-dep-update.stdout"
+    assert_file_contains "$E2E_LOG_DIR/default-dep-update.stderr" 'Would update 1 deps' "Default dependency preview reaches the configured clone"
+    printf 'owner/repo0\n' > "$RU_CONFIG_DIR/repos.d/public.txt"
     assert_cli_schema dry-ad-hoc 0 sync sync owner/new-repo --dry-run --json
     assert_cli_schema invalid-ad-hoc 2 sync sync 'bad "repository"' --dry-run --json
 
