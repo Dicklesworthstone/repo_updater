@@ -1332,6 +1332,11 @@ get_dirty_repos() {
         esac
     done
 
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; dirty-repository scan is incomplete"
+        return 3
+    fi
     local -a dirty_repos=()
     local spec url branch custom_name local_path repo_id
 
@@ -1370,7 +1375,7 @@ get_dirty_repos() {
         if [[ -n "$status_output" ]]; then
             dirty_repos+=("$local_path")
         fi
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     # Output results
     if [[ "$json_output" == "true" ]]; then
@@ -2362,7 +2367,12 @@ cmd_ai_sync() {
     local dirty_args=""
     [[ "$include_untracked" == "false" ]] && dirty_args="--no-untracked"
 
-    dirty_repos_output=$(get_dirty_repos $dirty_args)
+    local dirty_repos_rc=0
+    dirty_repos_output=$(get_dirty_repos $dirty_args) || dirty_repos_rc=$?
+    if [[ "$dirty_repos_rc" -gt 1 ]]; then
+        log_error "Could not complete the dirty-repository scan; ai-sync was not started"
+        return 3
+    fi
     if [[ -z "$dirty_repos_output" ]]; then
         log_success "All repositories are clean - nothing to sync"
         return 0
@@ -2666,11 +2676,16 @@ cmd_dep_update() {
         # Resolve configured repos the same way list and ai-sync do. A
         # configured repo that cannot be processed is counted as skipped
         # with its reason, never reported as missing configuration.
+        local configured_repos
+        if ! configured_repos=$(get_all_repos); then
+            log_error "Could not read configured repositories; dependency update was not started"
+            return 3
+        fi
         local -a configured_specs=()
         local spec
         while IFS= read -r spec; do
             [[ -n "$spec" ]] && configured_specs+=("$spec")
-        done < <(get_all_repos)
+        done < <(printf '%s\n' "$configured_repos")
         if [[ ${#configured_specs[@]} -eq 0 ]]; then
             log_warn "No repositories configured. Run 'ru add <repo>' first."
             return 0
@@ -7369,6 +7384,10 @@ load_repo_list() {
     local file="$1"
 
     if [[ ! -f "$file" ]]; then
+        if [[ -e "$file" || -L "$file" ]]; then
+            log_error "Repository list is not an accessible regular file: $file"
+            return 1
+        fi
         return 0  # Empty list, not an error
     fi
 
@@ -7677,6 +7696,11 @@ find_repo_spec_for_repo_id() {
     local target_repo_id="$1"
     [[ -z "$target_repo_id" ]] && return 1
 
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not find a repository specification in incomplete configuration"
+        return 3
+    fi
     local spec url branch custom_name path repo_id
     while IFS= read -r spec; do
         [[ -z "$spec" ]] && continue
@@ -7686,7 +7710,7 @@ find_repo_spec_for_repo_id() {
                 return 0
             fi
         fi
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     return 1
 }
@@ -8260,7 +8284,11 @@ get_sync_state_file() {
 # Generate a hash of the current repo configuration (for detecting changes)
 get_config_hash() {
     local input
-    input=$(get_all_repos 2>/dev/null | sort)
+    if ! input=$(get_all_repos); then
+        log_error "Could not hash incomplete repository configuration"
+        return 3
+    fi
+    input=$(printf '%s\n' "$input" | sort) || return 3
     if command -v md5sum &>/dev/null; then
         printf '%s\n' "$input" | md5sum | cut -d' ' -f1
     elif command -v md5 &>/dev/null; then
@@ -8343,7 +8371,10 @@ save_sync_state() {
     local run_id
     run_id="${SYNC_RUN_ID:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
     local config_hash
-    config_hash=$(get_config_hash)
+    if ! config_hash=$(get_config_hash); then
+        log_error "Sync checkpoint was not replaced because configuration could not be read"
+        return 3
+    fi
 
     # Build completed array JSON (handle empty array with set -u)
     local completed_json=""
@@ -9536,7 +9567,10 @@ cmd_sync() {
 
                 # Check if config changed
                 local current_hash
-                current_hash=$(get_config_hash)
+                if ! current_hash=$(get_config_hash); then
+                    log_error "Cannot resume sync with unreadable repository configuration"
+                    return 3
+                fi
                 if [[ "$current_hash" != "$SYNC_CONFIG_HASH" ]]; then
                     log_warn "Repository list has changed since last sync"
                 fi
@@ -10559,29 +10593,31 @@ cmd_list() {
         exit 4
     fi
 
-    local repos=()
+    local repos=() configured_repos
     if [[ "$filter_public" == "true" ]]; then
         # Only repos from public.txt
         local public_file="$RU_CONFIG_DIR/repos.d/public.txt"
-        if [[ -f "$public_file" ]]; then
-            while IFS= read -r line; do
-                [[ -n "$line" ]] && repos+=("$line")
-            done < <(load_repo_list "$public_file")
+        if ! configured_repos=$(load_repo_list "$public_file"); then
+            log_error "Could not read public repositories; list is incomplete"
+            return 3
         fi
     elif [[ "$filter_private" == "true" ]]; then
         # Only repos from private.txt
         local private_file="$RU_CONFIG_DIR/repos.d/private.txt"
-        if [[ -f "$private_file" ]]; then
-            while IFS= read -r line; do
-                [[ -n "$line" ]] && repos+=("$line")
-            done < <(load_repo_list "$private_file")
+        if ! configured_repos=$(load_repo_list "$private_file"); then
+            log_error "Could not read private repositories; list is incomplete"
+            return 3
         fi
     else
         # All repos (default behavior)
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && repos+=("$line")
-        done < <(get_all_repos)
+        if ! configured_repos=$(get_all_repos); then
+            log_error "Could not read configured repositories; list is incomplete"
+            return 3
+        fi
     fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && repos+=("$line")
+    done < <(printf '%s\n' "$configured_repos")
 
     if [[ ${#repos[@]} -eq 0 ]]; then
         log_info "No repositories configured."
@@ -10687,13 +10723,21 @@ cmd_doctor() {
     fi
 
     # Check repos configured
-    local repo_count=0
+    local repo_count=0 configured_repos repos_readable=true
     if [[ -d "$RU_CONFIG_DIR/repos.d" ]]; then
-        while IFS= read -r _; do
-            ((repo_count++))
-        done < <(get_all_repos 2>/dev/null)
+        if configured_repos=$(get_all_repos); then
+            while IFS= read -r _; do
+                [[ -z "$_" ]] || ((repo_count++))
+            done < <(printf '%s\n' "$configured_repos")
+        else
+            repos_readable=false
+            repo_count=null
+            ((issues++))
+        fi
     fi
-    if [[ $repo_count -gt 0 ]]; then
+    if [[ "$repos_readable" == false ]]; then
+        printf '%b\n' "${RED}[!!]${RESET} Repos: configuration could not be read" >&2
+    elif [[ $repo_count -gt 0 ]]; then
         printf '%b\n' "${GREEN}[OK]${RESET} Repos: $repo_count configured" >&2
     else
         printf '%b\n' "${YELLOW}[??]${RESET} Repos: none configured" >&2
@@ -17728,7 +17772,10 @@ checkpoint_review_state() {
     local run_id="${REVIEW_RUN_ID:-unknown}"
     local mode="${REVIEW_MODE:-plan}"
     local config_hash
-    config_hash=$(get_config_hash)
+    if ! config_hash=$(get_config_hash); then
+        log_error "Review checkpoint was not replaced because configuration could not be read"
+        return 3
+    fi
 
     local questions_pending=0
     local questions_file
@@ -18542,8 +18589,14 @@ prepare_review_worktrees() {
         # Preserve branch pins/custom names from config when possible.
         local config_spec=""
         if declare -F find_repo_spec_for_repo_id >/dev/null; then
-            if config_spec=$(find_repo_spec_for_repo_id "$repo_spec" 2>/dev/null); then
+            if config_spec=$(find_repo_spec_for_repo_id "$repo_spec"); then
                 repo_spec="$config_spec"
+            else
+                local config_spec_rc=$?
+                if [[ "$config_spec_rc" -ne 1 ]]; then
+                    log_error "Cannot prepare review worktrees with incomplete configuration"
+                    return 1
+                fi
             fi
         fi
 
@@ -19621,12 +19674,17 @@ show_discovery_summary() {
 # Count configured GitHub repos (for discovery summary)
 count_github_repos() {
     local count=0
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not count configured GitHub repositories"
+        return 3
+    fi
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         local github_id
         github_id=$(repo_spec_to_github_id "$line")
         [[ -n "$github_id" ]] && ((count++))
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
     echo "$count"
 }
 
@@ -20103,7 +20161,10 @@ cmd_review() {
 
             if [[ -n "$checkpoint_hash" ]]; then
                 local current_hash
-                current_hash=$(get_config_hash)
+                if ! current_hash=$(get_config_hash); then
+                    log_error "Cannot resume review with unreadable repository configuration"
+                    return 3
+                fi
                 if [[ "$current_hash" != "$checkpoint_hash" ]]; then
                     log_warn "Repository list has changed since checkpoint"
                 fi
@@ -20139,6 +20200,11 @@ cmd_review() {
     if [[ -n "$REVIEW_INVALIDATE_CACHE" ]]; then
         local -a invalidate_repos=()
         if [[ "$REVIEW_INVALIDATE_CACHE" == "all" ]]; then
+            local configured_repos
+            if ! configured_repos=$(get_all_repos); then
+                log_error "Cannot invalidate review caches with incomplete configuration"
+                return 3
+            fi
             while IFS= read -r spec; do
                 [[ -z "$spec" ]] && continue
                 # shellcheck disable=SC2034  # resolved_repo_id used by resolve_repo_spec
@@ -20147,7 +20213,7 @@ cmd_review() {
                         url branch custom_name local_path resolved_repo_id 2>/dev/null; then
                     invalidate_repos+=("$resolved_repo_id")
                 fi
-            done < <(get_all_repos)
+            done < <(printf '%s\n' "$configured_repos")
         else
             # Use IFS+read to safely split without glob expansion
             local -a tokens
@@ -20218,7 +20284,10 @@ cmd_review() {
     fi
 
     if [[ $repos_scanned -eq 0 ]]; then
-        repos_scanned=$(count_github_repos)
+        if ! repos_scanned=$(count_github_repos); then
+            log_error "Review repository count is incomplete"
+            return 3
+        fi
     fi
 
     if [[ ${#work_items[@]} -eq 0 ]]; then
@@ -22090,10 +22159,15 @@ cmd_fork_status() {
     _fork_parse_args upstream_remote repos_pattern do_fetch do_push no_rescue do_reset do_force strategy
 
     # Load all repos from config
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; fork status is incomplete"
+        return 3
+    fi
     local repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && repos+=("$line")
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     local total=${#repos[@]}
     if [[ "$total" -eq 0 ]]; then
@@ -22276,10 +22350,15 @@ cmd_fork_sync() {
     local upstream_remote repos_pattern do_fetch do_push no_rescue do_reset do_force strategy
     _fork_parse_args upstream_remote repos_pattern do_fetch do_push no_rescue do_reset do_force strategy
 
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; fork sync was not started"
+        return 3
+    fi
     local repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && repos+=("$line")
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     local total=${#repos[@]}
     if [[ "$total" -eq 0 ]]; then
@@ -22472,10 +22551,17 @@ cmd_fork_clean() {
         return 4
     fi
 
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; fork cleanup was not started"
+        counts_complete=false
+        emit_fork_clean_result 3 config_read_failed
+        return 3
+    fi
     local repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && repos+=("$line")
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     total=${#repos[@]}
     if [[ "$total" -eq 0 ]]; then
@@ -22912,6 +22998,15 @@ cmd_commit_sweep() {
         esac
     done
 
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; commit-sweep was not started"
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            emit_structured "$(build_json_envelope commit-sweep '{"error":"config_read_failed"}' '{"exit_code":3}')"
+        fi
+        return 3
+    fi
+
     # Global accumulators
     CS_TOTAL_COMMITS=0
     CS_FAILED_COMMITS=0
@@ -22958,7 +23053,7 @@ cmd_commit_sweep() {
            [[ "$CS_FAILED_COMMITS" -eq "$failures_before" ]]; then
             CS_FAILED_COMMITS=$((CS_FAILED_COMMITS + 1))
         fi
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     local clean_repos=$((repos_scanned - CS_DIRTY_REPOS))
     local exit_code=0
