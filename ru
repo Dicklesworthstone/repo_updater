@@ -7631,18 +7631,37 @@ detect_collisions() {
 get_all_repos() {
     local repos_dir="${RU_CONFIG_DIR}/repos.d"
     local all_repos=""
+    local list_file list_repos
 
     if [[ ! -d "$repos_dir" ]]; then
+        if [[ -e "$repos_dir" || -L "$repos_dir" ]]; then
+            log_error "Repository list path is not an accessible directory: $repos_dir"
+            return 1
+        fi
         return 0
+    fi
+    if [[ ! -r "$repos_dir" || ! -x "$repos_dir" ]]; then
+        log_error "Could not read repository list directory: $repos_dir"
+        return 1
     fi
 
     # Process all .txt files in repos.d/
     for list_file in "$repos_dir"/*.txt; do
-        [[ -f "$list_file" ]] || continue
+        if [[ ! -f "$list_file" ]]; then
+            if [[ -L "$list_file" && ! -e "$list_file" ]]; then
+                log_error "Repository list has an unavailable symlink target: $list_file"
+                return 1
+            fi
+            continue
+        fi
 
-        while IFS= read -r spec; do
-            all_repos+="${spec}"$'\n'
-        done < <(load_repo_list "$list_file")
+        # Capture the producer's status before exposing any repositories. Process
+        # substitution hides read failures and can turn a partial list into success.
+        if ! list_repos=$(load_repo_list "$list_file"); then
+            log_error "Could not read repository list: $list_file"
+            return 1
+        fi
+        [[ -z "$list_repos" ]] || all_repos+="${list_repos}"$'\n'
     done
 
     # Deduplicate and output
@@ -9471,10 +9490,15 @@ cmd_sync() {
     fi
 
     # Load all repos from config (checks all .txt files in repos.d/)
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; sync was not started"
+        return 3
+    fi
     local repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && repos+=("$line")
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     # No arguments - check for configured repos
     if [[ ${#repos[@]} -eq 0 ]]; then
@@ -9798,10 +9822,15 @@ cmd_status() {
     fi
 
     # Load all repos from config (reads from all *.txt files in repos.d/)
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; status is incomplete"
+        return 3
+    fi
     local repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && repos+=("$line")
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     local total=${#repos[@]}
 

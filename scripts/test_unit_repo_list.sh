@@ -798,6 +798,85 @@ test_get_all_repos_ignores_non_txt() {
     log_test_pass "$test_name"
 }
 
+test_get_all_repos_rejects_partial_list_failure() {
+    local test_name="get_all_repos rejects a failing list without partial output"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+    local RU_CONFIG_DIR="$test_env/config" PROJECTS_DIR="$test_env/projects" LAYOUT="flat"
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+    printf '%s\n' 'owner/valid' > "$RU_CONFIG_DIR/repos.d/a-public.txt"
+    printf '%s\n' 'owner/private' > "$RU_CONFIG_DIR/repos.d/z-private.txt"
+
+    local result rc
+    result=$(
+        # A producer may emit bytes before its I/O fails. Neither that partial
+        # list nor the earlier complete list may escape as a complete config.
+        load_repo_list() {
+            if [[ "$1" == */z-private.txt ]]; then
+                printf '%s\n' 'owner/partial'
+                return 42
+            fi
+            printf '%s\n' 'owner/valid'
+        }
+        get_all_repos
+    )
+    rc=$?
+    assert_equals "1" "$rc" "A failed list read must fail the complete load"
+    assert_equals "" "$result" "A failed complete load must not expose partial repositories"
+    log_test_pass "$test_name"
+}
+
+test_configured_commands_reject_list_failure() {
+    local test_name="sync and status reject a failed configuration load"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+    local command_name result rc
+    for command_name in cmd_sync cmd_status; do
+        result=$(
+            source_ru_function "$command_name"
+            RU_CONFIG_DIR="$test_env"
+            PROJECTS_DIR="$test_env/projects"
+            JSON_OUTPUT=false
+            ARGS=()
+            get_all_repos() { return 42; }
+            ensure_dir() { :; }
+            log_info() { :; }
+            "$command_name"
+        )
+        rc=$?
+        assert_equals "3" "$rc" "$command_name must report a configuration error"
+        assert_equals "" "$result" "$command_name must not output a successful empty result"
+    done
+    log_test_pass "$test_name"
+}
+
+test_get_all_repos_rejects_unavailable_list_paths() {
+    local test_name="get_all_repos rejects unavailable list paths"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+    local RU_CONFIG_DIR="$test_env/config" PROJECTS_DIR="$test_env/projects" LAYOUT="flat"
+    mkdir -p "$RU_CONFIG_DIR/repos.d"
+    printf '%s\n' 'owner/valid' > "$RU_CONFIG_DIR/repos.d/a-public.txt"
+    ln -s "$test_env/missing-list.txt" "$RU_CONFIG_DIR/repos.d/z-private.txt"
+    local result rc
+    result=$(get_all_repos)
+    rc=$?
+    assert_equals "1" "$rc" "A broken list symlink must fail the complete load"
+    assert_equals "" "$result" "The readable list must not escape as a complete configuration"
+
+    RU_CONFIG_DIR="$test_env/wrong-kind"
+    mkdir -p "$RU_CONFIG_DIR"
+    printf '%s\n' 'not a directory' > "$RU_CONFIG_DIR/repos.d"
+    result=$(get_all_repos)
+    rc=$?
+    assert_equals "1" "$rc" "An existing non-directory repos.d must not be reported as missing"
+    assert_equals "" "$result" "An invalid list path must not yield repositories"
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -848,6 +927,9 @@ run_test test_get_all_repos_loads_single_file
 run_test test_get_all_repos_loads_multiple_files
 run_test test_get_all_repos_deduplicates
 run_test test_get_all_repos_ignores_non_txt
+run_test test_get_all_repos_rejects_partial_list_failure
+run_test test_configured_commands_reject_list_failure
+run_test test_get_all_repos_rejects_unavailable_list_paths
 
 echo ""
 print_results
