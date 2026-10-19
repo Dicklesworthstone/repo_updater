@@ -18782,24 +18782,129 @@ gh_api_graphql_repo_batch() {
         q+=" nameWithOwner isArchived isFork updatedAt"
         # Issues with metadata for scoring
         q+=" issues(states:OPEN, first:50, orderBy:{field:CREATED_AT, direction:DESC}) {"
+        q+="   pageInfo { hasNextPage endCursor }"
         q+="   nodes { number title createdAt updatedAt"
-        q+="     labels(first:10) { nodes { name } }"
+        q+="     labels(first:10) { totalCount nodes { name } }"
         q+="   }"
         q+=" }"
         # PRs with metadata for scoring
         q+=" pullRequests(states:OPEN, first:20, orderBy:{field:CREATED_AT, direction:DESC}) {"
+        q+="   pageInfo { hasNextPage endCursor }"
         q+="   nodes { number title createdAt updatedAt isDraft"
-        q+="     labels(first:10) { nodes { name } }"
+        q+="     labels(first:10) { totalCount nodes { name } }"
         q+="   }"
         q+=" }"
         q+=" }"
         ((i++))
-    done <<< "$chunk"
+    done < <(printf '%s\n' "$chunk")
 
     q+=" }"
 
     # Execute query via gh CLI
-    retry_with_backoff --capture=stdout 3 1 -- gh api graphql -f query="$q"
+    local response
+    if [[ "$i" -eq 0 ]]; then
+        printf '%s\n' '{"data":{}}'
+        return 0
+    fi
+    response=$(retry_with_backoff --capture=stdout 3 1 -- gh api graphql -f query="$q") || return $?
+    if ! printf '%s\n' "$response" | jq -e --argjson count "$i" '.data | type == "object" and length == $count' >/dev/null; then
+        log_error "GraphQL discovery omitted a requested repository"
+        return 1
+    fi
+    complete_graphql_work_items "$response"
+}
+
+# Complete only the connections truncated by the batched first request. Normal
+# small repositories still share one request; larger backlogs and label sets
+# must be complete before callers may report an empty or finished discovery.
+complete_graphql_work_items() {
+    local response="$1" pages alias connection repo_id cursor owner name query
+    local index number labels
+    if ! printf '%s\n' "$response" | jq -e '
+        ((.errors // []) | length) == 0 and (.data | type == "object") and
+        all(.data[]; type == "object" and (.nameWithOwner | type == "string") and
+            all(.issues, .pullRequests;
+                (.nodes | type == "array") and
+                (.pageInfo.hasNextPage | type == "boolean") and
+                all(.nodes[]; (.labels.nodes | type == "array") and
+                    (.labels.totalCount | type == "number"))))
+    ' >/dev/null; then
+        log_error "GraphQL discovery returned errors or an incomplete repository response"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r alias connection repo_id cursor; do
+        [[ -n "$alias" ]] || continue
+        if [[ -z "$cursor" || "$cursor" == null ]]; then
+            log_error "GraphQL discovery omitted a continuation cursor for $repo_id"
+            return 1
+        fi
+        owner="${repo_id%%/*}"
+        name="${repo_id#*/}"
+        query='query($owner:String!,$name:String!,$endCursor:String) { repository(owner:$owner,name:$name) {'
+        query+=" $connection(states:OPEN,first:100,after:\$endCursor,orderBy:{field:CREATED_AT,direction:DESC}) {"
+        query+=' pageInfo { hasNextPage endCursor } nodes { number title createdAt updatedAt'
+        [[ "$connection" != pullRequests ]] || query+=' isDraft'
+        query+=' labels(first:10) { totalCount nodes { name } } } } } }'
+        pages=$(retry_with_backoff --capture=stdout 3 1 -- gh api graphql --paginate --slurp \
+            -f query="$query" -f owner="$owner" -f name="$name" -f endCursor="$cursor") || return $?
+        if ! printf '%s\n' "$pages" | jq -e --arg kind "$connection" '
+            type == "array" and length > 0 and
+            all(.[]; ((.errors // []) | length) == 0 and
+                (.data.repository[$kind].nodes | type == "array") and
+                (.data.repository[$kind].pageInfo.hasNextPage | type == "boolean") and
+                all(.data.repository[$kind].nodes[];
+                    (.labels.nodes | type == "array") and (.labels.totalCount | type == "number"))) and
+            (.[-1].data.repository[$kind].pageInfo.hasNextPage == false)
+        ' >/dev/null; then
+            log_error "GraphQL discovery could not finish $repo_id $connection"
+            return 1
+        fi
+        response=$(printf '%s\n%s\n' "$response" "$pages" | jq -cs --arg alias "$alias" --arg kind "$connection" '
+            .[1] as $pages | .[0] |
+            .data[$alias][$kind].nodes += [$pages[].data.repository[$kind].nodes[]] |
+            .data[$alias][$kind].nodes |= unique_by(.number) |
+            .data[$alias][$kind].pageInfo = $pages[-1].data.repository[$kind].pageInfo
+        ') || return 1
+    done < <(printf '%s\n' "$response" | jq -r '
+        .data | to_entries[] | .key as $alias | .value as $repo |
+        select($repo.isArchived != true and $repo.isFork != true) |
+        ("issues", "pullRequests") as $kind |
+        select($repo[$kind].pageInfo.hasNextPage == true) |
+        [$alias, $kind, $repo.nameWithOwner, $repo[$kind].pageInfo.endCursor] | @tsv
+    ')
+
+    # REST label pagination avoids a separate nested GraphQL cursor for every
+    # item. Only items with more than the initial ten labels need this request.
+    while IFS=$'\t' read -r alias connection index repo_id number; do
+        [[ -n "$alias" ]] || continue
+        labels=$(retry_with_backoff --capture=stdout 3 1 -- gh api --paginate --slurp \
+            "repos/$repo_id/issues/$number/labels?per_page=100") || return $?
+        if ! printf '%s\n' "$labels" | jq -e '
+            type == "array" and length > 0 and
+            all(.[]; type == "array" and all(.[]; .name | type == "string"))
+        ' >/dev/null; then
+            log_error "GitHub discovery could not finish labels for $repo_id#$number"
+            return 1
+        fi
+        response=$(printf '%s\n%s\n' "$response" "$labels" | jq -cs \
+            --arg alias "$alias" --arg kind "$connection" --argjson index "$index" '
+            (.[1] | add | unique_by(.name)) as $labels | .[0] |
+            if ($labels | length) < .data[$alias][$kind].nodes[$index].labels.totalCount then
+                error("Label pagination returned fewer labels than discovery advertised")
+            else
+                .data[$alias][$kind].nodes[$index].labels = {nodes: $labels, totalCount: ($labels | length)}
+            end
+        ') || return 1
+    done < <(printf '%s\n' "$response" | jq -r '
+        .data | to_entries[] | .key as $alias | .value as $repo |
+        select($repo.isArchived != true and $repo.isFork != true) |
+        ("issues", "pullRequests") as $kind |
+        $repo[$kind].nodes | to_entries[] |
+        select(.value.labels.totalCount > (.value.labels.nodes | length)) |
+        [$alias, $kind, .key, $repo.nameWithOwner, .value.number] | @tsv
+    ')
+    printf '%s\n' "$response"
 }
 
 # Parse GraphQL response into work items (TSV format)
@@ -18808,7 +18913,14 @@ gh_api_graphql_repo_batch() {
 parse_graphql_work_items() {
     local resp="$1"
 
-    echo "$resp" | jq -r '
+    if ! printf '%s\n' "$resp" | jq -e '
+        ((.errors // []) | length) == 0 and (.data | type == "object") and
+        all(.data[]; type == "object")
+    ' >/dev/null; then
+        log_error "Cannot parse incomplete GitHub discovery results"
+        return 1
+    fi
+    printf '%s\n' "$resp" | jq -r '
         .data | to_entries[] | select(.value != null) |
         select(.value.isArchived != true) |
         select(.value.isFork != true) |
@@ -18816,18 +18928,18 @@ parse_graphql_work_items() {
         (
             # Issues
             ($repo.issues.nodes // [])[] |
-            [$repo.nameWithOwner, "issue", .number, .title,
-             ([.labels.nodes[].name] | join(",")),
+            [$repo.nameWithOwner, "issue", .number, (.title | gsub("[|]"; " ")),
+             ([.labels.nodes[].name] | join(",") | gsub("[|]"; " ")),
              .createdAt, .updatedAt, "false"] | @tsv
         ),
         (
             # PRs
             ($repo.pullRequests.nodes // [])[] |
-            [$repo.nameWithOwner, "pr", .number, .title,
-             ([.labels.nodes[].name] | join(",")),
+            [$repo.nameWithOwner, "pr", .number, (.title | gsub("[|]"; " ")),
+             ([.labels.nodes[].name] | join(",") | gsub("[|]"; " ")),
              .createdAt, .updatedAt, (.isDraft | tostring)] | @tsv
         )
-    ' 2>/dev/null
+    '
 }
 
 #------------------------------------------------------------------------------
@@ -18909,12 +19021,15 @@ calculate_item_priority_score() {
         score=$((score + 10))
     fi
 
-    # Component 2: Label-Based Priority (0-50 points)
-    if echo "$labels" | grep -qiE 'security|critical'; then
-        score=$((score + 50))
-    elif echo "$labels" | grep -qiE 'bug|urgent'; then
+    # Explicit security/critical labels must reach the CRITICAL threshold,
+    # including a new issue with no age or recent-update bonus.
+    local labels_lower="${labels,,}" critical_label=false
+    if [[ "$labels_lower" =~ security|critical ]]; then
+        critical_label=true
+        score=$((score + 150))
+    elif [[ "$labels_lower" =~ bug|urgent ]]; then
         score=$((score + 30))
-    elif echo "$labels" | grep -qiE 'enhancement|feature'; then
+    elif [[ "$labels_lower" =~ enhancement|feature ]]; then
         score=$((score + 10))
     fi
 
@@ -18923,7 +19038,7 @@ calculate_item_priority_score() {
     age_days=$(days_since_timestamp "$created_at")
 
     # Bug/security items: older = more urgent
-    if echo "$labels" | grep -qiE 'bug|security|critical'; then
+    if [[ "$labels_lower" =~ bug|security|critical ]]; then
         if [[ $age_days -gt 60 ]]; then
             score=$((score + 50))
         elif [[ $age_days -gt 30 ]]; then
@@ -18952,6 +19067,8 @@ calculate_item_priority_score() {
     if item_recently_reviewed "$item_key"; then
         score=$((score - 20))
     fi
+    # Review recency may change ordering within CRITICAL, not hide the label.
+    [[ "$critical_label" != true || $score -ge 150 ]] || score=150
 
     # Ensure non-negative
     [[ $score -lt 0 ]] && score=0
@@ -19007,8 +19124,13 @@ passes_priority_threshold() {
 score_and_sort_work_items() {
     local tsv_input="$1"
     local threshold="${2:-all}"
+    local tsv_line repo_id item_type number title labels created_at updated_at is_draft
 
-    while IFS=$'\t' read -r repo_id item_type number title labels created_at updated_at is_draft; do
+    while IFS= read -r tsv_line; do
+        # Bash treats tabs as IFS whitespace and collapses empty label fields.
+        # The producer already normalizes pipes in titles and label names.
+        IFS='|' read -r repo_id item_type number title labels created_at updated_at is_draft \
+            <<< "${tsv_line//$'\t'/|}"
         [[ -z "$repo_id" ]] && continue
 
         local score
@@ -19022,7 +19144,7 @@ score_and_sort_work_items() {
             printf '%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$score" "$level" "$repo_id" "$item_type" "$number" "$title" "$labels" "$created_at" "$updated_at" "$is_draft"
         fi
-    done <<< "$tsv_input" | sort -t$'\t' -k1 -rn
+    done < <(printf '%s\n' "$tsv_input") | sort -t$'\t' -k1,1nr -k3,3 -k4,4 -k5,5n
 }
 
 # Convert repo spec to owner/repo format (GitHub only)
@@ -19067,13 +19189,13 @@ discover_work_items() {
     # Check for jq (required for parsing)
     if ! command -v jq &>/dev/null; then
         log_warn "jq is required for work item discovery"
-        return 0
+        return 3
     fi
 
     # Check for gh CLI
     if ! command -v gh &>/dev/null; then
         log_warn "gh CLI is required for work item discovery"
-        return 0
+        return 3
     fi
 
     # Load all configured repos
@@ -19123,10 +19245,11 @@ discover_work_items() {
             local response
             if response=$(gh_api_graphql_repo_batch "$chunk"); then
                 local parsed_items
-                parsed_items=$(parse_graphql_work_items "$response")
+                parsed_items=$(parse_graphql_work_items "$response") || return 1
                 [[ -n "$parsed_items" ]] && all_work_items+="${parsed_items}"$'\n'
             else
-                log_warn "GraphQL batch query failed"
+                log_error "GraphQL batch query failed; discovery is incomplete"
+                return 1
             fi
             chunk=""
             count=0
@@ -19139,28 +19262,33 @@ discover_work_items() {
         local response
         if response=$(gh_api_graphql_repo_batch "$chunk"); then
             local parsed_items
-            parsed_items=$(parse_graphql_work_items "$response")
+            parsed_items=$(parse_graphql_work_items "$response") || return 1
             [[ -n "$parsed_items" ]] && all_work_items+="${parsed_items}"$'\n'
         else
-            log_warn "GraphQL batch query failed"
+            log_error "GraphQL batch query failed; discovery is incomplete"
+            return 1
         fi
     fi
 
-    # Parse work items into array (pipe-separated format)
-    # Format: repo_id|type|number|title|labels|created_at|updated_at|is_draft
-    while IFS=$'\t' read -r repo_id item_type number title labels created_at updated_at is_draft; do
-        [[ -z "$repo_id" ]] && continue
-        # Sanitize fields that might contain pipes
-        title="${title//|/ }"
-        labels="${labels//|/ }"
-        # Convert TSV to pipe-separated for easier parsing later
-        _items_ref+=("${repo_id}|${item_type}|${number}|${title}|${labels}|${created_at}|${updated_at}|${is_draft}")
-    done <<< "$all_work_items"
-
-    # Apply max_repos limit if specified
-    if [[ -n "$max_repos" ]] && [[ ${#_items_ref[@]} -gt $max_repos ]]; then
-        _items_ref=("${_items_ref[@]:0:$max_repos}")
-    fi
+    # Rank/filter the complete backlog before applying a repository budget.
+    # Keep every matching item for each selected repo, including empty labels.
+    local sorted_items row item repo_id selected_count=0
+    local -A selected_repos=()
+    sorted_items=$(score_and_sort_work_items "$all_work_items" "$priority_filter") || return 1
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        item="${row#*$'\t'}"
+        item="${item#*$'\t'}"
+        repo_id="${item%%$'\t'*}"
+        if [[ -z "${selected_repos[$repo_id]:-}" ]]; then
+            if [[ -n "$max_repos" ]] && (( selected_count >= max_repos )); then
+                continue
+            fi
+            selected_repos["$repo_id"]=1
+            ((selected_count++))
+        fi
+        _items_ref+=("${item//$'\t'/|}")
+    done < <(printf '%s\n' "$sorted_items")
 
     log_verbose "Discovered ${#_items_ref[@]} work item(s)"
 }
@@ -20015,7 +20143,10 @@ cmd_review() {
     # Discovery phase
     log_step "Scanning repositories for open issues and PRs..."
     local -a work_items
-    discover_work_items work_items "$REVIEW_PRIORITY" "$REVIEW_MAX_REPOS" "$resume_pending_repos"
+    if ! discover_work_items work_items "$REVIEW_PRIORITY" "$REVIEW_MAX_REPOS" "$resume_pending_repos"; then
+        log_error "Review discovery failed; no complete backlog is available"
+        return 3
+    fi
 
     if [[ $repos_scanned -eq 0 ]]; then
         repos_scanned=$(count_github_repos)
