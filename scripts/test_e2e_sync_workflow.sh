@@ -622,6 +622,65 @@ test_sync_pinned_tag_is_stable() {
     e2e_cleanup
 }
 
+test_sync_can_change_a_detached_pin() {
+    local parallel remote old_sha new_sha branch config clone preserved
+    for parallel in 1 2; do
+        sync_test_setup
+        create_test_remote pins changing-tag 2
+        remote="${REMOTE_REGISTRY[pins/changing-tag]}"
+        old_sha=$(git -C "$remote" rev-parse HEAD^)
+        new_sha=$(git -C "$remote" rev-parse HEAD)
+        branch=$(git -C "$remote" symbolic-ref --short HEAD)
+        git -C "$remote" tag old-pin "$old_sha"
+        git -C "$remote" tag next-pin "$new_sha"
+        "$RU_SCRIPT" init >/dev/null 2>&1
+        "$RU_SCRIPT" add pins/changing-tag@old-pin >/dev/null 2>&1
+        sync_test_finalize_mock
+        clone="$E2E_TEMP_DIR/projects/changing-tag"
+        config="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+        run_ru_sync "--parallel=$parallel" --json
+        assert_equals 0 "$RU_EXIT_CODE" "Initial tag pin works with parallel=$parallel"
+        assert_equals "$old_sha" "$(git -C "$clone" rev-parse HEAD)" "Initial exact commit is selected"
+
+        printf '%s\n' pins/changing-tag@next-pin > "$config"
+        run_ru_sync "--parallel=$parallel" --json
+        assert_equals 0 "$RU_EXIT_CODE" "A valid tag upgrade is not a no-upstream conflict"
+        assert_equals "$new_sha" "$(git -C "$clone" rev-parse HEAD)" "Updated pin selects the exact new commit"
+        assert_equals 1 "$(jq -r '.data.summary.updated' <<< "$RU_STDOUT")" "Tag transition is counted as updated"
+
+        printf '%s\n' "pins/changing-tag@$branch" > "$config"
+        run_ru_sync "--parallel=$parallel" --json
+        assert_equals 0 "$RU_EXIT_CODE" "A detached tag can change to a valid branch"
+        assert_equals "refs/heads/$branch" "$(git -C "$clone" symbolic-ref HEAD)" "Requested branch becomes attached"
+        assert_equals "origin/$branch" "$(git -C "$clone" rev-parse --abbrev-ref '@{u}')" "Requested branch retains its genuine origin upstream"
+
+        printf '%s\n' pins/changing-tag@old-pin > "$config"
+        run_ru_sync "--parallel=$parallel" --json
+        assert_equals 0 "$RU_EXIT_CODE" "Branch can return to a valid fixed tag"
+        assert_equals "$old_sha" "$(git -C "$clone" rev-parse HEAD)" "Return to the fixed tag selects the exact original commit"
+        preserved=$(cat "$clone/file1.txt")
+        printf '%s\n' pins/changing-tag@file1.txt > "$config"
+        run_ru_sync "--parallel=$parallel" --json
+        assert_equals 1 "$RU_EXIT_CODE" "A missing path-like ref remains a failure after a real tag install"
+        assert_equals "$old_sha" "$(git -C "$clone" rev-parse HEAD)" "Missing ref preserves exact installed tag"
+        assert_equals "$preserved" "$(cat "$clone/file1.txt")" "Missing ref preserves tracked bytes"
+
+        git -C "$clone" checkout -q -b local-work
+        printf '%s\n' pins/changing-tag@next-pin > "$config"
+        run_ru_sync "--parallel=$parallel" --json
+        assert_equals 2 "$RU_EXIT_CODE" "A user's attached no-upstream branch is still a conflict"
+        assert_equals refs/heads/local-work "$(git -C "$clone" symbolic-ref HEAD)" "A different configured pin does not switch the user's local branch"
+        printf 'retain local work\n' >> "$clone/file1.txt"
+        preserved=$(cat "$clone/file1.txt")
+        run_ru_sync "--parallel=$parallel" --autostash --json
+        assert_equals 2 "$RU_EXIT_CODE" "Autostash does not bypass attached no-upstream protection"
+        assert_equals refs/heads/local-work "$(git -C "$clone" symbolic-ref HEAD)" "Autostash preserves the user's selected branch"
+        assert_equals "$preserved" "$(cat "$clone/file1.txt")" "Autostash refusal preserves dirty bytes"
+        e2e_preserve_on_failure
+        e2e_cleanup
+    done
+}
+
 #==============================================================================
 # Test: Clone failure handling (bd-mlgr)
 #==============================================================================
@@ -844,6 +903,7 @@ run_test test_sync_clone_with_branch
 run_test test_sync_missing_ref_preserves_clone_and_checkpoint
 run_test test_sync_missing_pin_named_like_tracked_file
 run_test test_sync_pinned_tag_is_stable
+run_test test_sync_can_change_a_detached_pin
 run_test test_sync_clone_failure
 run_test test_sync_clone_timeout_handling
 run_test test_sync_clone_dry_run_paths

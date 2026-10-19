@@ -8136,7 +8136,9 @@ do_pull() {
     start_time=$(date +%s)
 
     # If a specific branch was requested, ensure we're on it
+    local requested_was_current=true
     if [[ -n "$branch" ]]; then
+        repo_matches_requested_ref "$repo_path" "$branch" || requested_was_current=false
         local current_branch
         current_branch=$(git -C "$repo_path" symbolic-ref --quiet HEAD 2>/dev/null || echo "")
         if [[ "$current_branch" != "refs/heads/$branch" ]]; then
@@ -8158,8 +8160,13 @@ do_pull() {
     if [[ -n "$branch" ]] &&
        ! git -C "$repo_path" symbolic-ref --quiet HEAD >/dev/null 2>&1 &&
        repo_matches_requested_ref "$repo_path" "$branch"; then
-        write_result "$repo_name" "pull" "current" "0" "pinned tag $branch" "$repo_path"
-        log_info "Current: $repo_name@$branch (pinned tag)"
+        if [[ "$requested_was_current" == true ]]; then
+            write_result "$repo_name" "pull" "current" "0" "pinned tag $branch" "$repo_path"
+            log_info "Current: $repo_name@$branch (pinned tag)"
+        else
+            write_result "$repo_name" "pull" "updated" "0" "pinned tag $branch" "$repo_path"
+            log_success "Updated: $repo_name@$branch (pinned tag)"
+        fi
         return 0
     fi
 
@@ -8464,10 +8471,19 @@ process_single_repo_worker() {
             echo "CONFLICT:diverged:$repo_label"
             return 0
         fi
-        if [[ "$status" == no_upstream && -n "$branch" ]] && repo_matches_requested_ref "$local_path" "$branch" &&
+        if [[ "$status" == no_upstream && -n "$branch" ]] &&
            ! git -C "$local_path" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
-            do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1
-            echo "OK:current:$repo_label"
+            local pin_was_current=false
+            repo_matches_requested_ref "$local_path" "$branch" && pin_was_current=true
+            if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
+                if [[ "$pin_was_current" == true ]]; then
+                    echo "OK:current:$repo_label"
+                else
+                    echo "OK:updated:$repo_label"
+                fi
+            else
+                echo "FAIL:failed:$repo_label"
+            fi
             return 0
         fi
         if [[ "$status" == "no_upstream" ]]; then
@@ -9681,10 +9697,16 @@ cmd_sync() {
                 write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
                 continue
             fi
-            if [[ "$status" == no_upstream && -n "$branch" ]] && repo_matches_requested_ref "$local_path" "$branch" &&
+            if [[ "$status" == no_upstream && -n "$branch" ]] &&
                ! git -C "$local_path" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+                local pin_was_current=false
+                repo_matches_requested_ref "$local_path" "$branch" && pin_was_current=true
                 if do_pull "$local_path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
-                    ((skipped++))
+                    if [[ "$pin_was_current" == true ]]; then
+                        ((skipped++))
+                    else
+                        ((updated++))
+                    fi
                 else
                     ((failed++))
                 fi
@@ -18767,7 +18789,7 @@ worktree_exists() {
 gh_api_graphql_repo_batch() {
     local chunk="$1"
     local q="query {"
-    local i=0
+    local i=0 repo_id
 
     while IFS= read -r repo_id; do
         [[ -z "$repo_id" ]] && continue
@@ -18808,6 +18830,7 @@ gh_api_graphql_repo_batch() {
     fi
     response=$(retry_with_backoff --capture=stdout 3 1 -- gh api graphql -f query="$q") || return $?
     if ! printf '%s\n' "$response" | jq -e --argjson count "$i" '.data | type == "object" and length == $count' >/dev/null; then
+        printf '%s\n' "$response" | jq -r '.errors[]? | "GitHub: \(.message)"' >&2
         log_error "GraphQL discovery omitted a requested repository"
         return 1
     fi
@@ -18829,6 +18852,7 @@ complete_graphql_work_items() {
                 all(.nodes[]; (.labels.nodes | type == "array") and
                     (.labels.totalCount | type == "number"))))
     ' >/dev/null; then
+        printf '%s\n' "$response" | jq -r '.errors[]? | "GitHub \((.path // []) | map(tostring) | join(".")): \(.message)"' >&2
         log_error "GraphQL discovery returned errors or an incomplete repository response"
         return 1
     fi
@@ -18857,6 +18881,7 @@ complete_graphql_work_items() {
                     (.labels.nodes | type == "array") and (.labels.totalCount | type == "number"))) and
             (.[-1].data.repository[$kind].pageInfo.hasNextPage == false)
         ' >/dev/null; then
+            printf '%s\n' "$pages" | jq -r '.[] | .errors[]? | "GitHub: \(.message)"' >&2
             log_error "GraphQL discovery could not finish $repo_id $connection"
             return 1
         fi
@@ -19175,6 +19200,7 @@ discover_work_items() {
     local priority_filter="$2"
     local max_repos="$3"
     local allowed_repos="${4:-}"
+    local line spec repo
 
     local -A allowed_repo_map=()
     if [[ -n "$allowed_repos" ]]; then
@@ -19199,10 +19225,15 @@ discover_work_items() {
     fi
 
     # Load all configured repos
+    local configured_repos
+    if ! configured_repos=$(get_all_repos); then
+        log_error "Could not read configured repositories; discovery is incomplete"
+        return 1
+    fi
     local -a all_repos=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && all_repos+=("$line")
-    done < <(get_all_repos)
+    done < <(printf '%s\n' "$configured_repos")
 
     if [[ ${#all_repos[@]} -eq 0 ]]; then
         log_verbose "No configured repos"

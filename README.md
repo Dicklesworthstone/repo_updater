@@ -1511,6 +1511,7 @@ reviewed. Discovery follows all issue, PR and label pages before filtering and
 ranking. `--max-repos` selects the highest-priority repositories and retains all
 matching items in each selected repository. An API or pagination failure fails
 discovery rather than reporting a complete empty backlog.
+This requires a GitHub CLI build with `gh api --paginate --slurp` support.
 
 ### Session Drivers
 

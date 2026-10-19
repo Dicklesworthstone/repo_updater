@@ -37,6 +37,7 @@ source_ru_function "passes_priority_threshold"
 source_ru_function "days_since_timestamp"
 source_ru_function "item_recently_reviewed"
 source_ru_function "get_review_state_file"
+source_ru_function "get_review_state_dir"
 
 # Mock log functions
 log_warn() { :; }
@@ -247,6 +248,21 @@ test_graphql_partial_errors_are_failures() {
     assert_equals '' "$output" "Parser cannot emit partial rows"
 }
 
+test_graphql_continuation_errors_are_failures() {
+    log_test_start "GraphQL: an error on a later page cannot publish the first page as complete"
+    gh() {
+        if [[ "$*" == *'--paginate --slurp'* ]]; then
+            printf '%s\n' '[{"data":{"repository":null},"errors":[{"message":"continuation denied"}]}]'
+        else
+            printf '%s\n' '{"data":{"repo0":{"nameWithOwner":"owner/repo","issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"next"}},"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
+        fi
+    }
+    local output rc=0
+    output=$(gh_api_graphql_repo_batch owner/repo) || rc=$?
+    assert_equals 1 "$rc" "An unsuccessful continuation fails the entire batch"
+    assert_equals '' "$output" "A partial first page is not emitted"
+}
+
 test_discovery_priority_budget_and_empty_labels() {
     log_test_start "Discovery: priority is applied before a repository budget; empty labels preserve fields"
     PROJECTS_DIR=/nonexistent/ru-controlled-projects
@@ -262,9 +278,11 @@ test_discovery_priority_budget_and_empty_labels() {
                 repo1:{nameWithOwner:"owner/second",issues:{nodes:[item(2;"Unlabelled";[]),item(3;"Critical";["critical"]),item(4;"Bug";["bug"])]},pullRequests:{nodes:[]}}}}
         '
     }
+    local repo=caller-repo-sentinel
     local -a items=()
     discover_work_items items all 1
     assert_equals 0 "$?" "Successful complete discovery remains successful"
+    assert_equals caller-repo-sentinel "$repo" "Discovery does not overwrite a caller's loop variable"
     assert_equals 3 "${#items[@]}" "A one-repository budget retains every item of the highest-priority repository"
     assert_contains "${items[*]}" 'owner/second|issue|2|Unlabelled||2000-01-01T00:00:00Z|2000-01-01T00:00:00Z|false' "Empty label field does not consume either timestamp or draft flag"
     assert_equals 'owner/second|issue|3|Critical|critical|2000-01-01T00:00:00Z|2000-01-01T00:00:00Z|false' "${items[0]}" "Critical item leads the selected repository"
@@ -276,6 +294,11 @@ test_discovery_priority_budget_and_empty_labels() {
     discover_work_items items all '' || rc=$?
     assert_equals 1 "$rc" "Failed discovery is nonzero"
     assert_equals 0 "${#items[@]}" "Failure does not leak a previous successful result"
+    get_all_repos() { return 42; }
+    rc=0
+    discover_work_items items all '' || rc=$?
+    assert_equals 1 "$rc" "Failure to load configured repositories is not a successful empty review"
+    assert_equals 0 "${#items[@]}" "Repository-load failure leaves no partial results"
 }
 
 run_test test_retry_preserves_process_outcomes
@@ -283,6 +306,7 @@ run_test test_graphql_injection_protection
 run_test test_discover_work_items_pipe_sanitization
 run_test test_graphql_completes_backlog_and_labels
 run_test test_graphql_partial_errors_are_failures
+run_test test_graphql_continuation_errors_are_failures
 run_test test_discovery_priority_budget_and_empty_labels
 
 print_results

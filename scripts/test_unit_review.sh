@@ -261,6 +261,21 @@ test_calculate_item_priority_score_security_label() {
     log_test_pass "$test_name"
 }
 
+test_explicit_critical_labels_survive_recent_review() {
+    log_test_start "Explicit critical/security labels remain CRITICAL for new recently reviewed items"
+    days_since_timestamp() { echo 0; }
+    item_recently_reviewed() { return 0; }
+    local item_type label score level
+    for item_type in issue pr; do
+        for label in security CRITICAL; do
+            score=$(calculate_item_priority_score "$item_type" "$label" created updated true octo/repo1 101)
+            level=$(get_priority_level "$score")
+            assert_equals CRITICAL "$level" "New $item_type with $label remains critical despite recency/draft penalties"
+            assert_exit_code 0 "Critical-only filter retains $item_type with $label" passes_priority_threshold "$level" critical
+        done
+    done
+}
+
 test_calculate_item_priority_score_very_old_bug() {
     local test_name="calculate_item_priority_score: very old bug bonus"
     log_test_start "$test_name"
@@ -713,6 +728,7 @@ run_test test_calculate_item_priority_score_components
 run_test test_calculate_item_priority_score_recent_review_penalty
 run_test test_calculate_item_priority_score_draft_pr_penalty
 run_test test_calculate_item_priority_score_security_label
+run_test test_explicit_critical_labels_survive_recent_review
 run_test test_calculate_item_priority_score_very_old_bug
 run_test test_calculate_item_priority_score_stale_feature
 run_test test_calculate_item_priority_score_clamps_to_zero

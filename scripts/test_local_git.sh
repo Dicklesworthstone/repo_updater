@@ -431,6 +431,50 @@ test_requested_pin_never_restores_a_tracked_path() {
     cleanup_test_env
 }
 
+test_pin_worker_routes_and_propagates_pull_failure() {
+    # Controlled dispatch coverage complements the real-Git full CLI matrix.
+    # Run doubles in a subshell so later integration tests retain real helpers.
+    if (
+        source <(sed -n '/^process_single_repo_worker()/,/^}/p' "$PROJECT_DIR/ru")
+        ru_probe_checkout="$PROJECT_DIR"
+        resolve_repo_spec() {
+            printf -v "$4" '%s' https://github.com/owner/repo
+            printf -v "$5" '%s' "$ru_probe_requested"
+            printf -v "$6" '%s' ''
+            printf -v "$7" '%s' "$ru_probe_checkout"
+            printf -v "$8" '%s' owner/repo
+        }
+        write_result() { :; }
+        is_git_repo() { return 0; }
+        check_remote_mismatch() { return 1; }
+        get_repo_status() { printf 'STATUS=no_upstream DIRTY=%s\n' "$ru_probe_dirty"; }
+        repo_matches_requested_ref() { [[ "$ru_probe_matches" == true ]]; }
+        git() { return "$ru_probe_symbolic_rc"; }
+        do_pull() { return "$ru_probe_pull_rc"; }
+        do_clone() { printf 'Unexpected clone route in pin dispatch test\n' >&2; return 99; }
+        while IFS='|' read -r ru_probe_requested ru_probe_matches ru_probe_dirty ru_probe_symbolic_rc ru_probe_pull_rc ru_probe_autostash ru_probe_expected; do
+            ru_probe_output=$(process_single_repo_worker owner/repo "$ru_probe_checkout" flat ff-only "$ru_probe_autostash" false false false)
+            if [[ "$ru_probe_output" != "$ru_probe_expected" ]]; then
+                printf 'Pin dispatch expected %s, got %s\n' "$ru_probe_expected" "$ru_probe_output" >&2
+                exit 1
+            fi
+        done < <(printf '%s\n' \
+            'next-pin|false|false|1|0|false|OK:updated:owner/repo' \
+            'next-pin|true|false|1|0|false|OK:current:owner/repo' \
+            'next-pin|true|false|1|42|false|FAIL:failed:owner/repo' \
+            'next-pin|false|false|1|42|false|FAIL:failed:owner/repo' \
+            '|false|false|1|0|false|CONFLICT:no_upstream:owner/repo' \
+            'next-pin|true|false|0|0|false|CONFLICT:no_upstream:owner/repo' \
+            'next-pin|false|false|0|0|false|CONFLICT:no_upstream:owner/repo' \
+            'next-pin|false|true|0|0|true|CONFLICT:no_upstream:owner/repo' \
+            'next-pin|false|true|1|0|false|CONFLICT:dirty:owner/repo')
+    ); then
+        pass "Pinned worker routes valid changes and preserves failures/dirty/upstream conflicts (9 controlled cases)"
+    else
+        fail "Pinned worker dispatch or pull failure propagation"
+    fi
+}
+
 #==============================================================================
 # Tests: do_fetch
 #==============================================================================
@@ -1148,6 +1192,7 @@ test_do_pull
 echo ""
 
 test_requested_pin_never_restores_a_tracked_path
+test_pin_worker_routes_and_propagates_pull_failure
 echo ""
 
 # Fetch tests
