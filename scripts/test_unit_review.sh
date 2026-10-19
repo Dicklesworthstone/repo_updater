@@ -255,8 +255,8 @@ test_calculate_item_priority_score_security_label() {
     local score
     score=$(calculate_item_priority_score "issue" "security" "created" "updated" "false" "octo/repo1" "100")
 
-    # Issue 10 + security 50 + age>60 50 + recency 10 = 120
-    assert_equals "120" "$score" "Security label should get +50 and old bug +50"
+    # Issue 10 + security 150 + age>60 50 + recency 10 = 220
+    assert_equals "220" "$score" "Security label reaches CRITICAL and retains the age bonus"
 
     log_test_pass "$test_name"
 }

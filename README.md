@@ -1492,7 +1492,7 @@ ru uses a multi-factor scoring system to prioritize work items intelligently:
 | Factor | Points | Logic |
 |--------|--------|-------|
 | **Type** | 0-20 | PRs: +20, Issues: +10, Draft PRs: -15 |
-| **Labels** | 0-50 | security/critical: +50, bug/urgent: +30, enhancement: +10 |
+| **Labels** | 0-150 | security/critical: +150, bug/urgent: +30, enhancement: +10 |
 | **Age (bugs)** | 0-50 | >60 days: +50, >30 days: +30, >14 days: +15 |
 | **Age (features)** | -10 to 0 | Very old (>180 days): -10 (likely stale) |
 | **Recency** | 0-15 | Updated <3 days: +15, <7 days: +10 |
@@ -1501,10 +1501,16 @@ ru uses a multi-factor scoring system to prioritize work items intelligently:
 **Priority levels:**
 | Score | Level | Meaning |
 |-------|-------|---------|
-| ≥150 | CRITICAL | Security issues, long-standing bugs |
+| ≥150 | CRITICAL | Items labelled security or critical |
 | ≥100 | HIGH | Bugs, urgent items |
 | ≥50 | NORMAL | Regular features and issues |
 | <50 | LOW | Backlog items |
+
+Security and critical labels keep a minimum score of 150 even when recently
+reviewed. Discovery follows all issue, PR and label pages before filtering and
+ranking. `--max-repos` selects the highest-priority repositories and retains all
+matching items in each selected repository. An API or pagination failure fails
+discovery rather than reporting a complete empty backlog.
 
 ### Session Drivers
 
