@@ -7944,13 +7944,33 @@ repo_matches_requested_ref() {
     [[ -z "$requested" ]] && return 0
     if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$requested" ||
        git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$requested"; then
-        [[ "$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null)" == "$requested" ]]
+        [[ "$(git -C "$repo_path" symbolic-ref --quiet HEAD 2>/dev/null)" == "refs/heads/$requested" ]]
         return $?
     fi
     local tag_sha head_sha
     tag_sha=$(git -C "$repo_path" rev-parse --verify "refs/tags/$requested^{commit}" 2>/dev/null) || return 1
     head_sha=$(git -C "$repo_path" rev-parse HEAD) || return 1
     [[ "$head_sha" == "$tag_sha" ]]
+}
+
+# Select only named refs. Bare `git checkout "$requested"` also accepts a
+# tracked path, so a missing pin could restore a file and report success.
+checkout_requested_ref() {
+    local repo_path="$1" requested="$2"
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$requested"; then
+        git -C "$repo_path" checkout "$requested" -- || return $?
+    elif git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$requested"; then
+        git -C "$repo_path" checkout -b "$requested" --track "refs/remotes/origin/$requested" -- || return $?
+    elif git -C "$repo_path" show-ref --verify --quiet "refs/tags/$requested"; then
+        git -C "$repo_path" checkout --detach "refs/tags/$requested" -- || return $?
+    else
+        printf 'Requested branch/tag not found: %s\n' "$requested" >&2
+        return 1
+    fi
+    if ! repo_matches_requested_ref "$repo_path" "$requested"; then
+        printf 'Checkout did not select the requested branch/tag: %s\n' "$requested" >&2
+        return 1
+    fi
 }
 
 # Check if a git error indicates a timeout
@@ -8063,14 +8083,11 @@ do_clone() {
         # If a specific branch was requested, check it out
         if [[ -n "$branch" ]]; then
             local checkout_output
-            if ! checkout_output=$(git -C "$target_dir" checkout "$branch" 2>&1); then
-                # Branch might be a remote branch, try fetching and checking out
-                if ! checkout_output=$(git -C "$target_dir" checkout -b "$branch" "origin/$branch" 2>&1); then
-                    log_error "Cloned $repo_name but could not checkout requested ref '$branch'; clone preserved at $target_dir"
-                    log_verbose "  $checkout_output"
-                    write_result "$repo_name" "clone" "failed" "$duration" "requested ref checkout failed: $checkout_output" "$target_dir"
-                    return 1
-                fi
+            if ! checkout_output=$(checkout_requested_ref "$target_dir" "$branch" 2>&1); then
+                log_error "Cloned $repo_name but could not checkout requested ref '$branch'; clone preserved at $target_dir"
+                log_verbose "  $checkout_output"
+                write_result "$repo_name" "clone" "failed" "$duration" "requested ref checkout failed: $checkout_output" "$target_dir"
+                return 1
             fi
             log_success "Cloned: $repo_name@$branch (${duration}s)"
         else
@@ -8121,17 +8138,14 @@ do_pull() {
     # If a specific branch was requested, ensure we're on it
     if [[ -n "$branch" ]]; then
         local current_branch
-        current_branch=$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-        if [[ "$current_branch" != "$branch" ]]; then
+        current_branch=$(git -C "$repo_path" symbolic-ref --quiet HEAD 2>/dev/null || echo "")
+        if [[ "$current_branch" != "refs/heads/$branch" ]]; then
             local checkout_output
-            if ! checkout_output=$(git -C "$repo_path" checkout "$branch" 2>&1); then
-                # Try to checkout as tracking branch
-                if ! checkout_output=$(git -C "$repo_path" checkout -b "$branch" "origin/$branch" 2>&1); then
-                    log_warn "Could not switch to branch '$branch' for $repo_name"
-                    log_verbose "  $checkout_output"
-                    write_result "$repo_name" "pull" "branch_error" "0" "branch checkout failed: $checkout_output" "$repo_path"
-                    return 1
-                fi
+            if ! checkout_output=$(checkout_requested_ref "$repo_path" "$branch" 2>&1); then
+                log_warn "Could not switch to branch '$branch' for $repo_name"
+                log_verbose "  $checkout_output"
+                write_result "$repo_name" "pull" "branch_error" "0" "branch checkout failed: $checkout_output" "$repo_path"
+                return 1
             fi
             log_verbose "Switched to branch: $branch"
         fi

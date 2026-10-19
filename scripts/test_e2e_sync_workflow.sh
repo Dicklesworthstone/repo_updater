@@ -584,6 +584,25 @@ test_sync_missing_ref_preserves_clone_and_checkpoint() {
     e2e_cleanup
 }
 
+test_sync_missing_pin_named_like_tracked_file() {
+    sync_test_setup
+    create_test_remote pins path-pin 1
+    local expected_head
+    expected_head=$(git -C "${REMOTE_REGISTRY[pins/path-pin]}" rev-parse HEAD)
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add pins/path-pin@file1.txt >/dev/null 2>&1
+    sync_test_finalize_mock
+    run_ru_sync --json
+    assert_equals 1 "$RU_EXIT_CODE" "A tracked filename cannot satisfy a missing clone pin"
+    assert_equals 1 "$(jq -r '.data.summary.failed' <<< "$RU_STDOUT")" "Wrong pin is counted as a clone failure"
+    assert_equals failed "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Missing pin never reports a successful clone"
+    assert_equals "$expected_head" "$(git -C "$E2E_TEMP_DIR/projects/path-pin" rev-parse HEAD)" "Incomplete clone keeps its original HEAD"
+    assert_file_contains "$E2E_TEMP_DIR/projects/path-pin/file1.txt" 'Commit 1 content for path-pin' "Incomplete clone preserves the tracked file"
+    assert_file_exists "$XDG_STATE_HOME/ru/sync_state.json" "Missing path-like pin preserves the recovery checkpoint"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 test_sync_pinned_tag_is_stable() {
     sync_test_setup
     create_test_remote pins tag-repo 2
@@ -823,6 +842,7 @@ run_test test_sync_json_output
 # Clone Driver Tests (bd-mlgr)
 run_test test_sync_clone_with_branch
 run_test test_sync_missing_ref_preserves_clone_and_checkpoint
+run_test test_sync_missing_pin_named_like_tracked_file
 run_test test_sync_pinned_tag_is_stable
 run_test test_sync_clone_failure
 run_test test_sync_clone_timeout_handling

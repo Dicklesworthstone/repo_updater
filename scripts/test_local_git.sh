@@ -53,6 +53,7 @@ source <(sed -n '/^get_repo_status()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^setup_git_timeout()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^run_network_command()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^repo_matches_requested_ref()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^checkout_requested_ref()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^is_timeout_error()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_pull()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_fetch()/,/^}/p' "$PROJECT_DIR/ru")
@@ -370,6 +371,63 @@ test_do_pull() {
         fail "do_pull did not update the repo"
     fi
 
+    cleanup_test_env
+}
+
+#==============================================================================
+# Tests: explicit branch/tag pins
+#==============================================================================
+
+test_requested_pin_never_restores_a_tracked_path() {
+    echo "Testing missing ref with a tracked filename..."
+    setup_test_env
+    local remote dev_dir work_dir before_head rc=0
+    remote=$(create_remote_repo pin-path)
+    dev_dir="$TEMP_DIR/dev"
+    work_dir="$PROJECTS_DIR/pin-path"
+    init_repo_with_commit "$remote" "$dev_dir"
+    git clone "$remote" "$work_dir" >/dev/null 2>&1
+    before_head=$(git -C "$work_dir" rev-parse HEAD)
+
+    # file.txt exists, but neither a branch nor a tag has that name. A plain
+    # checkout accepts it as a path and would silently discard this edit.
+    printf 'keep this uncommitted content\n' >> "$work_dir/file.txt"
+    local before_content
+    before_content=$(cat "$work_dir/file.txt")
+    do_pull "$work_dir" pin-path ff-only false file.txt || rc=$?
+    assert_equals 1 "$rc" "A tracked path cannot satisfy a missing branch pin"
+    assert_equals main "$(git -C "$work_dir" symbolic-ref --short HEAD)" "Missing pin leaves the branch unchanged"
+    assert_equals "$before_head" "$(git -C "$work_dir" rev-parse HEAD)" "Missing pin leaves HEAD unchanged"
+    assert_equals "$before_content" "$(cat "$work_dir/file.txt")" "Missing pin preserves uncommitted file bytes"
+    assert_contains "$(cat "$RESULTS_FILE")" '"status":"branch_error"' "Missing pin records a typed branch failure"
+
+    # A genuine branch with the same name as the file remains valid.
+    git -C "$remote" branch file.txt "$before_head"
+    git -C "$work_dir" fetch origin >/dev/null 2>&1
+    rc=0
+    checkout_requested_ref "$work_dir" file.txt || rc=$?
+    assert_equals 0 "$rc" "A genuine origin branch may share a tracked filename"
+    assert_equals file.txt "$(git -C "$work_dir" symbolic-ref --short HEAD)" "Remote branch becomes the selected local branch"
+    assert_equals origin/file.txt "$(git -C "$work_dir" rev-parse --abbrev-ref '@{u}')" "Selected remote branch tracks origin"
+    assert_equals "$before_content" "$(cat "$work_dir/file.txt")" "Valid same-commit branch retains local edits"
+
+    git -C "$work_dir" tag file.txt "$before_head"
+    rc=0
+    checkout_requested_ref "$work_dir" file.txt || rc=$?
+    assert_equals 0 "$rc" "A branch remains valid when a tag shares its name"
+    assert_equals refs/heads/file.txt "$(git -C "$work_dir" symbolic-ref HEAD)" "Ambiguous short ref names still select the branch"
+
+    git -C "$work_dir" tag exact-pin "$before_head"
+    rc=0
+    checkout_requested_ref "$work_dir" exact-pin || rc=$?
+    assert_equals 0 "$rc" "Explicit tag selection succeeds"
+    assert_equals "$before_head" "$(git -C "$work_dir" rev-parse HEAD)" "Tag selection uses the exact commit"
+    if git -C "$work_dir" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+        fail "Tag selection must detach HEAD"
+    else
+        pass "Tag selection detaches HEAD"
+    fi
+    assert_equals "$before_content" "$(cat "$work_dir/file.txt")" "Tag selection preserves compatible local edits"
     cleanup_test_env
 }
 
@@ -1087,6 +1145,9 @@ echo ""
 
 # Pull tests
 test_do_pull
+echo ""
+
+test_requested_pin_never_restores_a_tracked_path
 echo ""
 
 # Fetch tests
