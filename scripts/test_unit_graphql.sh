@@ -197,7 +197,7 @@ EOF
 }
 
 test_graphql_completes_backlog_and_labels() {
-    log_test_start "GraphQL: paginate 51 issues, 21 PRs and the eleventh label"
+    log_test_start "GraphQL: paginate 52 issues, 21 PRs and the eleventh label without --slurp"
     local env_root initial response
     env_root=$(create_test_env)
     initial=$(jq -nc '
@@ -210,15 +210,20 @@ test_graphql_completes_backlog_and_labels() {
     ')
     gh() {
         printf '%s\n' "$*" >> "$env_root/calls"
+        local arg
+        for arg in "$@"; do
+            [[ "$arg" != --slurp ]] || return 99
+        done
         if [[ "$*" == *'/labels?per_page=100'* ]]; then
-            jq -nc '[[range(1;11)|{name:("label"+tostring)}] + [{name:"security"}]]'
-        elif [[ "$*" == *'--paginate --slurp'* ]]; then
+            jq -nc '[range(1;11)|{name:("label"+tostring)}], [{name:"security"}]'
+        elif [[ "$*" == *'--paginate'* ]]; then
             local kind=issues number=51
             if [[ "$*" == *'pullRequests(states:'* ]]; then kind=pullRequests; number=121; fi
             jq -nc --arg kind "$kind" --argjson number "$number" '
-                [{data:{repository:{($kind):{nodes:[{number:$number,title:"Old bug",createdAt:"2000-01-01T00:00:00Z",
+                def page($n;$more): {data:{repository:{($kind):{nodes:[{number:$n,title:"Old bug",createdAt:"2000-01-01T00:00:00Z",
                     updatedAt:"2000-01-01T00:00:00Z",isDraft:false,labels:{totalCount:0,nodes:[]}}],
-                    pageInfo:{hasNextPage:false,endCursor:"done"}}}}}]
+                    pageInfo:{hasNextPage:$more,endCursor:"done"}}}}};
+                if $kind == "issues" then page($number;true), page($number+1;false) else page($number;false) end
             '
         else
             printf '%s\n' "$initial"
@@ -226,7 +231,7 @@ test_graphql_completes_backlog_and_labels() {
     }
     response=$(gh_api_graphql_repo_batch owner/repo)
     assert_equals 0 "$?" "Complete discovery succeeds"
-    assert_equals 51 "$(printf '%s\n' "$response" | jq '.data.repo0.issues.nodes | length')" "Issue 51 survives pagination"
+    assert_equals 52 "$(printf '%s\n' "$response" | jq '.data.repo0.issues.nodes | length')" "Both issue continuation pages survive pagination"
     assert_equals 21 "$(printf '%s\n' "$response" | jq '.data.repo0.pullRequests.nodes | length')" "PR 21 survives pagination"
     assert_equals 11 "$(printf '%s\n' "$response" | jq '.data.repo0.issues.nodes[] | select(.number==1) | .labels.nodes | length')" "All eleven labels survive"
     assert_contains "$(parse_graphql_work_items "$response")" security "Security label beyond the first ten is discovered"
@@ -251,8 +256,8 @@ test_graphql_partial_errors_are_failures() {
 test_graphql_continuation_errors_are_failures() {
     log_test_start "GraphQL: an error on a later page cannot publish the first page as complete"
     gh() {
-        if [[ "$*" == *'--paginate --slurp'* ]]; then
-            printf '%s\n' '[{"data":{"repository":null},"errors":[{"message":"continuation denied"}]}]'
+        if [[ "$*" == *'--paginate'* ]]; then
+            printf '%s\n' '{"data":{"repository":null},"errors":[{"message":"continuation denied"}]}'
         else
             printf '%s\n' '{"data":{"repo0":{"nameWithOwner":"owner/repo","issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"next"}},"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}'
         fi

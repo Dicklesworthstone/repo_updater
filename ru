@@ -18870,8 +18870,9 @@ complete_graphql_work_items() {
         query+=' pageInfo { hasNextPage endCursor } nodes { number title createdAt updatedAt'
         [[ "$connection" != pullRequests ]] || query+=' isDraft'
         query+=' labels(first:10) { totalCount nodes { name } } } } } }'
-        pages=$(retry_with_backoff --capture=stdout 3 1 -- gh api graphql --paginate --slurp \
+        pages=$(retry_with_backoff --capture=stdout 3 1 -- gh api graphql --paginate \
             -f query="$query" -f owner="$owner" -f name="$name" -f endCursor="$cursor") || return $?
+        pages=$(printf '%s\n' "$pages" | jq -s .) || return 1
         if ! printf '%s\n' "$pages" | jq -e --arg kind "$connection" '
             type == "array" and length > 0 and
             all(.[]; ((.errors // []) | length) == 0 and
@@ -18903,8 +18904,9 @@ complete_graphql_work_items() {
     # item. Only items with more than the initial ten labels need this request.
     while IFS=$'\t' read -r alias connection index repo_id number; do
         [[ -n "$alias" ]] || continue
-        labels=$(retry_with_backoff --capture=stdout 3 1 -- gh api --paginate --slurp \
+        labels=$(retry_with_backoff --capture=stdout 3 1 -- gh api --paginate \
             "repos/$repo_id/issues/$number/labels?per_page=100") || return $?
+        labels=$(printf '%s\n' "$labels" | jq -s .) || return 1
         if ! printf '%s\n' "$labels" | jq -e '
             type == "array" and length > 0 and
             all(.[]; type == "array" and all(.[]; .name | type == "string"))
@@ -19048,22 +19050,29 @@ calculate_item_priority_score() {
 
     # Explicit security/critical labels must reach the CRITICAL threshold,
     # including a new issue with no age or recent-update bonus.
-    local labels_lower="${labels,,}" critical_label=false
-    if [[ "$labels_lower" =~ security|critical ]]; then
-        critical_label=true
-        score=$((score + 150))
-    elif [[ "$labels_lower" =~ bug|urgent ]]; then
-        score=$((score + 30))
-    elif [[ "$labels_lower" =~ enhancement|feature ]]; then
-        score=$((score + 10))
-    fi
+    local remaining_labels="${labels,,}" critical_label=false bug_label=false label label_score=0
+    while [[ -n "$remaining_labels" ]]; do
+        label="${remaining_labels%%,*}"
+        if [[ "$remaining_labels" == *,* ]]; then
+            remaining_labels="${remaining_labels#*,}"
+        else
+            remaining_labels=""
+        fi
+        case "$label" in
+            security|critical) critical_label=true; bug_label=true; label_score=150; break ;;
+            bug) bug_label=true; label_score=$((label_score < 30 ? 30 : label_score)) ;;
+            urgent) label_score=$((label_score < 30 ? 30 : label_score)) ;;
+            enhancement|feature) label_score=$((label_score < 10 ? 10 : label_score)) ;;
+        esac
+    done
+    score=$((score + label_score))
 
     # Component 3: Age Factor
     local age_days
     age_days=$(days_since_timestamp "$created_at")
 
     # Bug/security items: older = more urgent
-    if [[ "$labels_lower" =~ bug|security|critical ]]; then
+    if [[ "$bug_label" == true ]]; then
         if [[ $age_days -gt 60 ]]; then
             score=$((score + 50))
         elif [[ $age_days -gt 30 ]]; then

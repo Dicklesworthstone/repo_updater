@@ -276,6 +276,23 @@ test_explicit_critical_labels_survive_recent_review() {
     done
 }
 
+test_priority_keywords_match_complete_labels() {
+    log_test_start "Priority label tokens: negated keywords and debug are not urgent labels"
+    days_since_timestamp() { if [[ "$1" == created ]]; then echo 70; else echo 5; fi; }
+    item_recently_reviewed() { return 1; }
+    local label score
+    for label in non-critical criticality:low security-review-not-needed debug; do
+        score=$(calculate_item_priority_score issue "$label" created updated false octo/repo1 102)
+        assert_equals 20 "$score" "$label is an ordinary label, without a keyword or bug-age boost"
+    done
+    score=$(calculate_item_priority_score issue noncritical,enhancement created updated false octo/repo1 102)
+    assert_equals 30 "$score" "A genuine enhancement retains its boost beside an unrelated label"
+    score=$(calculate_item_priority_score issue bug created updated false octo/repo1 102)
+    assert_equals 100 "$score" "A genuine bug retains its label and old-bug boosts"
+    score=$(calculate_item_priority_score issue enhancement,critical created updated false octo/repo1 102)
+    assert_equals 220 "$score" "A genuine critical token still takes precedence"
+}
+
 test_calculate_item_priority_score_very_old_bug() {
     local test_name="calculate_item_priority_score: very old bug bonus"
     log_test_start "$test_name"
@@ -729,6 +746,7 @@ run_test test_calculate_item_priority_score_recent_review_penalty
 run_test test_calculate_item_priority_score_draft_pr_penalty
 run_test test_calculate_item_priority_score_security_label
 run_test test_explicit_critical_labels_survive_recent_review
+run_test test_priority_keywords_match_complete_labels
 run_test test_calculate_item_priority_score_very_old_bug
 run_test test_calculate_item_priority_score_stale_feature
 run_test test_calculate_item_priority_score_clamps_to_zero
