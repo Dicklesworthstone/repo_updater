@@ -2623,18 +2623,29 @@ The `dep-update` subcommand uses AI agents to automatically update dependencies 
 
 ### Supported Package Managers
 
-`ru dep-update` automatically detects and supports these package managers:
+`ru dep-update` detects these manifests. Automatic discovery currently has
+adapters for npm, cargo (requires `cargo-outdated`), Go modules, and Composer:
 
-| Manager | Detection Files | Update Command |
-|---------|-----------------|----------------|
-| npm/yarn/pnpm | `package.json`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | `npm update` / `yarn upgrade` |
-| pip | `pyproject.toml`, `requirements.txt`, `setup.py`, `Pipfile` | `pip install --upgrade` |
-| cargo | `Cargo.toml` | `cargo update` |
-| go | `go.mod` | `go get -u` |
-| composer | `composer.json` | `composer update` |
-| bundler | `Gemfile` | `bundle update` |
-| maven | `pom.xml` | `mvn versions:use-latest-releases` |
-| gradle | `build.gradle`, `build.gradle.kts` | `./gradlew dependencies --write-locks` |
+| Manager | Detection Files | Discovery |
+|---------|-----------------|-----------|
+| npm | `package.json`, `package-lock.json` | `npm outdated --json` |
+| cargo | `Cargo.toml` | `cargo outdated --format json` |
+| go | `go.mod` | `go list -m -u -json all` |
+| composer | `composer.json` | `composer outdated --format=json` |
+| yarn/pnpm | `yarn.lock`, `pnpm-lock.yaml` | Explicit unsupported-scan error |
+| pip/pipenv | `pyproject.toml`, `requirements.txt`, `setup.py`, `Pipfile` | Explicit unsupported-scan error; project environment discovery is pending |
+| bundler | `Gemfile` | Explicit unsupported-scan error |
+| maven/gradle | `pom.xml`, `build.gradle`, `build.gradle.kts` | Explicit unsupported-scan error |
+
+Missing tools, malformed output, failed commands, and unsupported scans count
+as failed repositories and give a nonzero exit status, including in `--dry-run`.
+A failure in any detected manager prevents an update session for that repository;
+partial results do not establish that all dependencies are current. The supported
+adapters still require live project and test validation before a release.
+
+Detection currently chooses npm when `package.json` exists, even beside a Yarn
+or pnpm lockfile. Do not treat that selection as qualification of those managers.
+Python discovery cannot use a global `pip list` as proof about a project's manifest.
 
 ### Update Workflow
 

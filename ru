@@ -878,61 +878,98 @@ detect_test_command() {
 # Check for outdated dependencies in a repository.
 # Usage: check_outdated_deps <repo_path> [manager]
 # Output: JSON to stdout with outdated dependencies
-# Returns: 0 if any outdated deps found, 1 if all current or error
+# Returns: 0 if outdated deps found, 1 if all checked managers are current,
+#          3 if any manager could not be checked (including partial scans)
 # If manager is omitted, checks all detected managers
 check_outdated_deps() {
     local repo_path="${1:-}"
     local specific_manager="${2:-}"
 
+    if ! command -v jq &>/dev/null; then
+        _dep_scan_error "" missing_tool "Dependency scanning requires jq"
+        return 3
+    fi
     if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
-        echo '{"error":"Invalid or missing repo path","outdated":[]}'
-        return 1
+        _dep_scan_error "" invalid_repo "Invalid or missing repo path"
+        return 3
     fi
 
     # Get detected managers if not specified
     local -a managers=()
+    local managers_json
     if [[ -n "$specific_manager" ]]; then
         managers=("$specific_manager")
+        managers_json=$(jq -cn --arg manager "$specific_manager" '[$manager]') || return 3
     else
-        local detected
-        detected=$(detect_package_managers "$repo_path")
-        if [[ -n "$detected" ]]; then
-            readarray -t managers < <(echo "$detected" | jq -r '.managers[]' 2>/dev/null)
+        local detected detected_rc=0 manager_names
+        detected=$(detect_package_managers "$repo_path") || detected_rc=$?
+        if [[ "$detected_rc" -gt 1 ]] || ! managers_json=$(jq -cse '
+            if length == 1 then .[0] else error("Expected one detection result") end |
+            if type == "object" and .error == null and (.managers | type == "array")
+                and all(.managers[]; type == "string" and length > 0)
+            then .managers else error("Invalid manager detection result") end
+        ' <<< "$detected"); then
+            _dep_scan_error "" detection_failed "Could not detect package managers"
+            return 3
         fi
+        manager_names=$(jq -r '.[]' <<< "$managers_json") || return 3
+        local manager
+        while IFS= read -r manager; do
+            [[ -n "$manager" ]] && managers+=("$manager")
+        done <<< "$manager_names"
     fi
 
     if [[ ${#managers[@]} -eq 0 ]]; then
-        echo '{"managers":[],"outdated":[],"error":"No package managers detected"}'
+        echo '{"status":"ok","managers":[],"results":[],"total_outdated":0,"failed_managers":0}'
         return 1
     fi
 
     local -a all_results=()
     local total_outdated=0
+    local failed_managers=0 manager result result_rc count
 
     for manager in "${managers[@]}"; do
-        local result
-        result=$(_check_outdated_for_manager "$repo_path" "$manager")
-        if [[ -n "$result" ]]; then
-            all_results+=("$result")
-            local count
-            count=$(echo "$result" | jq '.outdated | length' 2>/dev/null || echo 0)
+        result_rc=0
+        result=$(_check_outdated_for_manager "$repo_path" "$manager") || result_rc=$?
+        if ! jq -se --arg manager "$manager" --argjson rc "$result_rc" '
+            length == 1 and (.[0] | type == "object" and .manager == $manager
+                and (.outdated | type == "array") and
+                (if $rc == 0 then .status == "ok" and .error == null
+                 else .status == "error" and (.error | type == "string" and length > 0) end))
+        ' <<< "$result" >/dev/null; then
+            result=$(_dep_scan_error "$manager" invalid_result "Invalid dependency scanner result")
+            result_rc=3
+        fi
+        all_results+=("$result")
+        if [[ "$result_rc" -ne 0 ]]; then
+            ((failed_managers+=1))
+        else
+            count=$(jq '.outdated | length' <<< "$result") || return 3
             total_outdated=$((total_outdated + count))
         fi
     done
 
-    # Combine results
-    if [[ ${#all_results[@]} -eq 0 ]]; then
-        echo '{"managers":[],"outdated":[]}'
-        return 1
-    fi
+    printf '%s\n' "${all_results[@]}" | jq -cs \
+        --argjson managers "$managers_json" --argjson total "$total_outdated" \
+        --argjson failed "$failed_managers" \
+        '{status:(if $failed > 0 then "error" else "ok" end), managers:$managers,
+          results:., total_outdated:$total, failed_managers:$failed}' || return 3
 
-    # Build combined JSON
-    printf '{"managers":%s,"results":[%s],"total_outdated":%d}\n' \
-        "$(printf '%s\n' "${managers[@]}" | jq -R . | jq -s .)" \
-        "$(IFS=,; echo "${all_results[*]}")" \
-        "$total_outdated"
-
+    [[ "$failed_managers" -eq 0 ]] || return 3
     [[ $total_outdated -gt 0 ]]
+}
+
+# Emit a typed failure, never an empty successful dependency set.
+_dep_scan_error() {
+    local manager="$1" code="$2" message="$3"
+    log_error "Dependency scan${manager:+ ($manager)}: $message"
+    if command -v jq &>/dev/null; then
+        jq -cn --arg manager "$manager" --arg code "$code" --arg error "$message" \
+            '{manager:$manager,status:"error",error_code:$code,error:$error,outdated:[]}'
+    else
+        printf '%s\n' '{"status":"error","error_code":"missing_tool","error":"Dependency scanning requires jq","outdated":[]}'
+    fi
+    return 3
 }
 
 # Internal function to check outdated deps for a specific manager.
@@ -940,120 +977,106 @@ check_outdated_deps() {
 _check_outdated_for_manager() {
     local repo_path="$1"
     local manager="$2"
-    local output=""
+    local output="" command_rc=0 tool="" json_array="" filter=""
+    local -a scan_command=()
+
+    if ! command -v jq &>/dev/null; then
+        _dep_scan_error "$manager" missing_tool "Dependency scanning requires jq"
+        return 3
+    fi
+    if [[ ! -d "$repo_path" ]]; then
+        _dep_scan_error "$manager" invalid_repo "Invalid or missing repo path"
+        return 3
+    fi
 
     case "$manager" in
-        npm|yarn|pnpm)
-            # npm outdated --json returns non-zero if outdated packages exist
-            output=$(cd "$repo_path" && npm outdated --json 2>/dev/null || true)
-            if [[ -n "$output" && "$output" != "{}" ]]; then
-                # Parse npm outdated JSON format: {"pkg": {"current": "x", "wanted": "y", "latest": "z"}}
-                local json_array
-                json_array=$(echo "$output" | jq -r 'to_entries | map({name: .key, current: .value.current, wanted: .value.wanted, latest: .value.latest, type: .value.type})' 2>/dev/null || echo "[]")
-                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+        npm)
+            tool=npm
+            scan_command=(npm outdated --json)
+            # Workspace duplicates may be arrays; an uninstalled package may
+            # omit current. Neither should silently disappear from the scan.
+            filter='one | if type != "object" then error("Invalid npm result") else
+                [to_entries[] | .key as $name | .value |
+                 (if type == "array" then
+                    if length > 0 then .[] else error("Empty npm workspace result") end
+                  else . end) |
+                 if type == "object" and (.latest | nonempty_string)
+                    and (.wanted | nonempty_string)
+                    and (.current == null or (.current | nonempty_string))
+                 then {name:$name,current:(.current // "MISSING"),wanted,latest,type}
+                 else error("Invalid npm dependency") end] end'
             ;;
-
         pip|pipenv)
-            output=$(cd "$repo_path" && pip list --outdated --format=json 2>/dev/null || true)
-            if [[ -n "$output" && "$output" != "[]" ]]; then
-                # pip returns: [{"name": "pkg", "version": "current", "latest_version": "latest"}]
-                local json_array
-                json_array=$(echo "$output" | jq 'map({name: .name, current: .version, latest: .latest_version, type: .latest_filetype})' 2>/dev/null || echo "[]")
-                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            # pip list describes the invoking environment, not this manifest,
+            # and can return []/0 after failing to obtain registry candidates.
+            _dep_scan_error "$manager" unsupported_scan "Project-aware Python dependency discovery is not implemented"
+            return 3
             ;;
-
         cargo)
-            # cargo-outdated is an optional tool
-            if ! command -v cargo-outdated &>/dev/null && ! cargo outdated --version &>/dev/null 2>&1; then
-                printf '{"manager":"%s","outdated":[],"warning":"cargo-outdated not installed"}\n' "$manager"
-                return
+            tool=cargo
+            if ! command -v cargo-outdated &>/dev/null; then
+                _dep_scan_error "$manager" missing_tool "cargo-outdated is not installed"
+                return 3
             fi
-            output=$(cd "$repo_path" && cargo outdated --format json 2>/dev/null || true)
-            if [[ -n "$output" ]]; then
-                # cargo outdated returns: {"dependencies": [{"name": "pkg", "project": "cur", "latest": "x"}]}
-                local json_array
-                json_array=$(echo "$output" | jq '.dependencies | map({name: .name, current: .project, latest: .latest})' 2>/dev/null || echo "[]")
-                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            scan_command=(cargo outdated --format json)
+            filter='one | if type == "object" and .error == null and (.dependencies | type == "array")
+                then .dependencies | map({name,current:.project,latest})
+                else error("Invalid cargo-outdated result") end'
             ;;
-
         go)
-            output=$(cd "$repo_path" && go list -m -u -json all 2>/dev/null || true)
-            if [[ -n "$output" ]]; then
-                # go list returns NDJSON, parse it
-                local json_array
-                json_array=$(echo "$output" | jq -s '[.[] | select(.Update != null) | {name: .Path, current: .Version, latest: .Update.Version}]' 2>/dev/null || echo "[]")
-                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            tool=go
+            scan_command=(go list -m -u -json all)
+            filter='if length > 0 and all(.[]; type == "object" and (.Path | nonempty_string)
+                and .Error == null and (.Update == null or
+                    (.Update | type == "object" and .Error == null and (.Version | nonempty_string))))
+                then [.[] | select(.Update != null) | {name:.Path,current:.Version,latest:.Update.Version}]
+                else error("Invalid or incomplete go module result") end'
             ;;
-
         composer)
-            output=$(cd "$repo_path" && composer outdated --format=json 2>/dev/null || true)
-            if [[ -n "$output" ]]; then
-                # composer returns: {"installed": [{"name": "pkg", "version": "cur", "latest": "x"}]}
-                local json_array
-                json_array=$(echo "$output" | jq '.installed // [] | map({name: .name, current: .version, latest: .latest})' 2>/dev/null || echo "[]")
-                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            tool=composer
+            scan_command=(composer outdated --format=json)
+            filter='one | if type == "object" and .error == null and (.installed | type == "array")
+                then .installed | map({name,current:.version,latest})
+                else error("Invalid Composer result") end'
             ;;
-
-        bundler)
-            output=$(cd "$repo_path" && bundle outdated --parseable 2>/dev/null || true)
-            if [[ -n "$output" ]]; then
-                # bundle outdated --parseable returns: pkg (newest x.y.z, installed a.b.c)
-                # Build JSON array using jq for proper escaping
-                local json_array="[]"
-                while IFS= read -r line; do
-                    [[ -z "$line" ]] && continue
-                    local name current latest
-                    # Parse: "pkg (newest x.y.z, installed a.b.c, requested ~> m.n)"
-                    name=$(echo "$line" | sed -E 's/^([^ ]+) .*/\1/')
-                    latest=$(echo "$line" | sed -E 's/.*newest ([^,)]+).*/\1/')
-                    current=$(echo "$line" | sed -E 's/.*installed ([^,)]+).*/\1/')
-                    if [[ -n "$name" && -n "$current" && -n "$latest" ]]; then
-                        json_array=$(echo "$json_array" | jq --arg n "$name" --arg c "$current" --arg l "$latest" \
-                            '. + [{name: $n, current: $c, latest: $l}]')
-                    fi
-                done <<< "$output"
-                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+        yarn|pnpm|bundler|maven|gradle)
+            _dep_scan_error "$manager" unsupported_scan "Dependency discovery for $manager is not implemented"
+            return 3
             ;;
-
-        maven)
-            # Maven versions plugin requires specific setup
-            output=$(cd "$repo_path" && mvn versions:display-dependency-updates -DprocessDependencyManagement=false -q 2>/dev/null || true)
-            if [[ -n "$output" ]]; then
-                # Parse Maven output (text format) - this is a simplified version
-                local json_array="[]"
-                printf '{"manager":"%s","outdated":%s,"note":"Run mvn versions:display-dependency-updates for details"}\n' "$manager" "$json_array"
-                return
-            fi
-            printf '{"manager":"%s","outdated":[]}\n' "$manager"
-            ;;
-
-        gradle)
-            # Gradle requires plugins for version checking
-            printf '{"manager":"%s","outdated":[],"note":"Use gradle-versions-plugin for dependency updates"}\n' "$manager"
-            ;;
-
         *)
-            printf '{"manager":"%s","outdated":[],"error":"Unsupported manager"}\n' "$manager"
+            _dep_scan_error "$manager" unsupported_manager "Unknown package manager: $manager"
+            return 3
             ;;
     esac
+
+    if ! command -v "$tool" &>/dev/null; then
+        _dep_scan_error "$manager" missing_tool "$tool is not installed"
+        return 3
+    fi
+    output=$(cd "$repo_path" && "${scan_command[@]}") || command_rc=$?
+    # npm uses exit 1 for a nonempty outdated set. All other failures remain
+    # failures, even when a tool emitted a valid-looking partial JSON result.
+    if [[ "$command_rc" -ne 0 && ( "$manager" != npm || "$command_rc" -ne 1 ) ]]; then
+        _dep_scan_error "$manager" command_failed "$tool dependency scan exited $command_rc"
+        return 3
+    fi
+    if ! json_array=$(jq -cse '
+        def nonempty_string: type == "string" and length > 0;
+        def one: if length == 1 then .[0] else error("Expected one JSON result") end;
+        '"$filter"' |
+        if type == "array" and all(.[]; type == "object" and
+            (.name | nonempty_string) and (.current | nonempty_string) and (.latest | nonempty_string))
+        then . else error("Invalid dependency records") end
+    ' <<< "$output"); then
+        _dep_scan_error "$manager" invalid_output "$tool returned invalid or incomplete dependency data"
+        return 3
+    fi
+    if [[ "$command_rc" -eq 1 && "$json_array" == '[]' ]]; then
+        _dep_scan_error "$manager" command_failed "npm exited 1 without any outdated dependencies"
+        return 3
+    fi
+    jq -cn --arg manager "$manager" --argjson outdated "$json_array" \
+        '{manager:$manager,status:"ok",outdated:$outdated}'
 }
 
 #------------------------------------------------------------------------------
@@ -2625,6 +2648,10 @@ cmd_dep_update() {
     done
 
     # Check dependencies
+    if ! command -v jq &>/dev/null; then
+        log_error "dep-update requires jq for dependency scanning"
+        return 3
+    fi
     if ! command -v ntm &>/dev/null; then
         log_error "dep-update requires ntm (Named Tmux Manager)"
         log_error "Install from: https://github.com/Dicklesworthstone/ntm"
@@ -2716,16 +2743,26 @@ cmd_dep_update() {
     fi
 
     # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+    local repo_path
     for repo_path in ${repos_to_process[@]+"${repos_to_process[@]}"}; do
         local repo_name
         repo_name=$(basename "$repo_path")
 
         # Detect package managers in this repo
-        local managers_json
-        managers_json=$(detect_package_managers "$repo_path")
-        local managers_array
-        managers_array=$(echo "$managers_json" | jq -r '.managers // []' 2>/dev/null)
-        if [[ -z "$managers_array" || "$managers_array" == "[]" ]]; then
+        local managers_json detection_rc=0 managers_array
+        managers_json=$(detect_package_managers "$repo_path") || detection_rc=$?
+        if [[ "$detection_rc" -gt 1 ]] || ! managers_array=$(jq -cse '
+            if length == 1 then .[0] else error("Expected one detection result") end |
+            if type == "object" and .error == null and (.managers | type == "array")
+                and all(.managers[]; type == "string" and length > 0)
+            then .managers else error("Invalid manager detection result") end
+        ' <<< "$managers_json"); then
+            log_error "Could not detect package managers in $repo_name"
+            ((failed++))
+            results+=("$(jq -cn --arg repo "$repo_path" '{repo:$repo,status:"failed",error:"Package manager detection failed"}')")
+            continue
+        fi
+        if [[ "$managers_array" == "[]" ]]; then
             log_debug "No package managers found in $repo_name, skipping"
             ((skipped++))
             results+=("$(_dep_update_skipped_json "$repo_path" "no supported package manager")")
@@ -2734,7 +2771,7 @@ cmd_dep_update() {
 
         # Filter by manager if specified
         if [[ -n "$manager_filter" ]]; then
-            if ! echo "$managers_json" | jq -e ".managers[] | select(. == \"$manager_filter\")" &>/dev/null; then
+            if ! jq -e --arg manager "$manager_filter" 'index($manager) != null' <<< "$managers_array" >/dev/null; then
                 log_debug "Repo $repo_name does not use manager '$manager_filter', skipping"
                 ((skipped++))
                 results+=("$(_dep_update_skipped_json "$repo_path" "does not use manager $manager_filter")")
@@ -2743,10 +2780,24 @@ cmd_dep_update() {
         fi
 
         # Check for outdated dependencies
-        local outdated_json
-        outdated_json=$(check_outdated_deps "$repo_path" "$manager_filter")
-        local total_outdated
-        total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+        local outdated_json scan_rc=0 total_outdated
+        outdated_json=$(check_outdated_deps "$repo_path" "$manager_filter") || scan_rc=$?
+        if [[ "$scan_rc" -gt 1 ]] || ! total_outdated=$(jq -rse --argjson rc "$scan_rc" '
+            if length == 1 then .[0] else error("Expected one scan result") end |
+            if .status == "ok" and .failed_managers == 0 and (.results | type == "array")
+                and (.total_outdated | type == "number" and . >= 0 and . == floor)
+                and (($rc == 0) == (.total_outdated > 0))
+            then .total_outdated else error("Failed or invalid dependency scan") end
+        ' <<< "$outdated_json"); then
+            log_error "Dependency scan failed for $repo_name; no update session started"
+            ((failed++))
+            # Preserve typed per-manager details when the result is valid JSON.
+            local scan_details
+            scan_details=$(jq -cs 'if length == 1 then .[0] else null end' <<< "$outdated_json") || scan_details=null
+            results+=("$(jq -cn --arg repo "$repo_path" --argjson scan "$scan_details" \
+                '{repo:$repo,status:"failed",error:"Dependency scan failed",scan:$scan}')")
+            continue
+        fi
 
         if [[ "$total_outdated" -eq 0 ]]; then
             log_debug "No outdated dependencies in $repo_name"
@@ -2757,7 +2808,12 @@ cmd_dep_update() {
 
         # Filter by include/exclude patterns (on package names)
         if [[ -n "$include_pattern" || -n "$exclude_pattern" ]]; then
-            outdated_json=$(_filter_outdated_deps "$outdated_json" "$include_pattern" "$exclude_pattern")
+            if ! outdated_json=$(_filter_outdated_deps "$outdated_json" "$include_pattern" "$exclude_pattern"); then
+                log_error "Invalid dependency filter for $repo_name; no update session started"
+                ((failed++))
+                results+=("$(jq -cn --arg repo "$repo_path" '{repo:$repo,status:"failed",error:"Dependency filtering failed"}')")
+                continue
+            fi
             total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
             if [[ "$total_outdated" -eq 0 ]]; then
                 log_debug "No matching dependencies after filtering in $repo_name"
@@ -2769,7 +2825,12 @@ cmd_dep_update() {
 
         # Filter out major updates unless --major specified
         if [[ "$include_major" != "true" ]]; then
-            outdated_json=$(_filter_major_updates "$outdated_json")
+            if ! outdated_json=$(_filter_major_updates "$outdated_json"); then
+                log_error "Could not classify dependency versions in $repo_name; review them explicitly with --major"
+                ((failed++))
+                results+=("$(jq -cn --arg repo "$repo_path" '{repo:$repo,status:"failed",error:"Dependency version classification failed"}')")
+                continue
+            fi
             total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
             if [[ "$total_outdated" -eq 0 ]]; then
                 log_debug "No non-major updates in $repo_name (use --major to include)"
@@ -2917,7 +2978,7 @@ _filter_outdated_deps() {
             ))
         )) |
         .total_outdated = ([.results[].outdated | length] | add // 0)
-    ' 2>/dev/null) || filtered="$json"
+    ') || return 3
 
     echo "$filtered"
 }
@@ -2932,17 +2993,19 @@ _filter_major_updates() {
     local filtered
     filtered=$(echo "$json" | jq '
         def is_major_update:
-            (.current // "0") as $curr |
-            (.latest // "0") as $lat |
-            ($curr | split(".")[0] // "0") as $curr_major |
-            ($lat | split(".")[0] // "0") as $lat_major |
+            def major:
+                if type == "string" and test("^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$")
+                then ltrimstr("v") | split(".")[0]
+                else error("Cannot classify non-semver dependency version") end;
+            (.current | major) as $curr_major |
+            (.latest | major) as $lat_major |
             $curr_major != $lat_major;
 
         .results = (.results // [] | map(
             .outdated = (.outdated // [] | map(select(is_major_update | not)))
         )) |
         .total_outdated = ([.results[].outdated | length] | add // 0)
-    ' 2>/dev/null) || filtered="$json"
+    ') || return 3
 
     echo "$filtered"
 }

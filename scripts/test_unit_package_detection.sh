@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Unit tests for package manager detection functions
-# Tests: detect_package_managers
+# Tests: detect_package_managers and dependency scan failure propagation
 #
 # Covers detection of:
 # - npm (package.json, package-lock.json, yarn.lock, pnpm-lock.yaml)
@@ -56,6 +56,10 @@ extract_function() {
 }
 
 source <(extract_function "detect_package_managers" "$PROJECT_DIR/ru")
+for scan_function in _dep_scan_error _check_outdated_for_manager check_outdated_deps \
+    cmd_dep_update _dep_update_skipped_json _filter_outdated_deps _filter_major_updates; do
+    source_ru_function "$scan_function"
+done
 
 #==============================================================================
 # Test Setup/Teardown
@@ -600,6 +604,217 @@ test_output_has_required_fields() {
 }
 
 #==============================================================================
+# Dependency scan contracts. Controlled commands prove status/JSON handling,
+# not registry availability, installed project dependencies, or AI updates.
+# These cases need no temporary files and isolate command doubles in subshells.
+#==============================================================================
+
+assert_dep_scan_result() {
+    local result="$1" actual_rc="$2" expected_rc="$3" predicate="$4" message="$5"
+    assert_equals "$expected_rc" "$actual_rc" "$message: exit status"
+    if jq -se "length == 1 and (.[0] | $predicate)" <<< "$result" >/dev/null; then
+        _tf_pass "$message: result"
+    else
+        _tf_fail "$message: result" "Got: $result"
+    fi
+}
+
+test_dep_scan_npm_contract() {
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED
+        npm() {
+            [[ "$PWD" == "$PROJECT_DIR" && "$*" == 'outdated --json' ]] || return 91
+            printf '%s' "$scan_payload"
+            return "$scan_tool_rc"
+        }
+        local scan_payload='{}' scan_tool_rc=0 result rc
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.status == "ok" and .total_outdated == 0 and .failed_managers == 0' "npm verified current"
+
+        scan_payload='{"example":{"current":"1.0.0","wanted":"1.1.0","latest":"1.1.0"}}'
+        scan_tool_rc=1
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 1 and .results[0].outdated[0].name == "example"' "npm outdated exit 1"
+
+        scan_payload='{"error":[{"current":"1.0.0","wanted":"1.1.0","latest":"1.1.0"},{"wanted":"1.2.0","latest":"1.2.0"}]}'
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 2 and .results[0].outdated[1].current == "MISSING"' "npm workspace duplicates and missing install"
+
+        local bad_payload
+        for bad_payload in '' '{' '[]' '{} {}' \
+            '{"error":{"code":"E403","summary":"registry refused"}}' \
+            '{"example":{"current":"1","wanted":"2","latest":null}}' '{"example":[]}'; do
+            scan_payload="$bad_payload"
+            result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+            assert_dep_scan_result "$result" "$rc" 3 \
+                '.status == "error" and .failed_managers == 1 and .results[0].error_code == "invalid_output"' \
+                "npm refuses invalid payload $bad_payload"
+        done
+        scan_payload='{}'
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "command_failed"' "npm exit 1 requires outdated records"
+
+        scan_tool_rc=2
+        scan_payload='{"example":{"current":"1","wanted":"2","latest":"2"}}'
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "command_failed"' "npm partial output with command failure"
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+}
+
+test_dep_scan_other_manager_contracts() {
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED
+        cargo-outdated() { return 0; }
+        cargo() { printf '%s' "$scan_payload"; return "$scan_tool_rc"; }
+        go() { printf '%s' "$scan_payload"; return "$scan_tool_rc"; }
+        composer() { printf '%s' "$scan_payload"; return "$scan_tool_rc"; }
+        # Also contain historical adapters when running these same controls
+        # against a prior ru revision. They must never reach a real tool.
+        npm() { return 42; }
+        pip() { return 42; }
+        bundle() { return 42; }
+        mvn() { return 42; }
+        local scan_payload scan_tool_rc=0 result rc manager
+        for manager in cargo go composer; do
+            case "$manager" in
+                cargo) scan_payload='{"dependencies":[{"name":"example","project":"1.0.0","latest":"1.1.0"}]}' ;;
+                go) scan_payload=$'{"Path":"example/main","Main":true}\n{"Path":"example/dep","Version":"v1.0.0","Update":{"Version":"v1.1.0"}}' ;;
+                composer) scan_payload='{"installed":[{"name":"example/pkg","version":"1.0.0","latest":"1.1.0"}]}' ;;
+            esac
+            scan_tool_rc=0
+            result=$(check_outdated_deps "$PROJECT_DIR" "$manager"); rc=$?
+            assert_dep_scan_result "$result" "$rc" 0 \
+                '.status == "ok" and .total_outdated == 1' "$manager valid outdated"
+            scan_tool_rc=42
+            result=$(check_outdated_deps "$PROJECT_DIR" "$manager"); rc=$?
+            assert_dep_scan_result "$result" "$rc" 3 \
+                '.results[0].error_code == "command_failed"' "$manager partial output refused"
+            scan_tool_rc=0 scan_payload='{}'
+            result=$(check_outdated_deps "$PROJECT_DIR" "$manager"); rc=$?
+            assert_dep_scan_result "$result" "$rc" 3 \
+                '.results[0].error_code == "invalid_output"' "$manager wrong schema refused"
+            case "$manager" in
+                cargo) scan_payload='{"dependencies":[]}' ;;
+                go) scan_payload='{"Path":"example/main","Main":true}' ;;
+                composer) scan_payload='{"installed":[]}' ;;
+            esac
+            result=$(check_outdated_deps "$PROJECT_DIR" "$manager"); rc=$?
+            assert_dep_scan_result "$result" "$rc" 1 \
+                '.status == "ok" and .total_outdated == 0' "$manager valid current"
+        done
+        scan_payload='{"Path":"example/dep","Version":"v1.0.0","Error":{"Err":"registry unavailable"}}'
+        result=$(check_outdated_deps "$PROJECT_DIR" go); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "invalid_output"' "Go embedded registry error"
+
+        for manager in pip pipenv yarn pnpm bundler maven gradle unknown; do
+            result=$(check_outdated_deps "$PROJECT_DIR" "$manager"); rc=$?
+            assert_dep_scan_result "$result" "$rc" 3 \
+                '.status == "error" and .failed_managers == 1 and (.results[0].error | length > 0)' \
+                "$manager is an explicit limitation"
+        done
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+}
+
+test_dep_scan_missing_tools_and_partial_results() {
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED
+        local scan_missing=jq result rc
+        npm() { return 42; }
+        cargo() { return 42; }
+        command() {
+            if [[ "$1" == -v && "${2:-}" == "$scan_missing" ]]; then return 1; fi
+            builtin command "$@"
+        }
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 '.error_code == "missing_tool"' "missing jq"
+        scan_missing=npm
+        result=$(check_outdated_deps "$PROJECT_DIR" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 '.results[0].error_code == "missing_tool"' "missing npm"
+        scan_missing=cargo-outdated
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 '.results[0].error_code == "missing_tool"' "missing cargo-outdated"
+        scan_missing=''
+        npm() { printf '%s\n' '{"example":{"current":"1","wanted":"2","latest":"2"}}'; return 1; }
+        detect_package_managers() { printf '%s\n' '{"managers":["npm","gradle"]}'; }
+        local manager=outer-sentinel
+        result=$(check_outdated_deps "$PROJECT_DIR"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.total_outdated == 1 and .failed_managers == 1 and (.results | length == 2)' "mixed-manager failure preserves partial results"
+        assert_equals outer-sentinel "$manager" "scanner does not leak its loop variable"
+        detect_package_managers() { printf '%s\n' '{"managers":["npm"]}'; return 42; }
+        result=$(check_outdated_deps "$PROJECT_DIR"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 '.error_code == "detection_failed"' "partial detection failure"
+        detect_package_managers() { printf '%s\n' '{"managers":[]}'; return 1; }
+        result=$(check_outdated_deps "$PROJECT_DIR"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 '.status == "ok" and .total_outdated == 0' "no detected managers"
+        detect_package_managers() { printf '%s\n' '{"managers":null}'; }
+        result=$(check_outdated_deps "$PROJECT_DIR"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 '.error_code == "detection_failed"' "malformed detection result"
+        result=$(check_outdated_deps "${PROJECT_DIR}/does-not-exist-scan-fixture" npm); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 '.error_code == "invalid_repo"' "invalid repository"
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+}
+
+test_dep_update_counts_scan_failure() {
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED
+        ntm() { printf 'UNEXPECTED ntm execution\n' >&2; return 92; }
+        claude() { printf 'UNEXPECTED agent execution\n' >&2; return 93; }
+        spawn_ai_session() { printf 'UNEXPECTED session\n' >&2; return 94; }
+        detect_package_managers() { printf '%s\n' '{"managers":["npm"]}'; }
+        npm() { printf '%s' "$scan_payload"; return "$scan_tool_rc"; }
+        local JSON_OUTPUT=true ARGS=(--dry-run --major "--repo=$PROJECT_DIR")
+        local scan_payload='{"error":{"code":"E403"}}' scan_tool_rc=1 result rc
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .skipped == 0 and .processed == 0 and .results[0].status == "failed"
+             and .results[0].scan.results[0].error_code == "invalid_output"' "dep-update counts scanner failure"
+        scan_payload='{}' scan_tool_rc=0
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.failed == 0 and .skipped == 1 and .results[0].reason == "no outdated dependencies"' "dep-update skips verified current"
+        scan_payload='{"example":{"current":"1.0.0","wanted":"1.1.0","latest":"1.1.0"}}' scan_tool_rc=1
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.failed == 0 and .processed == 1 and .results[0].status == "pending"' "dep-update valid dry-run"
+        ARGS=(--dry-run "--repo=$PROJECT_DIR")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.processed == 1 and .results[0].outdated.total_outdated == 1' "default filter keeps minor update"
+        scan_payload='{"example":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0"}}'
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.skipped == 1 and .processed == 0 and (.results[0].reason | contains("only major"))' "default filter excludes major update"
+        ARGS=(--dry-run --major '--include=[' "--repo=$PROJECT_DIR")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .processed == 0 and .results[0].error == "Dependency filtering failed"' "invalid regex does not fail open"
+        ARGS=(--dry-run "--repo=$PROJECT_DIR")
+        scan_payload='{"example":{"wanted":"1.1.0","latest":"1.1.0"}}'
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .processed == 0 and .results[0].error == "Dependency version classification failed"' "unknown current version cannot be skipped as major"
+        command() {
+            if [[ "$1" == -v && "${2:-}" == jq ]]; then return 1; fi
+            builtin command "$@"
+        }
+        result=$(cmd_dep_update); rc=$?
+        assert_equals 3 "$rc" "dep-update missing jq returns dependency error"
+        assert_equals '' "$result" "dep-update emits no malformed payload without jq"
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+}
+
+#==============================================================================
 # Main Test Runner
 #==============================================================================
 
@@ -651,6 +866,11 @@ main() {
     # JSON format tests
     run_test test_output_is_valid_json
     run_test test_output_has_required_fields
+
+    run_test test_dep_scan_npm_contract
+    run_test test_dep_scan_other_manager_contracts
+    run_test test_dep_scan_missing_tools_and_partial_results
+    run_test test_dep_update_counts_scan_failure
 
     echo ""
     print_results
