@@ -54,9 +54,9 @@ assert result["output_format"] == "json", result
 print("validated", sys.argv[2], "exit", sys.argv[4])
 PY
     then
-        pass "$label validates against the actual advertised command schema"
+        pass "$label validates the advertised output schema and command/exit identity"
     else
-        fail "$label does not validate against the actual advertised command schema"
+        fail "$label does not validate the advertised output schema and command/exit identity"
         cat "$E2E_LOG_DIR/$label.stderr" >&2
     fi
 }
@@ -337,6 +337,49 @@ test_actual_empty_and_failure_schemas() {
     assert_cli_schema structured-help 0 review --json review --help
     assert_file_contains "$E2E_LOG_DIR/failed-ai-option.stderr" 'Unknown option' "Argument diagnostics remain on stderr"
     assert_success "Failed option has one typed refusal document" jq -se 'length == 1 and .[0].data.error.code == 4' "$E2E_LOG_DIR/failed-ai-option.stdout"
+    cleanup_structured_conformance
+}
+
+test_configured_read_failure_schemas() {
+    setup_structured_conformance
+    local command_name
+    # A nonregular list is invalid even for privileged test users. This avoids
+    # treating chmod(000), which root can still read, as an actual I/O failure.
+    mkdir "$RU_CONFIG_DIR/repos.d/public.txt" || { fail "Could not create the nonregular list"; cleanup_structured_conformance; return; }
+    for command_name in sync status list fork-status fork-sync; do
+        # Fork commands currently advertise only the common envelope schema;
+        # the reason assertion below checks their actual error payload too.
+        assert_cli_schema "bad-list-$command_name" 3 "$command_name" "$command_name" --json
+        assert_success "$command_name emits exactly one typed configuration error" jq -se \
+            'length == 1 and .[0].data.error.reason == "config_read_failed"' "$E2E_LOG_DIR/bad-list-$command_name.stdout"
+    done
+    # A selected optional list is independent of another list's invalid entry.
+    assert_cli_schema missing-selected-private 0 list list --private --json
+    mkdir "$RU_CONFIG_DIR/repos.d/private.txt" || { fail "Could not create the nonregular private list"; cleanup_structured_conformance; return; }
+    for command_name in public private; do
+        assert_cli_schema "bad-selected-$command_name" 3 list list "--$command_name" --json
+        assert_success "Selected $command_name list emits the actual read error" jq -e \
+            '.data.error.reason == "config_read_failed"' "$E2E_LOG_DIR/bad-selected-$command_name.stdout"
+    done
+
+    # Filtered reads must also reject an existing repos.d with the wrong kind;
+    # appending /public.txt must not make that parent look like an absent list.
+    export RU_CONFIG_DIR="$E2E_TEMP_DIR/wrong-kind-config"
+    mkdir "$RU_CONFIG_DIR" || { fail "Could not create the wrong-kind configuration"; cleanup_structured_conformance; return; }
+    printf '%s\n' 'not a directory' > "$RU_CONFIG_DIR/repos.d"
+    for command_name in public private; do
+        assert_cli_schema "bad-parent-$command_name" 3 list list "--$command_name" --json
+        assert_success "Selected $command_name list rejects an invalid parent" jq -e \
+            '.data.error.reason == "config_read_failed"' "$E2E_LOG_DIR/bad-parent-$command_name.stdout"
+    done
+    export RU_CONFIG_DIR="$E2E_TEMP_DIR/searchable-config"
+    mkdir -p "$RU_CONFIG_DIR/repos.d" || { fail "Could not create the searchable configuration"; cleanup_structured_conformance; return; }
+    printf '%s\n' 'owner/one' > "$RU_CONFIG_DIR/repos.d/public.txt"
+    chmod 111 "$RU_CONFIG_DIR/repos.d" || { fail "Could not restrict directory listing"; cleanup_structured_conformance; return; }
+    assert_cli_schema searchable-selected-public 0 list list --public --json
+    assert_success "Known selected file does not require directory listing" jq -e \
+        '.data.total == 1 and .data.repos[0].repo == "owner/one"' "$E2E_LOG_DIR/searchable-selected-public.stdout"
+    chmod 755 "$RU_CONFIG_DIR/repos.d" || fail "Could not restore the owned fixture permissions"
     cleanup_structured_conformance
 }
 
@@ -703,6 +746,7 @@ run_test test_schemas_has_command_schemas
 run_test test_schema_shortcut
 run_test test_version_matches
 run_test test_actual_empty_and_failure_schemas
+run_test test_configured_read_failure_schemas
 run_test test_actual_populated_and_dry_schemas
 run_test test_structured_workflow_source_api
 run_test test_structured_dispatcher_preserves_actual_tty_approval

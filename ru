@@ -10614,7 +10614,7 @@ cmd_list() {
     local repos_dir="$RU_CONFIG_DIR/repos.d"
     if [[ ( "$filter_public" == true || "$filter_private" == true ) &&
           ( -e "$repos_dir" || -L "$repos_dir" ) &&
-          ( ! -d "$repos_dir" || ! -r "$repos_dir" || ! -x "$repos_dir" ) ]]; then
+          ( ! -d "$repos_dir" || ! -x "$repos_dir" ) ]]; then
         log_error "Could not read repository list directory: $repos_dir"
         [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
         return 3
