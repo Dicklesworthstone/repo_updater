@@ -7667,8 +7667,8 @@ get_all_repos() {
     # Process all .txt files in repos.d/
     for list_file in "$repos_dir"/*.txt; do
         if [[ ! -f "$list_file" ]]; then
-            if [[ -L "$list_file" && ! -e "$list_file" ]]; then
-                log_error "Repository list has an unavailable symlink target: $list_file"
+            if [[ -e "$list_file" || -L "$list_file" ]]; then
+                log_error "Repository list is not an accessible regular file: $list_file"
                 return 1
             fi
             continue
@@ -9524,6 +9524,7 @@ cmd_sync() {
     local configured_repos
     if ! configured_repos=$(get_all_repos); then
         log_error "Could not read configured repositories; sync was not started"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
         return 3
     fi
     local repos=()
@@ -9569,6 +9570,7 @@ cmd_sync() {
                 local current_hash
                 if ! current_hash=$(get_config_hash); then
                     log_error "Cannot resume sync with unreadable repository configuration"
+                    [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
                     return 3
                 fi
                 if [[ "$current_hash" != "$SYNC_CONFIG_HASH" ]]; then
@@ -9630,7 +9632,12 @@ cmd_sync() {
         done
 
         # Save initial state
-        save_sync_state "in_progress" SYNC_COMPLETED pending_names
+        if ! save_sync_state "in_progress" SYNC_COMPLETED pending_names; then
+            log_error "Sync was not started because its checkpoint could not be saved"
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"checkpoint_save_failed"}}' '{"exit_code":3}')"
+            trap - INT TERM
+            return 3
+        fi
     fi
 
     local pending_count=${#pending_repos[@]}
@@ -9799,7 +9806,12 @@ cmd_sync() {
             pending_names=("${new_pending[@]}")
         fi
         # Save state after each repo (enables resume on interrupt)
-        save_sync_state "in_progress" SYNC_COMPLETED pending_names
+        if ! save_sync_state "in_progress" SYNC_COMPLETED pending_names; then
+            log_error "Sync stopped because its checkpoint could not be saved"
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"checkpoint_save_failed"}}' '{"exit_code":3}')"
+            trap - INT TERM
+            return 3
+        fi
     done
     fi  # End of sequential mode else block
 
@@ -9831,8 +9843,12 @@ cmd_sync() {
     else
         # The original pending set is retained in parallel mode. Sequential
         # failures never enter SYNC_COMPLETED and remain in pending_names.
-        save_sync_state "failed" SYNC_COMPLETED pending_names
-        log_warn "Incomplete sync retained; use ru sync --resume after resolving failures"
+        if ! save_sync_state "failed" SYNC_COMPLETED pending_names; then
+            log_error "The incomplete sync checkpoint could not be saved"
+            rc=3
+        else
+            log_warn "Incomplete sync retained; use ru sync --resume after resolving failures"
+        fi
     fi
 
     # Output JSON report if --json flag is set
@@ -9859,6 +9875,7 @@ cmd_status() {
     local configured_repos
     if ! configured_repos=$(get_all_repos); then
         log_error "Could not read configured repositories; status is incomplete"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope status '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
         return 3
     fi
     local repos=()
@@ -10594,24 +10611,35 @@ cmd_list() {
     fi
 
     local repos=() configured_repos
+    local repos_dir="$RU_CONFIG_DIR/repos.d"
+    if [[ ( "$filter_public" == true || "$filter_private" == true ) &&
+          ( -e "$repos_dir" || -L "$repos_dir" ) &&
+          ( ! -d "$repos_dir" || ! -r "$repos_dir" || ! -x "$repos_dir" ) ]]; then
+        log_error "Could not read repository list directory: $repos_dir"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
+        return 3
+    fi
     if [[ "$filter_public" == "true" ]]; then
         # Only repos from public.txt
-        local public_file="$RU_CONFIG_DIR/repos.d/public.txt"
+        local public_file="$repos_dir/public.txt"
         if ! configured_repos=$(load_repo_list "$public_file"); then
             log_error "Could not read public repositories; list is incomplete"
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
             return 3
         fi
     elif [[ "$filter_private" == "true" ]]; then
         # Only repos from private.txt
-        local private_file="$RU_CONFIG_DIR/repos.d/private.txt"
+        local private_file="$repos_dir/private.txt"
         if ! configured_repos=$(load_repo_list "$private_file"); then
             log_error "Could not read private repositories; list is incomplete"
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
             return 3
         fi
     else
         # All repos (default behavior)
         if ! configured_repos=$(get_all_repos); then
             log_error "Could not read configured repositories; list is incomplete"
+            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope list '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
             return 3
         fi
     fi
@@ -10723,17 +10751,15 @@ cmd_doctor() {
     fi
 
     # Check repos configured
-    local repo_count=0 configured_repos repos_readable=true
-    if [[ -d "$RU_CONFIG_DIR/repos.d" ]]; then
-        if configured_repos=$(get_all_repos); then
-            while IFS= read -r _; do
-                [[ -z "$_" ]] || ((repo_count++))
-            done < <(printf '%s\n' "$configured_repos")
-        else
-            repos_readable=false
-            repo_count=null
-            ((issues++))
-        fi
+    local repo_count=0 configured_repos repos_readable=true repo_spec_line
+    if configured_repos=$(get_all_repos); then
+        while IFS= read -r repo_spec_line; do
+            [[ -z "$repo_spec_line" ]] || ((repo_count++))
+        done < <(printf '%s\n' "$configured_repos")
+    else
+        repos_readable=false
+        repo_count=null
+        ((issues++))
     fi
     if [[ "$repos_readable" == false ]]; then
         printf '%b\n' "${RED}[!!]${RESET} Repos: configuration could not be read" >&2
@@ -20333,7 +20359,10 @@ cmd_review() {
         fi
     done
     pending_repos_list="${pending_repos_list%" "}"
-    checkpoint_review_state "" "$pending_repos_list"
+    if ! checkpoint_review_state "" "$pending_repos_list"; then
+        log_error "Review was not started because its checkpoint could not be saved"
+        return 3
+    fi
 
     # Run main orchestration loop (bd-l05s)
     log_info "Run ID: $run_id"
@@ -22162,6 +22191,7 @@ cmd_fork_status() {
     local configured_repos
     if ! configured_repos=$(get_all_repos); then
         log_error "Could not read configured repositories; fork status is incomplete"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-status '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
         return 3
     fi
     local repos=()
@@ -22353,6 +22383,7 @@ cmd_fork_sync() {
     local configured_repos
     if ! configured_repos=$(get_all_repos); then
         log_error "Could not read configured repositories; fork sync was not started"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-sync '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
         return 3
     fi
     local repos=()

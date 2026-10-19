@@ -828,26 +828,32 @@ test_get_all_repos_rejects_partial_list_failure() {
 }
 
 test_configured_commands_reject_list_failure() {
-    local test_name="sync and status reject a failed configuration load"
+    local test_name="configured commands reject a failed configuration load"
     log_test_start "$test_name"
     local test_env
     test_env=$(create_test_env)
     local command_name result rc
-    for command_name in cmd_sync cmd_status; do
+    for command_name in cmd_sync cmd_status get_dirty_repos cmd_ai_sync cmd_dep_update cmd_fork_status cmd_fork_sync cmd_fork_clean cmd_commit_sweep cmd_list count_github_repos get_config_hash; do
         result=$(
+            source_ru_function "get_dirty_repos"
             source_ru_function "$command_name"
+            source_ru_function "_fork_parse_args"
             RU_CONFIG_DIR="$test_env"
             PROJECTS_DIR="$test_env/projects"
             JSON_OUTPUT=false
             ARGS=()
-            get_all_repos() { return 42; }
+            get_all_repos() { printf '%s\n' 'controlled repository-list read failure' >&2; return 42; }
             ensure_dir() { :; }
             log_info() { :; }
+            ntm() { return 98; }
+            claude() { return 98; }
             "$command_name"
-        )
+        ) 2> "$test_env/$command_name.stderr"
         rc=$?
         assert_equals "3" "$rc" "$command_name must report a configuration error"
         assert_equals "" "$result" "$command_name must not output a successful empty result"
+        assert_contains "$(cat "$test_env/$command_name.stderr")" "controlled repository-list read failure" "$command_name must reach the failing list reader"
+        assert_not_contains "$(cat "$test_env/$command_name.stderr")" "command not found" "$command_name must not depend on missing test helpers"
     done
     log_test_pass "$test_name"
 }
@@ -874,6 +880,45 @@ test_get_all_repos_rejects_unavailable_list_paths() {
     rc=$?
     assert_equals "1" "$rc" "An existing non-directory repos.d must not be reported as missing"
     assert_equals "" "$result" "An invalid list path must not yield repositories"
+
+    RU_CONFIG_DIR="$test_env/nonregular-list"
+    mkdir -p "$RU_CONFIG_DIR/repos.d/public.txt"
+    result=$(get_all_repos)
+    rc=$?
+    assert_equals "1" "$rc" "An existing directory named as a list must not be silently skipped"
+    assert_equals "" "$result" "A nonregular list must not yield a partial configuration"
+    log_test_pass "$test_name"
+}
+
+test_checkpoints_preserve_state_on_list_failure() {
+    local test_name="checkpoints preserve prior state when configuration cannot be read"
+    log_test_start "$test_name"
+    local test_env
+    test_env=$(create_test_env)
+    local state_file="$test_env/checkpoint.json"
+    printf '%s\n' '{"run_id":"original","pending":["owner/repo"]}' > "$state_file"
+    local original result rc checkpoint_command
+    original=$(cat "$state_file")
+    for checkpoint_command in save_sync_state checkpoint_review_state; do
+        result=$(
+            source_ru_function "$checkpoint_command"
+            get_all_repos() { return 42; }
+            source_ru_function "get_config_hash"
+            get_sync_state_file() { printf '%s\n' "$state_file"; }
+            get_checkpoint_file() { printf '%s\n' "$state_file"; }
+            ensure_dir() { :; }
+            local -a completed=() pending=()
+            if [[ "$checkpoint_command" == save_sync_state ]]; then
+                save_sync_state in_progress completed pending
+            else
+                checkpoint_review_state '' owner/repo
+            fi
+        )
+        rc=$?
+        assert_equals "3" "$rc" "$checkpoint_command must reject incomplete configuration"
+        assert_equals "" "$result" "$checkpoint_command must not output a successful result"
+        assert_equals "$original" "$(cat "$state_file")" "$checkpoint_command must preserve the prior checkpoint"
+    done
     log_test_pass "$test_name"
 }
 
@@ -930,6 +975,7 @@ run_test test_get_all_repos_ignores_non_txt
 run_test test_get_all_repos_rejects_partial_list_failure
 run_test test_configured_commands_reject_list_failure
 run_test test_get_all_repos_rejects_unavailable_list_paths
+run_test test_checkpoints_preserve_state_on_list_failure
 
 echo ""
 print_results
