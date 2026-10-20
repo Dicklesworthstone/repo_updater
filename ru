@@ -3283,25 +3283,27 @@ declare -a AGENT_SWEEP_ALLOW_BINARY_PATTERNS_DEFAULT=(
 # AGENT-SWEEP PHASE PROMPTS
 # Default prompts for each phase of the agent-sweep workflow.
 # Each phase produces structured JSON output between markers.
+#
+# These are quoted literals, not heredocs, because they run on every
+# invocation. Bash writes a small heredoc whole into a pipe before reading it
+# back, and macOS shrinks new pipes to 512 bytes when kernel pipe memory runs
+# short, so a heredoc read here would hang every ru command on such a host.
 #------------------------------------------------------------------------------
 
 # Phase 1: Understanding - analyze the codebase and changes
 # Output markers: RU_UNDERSTANDING_JSON_BEGIN / RU_UNDERSTANDING_JSON_END
-read -r -d '' AGENT_SWEEP_PHASE1_PROMPT_DEFAULT << 'EOF_PHASE1'
-First read AGENTS.md (if present) and README.md (if present) carefully.
+AGENT_SWEEP_PHASE1_PROMPT_DEFAULT='First read AGENTS.md (if present) and README.md (if present) carefully.
 If a file is missing, explicitly note that and continue.
 Then use your investigation mode to understand the codebase architecture,
 entrypoints, conventions, and what the current changes appear to be.
 At the end, output a short structured summary as JSON between:
 RU_UNDERSTANDING_JSON_BEGIN
 { "summary": "...", "conventions": [...], "risks": [...], "notes": [...] }
-RU_UNDERSTANDING_JSON_END
-EOF_PHASE1
+RU_UNDERSTANDING_JSON_END'
 
 # Phase 2: Commit Plan - plan the commits without executing
 # Output markers: RU_COMMIT_PLAN_JSON_BEGIN / RU_COMMIT_PLAN_JSON_END
-read -r -d '' AGENT_SWEEP_PHASE2_PROMPT_DEFAULT << 'EOF_PHASE2'
-Now, based on your knowledge of the project, DO NOT run git commands.
+AGENT_SWEEP_PHASE2_PROMPT_DEFAULT='Now, based on your knowledge of the project, DO NOT run git commands.
 Instead, produce a COMMIT PLAN as JSON between these markers:
 RU_COMMIT_PLAN_JSON_BEGIN
 { ... }
@@ -3330,13 +3332,11 @@ Expected schema:
   ],
   "assumptions": ["No breaking changes detected"],
   "risks": ["Large diff in core module"]
-}
-EOF_PHASE2
+}'
 
 # Phase 3: Release Plan - plan any release actions without executing
 # Output markers: RU_RELEASE_PLAN_JSON_BEGIN / RU_RELEASE_PLAN_JSON_END
-read -r -d '' AGENT_SWEEP_PHASE3_PROMPT_DEFAULT << 'EOF_PHASE3'
-If a release is warranted based on the changes, DO NOT execute release commands.
+AGENT_SWEEP_PHASE3_PROMPT_DEFAULT='If a release is warranted based on the changes, DO NOT execute release commands.
 Produce a RELEASE PLAN as JSON between:
 RU_RELEASE_PLAN_JSON_BEGIN
 { ... }
@@ -3359,8 +3359,7 @@ Expected schema:
     {"path": "VERSION", "old": "1.1.0", "new": "1.2.0"}
   ],
   "checks": ["tests", "lint"]
-}
-EOF_PHASE3
+}'
 
 # Effective phase prompts (may be overridden by env vars or per-repo files)
 declare -g AGENT_SWEEP_PHASE1_PROMPT="${AGENT_SWEEP_PHASE1_PROMPT:-$AGENT_SWEEP_PHASE1_PROMPT_DEFAULT}"
