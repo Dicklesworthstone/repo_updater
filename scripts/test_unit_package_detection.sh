@@ -58,7 +58,7 @@ extract_function() {
 source <(extract_function "detect_package_managers" "$PROJECT_DIR/ru")
 for scan_function in _dep_scan_error _check_outdated_for_manager check_outdated_deps \
     cmd_dep_update _dep_update_skipped_json _filter_outdated_deps _filter_major_updates \
-    validate_ai_session_result; do
+    validate_ai_session_result detect_test_command run_test_gate; do
     source_ru_function "$scan_function"
 done
 # This function's JSON heredoc has an unindented closing brace of its own.
@@ -687,7 +687,7 @@ test_dep_scan_other_manager_contracts() {
         local scan_payload scan_tool_rc=0 result rc manager
         for manager in cargo go composer; do
             case "$manager" in
-                cargo) scan_payload='{"dependencies":[{"name":"example","project":"1.0.0","latest":"1.1.0"}]}' ;;
+                cargo) scan_payload='{"crate_name":"app","dependencies":[{"name":"example","project":"1.0.0","compat":"1.1.0","latest":"1.1.0","kind":"Normal","platform":null}]}' ;;
                 go) scan_payload=$'{"Path":"example/main","Main":true}\n{"Path":"example/dep","Version":"v1.0.0","Update":{"Version":"v1.1.0"}}' ;;
                 composer) scan_payload='{"installed":[{"name":"example/pkg","version":"1.0.0","latest":"1.1.0"}]}' ;;
             esac
@@ -704,7 +704,7 @@ test_dep_scan_other_manager_contracts() {
             assert_dep_scan_result "$result" "$rc" 3 \
                 '.results[0].error_code == "invalid_output"' "$manager wrong schema refused"
             case "$manager" in
-                cargo) scan_payload='{"dependencies":[]}' ;;
+                cargo) scan_payload='{"crate_name":"app","dependencies":[]}' ;;
                 go) scan_payload='{"Path":"example/main","Main":true}' ;;
                 composer) scan_payload='{"installed":[]}' ;;
             esac
@@ -725,6 +725,266 @@ test_dep_scan_other_manager_contracts() {
         done
         [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
     )
+}
+
+test_dep_scan_cargo_workspace_contract() {
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED result rc bad_payload
+        local scan_tool_rc=0 scan_check_args=false
+        cargo-outdated() { return 0; }
+        cargo() {
+            if [[ "$scan_check_args" == true &&
+                ( "$PWD" != "$PROJECT_DIR" || "$*" != 'outdated --workspace --root-deps-only --format json' ) ]]; then
+                return 91
+            fi
+            printf '%s' "$scan_payload"
+            return "$scan_tool_rc"
+        }
+        local current='{"crate_name":"gamma","dependencies":[]}'
+        local alpha='{"crate_name":"alpha","dependencies":[{"name":"shared","project":"1.0.0","compat":"---","latest":"1.2.0","kind":"Normal","platform":null},{"name":"major_dep","project":"1.0.0","compat":"1.5.0","latest":"2.0.0","kind":"Development","platform":"cfg(windows)"}]}'
+        local beta='{"crate_name":"beta","dependencies":[{"name":"shared","project":"2.0.0","compat":"2.1.0","latest":"2.1.0","kind":"Build","platform":"cfg(unix)"}]}'
+        local workspace="$alpha"$'\n'"$beta"$'\n'"$current"
+        local scan_payload="$current"
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.status == "ok" and .total_outdated == 0' "Cargo single member current"
+        scan_payload="$beta"
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 1 and .results[0].outdated[0] == {name:"shared",current:"2.0.0",latest:"2.1.0",compat:"2.1.0",kind:"Build",platform:"cfg(unix)",crate_name:"beta"}' \
+            "Cargo single member retains complete context"
+        scan_payload="$current"$'\n''{"crate_name":"delta","dependencies":[]}'
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.status == "ok" and .total_outdated == 0' "Cargo multiple current members"
+        scan_payload="$workspace"
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 3 and (.results[0].outdated | map(.crate_name)) == ["alpha","alpha","beta"]
+             and (.results[0].outdated | map(select(.name == "shared")) | length) == 2
+             and .results[0].outdated[0].compat == "---" and .results[0].outdated[0].platform == null
+             and .results[0].outdated[1].kind == "Development" and .results[0].outdated[1].platform == "cfg(windows)"' \
+            "Cargo workspace preserves duplicate names and member contexts"
+        scan_payload=$(jq -c '.dependencies[0].project="2.0.0-rc.1+b.5" | .dependencies[0].latest="2.1.0-rc.2+b.6"' <<< "$beta")
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 1 and .results[0].outdated[0].latest == "2.1.0-rc.2+b.6"' "Cargo prerelease plus build metadata"
+        scan_payload=$(jq -c '.crate_name="résumé_app" | .dependencies[0].name="résumé_crate" | .dependencies[0].latest="2.1.0-0.3a+001"' <<< "$beta")
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 1 and .results[0].outdated[0].name == "résumé_crate"
+             and .results[0].outdated[0].crate_name == "résumé_app" and .results[0].outdated[0].latest == "2.1.0-0.3a+001"' \
+            "Cargo Unicode names and numeric build metadata remain usable"
+
+        local scan_bad_case=0
+        for bad_payload in '' '{}' '[]' '{"crate_name":"","dependencies":[]}' \
+            '{"crate_name":"app","dependencies":null}' \
+            "$current"$'\n''{"crate_name":"broken","dependencies":[{}]}' \
+            "$current"$'\n''{"crate_name":"truncated"' \
+            "$current"$'\n'"$current" \
+            "$(jq -c '.dependencies[0].latest="---"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].latest="Removed"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].compat=null' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].kind={}' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].platform=[]' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].name="parent->child"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].name="bad name"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].name="bad\nname"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].project="01.2.3"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].latest="1.2.3-01"' <<< "$beta")" \
+            "$(jq -c '.dependencies[0].latest="1.2.3\n"' <<< "$beta")"; do
+            ((scan_bad_case+=1))
+            scan_payload="$bad_payload"
+            result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+            assert_dep_scan_result "$result" "$rc" 3 \
+                '.status == "error" and .results[0].error_code == "invalid_output"' "Cargo invalid stream $scan_bad_case refused"
+        done
+        scan_payload="$beta" scan_tool_rc=42
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "command_failed"' "Cargo valid partial member on failure"
+        scan_tool_rc=0 scan_check_args=true
+        result=$(check_outdated_deps "$PROJECT_DIR" cargo); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 1' "Cargo executes workspace direct-dependency scan in repository"
+        scan_check_args=false
+
+        # Exercise the real caller and filters, with only tool/agent boundaries
+        # controlled. No dependency update, Cargo execution or AI proof claimed.
+        detect_package_managers() { printf '%s\n' '{"managers":["cargo"]}'; }
+        ntm() { return 92; }
+        claude() { return 93; }
+        spawn_ai_session() { printf 'UNEXPECTED session\n' >&2; return 94; }
+        local JSON_OUTPUT=true ARGS=(--dry-run "--repo=$PROJECT_DIR")
+        scan_payload="$workspace"
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.processed == 1 and .failed == 0 and .results[0].outdated.total_outdated == 2
+             and (.results[0].outdated.results[0].outdated | map(.crate_name)) == ["alpha","beta"]' \
+            "Cargo caller retains both members through default minor filter"
+        ARGS=(--dry-run --major "--repo=$PROJECT_DIR")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.results[0].outdated.total_outdated == 3 and .results[0].outdated.results[0].outdated[1].platform == "cfg(windows)"' \
+            "Cargo caller major opt-in preserves target context"
+        ARGS=(--dry-run --major '--include=^major_dep$' "--repo=$PROJECT_DIR")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.results[0].outdated.total_outdated == 1 and .results[0].outdated.results[0].outdated[0].crate_name == "alpha"' \
+            "Cargo caller name filter retains member identity"
+        ARGS=(--dry-run --major '--exclude=.' "--repo=$PROJECT_DIR")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.processed == 0 and .skipped == 1 and .failed == 0' "Cargo caller all updates explicitly excluded"
+        ARGS=(--dry-run --major "--repo=$PROJECT_DIR")
+        scan_payload="$current"$'\n''{"crate_name":"delta","dependencies":[]}'
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.processed == 0 and .skipped == 1 and .failed == 0 and .results[0].reason == "no outdated dependencies"' \
+            "Cargo caller skips current multi-member scan"
+        scan_payload="$beta" scan_tool_rc=42
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .processed == 0 and .results[0].scan.results[0].error_code == "command_failed"' \
+            "Cargo caller refuses partial member result"
+        scan_tool_rc=0
+        scan_payload=$(jq -c '.dependencies[0].latest="---"' <<< "$beta")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .processed == 0 and .results[0].scan.results[0].error_code == "invalid_output"' \
+            "Cargo caller major opt-in cannot pass status marker to an update"
+        scan_payload=$(jq -c '.dependencies[0].name="parent->child"' <<< "$beta")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .processed == 0 and .results[0].scan.results[0].error_code == "invalid_output"' \
+            "Cargo caller cannot pass transitive label to a manifest update"
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+}
+
+# Real manifest reads, caller selection and host gate execution; Cargo and AI
+# remain controlled boundaries. A supplied root retains every generated file.
+test_cargo_workspace_test_command() {
+    local retained_root="${1:-}" fixture_root created_fixture=false
+    if [[ -n "$retained_root" ]]; then
+        fixture_root=$(mktemp -d "$retained_root/cargo-test-scope.XXXXXX") || return 1
+    else
+        setup_test_env
+        fixture_root="$TEMP_DIR"
+        created_fixture=true
+    fi
+    mkdir -p "$fixture_root/standalone/src" "$fixture_root/rooted/member/src" \
+        "$fixture_root/rooted/src" "$fixture_root/virtual/member/src" \
+        "$fixture_root/virtual/primary/src" "$fixture_root/npm-mixed/src" \
+        "$fixture_root/make-mixed/src" "$fixture_root/empty" || return 1
+    printf '[package]\nname="app"\nversion="0.1.0"\n' > "$fixture_root/standalone/Cargo.toml"
+    printf '[package]\nname="app"\nversion="0.1.0"\n[workspace]\nmembers=["member"]\ndefault-members=["."]\n' > "$fixture_root/rooted/Cargo.toml"
+    printf '[workspace]\nmembers=["primary","member"]\ndefault-members=["primary"]\n' > "$fixture_root/virtual/Cargo.toml"
+    printf '[package]\nname="member"\nversion="0.1.0"\n' > "$fixture_root/rooted/member/Cargo.toml"
+    printf '[package]\nname="member"\nversion="0.1.0"\n' > "$fixture_root/virtual/member/Cargo.toml"
+    printf '[package]\nname="primary"\nversion="0.1.0"\n' > "$fixture_root/virtual/primary/Cargo.toml"
+    printf '[package]\nname="app"\nversion="0.1.0"\n' > "$fixture_root/npm-mixed/Cargo.toml"
+    printf '[package]\nname="app"\nversion="0.1.0"\n' > "$fixture_root/make-mixed/Cargo.toml"
+    printf '{"scripts":{"test":"echo node-test"}}\n' > "$fixture_root/npm-mixed/package.json"
+    printf 'test:\n\ttrue\n' > "$fixture_root/make-mixed/Makefile"
+    local package_path
+    for package_path in standalone rooted rooted/member virtual/primary virtual/member npm-mixed make-mixed; do
+        printf '#[test]\nfn sample() { assert_eq!(2 + 2, 4); }\n' > "$fixture_root/$package_path/src/lib.rs"
+    done
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED kind result rc
+        local JSON_OUTPUT=true ARGS=()
+        log_warn() { :; }
+        log_success() { :; }
+        log_verbose() { :; }
+        cargo-outdated() { return 0; }
+        cargo() {
+            if [[ "${1:-}" == outdated ]]; then
+                printf '{"crate_name":"app","dependencies":[{"name":"example","project":"1.0.0","compat":"1.1.0","latest":"1.1.0","kind":"Normal","platform":null}]}\n'
+            else
+                printf '%s\n' "$PWD" "$@" > "$RU_SCOPE_TRACE"
+                printf 'controlled Cargo argv: %s\n' "$*"
+                printf 'controlled Cargo boundary\n' >&2
+                return "$RU_SCOPE_CARGO_RC"
+            fi
+        }
+        ntm() { return 92; }
+        claude() { return 93; }
+        _fetch_changelogs_for_outdated() { :; }
+        generate_depupdate_prompt_combined() { printf 'Test command: %s\n' "$3"; }
+        write_prompt_to_file() {
+            local file
+            file=$(mktemp "$fixture_root/prompt.XXXXXX") || return 1
+            printf '%s\n' "$1" > "$file" || return 1
+            printf '%s\n' "$file"
+        }
+        spawn_ai_session() {
+            local repo="$1" prompt_file="$2" argument command='' no_push=false
+            shift 2
+            for argument in "$@"; do
+                case "$argument" in
+                    --test-command=*) command="${argument#*=}" ;;
+                    --no-push) no_push=true ;;
+                esac
+            done
+            # Stop at this boundary; never fabricate completed work or tests.
+            jq -cn --arg repo "$(cd "$repo" && pwd -P)" --arg command "$command" \
+                --arg prompt "$(cat "$prompt_file")" --argjson no_push "$no_push" \
+                '{schema_version:1,repo:$repo,status:"failed",exit_code:2,
+                  transport:{status:"failed"},work:{status:"failed",commits:[],remaining_paths:[]},
+                  publication:{no_push:$no_push,status:"not_requested"},
+                  error:"Controlled session boundary",observed_command:$command,observed_prompt:$prompt}'
+            return 2
+        }
+        for kind in standalone rooted virtual rooted/member; do
+            result=$(detect_test_command "$fixture_root/$kind"); rc=$?
+            assert_equals 0 "$rc" "$kind detects Rust tests"
+            assert_equals 'cargo test --workspace' "$result" "$kind selects every workspace member"
+            ARGS=(--major --no-push "--repo=$fixture_root/$kind")
+            result=$(cmd_dep_update); rc=$?
+            assert_dep_scan_result "$result" "$rc" 1 \
+                '.failed == 1 and .updated == 0 and .results[0].error == "Controlled session boundary"
+                 and .results[0].observed_command == "cargo test --workspace"
+                 and .results[0].observed_prompt == "Test command: cargo test --workspace"
+                 and .results[0].publication.no_push == true' "$kind caller forwards automatic command"
+        done
+        result=$(detect_test_command "$fixture_root/npm-mixed"); rc=$?
+        assert_equals 0 "$rc" "mixed npm manifest detects tests"
+        assert_equals 'npm test' "$result" "npm test retains precedence over Cargo"
+        result=$(detect_test_command "$fixture_root/make-mixed"); rc=$?
+        assert_equals 0 "$rc" "Cargo plus Makefile detects tests"
+        assert_equals 'cargo test --workspace' "$result" "Cargo retains precedence over Makefile"
+        result=$(detect_test_command "$fixture_root/empty"); rc=$?
+        assert_equals 1 "$rc" "empty project still has no detected tests"
+        assert_equals '' "$result" "empty project does not fabricate a command"
+        ARGS=(--major --no-push '--test-cmd=printf explicit-test' "--repo=$fixture_root/rooted")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].error == "Controlled session boundary" and .results[0].observed_command == "printf explicit-test"
+             and .results[0].observed_prompt == "Test command: printf explicit-test"' "explicit command overrides automatic workspace command"
+        ARGS=(--major --no-push --test-cmd= "--repo=$fixture_root/rooted")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "explicit blank command still fails"
+
+        # Execute the actual standalone host gate. The child Cargo function is
+        # a command-boundary double, not a compiler or workspace-test simulator.
+        export -f cargo
+        export RU_SCOPE_TRACE RU_SCOPE_CARGO_RC
+        for RU_SCOPE_CARGO_RC in 0 7; do
+            RU_SCOPE_TRACE="$fixture_root/gate-$RU_SCOPE_CARGO_RC.trace"
+            result=$(run_test_gate "$fixture_root/rooted" '' 10); rc=$?
+            assert_dep_scan_result "$result" "$rc" "$RU_SCOPE_CARGO_RC" \
+                ".ran == true and .exit_code == $RU_SCOPE_CARGO_RC and .ok == ($RU_SCOPE_CARGO_RC == 0)
+                 and .command == \"cargo test --workspace\"" "host gate preserves command and actual child exit $RU_SCOPE_CARGO_RC"
+            assert_equals $'test\n--workspace' "$(tail -n +2 "$RU_SCOPE_TRACE")" "host gate child receives both Cargo arguments ($RU_SCOPE_CARGO_RC)"
+            assert_equals "$(cd "$fixture_root/rooted" && pwd -P)" "$(head -n 1 "$RU_SCOPE_TRACE")" "host gate child runs in repository ($RU_SCOPE_CARGO_RC)"
+        done
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+    local result_rc=$?
+    if [[ "$created_fixture" == true ]]; then cleanup_test_env; fi
+    return "$result_rc"
 }
 
 test_dep_scan_missing_tools_and_partial_results() {
@@ -1022,6 +1282,8 @@ main() {
 
     run_test test_dep_scan_npm_contract
     run_test test_dep_scan_other_manager_contracts
+    run_test test_dep_scan_cargo_workspace_contract
+    run_test test_cargo_workspace_test_command
     run_test test_dep_scan_missing_tools_and_partial_results
     run_test test_dep_update_counts_scan_failure
     run_test test_dep_scan_npm_lockfile_contract

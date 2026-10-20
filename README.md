@@ -2034,7 +2034,7 @@ Before applying changes, ru runs automated quality gates to catch issues early:
 | Project Type | Test Command | Lint Command |
 |--------------|--------------|--------------|
 | npm/yarn | `npm test` / `yarn test` | `npm run lint` / `eslint` |
-| Cargo (Rust) | `cargo test` | `cargo clippy` |
+| Cargo (Rust) | `cargo test --workspace` | `cargo clippy` |
 | Go | `go test ./...` | `golangci-lint run` |
 | Python | `pytest` / `python -m pytest` | `ruff check` / `flake8` |
 | Makefile | `make test` | `make lint` |
@@ -2629,7 +2629,7 @@ adapters for npm, cargo (requires `cargo-outdated`), Go modules, and Composer:
 | Manager | Detection Files | Discovery |
 |---------|-----------------|-----------|
 | npm | `package.json`, `package-lock.json` | `npm outdated --json` |
-| cargo | `Cargo.toml` | `cargo outdated --format json` |
+| cargo | `Cargo.toml` | `cargo outdated --workspace --root-deps-only --format json` |
 | go | `go.mod` | `go list -m -u -json all` |
 | composer | `composer.json` | `composer outdated --format=json` |
 | yarn/pnpm | `yarn.lock`, `pnpm-lock.yaml` | Explicit unsupported-scan error |
@@ -2642,6 +2642,21 @@ as failed repositories and give a nonzero exit status, including in `--dry-run`.
 A failure in any detected manager prevents an update session for that repository;
 partial results do not establish that all dependencies are current. The supported
 adapters still require live project and test validation before a release.
+
+Cargo discovery includes direct dependencies across workspace members. Each
+emitted update retains its `crate_name`, `compat`, `kind`, and `platform` in JSON;
+the same dependency in two members counts as two update records. Transitive
+dependencies are outside this manifest-update preview. Cargo's `---` and
+`Removed` latest-version status markers require manual review and fail the scan
+rather than entering an update session as versions. This adapter preserves the
+records cargo-outdated emits; it cannot recover distinctions that tool omits or
+independently establish that its successful output lists every expected member.
+
+Automatic Rust test detection selects `cargo test --workspace`, so a root
+package or a restricted `workspace.default-members` list does not silently omit
+other members from the update's host test command. An explicit `--test-cmd`
+still overrides automatic detection. This selects workspace members; it does
+not enable every Cargo feature or override a manifest's disabled test targets.
 
 Detection currently chooses npm when `package.json` exists, even beside a Yarn
 or pnpm lockfile. The npm scanner refuses those mixed inputs, so npm's view

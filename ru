@@ -775,7 +775,9 @@ detect_test_command() {
 
     # 2. Cargo (Rust)
     if [[ -f "$repo_path/Cargo.toml" ]]; then
-        echo "cargo test"
+        # Match dependency discovery across members, including workspaces
+        # whose default-members would otherwise omit the updated crate.
+        echo "cargo test --workspace"
         return 0
     fi
 
@@ -1025,10 +1027,26 @@ _check_outdated_for_manager() {
                 _dep_scan_error "$manager" missing_tool "cargo-outdated is not installed"
                 return 3
             fi
-            scan_command=(cargo outdated --format json)
-            filter='one | if type == "object" and .error == null and (.dependencies | type == "array")
-                then .dependencies | map({name,current:.project,latest})
-                else error("Invalid cargo-outdated result") end'
+            # cargo-outdated emits one JSON object per workspace member, even
+            # when that member is current. Scan editable direct dependencies;
+            # transitive rows cannot identify a manifest update to make.
+            scan_command=(cargo outdated --workspace --root-deps-only --format json)
+            filter='def cargo_name:
+                nonempty_string and (test("->|[[:space:][:cntrl:]]") | not);
+                def cargo_version:
+                type == "string" and test("\\A(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?\\z");
+                if length > 0 and all(.[]; type == "object" and .error == null
+                    and (.crate_name | cargo_name) and (.dependencies | type == "array"))
+                    and ((map(.crate_name) | unique | length) == length)
+                then [.[] | .crate_name as $crate_name | .dependencies[] |
+                    if type == "object" and (.name | cargo_name)
+                        and (.project | cargo_version) and (.latest | cargo_version)
+                        and (.compat == "---" or .compat == "Removed" or (.compat | cargo_version))
+                        and (.kind == null or .kind == "Normal" or .kind == "Development" or .kind == "Build")
+                        and (.platform == null or (.platform | nonempty_string))
+                    then {name,current:.project,latest,compat,kind,platform,crate_name:$crate_name}
+                    else error("Cargo dependency requires version-valued project/latest and valid context") end]
+                else error("Invalid or repeated cargo-outdated workspace member") end'
             ;;
         go)
             tool=go
@@ -2949,7 +2967,7 @@ cmd_dep_update() {
                 .results // [] | .[] |
                 "\(.manager):" as $mgr |
                 .outdated // [] | .[] |
-                "  \($mgr) \(.name): \(.current) -> \(.latest)"
+                "  \($mgr) \(if .crate_name then "[\(.crate_name)] " else "" end)\(.name): \(.current) -> \(.latest)"
             ' >&2 || true
             results+=("$(jq -cen --arg repo "$repo_path" --argjson deps "$outdated_json" '{repo:$repo,status:"pending",outdated:$deps}')")
             continue
