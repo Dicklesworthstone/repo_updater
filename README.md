@@ -2658,6 +2658,16 @@ other members from the update's host test command. An explicit `--test-cmd`
 still overrides automatic detection. This selects workspace members; it does
 not enable every Cargo feature or override a manifest's disabled test targets.
 
+For dependency updates, automatic test selection follows the managers that
+still have planned updates after name/major filtering. A mixed npm/Cargo
+update runs `npm test && cargo test --workspace`; a Cargo-only update selects
+the Cargo suite even when `package.json` also exists. Go and Composer suites
+are included when their dependencies are updated, with each manager tested
+once. If an updated manager has no detected test command, the update stops
+before session setup; provide `--test-cmd` for a project-specific or combined
+suite. An explicit command replaces the automatic selection. Other quality
+gate callers retain the existing general detection precedence.
+
 Detection currently chooses npm when `package.json` exists, even beside a Yarn
 or pnpm lockfile. The npm scanner refuses those mixed inputs, so npm's view
 cannot classify a Yarn or pnpm project as current. Their own adapters remain pending.

@@ -58,12 +58,11 @@ extract_function() {
 source <(extract_function "detect_package_managers" "$PROJECT_DIR/ru")
 for scan_function in _dep_scan_error _check_outdated_for_manager check_outdated_deps \
     cmd_dep_update _dep_update_skipped_json _filter_outdated_deps _filter_major_updates \
-    validate_ai_session_result detect_test_command run_test_gate; do
+    validate_ai_session_result detect_test_command detect_dep_update_test_command run_test_gate; do
     source_ru_function "$scan_function"
 done
-# This function's JSON heredoc has an unindented closing brace of its own.
-# The generic first-^} extractor would truncate the heredoc and fail to load it.
-source <(sed -n '/^_robot_docs_schemas()/,/^SCJSON$/p' "$PROJECT_DIR/ru"; printf '}\n')
+# Match the function's complete closing line, not the literal JSON's }'.
+source <(sed -n '/^_robot_docs_schemas()/,/^}$/p' "$PROJECT_DIR/ru")
 
 #==============================================================================
 # Test Setup/Teardown
@@ -989,6 +988,202 @@ test_cargo_workspace_test_command() {
     return "$result_rc"
 }
 
+# Real manifest selection and shell command chaining with controlled tool/AI
+# boundaries. No package manager, compiler, registry or AI work is exercised.
+test_dep_update_manager_test_selection() {
+    local retained_root="${1:-}" fixture_root created_fixture=false
+    if [[ -n "$retained_root" ]]; then
+        fixture_root=$(mktemp -d "$retained_root/manager-tests.XXXXXX") || return 1
+    else
+        setup_test_env
+        fixture_root="$TEMP_DIR"
+        created_fixture=true
+    fi
+    mkdir -p "$fixture_root/project/src" "$fixture_root/no-npm-tests" "$fixture_root/no-go-tests" || return 1
+    printf '{"scripts":{"test":"echo node-test"}}\n' > "$fixture_root/project/package.json"
+    printf '[package]\nname="app"\nversion="0.1.0"\n' > "$fixture_root/project/Cargo.toml"
+    printf '#[test]\nfn sample() { assert_eq!(2 + 2, 4); }\n' > "$fixture_root/project/src/lib.rs"
+    printf 'module example.test/app\ngo 1.24\n' > "$fixture_root/project/go.mod"
+    printf 'package app\nimport "testing"\nfunc TestExample(t *testing.T) {}\n' > "$fixture_root/project/example_test.go"
+    printf '{"scripts":{"test":"echo php-test"}}\n' > "$fixture_root/project/composer.json"
+    printf '{}\n' > "$fixture_root/no-npm-tests/package.json"
+    printf '[package]\nname="fallback"\nversion="0.1.0"\n' > "$fixture_root/no-npm-tests/Cargo.toml"
+    printf '{"scripts":{"test":"echo node-test"}}\n' > "$fixture_root/no-go-tests/package.json"
+    printf 'module example.test/no_tests\ngo 1.24\n' > "$fixture_root/no-go-tests/go.mod"
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED result rc manager expected scan bad_scan
+        local planned_managers='npm cargo go composer' compound npm_latest=1.1.0
+        local JSON_OUTPUT=true ARGS=()
+        log_warn() { :; }
+        log_success() { :; }
+        log_verbose() { :; }
+        record_manager_test() {
+            local tool="$1"
+            shift
+            printf '%s:%s\n' "$tool" "$*" >> "$RU_MANAGER_TEST_TRACE"
+            printf 'controlled %s test child\n' "$tool"
+            printf 'controlled %s stderr\n' "$tool" >&2
+            [[ "$RU_MANAGER_FAIL" != "$tool" ]] || return 7
+        }
+        npm() {
+            if [[ "${1:-}" == outdated ]]; then
+                if [[ " $planned_managers " == *' npm '* ]]; then
+                    printf '{"node_dep":{"current":"1.0.0","wanted":"%s","latest":"%s"}}\n' "$npm_latest" "$npm_latest"; return 1
+                fi
+                printf '{}\n'
+            else record_manager_test npm "$@"; fi
+        }
+        cargo-outdated() { return 0; }
+        cargo() {
+            if [[ "${1:-}" == outdated ]]; then
+                if [[ " $planned_managers " == *' cargo '* ]]; then
+                    printf '{"crate_name":"app","dependencies":[{"name":"rust_dep","project":"1.0.0","compat":"1.1.0","latest":"1.1.0","kind":"Normal","platform":null}]}\n'
+                else printf '{"crate_name":"app","dependencies":[]}\n'; fi
+            else record_manager_test cargo "$@"; fi
+        }
+        go() {
+            if [[ "${1:-}" == list ]]; then
+                if [[ " $planned_managers " == *' go '* ]]; then
+                    printf '{"Path":"example.test/dep","Version":"v1.0.0","Update":{"Version":"v1.1.0"}}\n'
+                else printf '{"Path":"example.test/app","Main":true}\n'; fi
+            else record_manager_test go "$@"; fi
+        }
+        composer() {
+            if [[ "${1:-}" == outdated ]]; then
+                if [[ " $planned_managers " == *' composer '* ]]; then
+                    printf '{"installed":[{"name":"example/vendor","version":"1.0.0","latest":"1.1.0"}]}\n'
+                else printf '{"installed":[]}\n'; fi
+            else record_manager_test composer "$@"; fi
+        }
+        ntm() { return 92; }
+        claude() { return 93; }
+        _fetch_changelogs_for_outdated() { :; }
+        generate_depupdate_prompt_combined() { printf 'Test command: %s\n' "$3"; }
+        write_prompt_to_file() {
+            local file
+            file=$(mktemp "$fixture_root/prompt.XXXXXX") || return 1
+            printf '%s\n' "$1" > "$file" || return 1
+            printf '%s\n' "$file"
+        }
+        spawn_ai_session() {
+            local repo="$1" prompt_file="$2" argument command='' no_push=false
+            shift 2
+            for argument in "$@"; do
+                case "$argument" in
+                    --test-command=*) command="${argument#*=}" ;;
+                    --no-push) no_push=true ;;
+                esac
+            done
+            jq -cn --arg repo "$(cd "$repo" && pwd -P)" --arg command "$command" \
+                --arg prompt "$(cat "$prompt_file")" --argjson no_push "$no_push" \
+                '{schema_version:1,repo:$repo,status:"failed",exit_code:2,
+                  transport:{status:"failed"},work:{status:"failed",commits:[],remaining_paths:[]},
+                  publication:{no_push:$no_push,status:"not_requested"},
+                  error:"Controlled session boundary",observed_command:$command,observed_prompt:$prompt}'
+            return 2
+        }
+        result=$(detect_test_command "$fixture_root/project"); rc=$?
+        assert_equals 0 "$rc" "general mixed-project detection succeeds"
+        assert_equals 'npm test' "$result" "general callers retain npm precedence"
+        for manager in npm cargo go composer; do
+            case "$manager" in
+                npm) expected='npm test' ;;
+                cargo) expected='cargo test --workspace' ;;
+                go) expected='go test ./...' ;;
+                composer) expected='composer test' ;;
+            esac
+            result=$(detect_test_command "$fixture_root/project" "$manager"); rc=$?
+            assert_equals 0 "$rc" "$manager-specific detection succeeds"
+            assert_equals "$expected" "$result" "$manager-specific detection ignores unrelated manifests"
+        done
+        result=$(detect_test_command "$fixture_root/project" unknown); rc=$?
+        assert_equals 1 "$rc" "unknown manager cannot use a generic runner"
+        assert_equals '' "$result" "unknown manager emits no test command"
+
+        ARGS=(--major --no-push "--repo=$fixture_root/project")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .updated == 0 and .results[0].observed_command == "npm test && cargo test --workspace && go test ./... && composer test"
+             and .results[0].observed_prompt == "Test command: npm test && cargo test --workspace && go test ./... && composer test"
+             and .results[0].publication.no_push == true' "mixed updates forward all four suites once"
+        compound=$(printf '%s\n' "$result" | jq -r '.results[0].observed_command')
+        ARGS=(--major --no-push --manager=cargo "--repo=$fixture_root/project")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].observed_command == "cargo test --workspace"' "Cargo-only manager filter selects Cargo tests in mixed project"
+        ARGS=(--major --no-push "--repo=$fixture_root/project")
+        planned_managers=cargo
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].observed_command == "cargo test --workspace"' "current managers do not select unrelated suites"
+        planned_managers='npm cargo go composer'
+        ARGS=(--major --no-push '--include=^rust_dep$' "--repo=$fixture_root/project")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].observed_command == "cargo test --workspace"' "name filtering removes unrelated managers from test selection"
+        npm_latest=2.0.0
+        ARGS=(--no-push "--repo=$fixture_root/project")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].observed_command == "cargo test --workspace && go test ./... && composer test"' "major filtering removes managers without remaining updates"
+        npm_latest=1.1.0
+        scan=$(check_outdated_deps "$fixture_root/project")
+        scan=$(printf '%s\n' "$scan" | jq -c '.results += [.results[] | select(.manager == "cargo")]')
+        result=$(detect_dep_update_test_command "$fixture_root/project" "$scan"); rc=$?
+        assert_equals 0 "$rc" "repeated manager records remain usable"
+        assert_equals 'npm test && cargo test --workspace && go test ./... && composer test' "$result" "repeated manager records select one suite"
+        for bad_scan in '{"status":"error"}' \
+            '{"status":"ok","failed_managers":0,"results":[{"status":"ok","manager":"","outdated":[{}]}]}' \
+            '{"status":"ok","failed_managers":0,"results":[{"status":"ok","manager":"unknown","outdated":[{}]}]}' \
+            '{"status":"ok","failed_managers":0,"results":[]}' \
+            "$scan"$'\n'"$scan"; do
+            result=$(detect_dep_update_test_command "$fixture_root/project" "$bad_scan"); rc=$?
+            assert_equals 1 "$rc" "invalid or empty manager plan cannot select tests"
+            assert_equals '' "$result" "invalid plan emits no partial command"
+        done
+        ARGS=(--major --no-push --manager=npm "--repo=$fixture_root/no-npm-tests")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "missing npm suite cannot fall back to Cargo tests"
+        ARGS=(--major --no-push --manager=go "--repo=$fixture_root/no-go-tests")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "missing Go suite cannot fall back to npm tests"
+        ARGS=(--major --no-push --manager=go '--test-cmd=printf custom-test' "--repo=$fixture_root/no-go-tests")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].observed_command == "printf custom-test"' "explicit project suite replaces automatic manager selection"
+        ARGS=(--major --no-push --test-cmd= "--repo=$fixture_root/project")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "blank explicit command still blocks update"
+
+        export -f record_manager_test npm cargo go composer
+        export RU_MANAGER_TEST_TRACE RU_MANAGER_FAIL
+        for RU_MANAGER_FAIL in '' npm cargo go composer; do
+            RU_MANAGER_TEST_TRACE="$fixture_root/child-${RU_MANAGER_FAIL:-none}.trace"
+            case "$RU_MANAGER_FAIL" in
+                '') expected=$'npm:test\ncargo:test --workspace\ngo:test ./...\ncomposer:test' ;;
+                npm) expected='npm:test' ;;
+                cargo) expected=$'npm:test\ncargo:test --workspace' ;;
+                go) expected=$'npm:test\ncargo:test --workspace\ngo:test ./...' ;;
+                composer) expected=$'npm:test\ncargo:test --workspace\ngo:test ./...\ncomposer:test' ;;
+            esac
+            result=$(run_test_gate "$fixture_root/project" "$compound" 10); rc=$?
+            if [[ -z "$RU_MANAGER_FAIL" ]]; then
+                assert_dep_scan_result "$result" "$rc" 0 '.ran == true and .ok == true and .exit_code == 0' "all selected tool boundaries execute successfully"
+            else
+                assert_dep_scan_result "$result" "$rc" 7 '.ran == true and .ok == false and .exit_code == 7' "$RU_MANAGER_FAIL failure survives the actual host gate"
+            fi
+            assert_equals "$expected" "$(cat "$RU_MANAGER_TEST_TRACE")" "actual child order stops at ${RU_MANAGER_FAIL:-no failure}"
+        done
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+    local result_rc=$?
+    if [[ "$created_fixture" == true ]]; then cleanup_test_env; fi
+    return "$result_rc"
+}
+
 test_dep_scan_missing_tools_and_partial_results() {
     (
         local scan_failures_before=$TF_ASSERTIONS_FAILED
@@ -1286,6 +1481,7 @@ main() {
     run_test test_dep_scan_other_manager_contracts
     run_test test_dep_scan_cargo_workspace_contract
     run_test test_cargo_workspace_test_command
+    run_test test_dep_update_manager_test_selection
     run_test test_dep_scan_missing_tools_and_partial_results
     run_test test_dep_update_counts_scan_failure
     run_test test_dep_scan_npm_lockfile_contract

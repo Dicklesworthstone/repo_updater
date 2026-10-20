@@ -741,18 +741,20 @@ detect_package_managers() {
 #------------------------------------------------------------------------------
 
 # Detect the test command for a repository based on config files.
-# Usage: detect_test_command /path/to/repo
+# Usage: detect_test_command /path/to/repo [npm|cargo|go|composer]
 # Output: Test command string to stdout (empty if none detected)
 # Returns: 0 if test command found, 1 if none found
 detect_test_command() {
     local repo_path="${1:-}"
+    local requested_manager="${2:-}"
 
     if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
         return 1
     fi
+    case "$requested_manager" in ''|npm|cargo|go|composer) ;; *) return 1 ;; esac
 
     # 1. Check package.json scripts.test (npm/node projects)
-    if [[ -f "$repo_path/package.json" ]]; then
+    if [[ ( -z "$requested_manager" || "$requested_manager" == npm ) && -f "$repo_path/package.json" ]]; then
         local test_script
         test_script=$(jq -r '.scripts.test // empty' "$repo_path/package.json" 2>/dev/null)
         if [[ -n "$test_script" && "$test_script" != "null" ]]; then
@@ -774,7 +776,7 @@ detect_test_command() {
     fi
 
     # 2. Cargo (Rust)
-    if [[ -f "$repo_path/Cargo.toml" ]]; then
+    if [[ ( -z "$requested_manager" || "$requested_manager" == cargo ) && -f "$repo_path/Cargo.toml" ]]; then
         # Match dependency discovery across members, including workspaces
         # whose default-members would otherwise omit the updated crate.
         echo "cargo test --workspace"
@@ -782,7 +784,7 @@ detect_test_command() {
     fi
 
     # 3. Go modules
-    if [[ -f "$repo_path/go.mod" ]]; then
+    if [[ ( -z "$requested_manager" || "$requested_manager" == go ) && -f "$repo_path/go.mod" ]]; then
         # Check if there are test files
         if find "$repo_path" -maxdepth 3 -name "*_test.go" -type f 2>/dev/null | head -1 | grep -q .; then
             echo "go test ./..."
@@ -791,7 +793,7 @@ detect_test_command() {
     fi
 
     # 4. Python - pytest
-    if [[ -f "$repo_path/pytest.ini" || -f "$repo_path/conftest.py" || -f "$repo_path/pyproject.toml" ]]; then
+    if [[ -z "$requested_manager" && ( -f "$repo_path/pytest.ini" || -f "$repo_path/conftest.py" || -f "$repo_path/pyproject.toml" ) ]]; then
         # Check for pytest in pyproject.toml
         if [[ -f "$repo_path/pyproject.toml" ]] && grep -q "pytest" "$repo_path/pyproject.toml" 2>/dev/null; then
             echo "pytest"
@@ -805,18 +807,18 @@ detect_test_command() {
     fi
 
     # Check for test directory with python tests
-    if [[ -d "$repo_path/tests" ]] && find "$repo_path/tests" -maxdepth 2 -name "test_*.py" -type f 2>/dev/null | head -1 | grep -q .; then
+    if [[ -z "$requested_manager" && -d "$repo_path/tests" ]] && find "$repo_path/tests" -maxdepth 2 -name "test_*.py" -type f 2>/dev/null | head -1 | grep -q .; then
         echo "pytest"
         return 0
     fi
-    if [[ -f "$repo_path/pyproject.toml" || -f "$repo_path/setup.py" ]] &&
+    if [[ -z "$requested_manager" && ( -f "$repo_path/pyproject.toml" || -f "$repo_path/setup.py" ) ]] &&
        [[ -d "$repo_path/tests" || -d "$repo_path/test" ]]; then
         echo "pytest"
         return 0
     fi
 
     # 5. Ruby - bundler/rake
-    if [[ -f "$repo_path/Gemfile" ]]; then
+    if [[ -z "$requested_manager" && -f "$repo_path/Gemfile" ]]; then
         if grep -q "rspec" "$repo_path/Gemfile" 2>/dev/null; then
             echo "bundle exec rspec"
             return 0
@@ -828,13 +830,13 @@ detect_test_command() {
     fi
 
     # 6. Maven (Java)
-    if [[ -f "$repo_path/pom.xml" ]]; then
+    if [[ -z "$requested_manager" && -f "$repo_path/pom.xml" ]]; then
         echo "mvn test"
         return 0
     fi
 
     # 7. Gradle (Java/Kotlin)
-    if [[ -f "$repo_path/build.gradle" || -f "$repo_path/build.gradle.kts" ]]; then
+    if [[ -z "$requested_manager" && ( -f "$repo_path/build.gradle" || -f "$repo_path/build.gradle.kts" ) ]]; then
         if [[ -f "$repo_path/gradlew" ]]; then
             echo "./gradlew test"
         else
@@ -844,13 +846,13 @@ detect_test_command() {
     fi
 
     # 8. Makefile fallback after language-specific runners
-    if [[ -f "$repo_path/Makefile" ]] && grep -qE '^test[[:space:]]*:' "$repo_path/Makefile"; then
+    if [[ -z "$requested_manager" && -f "$repo_path/Makefile" ]] && grep -qE '^test[[:space:]]*:' "$repo_path/Makefile"; then
         echo "make test"
         return 0
     fi
 
     # 9. PHP Composer
-    if [[ -f "$repo_path/composer.json" ]]; then
+    if [[ ( -z "$requested_manager" || "$requested_manager" == composer ) && -f "$repo_path/composer.json" ]]; then
         local test_script
         test_script=$(jq -r '.scripts.test // empty' "$repo_path/composer.json" 2>/dev/null)
         if [[ -n "$test_script" && "$test_script" != "null" ]]; then
@@ -863,13 +865,41 @@ detect_test_command() {
         fi
     fi
 
-    if [[ -x "$repo_path/scripts/run_all_tests.sh" ]]; then
+    if [[ -z "$requested_manager" && -x "$repo_path/scripts/run_all_tests.sh" ]]; then
         echo "./scripts/run_all_tests.sh"
         return 0
     fi
 
     # No test command detected
     return 1
+}
+
+# Select tests for each manager whose dependencies will be updated, rather
+# than letting an unrelated higher-priority manifest choose the only suite.
+# General detect_test_command precedence remains unchanged for other callers.
+detect_dep_update_test_command() {
+    local repo_path="$1" outdated_json="$2" managers manager test_cmd combined=""
+    if ! managers=$(printf '%s\n' "$outdated_json" | jq -ers '
+        if length == 1 then .[0] else error("Expected one dependency scan") end |
+        if type == "object" and .status == "ok" and .failed_managers == 0
+            and (.results | type == "array")
+            and all(.results[]; .status == "ok" and
+                (.manager == "npm" or .manager == "cargo" or .manager == "go" or .manager == "composer")
+                and (.outdated | type == "array"))
+        then [.results[] | select(.outdated | length > 0) | .manager] |
+            reduce .[] as $manager ([]; if index($manager) == null then . + [$manager] else . end) |
+            if length > 0 then .[] else error("No managers with planned updates") end
+        else error("Invalid dependency scan for test selection") end
+    '); then
+        return 1
+    fi
+    while IFS= read -r manager; do
+        test_cmd=$(detect_test_command "$repo_path" "$manager") || return "$?"
+        [[ "$test_cmd" =~ [^[:space:]] ]] || return 1
+        combined+="${combined:+ && }$test_cmd"
+    done < <(printf '%s\n' "$managers")
+    [[ -n "$combined" ]] || return 1
+    printf '%s\n' "$combined"
 }
 
 #------------------------------------------------------------------------------
@@ -905,20 +935,20 @@ check_outdated_deps() {
     else
         local detected detected_rc=0 manager_names
         detected=$(detect_package_managers "$repo_path") || detected_rc=$?
-        if [[ "$detected_rc" -gt 1 ]] || ! managers_json=$(jq -cse '
+        if [[ "$detected_rc" -gt 1 ]] || ! managers_json=$(printf '%s\n' "$detected" | jq -cse '
             if length == 1 then .[0] else error("Expected one detection result") end |
             if type == "object" and .error == null and (.managers | type == "array")
                 and all(.managers[]; type == "string" and length > 0)
             then .managers else error("Invalid manager detection result") end
-        ' <<< "$detected"); then
+        '); then
             _dep_scan_error "" detection_failed "Could not detect package managers"
             return 3
         fi
-        manager_names=$(jq -r '.[]' <<< "$managers_json") || return 3
+        manager_names=$(printf '%s\n' "$managers_json" | jq -r '.[]') || return 3
         local manager
         while IFS= read -r manager; do
             [[ -n "$manager" ]] && managers+=("$manager")
-        done <<< "$manager_names"
+        done < <(printf '%s\n' "$manager_names")
     fi
 
     if [[ ${#managers[@]} -eq 0 ]]; then
@@ -933,12 +963,12 @@ check_outdated_deps() {
     for manager in "${managers[@]}"; do
         result_rc=0
         result=$(_check_outdated_for_manager "$repo_path" "$manager") || result_rc=$?
-        if ! jq -se --arg manager "$manager" --argjson rc "$result_rc" '
+        if ! printf '%s\n' "$result" | jq -se --arg manager "$manager" --argjson rc "$result_rc" '
             length == 1 and (.[0] | type == "object" and .manager == $manager
                 and (.outdated | type == "array") and
                 (if $rc == 0 then .status == "ok" and .error == null
                  else .status == "error" and (.error | type == "string" and length > 0) end))
-        ' <<< "$result" >/dev/null; then
+        ' >/dev/null; then
             result=$(_dep_scan_error "$manager" invalid_result "Invalid dependency scanner result")
             result_rc=3
         fi
@@ -946,7 +976,7 @@ check_outdated_deps() {
         if [[ "$result_rc" -ne 0 ]]; then
             ((failed_managers+=1))
         else
-            count=$(jq '.outdated | length' <<< "$result") || return 3
+            count=$(printf '%s\n' "$result" | jq '.outdated | length') || return 3
             total_outdated=$((total_outdated + count))
         fi
     done
@@ -1085,14 +1115,14 @@ _check_outdated_for_manager() {
         _dep_scan_error "$manager" command_failed "$tool dependency scan exited $command_rc"
         return 3
     fi
-    if ! json_array=$(jq -cse '
+    if ! json_array=$(printf '%s\n' "$output" | jq -cse '
         def nonempty_string: type == "string" and length > 0;
         def one: if length == 1 then .[0] else error("Expected one JSON result") end;
         '"$filter"' |
         if type == "array" and all(.[]; type == "object" and
             (.name | nonempty_string) and (.current | nonempty_string) and (.latest | nonempty_string))
         then . else error("Invalid dependency records") end
-    ' <<< "$output"); then
+    '); then
         _dep_scan_error "$manager" invalid_output "$tool returned invalid or incomplete dependency data"
         return 3
     fi
@@ -1682,7 +1712,7 @@ validate_ai_session_result() {
     local expected_test_command="${4:-}" tests_required=false
     [[ $# -lt 4 ]] || tests_required=true
     expected_repo=$(cd "$expected_repo" && pwd -P) || return 1
-    jq -es --argjson actual_exit "$actual_exit" --arg repo "$expected_repo" \
+    printf '%s\n' "$result" | jq -es --argjson actual_exit "$actual_exit" --arg repo "$expected_repo" \
         --arg command "$expected_test_command" --argjson tests_required "$tests_required" '
         length == 1 and (.[0] as $r |
             $r.schema_version == 1 and $r.repo == $repo and $r.exit_code == $actual_exit and
@@ -1709,7 +1739,7 @@ validate_ai_session_result() {
                  else $r.tests == null or ($r.tests.required == false and $r.tests.status == "not_requested") end) and
                 (if $r.publication.no_push then $r.publication.status == "not_requested" else $r.publication.status == "success" end)
              else $actual_exit != 0 and ($r.status == "failed" or $r.status == "timeout") end))
-    ' <<< "$result" >/dev/null
+    ' >/dev/null
 }
 
 # Run an inherited Bash worker in its own process group under one absolute
@@ -2869,12 +2899,12 @@ cmd_dep_update() {
         # Detect package managers in this repo
         local managers_json detection_rc=0 managers_array
         managers_json=$(detect_package_managers "$repo_path") || detection_rc=$?
-        if [[ "$detection_rc" -gt 1 ]] || ! managers_array=$(jq -cse '
+        if [[ "$detection_rc" -gt 1 ]] || ! managers_array=$(printf '%s\n' "$managers_json" | jq -cse '
             if length == 1 then .[0] else error("Expected one detection result") end |
             if type == "object" and .error == null and (.managers | type == "array")
                 and all(.managers[]; type == "string" and length > 0)
             then .managers else error("Invalid manager detection result") end
-        ' <<< "$managers_json"); then
+        '); then
             log_error "Could not detect package managers in $repo_name"
             ((failed++))
             results+=("$(jq -cn --arg repo "$repo_path" '{repo:$repo,status:"failed",error:"Package manager detection failed"}')")
@@ -2889,7 +2919,7 @@ cmd_dep_update() {
 
         # Filter by manager if specified
         if [[ -n "$manager_filter" ]]; then
-            if ! jq -e --arg manager "$manager_filter" 'index($manager) != null' <<< "$managers_array" >/dev/null; then
+            if ! printf '%s\n' "$managers_array" | jq -e --arg manager "$manager_filter" 'index($manager) != null' >/dev/null; then
                 log_debug "Repo $repo_name does not use manager '$manager_filter', skipping"
                 ((skipped++))
                 results+=("$(_dep_update_skipped_json "$repo_path" "does not use manager $manager_filter")")
@@ -2900,18 +2930,20 @@ cmd_dep_update() {
         # Check for outdated dependencies
         local outdated_json scan_rc=0 total_outdated
         outdated_json=$(check_outdated_deps "$repo_path" "$manager_filter") || scan_rc=$?
-        if [[ "$scan_rc" -gt 1 ]] || ! total_outdated=$(jq -rse --argjson rc "$scan_rc" '
+        # Stream JSON concurrently with its consumer; some Bash/macOS
+        # here-string writes can block before jq begins reading.
+        if [[ "$scan_rc" -gt 1 ]] || ! total_outdated=$(printf '%s\n' "$outdated_json" | jq -rse --argjson rc "$scan_rc" '
             if length == 1 then .[0] else error("Expected one scan result") end |
             if .status == "ok" and .failed_managers == 0 and (.results | type == "array")
                 and (.total_outdated | type == "number" and . >= 0 and . == floor)
                 and (($rc == 0) == (.total_outdated > 0))
             then .total_outdated else error("Failed or invalid dependency scan") end
-        ' <<< "$outdated_json"); then
+        '); then
             log_error "Dependency scan failed for $repo_name; no update session started"
             ((failed++))
             # Preserve typed per-manager details when the result is valid JSON.
             local scan_details
-            scan_details=$(jq -cs 'if length == 1 then .[0] else null end' <<< "$outdated_json") || scan_details=null
+            scan_details=$(printf '%s\n' "$outdated_json" | jq -cs 'if length == 1 then .[0] else null end') || scan_details=null
             results+=("$(jq -cn --arg repo "$repo_path" --argjson scan "$scan_details" \
                 '{repo:$repo,status:"failed",error:"Dependency scan failed",scan:$scan}')")
             continue
@@ -2978,7 +3010,7 @@ cmd_dep_update() {
         if [[ "$custom_test_cmd_set" == true ]]; then
             test_cmd="$custom_test_cmd"
         else
-            test_cmd=$(detect_test_command "$repo_path") || test_detection_rc=$?
+            test_cmd=$(detect_dep_update_test_command "$repo_path" "$outdated_json") || test_detection_rc=$?
         fi
         if [[ "$test_detection_rc" -ne 0 || ! "$test_cmd" =~ [^[:space:]] ]]; then
             log_error "No test command available for $repo_name; provide --test-cmd before updating dependencies"
@@ -3019,7 +3051,7 @@ cmd_dep_update() {
         if [[ "$no_push" == true ]]; then session_args+=(--no-push); else session_args+=(--push); fi
         session_result=$(spawn_ai_session "$repo_path" "$prompt_file" "${session_args[@]}") || session_exit=$?
         if validate_ai_session_result "$session_result" "$session_exit" "$repo_path" "$test_cmd"; then
-            status=$(jq -r '.status' <<< "$session_result") || status=failed
+            status=$(printf '%s\n' "$session_result" | jq -r '.status') || status=failed
         else
             [[ "$session_exit" -ne 0 ]] || session_exit=2
             session_result=$(jq -cen --arg repo "$repo_path" --argjson exit_code "$session_exit" '{repo:$repo,status:"failed",exit_code:$exit_code,error:"Invalid or incomplete AI session result"}') || return 3
@@ -25868,8 +25900,9 @@ FMJSON
 }
 
 _robot_docs_schemas() {
-    cat << 'SCJSON'
-{
+    # Keep this literal out of a here-document: macOS pipe sizing can block
+    # Bash before a here-document's consumer starts reading.
+    printf '%s\n' '{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "JSON Schema definitions for ru command outputs. All JSON outputs share the same envelope wrapper.",
   "allOf": [
@@ -26112,8 +26145,7 @@ _robot_docs_schemas() {
       }
     }
   }
-}
-SCJSON
+}'
 }
 
 #==============================================================================
