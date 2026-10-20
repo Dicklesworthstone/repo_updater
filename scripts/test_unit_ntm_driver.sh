@@ -619,7 +619,8 @@ test_is_file_denied_extra_patterns() {
 
 create_ai_work_fixture() {
     local env_root repo_path
-    env_root=$(create_test_env) || return 1
+    if [[ -n "${1:-}" ]]; then env_root=$(mktemp -d "$1/ai-work.XXXXXX") || return 1;
+    else env_root=$(create_test_env) || return 1; fi
     repo_path="$env_root/repo"
     mkdir -p "$repo_path" "$env_root/artifacts" || return 1
     git -C "$repo_path" init -q -b main || return 1
@@ -1089,6 +1090,176 @@ test_ai_host_publication_success() { assert_ai_host_publication success; }
 test_ai_host_publication_rejected() { assert_ai_host_publication rejected; }
 test_ai_host_no_push_invokes_no_transport() { assert_ai_host_publication no-push; }
 
+# Real test commands and real local Git receivers exercise the publication gate.
+# Only the provider/NTM transport is controlled. An optional caller-owned root
+# retains all fixtures without sourcing the stock framework or cleanup traps.
+test_ai_project_tests_before_publication() {
+    local retained_root="${1:-}" mode publication failed_scenarios=0
+    for publication in push no-push; do
+        for mode in success failed dirty changed-head changed-branch timeout; do
+            (
+                local repo_path env_root before result rc=0 evidence candidate command test_pid
+                local timeout_seconds=12
+                repo_path=$(create_ai_work_fixture "$retained_root") || exit 1
+                env_root=${repo_path%/*}
+                create_controlled_ai_bin "$env_root/mock-bin" || exit 1
+                git clone -q --bare "$repo_path" "$env_root/receiver.git" || exit 1
+                git -C "$repo_path" remote add origin "$env_root/receiver.git" || exit 1
+                cat > "$env_root/receiver.git/hooks/pre-receive" <<'TEST_RECEIVER'
+#!/usr/bin/env bash
+set -uo pipefail
+read -r old new ref || exit 1
+printf '%s %s %s\n' "$old" "$new" "$ref" >> "$RU_TEST_GATE_ROOT/received-updates"
+if [[ -f "$RU_TEST_GATE_ROOT/test.finished" ]]; then
+    printf 'yes\n' > "$RU_TEST_GATE_ROOT/receiver-saw-tests"
+else
+    printf 'no\n' > "$RU_TEST_GATE_ROOT/receiver-saw-tests"
+fi
+TEST_RECEIVER
+                chmod +x "$env_root/receiver.git/hooks/pre-receive" || exit 1
+                cat > "$env_root/project-test.sh" <<'PROJECT_TEST'
+#!/usr/bin/env bash
+set -uo pipefail
+cat "$RU_TEST_GATE_ROOT/expected.stdout"
+cat "$RU_TEST_GATE_ROOT/expected.stderr" >&2
+printf '%s\n' "$BASHPID" > "$RU_TEST_GATE_ROOT/test.pid"
+git rev-parse HEAD > "$RU_TEST_GATE_ROOT/tested.head" || exit 21
+[[ -f planned.txt && -f "$RU_TEST_GATE_ROOT/ntm.state.stopped" ]] || exit 22
+case "$RU_TEST_GATE_MODE" in
+    failed) exit 7 ;;
+    dirty) printf 'test left changed bytes\n' >> planned.txt ;;
+    changed-head)
+        printf 'test committed new bytes\n' >> planned.txt
+        git add -- planned.txt && git commit -qm 'Test changed validated candidate' || exit 23
+        ;;
+    changed-branch) git checkout -qb test-other || exit 24 ;;
+    timeout)
+        sleep 30 &
+        printf '%s\n' "$!" > "$RU_TEST_GATE_ROOT/test-child.pid"
+        wait "$!"
+        ;;
+esac
+printf 'test completed\n' > "$RU_TEST_GATE_ROOT/test.finished"
+PROJECT_TEST
+                printf 'real project-test stdout\n%0500d\nlast stdout line\n' 0 > "$env_root/expected.stdout"
+                printf 'real project-test stderr\n%0500d\nlast stderr line\n' 0 > "$env_root/expected.stderr"
+                printf 'actual requested bytes for test gate\n' > "$repo_path/planned.txt"
+                printf 'Commit the actual requested fixture work locally\n' > "$env_root/prompt.txt"
+                before=$(git -C "$repo_path" rev-parse HEAD) || exit 1
+                export PATH="$env_root/mock-bin:$PATH" NTM_MOCK_SCENARIO=session_work NTM_MOCK_REPO="$repo_path"
+                export NTM_MOCK_STATE_FILE="$env_root/ntm.state" NTM_MOCK_LAST_PROMPT="$env_root/ntm.prompt"
+                export NTM_MOCK_ARGS_LOG="$env_root/ntm.args" AGENT_SWEEP_SECRET_SCAN=block
+                export RU_TEST_GATE_ROOT="$env_root" RU_TEST_GATE_MODE="$mode"
+                [[ "$mode" != timeout ]] || timeout_seconds=5
+                # Quote the generated path as shell syntax, including spaces.
+                printf -v command 'bash %q' "$env_root/project-test.sh"
+                hash -r
+                result=$(spawn_ai_session "$repo_path" "$env_root/prompt.txt" --agent=codex \
+                    "--timeout=$timeout_seconds" "--$publication" "--test-command=$command" \
+                    2> "$env_root/session.stderr") || rc=$?
+                cat "$env_root/session.stderr" >&2
+                printf '%s\n' "$result" > "$env_root/session.json"
+                printf '%s\n' "$rc" > "$env_root/session.exit"
+                evidence=$(jq -r '.evidence_dir' <<< "$result")
+                candidate=$(jq -r '.work.after_head' <<< "$result")
+                assert_equals "$rc" "$(jq -r '.exit_code' <<< "$result")" "$publication/$mode retains actual session exit"
+                assert_success "$publication/$mode has a consistent common contract" validate_ai_session_result "$result" "$rc" "$repo_path" "$command"
+                assert_file_exists "$env_root/test.pid" "$publication/$mode executes the real test command"
+                assert_equals "$candidate" "$(cat "$env_root/tested.head")" "$publication/$mode tests the pre-publication candidate"
+                assert_success "$publication/$mode retains complete test stdout beyond the summary limit" cmp "$env_root/expected.stdout" "$evidence/test.stdout"
+                assert_success "$publication/$mode retains complete test stderr beyond the summary limit" cmp "$env_root/expected.stderr" "$evidence/test.stderr"
+                if [[ "$mode" == success ]]; then
+                    assert_equals 0 "$rc" "$publication permits a passing stable real test"
+                    assert_equals success "$(jq -r '.tests.status' <<< "$result")" "$publication test success is explicit"
+                    assert_equals "$command" "$(jq -r '.tests.command' <<< "$result")" "$publication records the exact configured command"
+                    assert_equals "$candidate" "$(jq -r '.tests.verified_head' <<< "$result")" "$publication binds passing tests to the exact candidate"
+                    if [[ "$publication" == push ]]; then
+                        assert_equals "$candidate" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "Receiver gets the actual tested candidate"
+                        assert_file_exists "$env_root/received-updates" "Real receiver hook verified test completion before push"
+                        assert_equals yes "$(cat "$env_root/receiver-saw-tests")" "Real receiver observes completed tests before receiving candidate"
+                    else
+                        assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "Passing no-push preserves the actual receiver"
+                        assert_file_not_exists "$env_root/received-updates" "Passing no-push never enters receiver hook"
+                    fi
+                else
+                    assert_not_equals 0 "$rc" "$publication/$mode blocks session success"
+                    assert_not_equals success "$(jq -r '.status' <<< "$result")" "$publication/$mode never reports success"
+                    assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "$publication/$mode preserves the real receiver"
+                    assert_file_not_exists "$env_root/received-updates" "$publication/$mode never attempts publication"
+                    case "$mode" in
+                        failed) assert_equals 7 "$(jq -r '.tests.exit_code' <<< "$result")" "Actual test exit 7 survives the workflow" ;;
+                        dirty)
+                            assert_equals false "$(jq -r '.tests.work_unchanged' <<< "$result")" "Dirty test output is detected"
+                            assert_contains "$(cat "$repo_path/planned.txt")" 'test left changed bytes' "Dirty test work is preserved"
+                            ;;
+                        changed-head|changed-branch)
+                            assert_equals false "$(jq -r '.tests.work_unchanged' <<< "$result")" "$mode is detected even when Git is clean"
+                            ;;
+                        timeout)
+                            assert_equals timeout "$(jq -r '.status' <<< "$result")" "Test command shares the original operation deadline"
+                            assert_equals tests "$(jq -r '.deadline.phase' <<< "$result")" "Deadline retains the test phase"
+                            test_pid=$(cat "$env_root/test.pid")
+                            assert_success "Expired test process actually stopped" ai_deadline_process_stopped "$test_pid"
+                            test_pid=$(cat "$env_root/test-child.pid")
+                            assert_success "Expired test child actually stopped" ai_deadline_process_stopped "$test_pid"
+                            assert_file_not_exists "$env_root/test.finished" "Delayed test cannot finish after timeout"
+                            ;;
+                    esac
+                fi
+                exit "$(get_exit_code)"
+            ) || ((failed_scenarios+=1))
+        done
+    done
+    [[ "$failed_scenarios" -eq 0 ]]
+}
+
+# Structural controls use actual Git work but deliberately altered reports;
+# execution proof belongs to test_ai_project_tests_before_publication above.
+test_ai_required_test_result_contract() {
+    local retained_root="${1:-}" repo_path env_root before work base tested malformed expression result rc command
+    repo_path=$(create_ai_work_fixture "$retained_root") || return 1
+    env_root=${repo_path%/*}
+    before=$(git -C "$repo_path" rev-parse HEAD) || return 1
+    printf 'actual work for test-result controls\n' >> "$repo_path/base.txt"
+    git -C "$repo_path" add -- base.txt && git -C "$repo_path" commit -qm 'Test-result controls' || return 1
+    work=$(capture_ai_session_work "$repo_path" "$before" refs/heads/main "$env_root/artifacts") || return 1
+    base=$(jq -cn --arg repo "$repo_path" --argjson work "$work" \
+        '{schema_version:1,repo:$repo,status:"success",exit_code:0,transport:{status:"idle"},
+          work:$work,publication:{no_push:true,status:"not_requested"}}') || return 1
+    command='printf configured-test'
+    assert_success "Legacy session without requested tests remains compatible" validate_ai_session_result "$base" 0 "$repo_path"
+    assert_fails "Expected command rejects a success record with no tests" validate_ai_session_result "$base" 0 "$repo_path" "$command"
+    tested=$(jq -c --arg command "$command" '.tests={required:true,status:"success",command:$command,
+        ran:true,ok:true,exit_code:0,work_unchanged:true,verified_head:.work.after_head}' <<< "$base") || return 1
+    for expression in '.tests.required=false' '.tests.required="true"' '.tests.command="wrong command"' \
+        '.tests.command="   "' '.tests.ran=false' '.tests.ran="true"' '.tests.ok=false' '.tests.exit_code=7' \
+        '.tests.work_unchanged=false' '.tests.verified_head="different-candidate"' '.tests.status="incomplete"' '.tests=null'; do
+        malformed=$(jq -c "$expression" <<< "$tested") || return 1
+        assert_fails "Expected-command validation rejects $expression" validate_ai_session_result "$malformed" 0 "$repo_path" "$command"
+        assert_success "Unaltered required-test contract remains accepted" validate_ai_session_result "$tested" 0 "$repo_path" "$command"
+    done
+    mkdir "$env_root/retained-gate" || return 1
+    result=$(run_test_gate "$repo_path" 'printf stdout; printf stderr >&2; exit 7' 5 "$env_root/retained-gate"); rc=$?
+    assert_equals 7 "$rc" "Retained gate preserves actual failing command exit"
+    assert_equals true "$(jq -r '.ran' <<< "$result")" "Failing command actually ran"
+    assert_equals false "$(jq -r '.ok' <<< "$result")" "Failing command cannot claim ok"
+    assert_equals stdout "$(cat "$env_root/retained-gate/test.stdout")" "Failing command retains exact stdout"
+    assert_equals stderr "$(cat "$env_root/retained-gate/test.stderr")" "Failing command retains exact stderr"
+    printf -v command 'printf unexpected > %q' "$env_root/unexpected-run"
+    result=$(run_test_gate "$repo_path" "$command" 5 "$env_root/retained-gate"); rc=$?
+    assert_equals 2 "$rc" "Existing artifacts block execution"
+    assert_equals false "$(jq -r '.ran' <<< "$result")" "Artifact collision never reports a run"
+    assert_equals stdout "$(cat "$env_root/retained-gate/test.stdout")" "Collision preserves prior stdout"
+    assert_file_not_exists "$env_root/unexpected-run" "Collision prevents command execution"
+    result=$(run_test_gate "$repo_path" "$command" 5 "$env_root/missing-artifact-dir"); rc=$?
+    assert_equals 2 "$rc" "Artifact open failure blocks execution"
+    assert_equals false "$(jq -r '.ran' <<< "$result")" "Artifact open failure never reports a run"
+    assert_file_not_exists "$env_root/unexpected-run" "Artifact open failure prevents command execution"
+    result=$(run_test_gate "$repo_path" 'printf legacy-output' 5); rc=$?
+    assert_equals 0 "$rc" "Legacy standalone gate still runs a real passing command"
+    assert_equals true "$(jq -r '.ran and .ok and (.exit_code == 0)' <<< "$result")" "Legacy standalone gate retains its result contract"
+}
+
 # Each deadline probe uses real Git work and a real clock. Only the named NTM
 # endpoint or actual Git hook is delayed; no fabricated completion envelope is
 # used as proof that the work, publication, or owned-session cleanup finished.
@@ -1468,6 +1639,8 @@ run_test test_controlled_ai_transport_and_real_git_work_results
 run_test test_ai_host_publication_success
 run_test test_ai_host_publication_rejected
 run_test test_ai_host_no_push_invokes_no_transport
+run_test test_ai_project_tests_before_publication
+run_test test_ai_required_test_result_contract
 run_test test_ai_whole_deadline_transport_stages
 run_test test_ai_whole_deadline_cleanup_uncertainty
 run_test test_ai_whole_deadline_real_git_inspection

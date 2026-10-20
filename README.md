@@ -2648,6 +2648,26 @@ or pnpm lockfile. The npm scanner refuses those mixed inputs, so npm's view
 cannot classify a Yarn or pnpm project as current. Their own adapters remain pending.
 Python discovery cannot use a global `pip list` as proof about a project's manifest.
 
+An actual update requires a successfully detected, nonempty test command or
+an explicit `--test-cmd`. Failed detection and blank commands fail the repository
+before changelog requests or AI session setup. `--dry-run` remains a discovery
+preview and does not require or claim test execution.
+
+After the AI session stops and its commits pass work validation, ru executes
+that exact test command itself. Complete stdout/stderr and the command's exit
+status remain in the session's `evidence_dir`. Tests and the subsequent Git
+inspection share the original session deadline. A failed test, incomplete
+result, changed commit/branch, or remaining repository changes prevents
+publication and also prevents `--no-push` from reporting success. Generated
+build files should use the project's existing ignore rules or an external
+output directory; ru preserves any remaining files for inspection.
+
+Successful session records report `deps_outdated_before`, the discovery count.
+They omit `deps_updated`: the initial count and an agent's reported count do
+not establish how many dependencies actually changed. Host-run tests validate
+the final candidate; per-dependency updates and the agent's claimed intermediate
+test/fix/rollback sequence still need their own validation.
+
 ### Update Workflow
 
 The AI agent follows this workflow for each repository:

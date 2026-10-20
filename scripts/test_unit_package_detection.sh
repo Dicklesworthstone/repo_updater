@@ -57,9 +57,13 @@ extract_function() {
 
 source <(extract_function "detect_package_managers" "$PROJECT_DIR/ru")
 for scan_function in _dep_scan_error _check_outdated_for_manager check_outdated_deps \
-    cmd_dep_update _dep_update_skipped_json _filter_outdated_deps _filter_major_updates; do
+    cmd_dep_update _dep_update_skipped_json _filter_outdated_deps _filter_major_updates \
+    validate_ai_session_result; do
     source_ru_function "$scan_function"
 done
+# This function's JSON heredoc has an unindented closing brace of its own.
+# The generic first-^} extractor would truncate the heredoc and fail to load it.
+source <(sed -n '/^_robot_docs_schemas()/,/^SCJSON$/p' "$PROJECT_DIR/ru"; printf '}\n')
 
 #==============================================================================
 # Test Setup/Teardown
@@ -862,6 +866,107 @@ test_dep_scan_npm_lockfile_contract() {
     return "$result_rc"
 }
 
+# The actual caller and common result validator run. Discovery, prompt-file,
+# and AI boundaries are controlled; no project test or AI session is executed.
+test_dep_update_requires_test_command() {
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED result rc
+        local detection_output='' detection_exit=1 expected_test_command="echo 'No tests configured'"
+        local JSON_OUTPUT=true ARGS=(--major --no-push "--repo=$PROJECT_DIR")
+        ntm() { return 92; }
+        claude() { return 93; }
+        log_warn() { :; }
+        log_success() { :; }
+        detect_package_managers() { printf '{"managers":["npm"]}\n'; }
+        npm() {
+            printf '{"example":{"current":"1.0.0","wanted":"1.1.0","latest":"1.1.0"}}\n'
+            return 1
+        }
+        detect_test_command() { printf '%s' "$detection_output"; return "$detection_exit"; }
+        _fetch_changelogs_for_outdated() { printf 'Controlled changelog\n'; }
+        generate_depupdate_prompt_combined() {
+            [[ "$3" == "$expected_test_command" ]] || return 71
+            printf 'Controlled prompt\n'
+        }
+        write_prompt_to_file() {
+            # Supply an existing readable file; never create/clean a prompt.
+            [[ "$1" == 'Controlled prompt' ]] || return 72
+            printf '%s\n' "$PROJECT_DIR/README.md"
+        }
+        spawn_ai_session() {
+            local session_no_push=false session_arg forwarded_test_command=''
+            for session_arg in "$@"; do
+                case "$session_arg" in
+                    --no-push) session_no_push=true ;;
+                    --push) return 73 ;;
+                    --test-command=*) forwarded_test_command="${session_arg#*=}" ;;
+                esac
+            done
+            [[ "$session_no_push" == true ]] || return 74
+            [[ "$forwarded_test_command" == "$expected_test_command" ]] || return 75
+            jq -cn --arg repo "$(cd "$PROJECT_DIR" && pwd -P)" --arg command "$forwarded_test_command" \
+                '{schema_version:1,repo:$repo,status:"success",exit_code:0,
+                  transport:{status:"idle"},
+                  work:{status:"success",after_head:"controlled-commit",commits:["controlled-commit"],remaining_paths:[],
+                    unpreserved_requests:[],requested_content_policy:"edit",requested_content_verified:false},
+                  tests:{required:true,status:"success",command:$command,ran:true,ok:true,
+                    exit_code:0,work_unchanged:true,verified_head:"controlled-commit"},
+                  publication:{no_push:true,status:"not_requested"},deps_updated:999}'
+        }
+
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .updated == 0 and .results[0].error_code == "test_command_unavailable"
+             and .results[0].test_detection_exit == 1' "missing test command blocks updates"
+
+        # Contain the old caller's fallback too: the control must reach its
+        # false-success session, not fail for an unrelated prompt mismatch.
+        detection_output='npm test' detection_exit=42 expected_test_command='npm test'
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"
+             and .results[0].test_detection_exit == 42' "failed detection cannot supply a test command"
+
+        detection_output='   ' detection_exit=0 expected_test_command='   '
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "blank detected test command blocks updates"
+
+        ARGS+=("--test-cmd=   ")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "blank explicit test command blocks updates"
+
+        ARGS=(--major --no-push --test-cmd= "--repo=$PROJECT_DIR")
+        detection_output='npm test' detection_exit=0 expected_test_command='npm test'
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.failed == 1 and .results[0].error_code == "test_command_unavailable"' "empty explicit command does not fall back to detection"
+
+        ARGS=(--major --no-push "--repo=$PROJECT_DIR")
+        detection_output='npm test' detection_exit=0
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.updated == 1 and .failed == 0 and .results[0].publication.no_push == true' "detected command reaches validated session boundary"
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.results[0].deps_outdated_before == 1 and (.results[0] | has("deps_updated") | not)' \
+            "discovery count is not a verified update count"
+
+        detection_output='' detection_exit=42 expected_test_command='make check'
+        ARGS+=(--test-cmd=make\ check)
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.updated == 1 and .failed == 0 and .results[0].deps_outdated_before == 1
+             and (.results[0] | has("deps_updated") | not)' "explicit command overrides failed automatic detection"
+        result=$(_robot_docs_schemas); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.commands["dep-update"].data_schema.properties.results.items.properties |
+             .deps_outdated_before.type == "integer" and (has("deps_updated") | not)' \
+            "advertised schema describes the discovery count"
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+}
+
 #==============================================================================
 # Main Test Runner
 #==============================================================================
@@ -920,6 +1025,7 @@ main() {
     run_test test_dep_scan_missing_tools_and_partial_results
     run_test test_dep_update_counts_scan_failure
     run_test test_dep_scan_npm_lockfile_contract
+    run_test test_dep_update_requires_test_command
 
     echo ""
     print_results

@@ -1609,10 +1609,53 @@ publish_ai_session_work() {
     done < <(jq -c '.[]' <<< "$receivers")
 }
 
+# Run the configured project tests against the already validated candidate.
+# Retain raw streams and reinspect work without changing the candidate or index.
+verify_ai_session_tests() {
+    local repo_path="$1" test_command="$2" timeout_seconds="$3" artifact_dir="$4" work_json="$5"
+    local gate_output gate_json=null gate_exit=0 post_work post_exit=0 unchanged=false status=failed
+    local before_head before_ref expected_head requested_content content_policy requested_tree error
+    before_head=$(jq -er '.before_head' <<< "$work_json") || return 2
+    before_ref=$(jq -er '.before_ref' <<< "$work_json") || return 2
+    expected_head=$(jq -er '.after_head' <<< "$work_json") || return 2
+    requested_content=$(jq -c '.requested_content' <<< "$work_json") || return 2
+    content_policy=$(jq -er '.requested_content_policy' <<< "$work_json") || return 2
+    requested_tree=$(jq -r '.requested_tree' <<< "$work_json") || return 2
+    gate_output=$(run_test_gate "$repo_path" "$test_command" "$timeout_seconds" "$artifact_dir") || gate_exit=$?
+    printf '%s\n' "$gate_output" > "$artifact_dir/test-result.stdout" || return 2
+    printf '%s\n' "$gate_exit" > "$artifact_dir/test.exit_code" || return 2
+    gate_json=$(jq -cs 'if length == 1 and (.[0] | type == "object") then .[0] else null end' <<< "$gate_output") || gate_json=null
+    mkdir "$artifact_dir/test-work" || return 2
+    post_work=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir/test-work" \
+        "$requested_content" "$content_policy" "$requested_tree") || post_exit=$?
+    printf '%s\n' "$post_work" > "$artifact_dir/test-work/work.json" || return 2
+    if [[ "$post_exit" -eq 0 ]] && jq -e --argjson before "$work_json" \
+        '.status == "success" and .after_head == $before.after_head and .after_ref == $before.after_ref' <<< "$post_work" >/dev/null; then
+        unchanged=true
+    fi
+    if [[ "$gate_exit" -ne 0 ]] || ! jq -e --arg command "$test_command" \
+        '.ran == true and .ok == true and .exit_code == 0 and .command == $command' <<< "$gate_json" >/dev/null; then
+        error='Configured project tests failed or returned an invalid result'
+    elif [[ "$unchanged" != true ]]; then
+        error='Project tests changed the validated candidate or left repository work incomplete'
+    else
+        status=success; error=""
+    fi
+    jq -cen --arg status "$status" --arg command "$test_command" --arg error "$error" \
+        --arg head "$expected_head" --argjson gate "$gate_json" --argjson exit_code "$gate_exit" --argjson unchanged "$unchanged" \
+        '{required:true,status:$status,command:$command,ran:($gate.ran == true),ok:($gate.ok == true),
+          exit_code:$exit_code,work_unchanged:$unchanged,verified_head:(if $unchanged then $head else null end),
+          result:$gate,error:$error}' || return 2
+    [[ "$status" == success ]]
+}
+
 validate_ai_session_result() {
     local result="$1" actual_exit="$2" expected_repo="$3"
+    local expected_test_command="${4:-}" tests_required=false
+    [[ $# -lt 4 ]] || tests_required=true
     expected_repo=$(cd "$expected_repo" && pwd -P) || return 1
-    jq -es --argjson actual_exit "$actual_exit" --arg repo "$expected_repo" '
+    jq -es --argjson actual_exit "$actual_exit" --arg repo "$expected_repo" \
+        --arg command "$expected_test_command" --argjson tests_required "$tests_required" '
         length == 1 and (.[0] as $r |
             $r.schema_version == 1 and $r.repo == $repo and $r.exit_code == $actual_exit and
             ($r.transport.status == "idle" or $r.transport.status == "failed" or $r.transport.status == "timeout") and
@@ -1627,6 +1670,13 @@ validate_ai_session_result() {
                     $r.work.requested_content_verified == true and
                     ($r.work.requested_tree | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$")) and $r.work.requested_tree == $r.work.after_tree
                  else $r.work.requested_content_policy == "edit" and $r.work.requested_content_verified == false end) and
+                (if $tests_required or $r.tests.required == true then
+                    $r.tests.required == true and $r.tests.status == "success" and
+                    $r.tests.ran == true and $r.tests.ok == true and $r.tests.exit_code == 0 and
+                    $r.tests.work_unchanged == true and $r.tests.verified_head == $r.work.after_head and
+                    ($r.tests.command | type == "string" and test("\\S")) and
+                    (if $tests_required then $r.tests.command == $command else true end)
+                 else $r.tests == null or ($r.tests.required == false and $r.tests.status == "not_requested") end) and
                 (if $r.publication.no_push then $r.publication.status == "not_requested" else $r.publication.status == "success" end)
              else $actual_exit != 0 and ($r.status == "failed" or $r.status == "timeout") end))
     ' <<< "$result" >/dev/null
@@ -1687,7 +1737,14 @@ stop_owned_ai_session() {
 incomplete_ai_session_result() {
     local operation_exit="$1" cleanup_status="$2" cleanup_exit="$3"
     local status=failed transport=failed publication=blocked phase=preflight before="" before_ref="" after="" after_ref="" work='{}' commits='[]' remaining='[]'
-    local error='AI workflow ended without a valid completed result'
+    local error='AI workflow ended without a valid completed result' tests_json
+    tests_json=$(jq -cn --argjson required "$session_tests_requested" --arg command "$session_test_command" \
+        '{required:$required,command:$command,status:(if $required then "not_started" else "not_requested" end)}') || return 2
+    if [[ -f "$artifact_dir/tests.json" ]] && jq -es 'length == 1 and (.[0] | type == "object")' "$artifact_dir/tests.json" >/dev/null; then
+        tests_json=$(cat "$artifact_dir/tests.json") || return 2
+    elif [[ -f "$artifact_dir/test.started" ]]; then
+        tests_json=$(jq -c '.status="incomplete"' <<< "$tests_json") || return 2
+    fi
     [[ "$operation_exit" -ne 124 ]] || { status=timeout; transport=timeout; error='Whole-operation AI deadline expired'; }
     [[ "$no_push" != true ]] || publication=not_requested
     [[ ! -f "$artifact_dir/publication.started" ]] || publication=uncertain
@@ -1708,9 +1765,9 @@ incomplete_ai_session_result() {
     [[ "$cleanup_status" == confirmed || "$cleanup_status" == not_started ]] || error+='; owned-session cleanup remains uncertain'
     jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg transport "$transport" \
         --arg error "$error" --arg evidence "$artifact_dir" --arg phase "$phase" --arg cleanup "$cleanup_status" --arg publication "$publication" \
-        --argjson work "$work" --argjson operation_exit "$operation_exit" --argjson cleanup_exit "$cleanup_exit" --argjson no_push "$no_push" \
+        --argjson work "$work" --argjson tests "$tests_json" --argjson operation_exit "$operation_exit" --argjson cleanup_exit "$cleanup_exit" --argjson no_push "$no_push" \
         --argjson seconds "$timeout_seconds" --argjson duration "$((SECONDS - ai_operation_entry))" \
-        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:1,duration_seconds:$duration,transport:{status:$transport,exit_code:$operation_exit},work:$work,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit,budget_seconds:2},deadline:{seconds:$seconds,expired:($operation_exit==124),phase:$phase},evidence_dir:$evidence}'
+        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:1,duration_seconds:$duration,transport:{status:$transport,exit_code:$operation_exit},work:$work,tests:$tests,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit,budget_seconds:2},deadline:{seconds:$seconds,expired:($operation_exit==124),phase:$phase},evidence_dir:$evidence}'
 }
 
 run_ai_session_workflow() {
@@ -1773,7 +1830,9 @@ run_ai_session_workflow() {
     printf 'stop\n' > "$artifact_dir/phase"
     if stop_owned_ai_session "$session_name" "$artifact_dir"; then cleanup_status=confirmed;
     else cleanup_exit=$?; cleanup_status=failed; transport=failed; status=failed; error='Owned session could not be stopped; final state remains unstable'; fi
-    local work_json work_exit=0 publication_status=not_requested
+    local work_json work_exit=0 publication_status=not_requested tests_json tests_exit=0
+    tests_json=$(jq -cn --argjson required "$session_tests_requested" --arg command "$session_test_command" \
+        '{required:$required,command:$command,status:(if $required then "not_started" else "not_requested" end)}') || return 2
     [[ "$no_push" == true ]] || publication_status=blocked
     printf 'inspection\n' > "$artifact_dir/phase"
     if [[ "$cleanup_status" != confirmed ]]; then
@@ -1782,8 +1841,16 @@ run_ai_session_workflow() {
     else work_json=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir" "$requested_content" "$requested_content_policy" "$requested_tree") || work_exit=$?; fi
     printf '%s\n' "$work_json" > "$artifact_dir/work.json"
     if [[ "$transport" == idle && "$work_exit" -eq 0 && "$cleanup_status" == confirmed ]]; then
-        status=success; result_exit=0
-        if [[ "$no_push" == false ]]; then
+        if [[ "$session_tests_requested" == true ]]; then
+            printf 'tests\n' > "$artifact_dir/phase"
+            tests_json=$(verify_ai_session_tests "$repo_path" "$session_test_command" "$timeout_seconds" "$artifact_dir" "$work_json") || tests_exit=$?
+            printf '%s\n' "$tests_json" > "$artifact_dir/tests.json" || return 2
+        fi
+        if [[ "$tests_exit" -ne 0 ]]; then
+            status=failed; result_exit=1
+            error=$(jq -r '.error // "Project test validation failed"' <<< "$tests_json") || error='Project test validation failed'
+        else status=success; result_exit=0; fi
+        if [[ "$status" == success && "$no_push" == false ]]; then
             printf 'publication\n' > "$artifact_dir/phase"
             printf 'started\n' > "$artifact_dir/publication.started"
             publication_status=failed
@@ -1796,8 +1863,8 @@ run_ai_session_workflow() {
     jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg error "$error" \
         --arg transport "$transport" --arg evidence "$artifact_dir" --arg cleanup "$cleanup_status" --arg publication "$publication_status" \
         --argjson duration "$((SECONDS - ai_operation_entry))" --argjson exit_code "$result_exit" --argjson transport_exit "$transport_exit" \
-        --argjson work "$work_json" --argjson no_push "$no_push" --argjson seconds "$timeout_seconds" --argjson cleanup_exit "$cleanup_exit" \
-        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:$exit_code,duration_seconds:$duration,transport:{status:$transport,exit_code:$transport_exit},work:$work,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit},deadline:{seconds:$seconds,expired:false},evidence_dir:$evidence}'
+        --argjson work "$work_json" --argjson tests "$tests_json" --argjson no_push "$no_push" --argjson seconds "$timeout_seconds" --argjson cleanup_exit "$cleanup_exit" \
+        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:$exit_code,duration_seconds:$duration,transport:{status:$transport,exit_code:$transport_exit},work:$work,tests:$tests,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit},deadline:{seconds:$seconds,expired:false},evidence_dir:$evidence}'
     return "$result_exit"
 }
 
@@ -1834,6 +1901,7 @@ spawn_ai_session() {
     local session_prefix="ru-ai"
     local no_push=true
     local requested_content_policy=edit
+    local session_test_command="" session_tests_requested=false
     local repo_name="" repo_parent="" artifact_dir="" session_label="" session_name="" resolved_repo=""
 
     # Parse arguments
@@ -1863,6 +1931,11 @@ spawn_ai_session() {
                 requested_content_policy=preserve
                 shift
                 ;;
+            --test-command=*)
+                session_test_command="${1#*=}"
+                session_tests_requested=true
+                shift
+                ;;
             -*)
                 log_error "spawn_ai_session: Unknown option: $1"
                 ai_session_preflight_failure 2 "Unknown option: $1"
@@ -1882,6 +1955,10 @@ spawn_ai_session() {
     done
 
     # Validate arguments
+    if [[ "$session_tests_requested" == true && ! "$session_test_command" =~ [^[:space:]] ]]; then
+        ai_session_preflight_failure 4 'test command must be nonempty'
+        return 4
+    fi
     if [[ -z "$repo_path" ]]; then
         log_error "spawn_ai_session: repo_path is required"
         ai_session_preflight_failure 2 'repo_path required'
@@ -2599,6 +2676,7 @@ cmd_dep_update() {
     local exclude_pattern=""
     local include_major="false"
     local custom_test_cmd=""
+    local custom_test_cmd_set=false
     local max_fix_attempts=5
     local no_push="false"
     local single_repo=""
@@ -2630,6 +2708,7 @@ cmd_dep_update() {
                 ;;
             --test-cmd=*)
                 custom_test_cmd="${arg#*=}"
+                custom_test_cmd_set=true
                 ;;
             --max-fix-attempts=*)
                 max_fix_attempts="${arg#*=}"
@@ -2862,22 +2941,26 @@ cmd_dep_update() {
             continue
         fi
 
-        # Fetch changelogs for outdated deps
+        # Detect or use custom test command
+        local test_cmd="" test_detection_rc=0
+        if [[ "$custom_test_cmd_set" == true ]]; then
+            test_cmd="$custom_test_cmd"
+        else
+            test_cmd=$(detect_test_command "$repo_path") || test_detection_rc=$?
+        fi
+        if [[ "$test_detection_rc" -ne 0 || ! "$test_cmd" =~ [^[:space:]] ]]; then
+            log_error "No test command available for $repo_name; provide --test-cmd before updating dependencies"
+            ((failed++))
+            results+=("$(jq -cn --arg repo "$repo_path" --argjson detection_exit "$test_detection_rc" \
+                '{repo:$repo,status:"failed",error_code:"test_command_unavailable",
+                  error:"No successfully detected or explicit nonempty test command",test_detection_exit:$detection_exit}')")
+            continue
+        fi
+
+        # Avoid changelog requests or session setup when tests are unavailable.
         log_info "Fetching changelogs for $repo_name..."
         local changelog_text=""
         changelog_text=$(_fetch_changelogs_for_outdated "$outdated_json")
-
-        # Detect or use custom test command
-        local test_cmd
-        if [[ -n "$custom_test_cmd" ]]; then
-            test_cmd="$custom_test_cmd"
-        else
-            test_cmd=$(detect_test_command "$repo_path")
-        fi
-        if [[ -z "$test_cmd" ]]; then
-            log_warn "No test command detected for $repo_name, tests will be skipped"
-            test_cmd="echo 'No tests configured'"
-        fi
 
         # Generate the combined prompt
         local prompt
@@ -2900,10 +2983,10 @@ cmd_dep_update() {
         # Spawn AI session
         log_info "Spawning AI session for $repo_name..."
         local session_result session_exit=0 status=failed
-        local -a session_args=("--timeout=$timeout_seconds" "--agent=$agent_type" --prefix=dep-update)
+        local -a session_args=("--timeout=$timeout_seconds" "--agent=$agent_type" --prefix=dep-update "--test-command=$test_cmd")
         if [[ "$no_push" == true ]]; then session_args+=(--no-push); else session_args+=(--push); fi
         session_result=$(spawn_ai_session "$repo_path" "$prompt_file" "${session_args[@]}") || session_exit=$?
-        if validate_ai_session_result "$session_result" "$session_exit" "$repo_path"; then
+        if validate_ai_session_result "$session_result" "$session_exit" "$repo_path" "$test_cmd"; then
             status=$(jq -r '.status' <<< "$session_result") || status=failed
         else
             [[ "$session_exit" -ne 0 ]] || session_exit=2
@@ -2914,7 +2997,10 @@ cmd_dep_update() {
             success)
                 log_success "Successfully updated dependencies in $repo_name"
                 ((updated++))
-                results+=("$(jq -cen --argjson session "$session_result" --argjson deps "$total_outdated" '$session + {deps_updated:$deps}')")
+                # Discovery counts do not establish which dependencies changed.
+                # Do not forward an unverified count supplied by the session.
+                results+=("$(jq -cen --argjson session "$session_result" --argjson deps "$total_outdated" \
+                    '$session | del(.deps_updated) | . + {deps_outdated_before:$deps}')")
                 ;;
             timeout)
                 log_warn "Timeout while updating $repo_name"
@@ -23246,6 +23332,8 @@ detect_lint_command() {
 #   $1 - Project directory path
 #   $2 - Optional: Test command override
 #   $3 - Optional: Timeout in seconds (default: 300)
+#   $4 - Optional: Retained artifact directory inside an AI workflow. In this
+#        mode the caller's absolute deadline owns the process group and timeout.
 #
 # Returns:
 #   Actual command exit status, or 2 with ran=false if no tests found
@@ -23257,6 +23345,7 @@ run_test_gate() {
     local project_dir="$1"
     local test_cmd="${2:-}"
     local timeout="${3:-300}"
+    local retained_dir="${4:-}"
     local start_time
     local exit_code=0
     local output=""
@@ -23273,28 +23362,52 @@ run_test_gate() {
 
     log_verbose "Running tests: $test_cmd"
 
-    # Run tests with timeout (portable: use gtimeout on macOS if available)
-    local timeout_cmd="timeout"
-    if ! command -v timeout &>/dev/null; then
-        if command -v gtimeout &>/dev/null; then
-            timeout_cmd="gtimeout"
-        else
-            timeout_cmd=""
-            log_verbose "No timeout command available; running tests without timeout"
+    if [[ -n "$retained_dir" ]]; then
+        # This mode is only used inside run_inherited_ai_deadline. Do not start
+        # a nested timeout process group that could escape that watchdog.
+        local retained_path
+        for retained_path in test.stdout test.stderr test.started; do
+            if [[ -e "$retained_dir/$retained_path" || -L "$retained_dir/$retained_path" ]]; then
+                jq -n '{ran:false,ok:false,reason:"test_artifact_collision"}'
+                return 2
+            fi
+        done
+        if (
+            set -C
+            (
+                printf '%s\n' "$test_cmd" > "$retained_dir/test.started" || exit 125
+                cd "$project_dir" && bash -c "$test_cmd"
+            ) > "$retained_dir/test.stdout" 2> "$retained_dir/test.stderr"
+        ); then exit_code=0; else exit_code=$?; fi
+        if [[ ! -f "$retained_dir/test.started" ]]; then
+            jq -n '{ran:false,ok:false,reason:"test_artifact_write_failed"}'
+            return 2
         fi
-    fi
-
-    if [[ -n "$timeout_cmd" ]]; then
-        if output=$(cd "$project_dir" && "$timeout_cmd" "$timeout" bash -c "$test_cmd" 2>&1); then
-            exit_code=0
-        else
-            exit_code=$?
-        fi
+        output=$(cat "$retained_dir/test.stdout" "$retained_dir/test.stderr" | tail -n 10 | cut -c1-200) || return 2
     else
-        if output=$(cd "$project_dir" && bash -c "$test_cmd" 2>&1); then
-            exit_code=0
+        # Run standalone tests with timeout when available.
+        local timeout_cmd="timeout"
+        if ! command -v timeout &>/dev/null; then
+            if command -v gtimeout &>/dev/null; then
+                timeout_cmd="gtimeout"
+            else
+                timeout_cmd=""
+                log_verbose "No timeout command available; running tests without timeout"
+            fi
+        fi
+
+        if [[ -n "$timeout_cmd" ]]; then
+            if output=$(cd "$project_dir" && "$timeout_cmd" "$timeout" bash -c "$test_cmd" 2>&1); then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
         else
-            exit_code=$?
+            if output=$(cd "$project_dir" && bash -c "$test_cmd" 2>&1); then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
         fi
     fi
 
@@ -25942,7 +26055,7 @@ _robot_docs_schemas() {
       "description":"Actual update outcomes, pending dependency previews, and skipped counts",
       "data_schema":{
         "type":"object","required":["processed","updated","failed","skipped","results"],
-        "properties":{"processed":{"type":"integer","minimum":0},"updated":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"results":{"type":"array","items":{"type":"object","required":["repo","status"],"properties":{"repo":{"type":"string"},"status":{"type":"string"},"outdated":{"type":"object","required":["total_outdated","results"]},"deps_updated":{"type":"integer","minimum":0},"error":{"type":"string"}}}}}
+        "properties":{"processed":{"type":"integer","minimum":0},"updated":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"results":{"type":"array","items":{"type":"object","required":["repo","status"],"properties":{"repo":{"type":"string"},"status":{"type":"string"},"outdated":{"type":"object","required":["total_outdated","results"]},"deps_outdated_before":{"type":"integer","minimum":0,"description":"Dependencies discovered before the session; not a verified completed-update count"},"error":{"type":"string"}}}}}
       }
     },
     "robot-docs": {
