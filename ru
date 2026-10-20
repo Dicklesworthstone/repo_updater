@@ -1614,7 +1614,16 @@ publish_ai_session_work() {
 verify_ai_session_tests() {
     local repo_path="$1" test_command="$2" timeout_seconds="$3" artifact_dir="$4" work_json="$5"
     local gate_output gate_json=null gate_exit=0 post_work post_exit=0 unchanged=false status=failed
-    local before_head before_ref expected_head requested_content content_policy requested_tree error
+    local before_head before_ref expected_head requested_content content_policy requested_tree error receipt
+    for receipt in test-result.stdout test.exit_code test-work; do
+        if [[ -e "$artifact_dir/$receipt" || -L "$artifact_dir/$receipt" ]]; then
+            jq -cn --arg command "$test_command" \
+                '{required:true,status:"failed",command:$command,ran:false,ok:false,exit_code:2,
+                  work_unchanged:false,verified_head:null,error:"Test validation artifact collision"}'
+            return 2
+        fi
+    done
+    mkdir "$artifact_dir/test-work" || return 2
     before_head=$(jq -er '.before_head' <<< "$work_json") || return 2
     before_ref=$(jq -er '.before_ref' <<< "$work_json") || return 2
     expected_head=$(jq -er '.after_head' <<< "$work_json") || return 2
@@ -1622,10 +1631,11 @@ verify_ai_session_tests() {
     content_policy=$(jq -er '.requested_content_policy' <<< "$work_json") || return 2
     requested_tree=$(jq -r '.requested_tree' <<< "$work_json") || return 2
     gate_output=$(run_test_gate "$repo_path" "$test_command" "$timeout_seconds" "$artifact_dir") || gate_exit=$?
-    printf '%s\n' "$gate_output" > "$artifact_dir/test-result.stdout" || return 2
-    printf '%s\n' "$gate_exit" > "$artifact_dir/test.exit_code" || return 2
+    ( set -C
+      printf '%s\n' "$gate_output" > "$artifact_dir/test-result.stdout" &&
+      printf '%s\n' "$gate_exit" > "$artifact_dir/test.exit_code"
+    ) || return 2
     gate_json=$(jq -cs 'if length == 1 and (.[0] | type == "object") then .[0] else null end' <<< "$gate_output") || gate_json=null
-    mkdir "$artifact_dir/test-work" || return 2
     post_work=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir/test-work" \
         "$requested_content" "$content_policy" "$requested_tree") || post_exit=$?
     printf '%s\n' "$post_work" > "$artifact_dir/test-work/work.json" || return 2
@@ -1673,7 +1683,9 @@ validate_ai_session_result() {
                 (if $tests_required or $r.tests.required == true then
                     $r.tests.required == true and $r.tests.status == "success" and
                     $r.tests.ran == true and $r.tests.ok == true and $r.tests.exit_code == 0 and
-                    $r.tests.work_unchanged == true and $r.tests.verified_head == $r.work.after_head and
+                    $r.tests.work_unchanged == true and
+                    ($r.tests.verified_head | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$")) and
+                    $r.tests.verified_head == $r.work.after_head and
                     ($r.tests.command | type == "string" and test("\\S")) and
                     (if $tests_required then $r.tests.command == $command else true end)
                  else $r.tests == null or ($r.tests.required == false and $r.tests.status == "not_requested") end) and
@@ -1696,6 +1708,8 @@ run_inherited_ai_deadline() {
         set -m
         ( set +m; "$@" ) > "$output_file" 2> "$error_file" &
         local ai_deadline_worker_pid="${!:-}" worker_exit=0 stop_exit=0 grace_deadline
+        # Only the worker needs a new group; polls must not create more jobs.
+        set +m
         [[ "$ai_deadline_worker_pid" =~ ^[1-9][0-9]*$ ]] || return 3
         trap 'stop_exit=130' INT
         trap 'stop_exit=143' TERM
@@ -1844,7 +1858,7 @@ run_ai_session_workflow() {
         if [[ "$session_tests_requested" == true ]]; then
             printf 'tests\n' > "$artifact_dir/phase"
             tests_json=$(verify_ai_session_tests "$repo_path" "$session_test_command" "$timeout_seconds" "$artifact_dir" "$work_json") || tests_exit=$?
-            printf '%s\n' "$tests_json" > "$artifact_dir/tests.json" || return 2
+            ( set -C; printf '%s\n' "$tests_json" > "$artifact_dir/tests.json" ) || return 2
         fi
         if [[ "$tests_exit" -ne 0 ]]; then
             status=failed; result_exit=1

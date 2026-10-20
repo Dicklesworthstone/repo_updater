@@ -907,10 +907,10 @@ test_dep_update_requires_test_command() {
             jq -cn --arg repo "$(cd "$PROJECT_DIR" && pwd -P)" --arg command "$forwarded_test_command" \
                 '{schema_version:1,repo:$repo,status:"success",exit_code:0,
                   transport:{status:"idle"},
-                  work:{status:"success",after_head:"controlled-commit",commits:["controlled-commit"],remaining_paths:[],
+                  work:{status:"success",after_head:"0123456789abcdef0123456789abcdef01234567",commits:["0123456789abcdef0123456789abcdef01234567"],remaining_paths:[],
                     unpreserved_requests:[],requested_content_policy:"edit",requested_content_verified:false},
                   tests:{required:true,status:"success",command:$command,ran:true,ok:true,
-                    exit_code:0,work_unchanged:true,verified_head:"controlled-commit"},
+                    exit_code:0,work_unchanged:true,verified_head:"0123456789abcdef0123456789abcdef01234567"},
                   publication:{no_push:true,status:"not_requested"},deps_updated:999}'
         }
 

@@ -1227,13 +1227,18 @@ test_ai_required_test_result_contract() {
         '{schema_version:1,repo:$repo,status:"success",exit_code:0,transport:{status:"idle"},
           work:$work,publication:{no_push:true,status:"not_requested"}}') || return 1
     command='printf configured-test'
+    assert_fails "Missing PID cannot prove a test process stopped" ai_deadline_process_stopped ''
+    assert_fails "Zero PID cannot prove a test process stopped" ai_deadline_process_stopped 0
+    assert_fails "Malformed PID cannot prove a test process stopped" ai_deadline_process_stopped not-a-pid
     assert_success "Legacy session without requested tests remains compatible" validate_ai_session_result "$base" 0 "$repo_path"
     assert_fails "Expected command rejects a success record with no tests" validate_ai_session_result "$base" 0 "$repo_path" "$command"
     tested=$(jq -c --arg command "$command" '.tests={required:true,status:"success",command:$command,
         ran:true,ok:true,exit_code:0,work_unchanged:true,verified_head:.work.after_head}' <<< "$base") || return 1
     for expression in '.tests.required=false' '.tests.required="true"' '.tests.command="wrong command"' \
         '.tests.command="   "' '.tests.ran=false' '.tests.ran="true"' '.tests.ok=false' '.tests.exit_code=7' \
-        '.tests.work_unchanged=false' '.tests.verified_head="different-candidate"' '.tests.status="incomplete"' '.tests=null'; do
+        '.tests.work_unchanged=false' '.tests.verified_head="different-candidate"' \
+        'del(.tests.verified_head,.work.after_head)' '.tests.verified_head="" | .work.after_head=""' \
+        '.tests.verified_head="invented" | .work.after_head="invented"' '.tests.status="incomplete"' '.tests=null'; do
         malformed=$(jq -c "$expression" <<< "$tested") || return 1
         assert_fails "Expected-command validation rejects $expression" validate_ai_session_result "$malformed" 0 "$repo_path" "$command"
         assert_success "Unaltered required-test contract remains accepted" validate_ai_session_result "$tested" 0 "$repo_path" "$command"
@@ -1258,6 +1263,37 @@ test_ai_required_test_result_contract() {
     result=$(run_test_gate "$repo_path" 'printf legacy-output' 5); rc=$?
     assert_equals 0 "$rc" "Legacy standalone gate still runs a real passing command"
     assert_equals true "$(jq -r '.ran and .ok and (.exit_code == 0)' <<< "$result")" "Legacy standalone gate retains its result contract"
+    mkdir "$env_root/metadata-collision" || return 1
+    printf 'prior exit receipt\n' > "$env_root/metadata-collision/test.exit_code"
+    printf -v command 'printf unexpected > %q' "$env_root/unexpected-run"
+    result=$(verify_ai_session_tests "$repo_path" "$command" 5 "$env_root/metadata-collision" "$work"); rc=$?
+    assert_equals 2 "$rc" "Existing metadata blocks test verification before command execution"
+    assert_equals 'prior exit receipt' "$(cat "$env_root/metadata-collision/test.exit_code")" "Verification preserves prior metadata exactly"
+    assert_file_not_exists "$env_root/unexpected-run" "Metadata collision prevents command execution"
+    local gate_payload gate_rc shape shape_index=0
+    for shape in skipped wrong-command string-boolean malformed multiple nonzero; do
+        ((shape_index+=1))
+        mkdir "$env_root/gate-shape-$shape_index" || return 1
+        gate_payload='{"ran":true,"ok":true,"command":"printf configured-test","exit_code":0}'
+        gate_rc=0
+        case "$shape" in
+            skipped) gate_payload='{"ran":false,"ok":null}' ;;
+            wrong-command) gate_payload='{"ran":true,"ok":true,"command":"other-command","exit_code":0}' ;;
+            string-boolean) gate_payload='{"ran":"true","ok":true,"command":"printf configured-test","exit_code":0}' ;;
+            malformed) gate_payload='not-json' ;;
+            multiple) gate_payload+=$'\n'"$gate_payload" ;;
+            nonzero) gate_rc=7 ;;
+        esac
+        # Only the test-gate protocol is controlled here; actual work inspection
+        # runs, and the execution-path controls above use the real gate.
+        result=$(
+            run_test_gate() { printf '%s\n' "$gate_payload"; return "$gate_rc"; }
+            verify_ai_session_tests "$repo_path" 'printf configured-test' 5 "$env_root/gate-shape-$shape_index" "$work"
+        ); rc=$?
+        assert_equals 1 "$rc" "$shape gate report blocks test verification"
+        assert_equals failed "$(jq -r '.status' <<< "$result")" "$shape gate report cannot report verified success"
+        assert_equals "$gate_rc" "$(jq -r '.exit_code' <<< "$result")" "$shape retains actual gate exit"
+    done
 }
 
 # Each deadline probe uses real Git work and a real clock. Only the named NTM
@@ -1265,6 +1301,7 @@ test_ai_required_test_result_contract() {
 # used as proof that the work, publication, or owned-session cleanup finished.
 ai_deadline_process_stopped() {
     local observed_state
+    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 2
     observed_state=$(ps -p "$1" -o stat=) || observed_state=""
     [[ -z "$observed_state" || "$observed_state" == Z* ]]
 }
@@ -1428,6 +1465,125 @@ test_ai_whole_deadline_real_host_publication() {
 test_ai_whole_deadline_is_one_shared_budget() {
     assert_ai_whole_deadline readiness,send,transition 0.05 timeout
     assert_ai_whole_deadline readiness,send,transition 0.05 success
+}
+
+# Observe real groups at the worker/poll boundary, with caller monitor mode both
+# off and on. The sleep wrapper only records its own identity, then execs the
+# real sleep; it does not fabricate process identities or completion results.
+test_ai_deadline_polling_group_scope() {
+    local retained_root="${1:-}" monitor_mode outcome failed_cases=0
+    for monitor_mode in off on; do
+        for outcome in success exit7 timeout; do
+            (
+                local env_root real_sleep real_ps caller_pid=$BASHPID caller_group
+                local unrelated_pid deadline rc=0 worker_pid worker_parent worker_group child_pid child_parent child_group
+                local watch_pid watch_parent watch_group poll_pid poll_parent poll_group poll_count=0 wrong_poll_groups=0
+                local worker_delay=0.2 worker_exit=0 startup_deadline
+                if [[ -n "$retained_root" ]]; then env_root=$(mktemp -d "$retained_root/poll-group.XXXXXX") || exit 1;
+                else env_root=$(create_test_env) || exit 1; fi
+                real_sleep=$(type -P sleep) || exit 1
+                real_ps=$(type -P ps) || exit 1
+                mkdir "$env_root/bin" || exit 1
+                cat > "$env_root/bin/sleep" <<'POLL_SLEEP'
+#!/usr/bin/env bash
+set -uo pipefail
+set +m
+"$RU_GROUP_REAL_PS" -p "$BASHPID" -o pid=,ppid=,pgid= >> "$RU_GROUP_POLL_LOG" || exit 91
+exec "$RU_GROUP_REAL_SLEEP" "$@"
+POLL_SLEEP
+                chmod +x "$env_root/bin/sleep" || exit 1
+                cat > "$env_root/unrelated.sh" <<'UNRELATED'
+#!/usr/bin/env bash
+set -uo pipefail
+root=$1
+trap 'printf "TERM\n" >> "$root/unrelated.signals"' TERM
+trap 'printf "INT\n" >> "$root/unrelated.signals"' INT
+printf 'ready\n' > "$root/unrelated.ready"
+while [[ ! -f "$root/unrelated.finish" && "$SECONDS" -lt 10 ]]; do "$2" 0.05; done
+UNRELATED
+                : > "$env_root/caller.signals"
+                : > "$env_root/unrelated.signals"
+                trap 'printf "TERM\n" >> "$env_root/caller.signals"' TERM
+                trap 'printf "INT\n" >> "$env_root/caller.signals"' INT
+                trap -p TERM INT > "$env_root/caller-traps.before"
+                if [[ "$monitor_mode" == on ]]; then set -m; else set +m; fi
+                caller_group=$("$real_ps" -p "$caller_pid" -o pgid=) || exit 1
+                caller_group=${caller_group//[[:space:]]/}
+                printf '%s %s %s\n' "$caller_pid" "$caller_group" "$monitor_mode" > "$env_root/caller.identity"
+                printf '%s %s\n' "$monitor_mode" "$outcome" > "$env_root/scenario"
+                bash "$env_root/unrelated.sh" "$env_root" "$real_sleep" &
+                unrelated_pid=$!
+                startup_deadline=$((SECONDS + 2))
+                while [[ ! -f "$env_root/unrelated.ready" && "$SECONDS" -lt "$startup_deadline" ]]; do "$real_sleep" 0.01; done
+                assert_file_exists "$env_root/unrelated.ready" "$monitor_mode/$outcome unrelated signal observer started"
+                export RU_GROUP_REAL_SLEEP="$real_sleep" RU_GROUP_REAL_PS="$real_ps" RU_GROUP_POLL_LOG="$env_root/polls"
+                export PATH="$env_root/bin:$PATH"
+                hash -r
+                record_group_worker() {
+                    local observed_pid=$BASHPID group_pid group_parent group_id observed_child
+                    "$real_ps" -p "$observed_pid" -o pid=,ppid=,pgid= > "$env_root/worker.identity" || return 92
+                    read -r group_pid group_parent group_id < "$env_root/worker.identity" || return 92
+                    "$real_ps" -p "$group_parent" -o pid=,ppid=,pgid= > "$env_root/watchdog.identity" || return 92
+                    printf 'actual worker stdout\n'
+                    printf 'actual worker stderr\n' >&2
+                    "$real_sleep" "$worker_delay" &
+                    observed_child=$!
+                    printf '%s\n' "$observed_child" > "$env_root/child.pid"
+                    "$real_ps" -p "$observed_child" -o pid=,ppid=,pgid= > "$env_root/child.identity" || return 92
+                    wait "$observed_child" || return $?
+                    printf 'finished\n' > "$env_root/worker.finished"
+                    return "$worker_exit"
+                }
+                deadline=$((SECONDS + 5))
+                [[ "$outcome" != exit7 ]] || worker_exit=7
+                if [[ "$outcome" == timeout ]]; then deadline=$((SECONDS + 2)); worker_delay=6; fi
+                run_inherited_ai_deadline "$deadline" "$env_root/worker.stdout" "$env_root/worker.stderr" record_group_worker \
+                    2> "$env_root/watchdog.stderr" || rc=$?
+                printf '%s\n' "$rc" > "$env_root/actual.exit"
+                read -r worker_pid worker_parent worker_group < "$env_root/worker.identity" || exit 1
+                read -r child_pid child_parent child_group < "$env_root/child.identity" || exit 1
+                read -r watch_pid watch_parent watch_group < "$env_root/watchdog.identity" || exit 1
+                assert_equals "$worker_pid" "$worker_group" "$monitor_mode/$outcome worker owns its actual process group"
+                assert_not_equals "$caller_group" "$worker_group" "$monitor_mode/$outcome worker is outside caller group"
+                assert_not_equals "$watch_group" "$worker_group" "$monitor_mode/$outcome worker is outside watchdog group"
+                assert_equals "$watch_pid" "$worker_parent" "$monitor_mode/$outcome identities describe the actual worker parent"
+                assert_equals "$worker_pid" "$child_parent" "$monitor_mode/$outcome child belongs to actual worker"
+                assert_equals "$worker_group" "$child_group" "$monitor_mode/$outcome child stays in worker group"
+                while read -r poll_pid poll_parent poll_group; do
+                    ((poll_count+=1))
+                    [[ "$poll_parent" == "$watch_pid" && "$poll_group" == "$watch_group" ]] || ((wrong_poll_groups+=1))
+                done < "$env_root/polls"
+                assert_not_equals 0 "$poll_count" "$monitor_mode/$outcome real polling commands were observed"
+                assert_equals 0 "$wrong_poll_groups" "$monitor_mode/$outcome polling stays in watchdog group"
+                assert_not_contains "$(cat "$env_root/watchdog.stderr")" 'child setpgid' "$monitor_mode/$outcome watchdog has no group-creation diagnostic"
+                assert_equals 'actual worker stdout' "$(cat "$env_root/worker.stdout")" "$monitor_mode/$outcome preserves actual worker stdout"
+                assert_contains "$(cat "$env_root/worker.stderr")" 'actual worker stderr' "$monitor_mode/$outcome preserves actual worker stderr"
+                assert_success "$monitor_mode/$outcome caller still exists" kill -0 "$caller_pid"
+                assert_success "$monitor_mode/$outcome unrelated process still exists" kill -0 "$unrelated_pid"
+                assert_equals '' "$(cat "$env_root/caller.signals" "$env_root/unrelated.signals")" "$monitor_mode/$outcome no caller or unrelated TERM/INT was caught"
+                trap -p TERM INT > "$env_root/caller-traps.after"
+                assert_success "$monitor_mode/$outcome caller traps preserved" cmp "$env_root/caller-traps.before" "$env_root/caller-traps.after"
+                if [[ "$monitor_mode" == on ]]; then assert_contains "$-" m "Caller monitor-on state preserved";
+                else assert_not_contains "$-" m "Caller monitor-off state preserved"; fi
+                if [[ "$outcome" == timeout ]]; then
+                    assert_equals 124 "$rc" "Real worker deadline expires"
+                    assert_success "Timed-out real worker stopped" ai_deadline_process_stopped "$worker_pid"
+                    assert_success "Timed-out real child stopped" ai_deadline_process_stopped "$child_pid"
+                    assert_file_not_exists "$env_root/worker.finished" "Deadline cannot claim completion"
+                else
+                    assert_equals "$worker_exit" "$rc" "Real $outcome worker exit preserved"
+                    assert_file_exists "$env_root/worker.finished" "Bounded $outcome worker actually finished"
+                fi
+                # End the unrelated observer normally, avoiding a test-issued
+                # signal that could be mistaken for a watchdog isolation failure.
+                printf 'finish\n' > "$env_root/unrelated.finish"
+                wait "$unrelated_pid" || exit 1
+                cat "$env_root/watchdog.stderr" >&2
+                exit "$(get_exit_code)"
+            ) || ((failed_cases+=1))
+        done
+    done
+    [[ "$failed_cases" -eq 0 ]]
 }
 
 test_ai_whole_deadline_process_group_ownership() {
@@ -1647,6 +1803,7 @@ run_test test_ai_whole_deadline_real_git_inspection
 run_test test_ai_whole_deadline_real_host_publication
 run_test test_ai_whole_deadline_is_one_shared_budget
 run_test test_ai_whole_deadline_process_group_ownership
+run_test test_ai_deadline_polling_group_scope
 run_test test_ai_preflight_input_failures_common_contract
 run_test test_ai_preflight_dependency_failures_common_contract
 run_test test_ai_preflight_no_jq_preserves_escaped_repo_and_error
