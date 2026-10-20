@@ -69,6 +69,8 @@ drop_last_lines() {
 #------------------------------------------------------------------------------
 EXTRACT_FILE=$(mktemp)
 sed -n '/^declare -a AGENT_SWEEP_DENYLIST_PATTERNS/,/^# Detect which review driver/p' "$RU_SCRIPT" | drop_last_lines 2 > "$EXTRACT_FILE"
+# is_file_denied feeds stdin through ru's run_with_input helper
+sed -n '/^_ru_input_bytes()/,/^}/p;/^run_with_input()/,/^}/p' "$RU_SCRIPT" >> "$EXTRACT_FILE"
 # shellcheck disable=SC1090
 source "$EXTRACT_FILE"
 rm -f "$EXTRACT_FILE"

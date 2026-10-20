@@ -93,6 +93,10 @@ extract_functions() {
     # Extract json_escape
     eval "$(sed -n '/^json_escape()/,/^}/p' "$RU_SCRIPT")"
 
+    # Extract run_with_input (ru's stdin helper, used by the functions below)
+    eval "$(sed -n '/^_ru_input_bytes()/,/^}/p' "$RU_SCRIPT")"
+    eval "$(sed -n '/^run_with_input()/,/^}/p' "$RU_SCRIPT")"
+
     # Extract json_get_field (multi-line with embedded code)
     eval "$(sed -n '/^json_get_field()/,/^}/p' "$RU_SCRIPT")"
 

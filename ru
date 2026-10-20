@@ -286,7 +286,7 @@ _set_out_array() {
     # read clears the target array in the caller's dynamic scope. Assign each
     # value through printf so shell-looking data is never evaluated as code.
     local _soa_value _soa_index=0
-    read -r -a "${out_name?}" <<< "" || return 1
+    run_with_input "" read -r -a "${out_name?}" || return 1
     for _soa_value; do
         printf -v "${out_name}[$_soa_index]" '%s' "$_soa_value" || return 1
         _soa_index=$((_soa_index + 1))
@@ -364,6 +364,32 @@ dir_lock_acquire() {
         sleep 0.1
     done
 }
+
+# Set _RU_INPUT_BYTES to the byte length of $1. The C locale is confined to
+# this function so the caller's command still runs in the user's locale.
+_ru_input_bytes() {
+    local LC_ALL=C
+    _RU_INPUT_BYTES=${#1}
+}
+
+# Run a command with STRING and a newline on stdin, as `command <<< "$STRING"`
+# would. ru uses this instead of here-strings and heredocs: Bash writes those
+# whole into a pipe before the command reads it, and macOS shrinks new pipes
+# to 512 bytes (PIPE_BUF) when kernel pipe memory runs short, so a longer one
+# blocks forever. Input that fits keeps the here-string, which needs no fork;
+# longer input comes from a separate writer process.
+# Usage: run_with_input STRING command [args...]
+run_with_input() {
+    local _ru_input=$1
+    shift
+    _ru_input_bytes "$_ru_input"
+    if (( _RU_INPUT_BYTES < 512 )); then
+        "$@" <<< "$_ru_input"
+    else
+        "$@" < <(printf '%s\n' "$_ru_input")
+    fi
+}
+
 # Ensure a directory exists
 ensure_dir() {
     local dir="$1"
@@ -564,7 +590,8 @@ is_binary_allowed() {
 
     local -a patterns=("${AGENT_SWEEP_ALLOW_BINARY_PATTERNS_DEFAULT[@]}")
     if [[ -n "${AGENT_SWEEP_ALLOW_BINARY_PATTERNS:-}" ]]; then
-        read -ra extra <<<"$AGENT_SWEEP_ALLOW_BINARY_PATTERNS"
+        local -a extra
+        run_with_input "$AGENT_SWEEP_ALLOW_BINARY_PATTERNS" read -ra extra
         patterns+=("${extra[@]}")
     fi
 
@@ -1525,8 +1552,8 @@ capture_ai_requested_content() {
     printf '%s\n' "$snapshot_tree" > "$artifact_dir/requested.tree" || return 2
     git -C "$repo_path" diff-tree -r --no-commit-id --no-renames --no-abbrev --raw -z "$before_head" "$snapshot_tree" > "$artifact_dir/requested-entries" || return 2
     while IFS= read -r -d '' metadata && IFS= read -r -d '' path; do
-        read -r _old_mode mode _old_sha sha _change <<< "$metadata"
-        requests=$(jq -c --arg path "$path" --arg mode "$mode" --arg sha "$sha" '. + [{path:$path,mode:$mode,sha:$sha}]' <<< "$requests") || return 2
+        run_with_input "$metadata" read -r _old_mode mode _old_sha sha _change
+        requests=$(run_with_input "$requests" jq -c --arg path "$path" --arg mode "$mode" --arg sha "$sha" '. + [{path:$path,mode:$mode,sha:$sha}]') || return 2
     done < "$artifact_dir/requested-entries"
     printf '%s\n' "$requests" > "$artifact_dir/requested-content.json" || return 2
     printf '%s\n' "$requests"
@@ -1537,14 +1564,14 @@ capture_ai_requested_content() {
 unpreserved_ai_requested_content() {
     local repo_path="$1" requests="$2" artifact_dir="$3" after_head="$4"
     local request path mode sha entry metadata found missing='[]'
-    jq -e 'type == "array" and all(.[]; type == "object" and
+    run_with_input "$requests" jq -e 'type == "array" and all(.[]; type == "object" and
         (.path | type == "string" and length > 0) and
         (.mode == "000000" or .mode == "100644" or .mode == "100755" or .mode == "120000" or .mode == "160000") and
-        (.sha | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$")))' <<< "$requests" >/dev/null || return 2
+        (.sha | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$")))' >/dev/null || return 2
     while IFS= read -r request; do
-        IFS= read -r -d '' path < <(jq -j '.path, "\u0000"' <<< "$request") || return 2
-        mode=$(jq -r '.mode' <<< "$request") || return 2
-        sha=$(jq -r '.sha' <<< "$request") || return 2
+        IFS= read -r -d '' path < <(run_with_input "$request" jq -j '.path, "\u0000"') || return 2
+        mode=$(run_with_input "$request" jq -r '.mode') || return 2
+        sha=$(run_with_input "$request" jq -r '.sha') || return 2
         found=false
         git --literal-pathspecs -C "$repo_path" ls-tree -z "$after_head" -- "$path" > "$artifact_dir/requested-candidate-entry" || return 2
         if [[ "$mode" == 000000 ]]; then
@@ -1554,9 +1581,9 @@ unpreserved_ai_requested_content() {
             [[ "${metadata%% *}" != "$mode" || "${metadata##* }" != "$sha" || "${entry#*$'\t'}" != "$path" ]] || found=true
         fi
         if [[ "$found" == false ]]; then
-            missing=$(jq -c --argjson request "$request" '. + [$request]' <<< "$missing") || return 2
+            missing=$(run_with_input "$missing" jq -c --argjson request "$request" '. + [$request]') || return 2
         fi
-    done < <(jq -c '.[]' <<< "$requests")
+    done < <(run_with_input "$requests" jq -c '.[]')
     printf '%s\n' "$missing"
 }
 
@@ -1622,8 +1649,8 @@ capture_ai_session_work() {
 publish_ai_session_work() {
     local repo_path="$1" expected_head="$2" target="$3" target_ref remote destination remote_tip old_sha
     local receivers='[]' receiver output exit_code
-    target_ref=$(jq -r '.ref' <<< "$target") || return 1
-    remote=$(jq -r '.remote' <<< "$target") || return 1
+    target_ref=$(run_with_input "$target" jq -r '.ref') || return 1
+    remote=$(run_with_input "$target" jq -r '.remote') || return 1
     [[ "$(get_commit_publication_target "$repo_path")" == "$target" ]] || return 1
     while IFS= read -r -d '' destination; do
         remote_tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$target_ref") || return 1
@@ -1633,16 +1660,16 @@ publish_ai_session_work() {
             git -C "$repo_path" merge-base --is-ancestor "$old_sha" "$expected_head" || return 1
         fi
         scan_commit_publication "$repo_path" "$old_sha" "$expected_head" || return 1
-        receivers=$(jq -c --arg url "$destination" --arg sha "$old_sha" '. + [{url:$url,sha:$sha}]' <<< "$receivers") || return 1
-    done < <(jq -j '.urls[] | ., "\u0000"' <<< "$target")
+        receivers=$(run_with_input "$receivers" jq -c --arg url "$destination" --arg sha "$old_sha" '. + [{url:$url,sha:$sha}]') || return 1
+    done < <(run_with_input "$target" jq -j '.urls[] | ., "\u0000"')
     if [[ "$(git -C "$repo_path" rev-parse HEAD)" != "$expected_head" ]] ||
        [[ "$(get_commit_publication_target "$repo_path")" != "$target" ]] || repo_is_dirty "$repo_path"; then
         log_error "Verified AI work or publication destination changed before publication"
         return 1
     fi
     while IFS= read -r receiver; do
-        destination=$(jq -r '.url' <<< "$receiver") || return 1
-        old_sha=$(jq -r '.sha' <<< "$receiver") || return 1
+        destination=$(run_with_input "$receiver" jq -r '.url') || return 1
+        old_sha=$(run_with_input "$receiver" jq -r '.sha') || return 1
         if output=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" push "$target_ref" "$expected_head" "$old_sha" 2>&1); then
             exit_code=0
         else
@@ -1654,7 +1681,7 @@ publish_ai_session_work() {
         fi
         remote_tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$target_ref") || return 1
         [[ "${remote_tip%%$'\t'*}" == "$expected_head" ]] || return 1
-    done < <(jq -c '.[]' <<< "$receivers")
+    done < <(run_with_input "$receivers" jq -c '.[]')
 }
 
 # Run the configured project tests against the already validated candidate.
@@ -1672,27 +1699,27 @@ verify_ai_session_tests() {
         fi
     done
     mkdir "$artifact_dir/test-work" || return 2
-    before_head=$(jq -er '.before_head' <<< "$work_json") || return 2
-    before_ref=$(jq -er '.before_ref' <<< "$work_json") || return 2
-    expected_head=$(jq -er '.after_head' <<< "$work_json") || return 2
-    requested_content=$(jq -c '.requested_content' <<< "$work_json") || return 2
-    content_policy=$(jq -er '.requested_content_policy' <<< "$work_json") || return 2
-    requested_tree=$(jq -r '.requested_tree' <<< "$work_json") || return 2
+    before_head=$(run_with_input "$work_json" jq -er '.before_head') || return 2
+    before_ref=$(run_with_input "$work_json" jq -er '.before_ref') || return 2
+    expected_head=$(run_with_input "$work_json" jq -er '.after_head') || return 2
+    requested_content=$(run_with_input "$work_json" jq -c '.requested_content') || return 2
+    content_policy=$(run_with_input "$work_json" jq -er '.requested_content_policy') || return 2
+    requested_tree=$(run_with_input "$work_json" jq -r '.requested_tree') || return 2
     gate_output=$(run_test_gate "$repo_path" "$test_command" "$timeout_seconds" "$artifact_dir") || gate_exit=$?
     ( set -C
       printf '%s\n' "$gate_output" > "$artifact_dir/test-result.stdout" &&
       printf '%s\n' "$gate_exit" > "$artifact_dir/test.exit_code"
     ) || return 2
-    gate_json=$(jq -cs 'if length == 1 and (.[0] | type == "object") then .[0] else null end' <<< "$gate_output") || gate_json=null
+    gate_json=$(run_with_input "$gate_output" jq -cs 'if length == 1 and (.[0] | type == "object") then .[0] else null end') || gate_json=null
     post_work=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir/test-work" \
         "$requested_content" "$content_policy" "$requested_tree") || post_exit=$?
     printf '%s\n' "$post_work" > "$artifact_dir/test-work/work.json" || return 2
-    if [[ "$post_exit" -eq 0 ]] && jq -e --argjson before "$work_json" \
-        '.status == "success" and .after_head == $before.after_head and .after_ref == $before.after_ref' <<< "$post_work" >/dev/null; then
+    if [[ "$post_exit" -eq 0 ]] && run_with_input "$post_work" jq -e --argjson before "$work_json" \
+        '.status == "success" and .after_head == $before.after_head and .after_ref == $before.after_ref' >/dev/null; then
         unchanged=true
     fi
-    if [[ "$gate_exit" -ne 0 ]] || ! jq -e --arg command "$test_command" \
-        '.ran == true and .ok == true and .exit_code == 0 and .command == $command' <<< "$gate_json" >/dev/null; then
+    if [[ "$gate_exit" -ne 0 ]] || ! run_with_input "$gate_json" jq -e --arg command "$test_command" \
+        '.ran == true and .ok == true and .exit_code == 0 and .command == $command' >/dev/null; then
         error='Configured project tests failed or returned an invalid result'
     elif [[ "$unchanged" != true ]]; then
         error='Project tests changed the validated candidate or left repository work incomplete'
@@ -1805,7 +1832,7 @@ incomplete_ai_session_result() {
     if [[ -f "$artifact_dir/tests.json" ]] && jq -es 'length == 1 and (.[0] | type == "object")' "$artifact_dir/tests.json" >/dev/null; then
         tests_json=$(cat "$artifact_dir/tests.json") || return 2
     elif [[ -f "$artifact_dir/test.started" ]]; then
-        tests_json=$(jq -c '.status="incomplete"' <<< "$tests_json") || return 2
+        tests_json=$(run_with_input "$tests_json" jq -c '.status="incomplete"') || return 2
     fi
     [[ "$operation_exit" -ne 124 ]] || { status=timeout; transport=timeout; error='Whole-operation AI deadline expired'; }
     [[ "$no_push" != true ]] || publication=not_requested
@@ -1910,18 +1937,18 @@ run_ai_session_workflow() {
         fi
         if [[ "$tests_exit" -ne 0 ]]; then
             status=failed; result_exit=1
-            error=$(jq -r '.error // "Project test validation failed"' <<< "$tests_json") || error='Project test validation failed'
+            error=$(run_with_input "$tests_json" jq -r '.error // "Project test validation failed"') || error='Project test validation failed'
         else status=success; result_exit=0; fi
         if [[ "$status" == success && "$no_push" == false ]]; then
             printf 'publication\n' > "$artifact_dir/phase"
             printf 'started\n' > "$artifact_dir/publication.started"
             publication_status=failed
-            if publish_ai_session_work "$repo_path" "$(jq -r '.after_head' <<< "$work_json")" "$publication_target" > "$artifact_dir/publication.stdout" 2> "$artifact_dir/publication.stderr"; then
+            if publish_ai_session_work "$repo_path" "$(run_with_input "$work_json" jq -r '.after_head')" "$publication_target" > "$artifact_dir/publication.stdout" 2> "$artifact_dir/publication.stderr"; then
                 publication_status=success
                 printf 'confirmed\n' > "$artifact_dir/publication.confirmed"
             else status=failed; result_exit=1; error='Requested publication failed; verified local commits are retained'; fi
         fi
-    elif [[ "$transport" == idle ]]; then error=$(jq -r '.error' <<< "$work_json") || error='Invalid work result'; fi
+    elif [[ "$transport" == idle ]]; then error=$(run_with_input "$work_json" jq -r '.error') || error='Invalid work result'; fi
     jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg error "$error" \
         --arg transport "$transport" --arg evidence "$artifact_dir" --arg cleanup "$cleanup_status" --arg publication "$publication_status" \
         --argjson duration "$((SECONDS - ai_operation_entry))" --argjson exit_code "$result_exit" --argjson transport_exit "$transport_exit" \
@@ -2569,7 +2596,7 @@ cmd_ai_sync() {
         fi
 
         dirty_repos+=("$repo_path")
-    done <<< "$dirty_repos_output"
+    done < <(printf '%s\n' "$dirty_repos_output")
 
     if [[ ${#dirty_repos[@]} -eq 0 ]]; then
         log_success "No dirty repositories match the filters"
@@ -2635,7 +2662,7 @@ cmd_ai_sync() {
         if [[ "$no_push" == true ]]; then session_args+=(--no-push); else session_args+=(--push); fi
         session_result=$(spawn_ai_session "$repo_path" "$prompt_file" "${session_args[@]}") || exit_code=$?
         if validate_ai_session_result "$session_result" "$exit_code" "$repo_path"; then
-            status=$(jq -r '.status' <<< "$session_result") || status=failed
+            status=$(run_with_input "$session_result" jq -r '.status') || status=failed
         else
             status=failed
             [[ "$exit_code" -ne 0 ]] || exit_code=2
@@ -2677,8 +2704,7 @@ cmd_ai_sync() {
 
 # Print ai-sync help
 _ai_sync_help() {
-    cat >&2 <<'EOF'
-Usage: ru ai-sync [OPTIONS]
+    printf '%s\n' 'Usage: ru ai-sync [OPTIONS]
 
 Automatically commit uncommitted changes across repositories using AI.
 
@@ -2687,7 +2713,7 @@ Options:
   --include=PAT   Only process repos with paths matching pattern
   --exclude=PAT   Skip repos with paths matching pattern
   --timeout=SEC   Per-repo timeout in seconds (default: 600)
-  --no-push       Commit changes but don't push to remote
+  --no-push       Commit changes but don'\''t push to remote
   --agent=TYPE    Agent type: claude (default), codex, gemini
   --no-untracked  Ignore untracked files when detecting dirty repos
 
@@ -2704,14 +2730,13 @@ Examples:
   ru ai-sync --dry-run              # Show what would be processed
   ru ai-sync --include=my-project   # Only process matching repos
   ru ai-sync --timeout=1200         # Allow 20 minutes per repo
-  ru ai-sync --no-push              # Commit but don't push
+  ru ai-sync --no-push              # Commit but don'\''t push
 
 Exit Codes:
   0  All repos processed successfully
   1  Some repos failed
   3  Missing dependencies (ntm, claude-code)
-  4  Invalid arguments
-EOF
+  4  Invalid arguments' >&2
 }
 
 #------------------------------------------------------------------------------
@@ -3200,7 +3225,7 @@ $changelog
 "
             ((count++))
         fi
-    done <<< "$packages"
+    done < <(printf '%s\n' "$packages")
 
     if [[ -z "$changelog_text" ]]; then
         changelog_text="No changelogs could be fetched. Check package documentation manually."
@@ -3211,8 +3236,7 @@ $changelog
 
 # Print dep-update help
 _dep_update_help() {
-    cat >&2 <<'EOF'
-Usage: ru dep-update [OPTIONS]
+    printf '%s\n' 'Usage: ru dep-update [OPTIONS]
 
 Update dependencies across repositories using AI-powered analysis.
 
@@ -3224,7 +3248,7 @@ Options:
   --major               Include major version updates (default: skip major)
   --test-cmd=CMD        Custom test command (overrides auto-detection)
   --max-fix-attempts=N  Max fix iterations per dependency (default: 5)
-  --no-push             Commit changes but don't push to remote
+  --no-push             Commit changes but don'\''t push to remote
   --repo=PATH           Process single repo only (default: all repos)
   --agent=TYPE          Agent type: claude (default), codex, gemini
   --timeout=SEC         Per-repo timeout in seconds (default: 900)
@@ -3235,7 +3259,7 @@ The AI agent will:
 3. Update each dependency one at a time
 4. Run tests after each update and fix failures
 5. Commit each successful update with descriptive message
-6. Roll back and report any dependencies that can't be updated
+6. Roll back and report any dependencies that can'\''t be updated
 
 Examples:
   ru dep-update                          # Update all deps in all repos
@@ -3243,15 +3267,14 @@ Examples:
   ru dep-update --repo=./my-project      # Update single repo
   ru dep-update --manager=npm            # Only npm packages
   ru dep-update --major                  # Include major version updates
-  ru dep-update --include='react|vue'    # Only update matching packages
-  ru dep-update --exclude='typescript'   # Skip matching packages
+  ru dep-update --include='\''react|vue'\''    # Only update matching packages
+  ru dep-update --exclude='\''typescript'\''   # Skip matching packages
 
 Exit Codes:
   0  All updates successful
   1  Some dependencies failed to update
   3  Missing dependencies (ntm, claude-code)
-  4  Invalid arguments
-EOF
+  4  Invalid arguments' >&2
 }
 
 #------------------------------------------------------------------------------
@@ -3585,25 +3608,21 @@ prepare_commit_plan_index() {
         printf '%s' "$plan_json" | jq -j '.commits[].files[] | ., "\u0000"' > "$manifest" || return 1
         printf '%s' "$plan_json" | jq -j '.commits[] | (.source // "worktree") as $source | .files[] | $source, "\u0000", ., "\u0000"' > "$index_file.entries" || return 1
     elif command -v python3 >/dev/null 2>&1; then
-        RU_COMMIT_PLAN_JSON="$plan_json" python3 - <<'PY' > "$manifest" || return 1
-import json, os, sys
+        RU_COMMIT_PLAN_JSON="$plan_json" python3 - < <(printf '%s\n' 'import json, os, sys
 plan = json.loads(os.environ["RU_COMMIT_PLAN_JSON"])
 for commit in plan["commits"]:
     for path in commit["files"]:
         if not isinstance(path, str) or "\0" in path:
             raise ValueError("Invalid candidate path")
-        sys.stdout.buffer.write(path.encode("utf-8") + b"\0")
-PY
-        RU_COMMIT_PLAN_JSON="$plan_json" python3 - <<'PY' > "$index_file.entries" || return 1
-import json, os, sys
+        sys.stdout.buffer.write(path.encode("utf-8") + b"\0")') > "$manifest" || return 1
+        RU_COMMIT_PLAN_JSON="$plan_json" python3 - < <(printf '%s\n' 'import json, os, sys
 plan = json.loads(os.environ["RU_COMMIT_PLAN_JSON"])
 for commit in plan["commits"]:
     source = commit.get("source", "worktree")
     if source not in ("worktree", "index"):
         raise ValueError("Invalid candidate source")
     for path in commit["files"]:
-        sys.stdout.buffer.write(source.encode("ascii") + b"\0" + path.encode("utf-8") + b"\0")
-PY
+        sys.stdout.buffer.write(source.encode("ascii") + b"\0" + path.encode("utf-8") + b"\0")') > "$index_file.entries" || return 1
     else
         return 1
     fi
@@ -3617,17 +3636,16 @@ PY
 validate_secret_scan_result() {
     local result="$1" rc="$2"
     if command -v jq >/dev/null 2>&1; then
-        jq -e -s --argjson rc "$rc" '
+        run_with_input "$result" jq -e -s --argjson rc "$rc" '
             length == 1 and (.[0] | type == "object" and .ran == true and
                 (.ok | type == "boolean") and (.warning | type == "boolean") and
                 (.findings | type == "array" and all(type == "string")) and
                 (if $rc == 0 then .ok == true and .warning == false and (.findings | length) == 0
                  elif $rc == 2 then .ok == false and .warning == true and (.findings | length) > 0
                  else .ok == false and .warning == false end))
-        ' <<< "$result" >/dev/null
+        ' >/dev/null
     elif command -v python3 >/dev/null 2>&1; then
-        RU_SECRET_RESULT="$result" python3 - "$rc" <<'PY'
-import json, os, sys
+        RU_SECRET_RESULT="$result" python3 - "$rc" < <(printf '%s\n' 'import json, os, sys
 try:
     report = json.loads(os.environ["RU_SECRET_RESULT"])
     code = int(sys.argv[1])
@@ -3643,8 +3661,7 @@ try:
         valid = valid and not report["ok"] and not report["warning"]
     sys.exit(0 if valid else 1)
 except (ValueError, KeyError, TypeError):
-    sys.exit(1)
-PY
+    sys.exit(1)')
     else
         return 1
     fi
@@ -3674,10 +3691,10 @@ validate_commit_plan() {
     local commits_json push_flag
     commits_json=$(json_get_field "$plan_json" "commits" || echo "")
     push_flag=$(json_get_field "$plan_json" "push" || echo "")
-    if command -v jq >/dev/null 2>&1 && ! jq -e -s '
+    if command -v jq >/dev/null 2>&1 && ! run_with_input "$plan_json" jq -e -s '
         length == 1 and (.[0] | type == "object" and
             (if has("push") then (.push | type == "boolean") else true end))
-    ' <<< "$plan_json" >/dev/null; then
+    ' >/dev/null; then
         VALIDATION_ERROR="Commit plan must be one object with a boolean push flag"
         return 1
     fi
@@ -3703,7 +3720,7 @@ validate_commit_plan() {
                 return 1
             fi
             local commit_source
-            commit_source=$(jq -er 'if has("source") then .source | select(. == "worktree" or . == "index") else "worktree" end' <<< "$commit_json") || {
+            commit_source=$(run_with_input "$commit_json" jq -er 'if has("source") then .source | select(. == "worktree" or . == "index") else "worktree" end') || {
                 VALIDATION_ERROR="Commit $commit_count has an invalid file source"
                 return 1
             }
@@ -3766,8 +3783,7 @@ validate_commit_plan() {
     elif command -v python3 &>/dev/null; then
         local parser_dir
         parser_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-plan-parser.XXXXXX") || return 1
-        if ! RU_COMMIT_PLAN_JSON="$plan_json" python3 - <<'PY' > "$parser_dir/paths" 2> "$parser_dir/error"
-import json, os, sys
+        if ! RU_COMMIT_PLAN_JSON="$plan_json" python3 - < <(printf '%s\n' 'import json, os, sys
 
 try:
     data = json.loads(os.environ["RU_COMMIT_PLAN_JSON"])
@@ -3795,8 +3811,7 @@ try:
             sys.stdout.buffer.write(field.encode("utf-8") + b"\0")
 except (ValueError, KeyError, TypeError, UnicodeError) as error:
     print(str(error), file=sys.stderr)
-    sys.exit(1)
-PY
+    sys.exit(1)') > "$parser_dir/paths" 2> "$parser_dir/error"
         then
             VALIDATION_ERROR=$(cat "$parser_dir/error")
             [[ -z "$VALIDATION_ERROR" ]] && VALIDATION_ERROR="Invalid commit plan"
@@ -4060,8 +4075,7 @@ commit_plan_stage_and_commit() {
         [[ "${hook##*/}" == pre-commit ]] && continue
         ln -s "$hook" "$candidate_dir/hooks/${hook##*/}" || return 1
     done
-    cat > "$candidate_dir/hooks/pre-commit" <<'HOOK'
-#!/usr/bin/env bash
+    printf '%s\n' '#!/usr/bin/env bash
 set -uo pipefail
 if [[ -x "$RU_COMMIT_ORIGINAL_HOOK" ]]; then
     "$RU_COMMIT_ORIGINAL_HOOK" "$@" || exit $?
@@ -4070,10 +4084,9 @@ actual_tree=$(git write-tree) || exit 1
 actual_head=$(git rev-parse --verify HEAD) || exit 1
 actual_ref=$(git symbolic-ref --quiet HEAD) || actual_ref=""
 if [[ "$actual_tree" != "$RU_COMMIT_EXPECTED_TREE" || "$actual_head" != "$RU_COMMIT_EXPECTED_HEAD" || "$actual_ref" != "$RU_COMMIT_EXPECTED_REF" ]]; then
-    printf '%s\n' 'ru: candidate changed during pre-commit; refusing commit' >&2
+    printf '\''%s\n'\'' '\''ru: candidate changed during pre-commit; refusing commit'\'' >&2
     exit 1
-fi
-HOOK
+fi' > "$candidate_dir/hooks/pre-commit"
     chmod +x "$candidate_dir/hooks/pre-commit" || return 1
     local commit_output commit_exit
     if commit_output=$(GIT_INDEX_FILE="$candidate_index" \
@@ -4151,7 +4164,7 @@ scan_commit_publication() {
             fi
             log_warn "Unpublished commit $commit has a secret warning or scan error; warn mode permits publication"
         fi
-    done <<< "$commit_list"
+    done < <(printf '%s\n' "$commit_list")
 }
 
 # Snapshot the actual push URLs, which can differ from the remote's fetch URL.
@@ -4236,11 +4249,10 @@ run_commit_publication_transport() {
                 [[ "${hook##*/}" == pre-push ]] && continue
                 ln -s "$hook" "$guard_dir/hooks/${hook##*/}" || return 1
             done
-            cat > "$guard_dir/hooks/pre-push" <<'HOOK'
-#!/usr/bin/env bash
+            printf '%s\n' '#!/usr/bin/env bash
 set -uo pipefail
 if [[ "${2:-}" != "$RU_PUBLICATION_EXPECTED_DESTINATION" ]]; then
-    printf '%s\n' 'ru: actual receiver differs from the scanned publication destination; refusing push' >&2
+    printf '\''%s\n'\'' '\''ru: actual receiver differs from the scanned publication destination; refusing push'\'' >&2
     exit 1
 fi
 cat > "$RU_PUBLICATION_INPUT" || exit 1
@@ -4248,21 +4260,20 @@ if [[ -x "$RU_PUBLICATION_ORIGINAL_HOOK" ]]; then
     "$RU_PUBLICATION_ORIGINAL_HOOK" "$@" < "$RU_PUBLICATION_INPUT" || exit $?
 fi
 update_count=0
-while IFS=' ' read -r local_ref local_oid remote_ref remote_oid extra; do
+while IFS='\'' '\'' read -r local_ref local_oid remote_ref remote_oid extra; do
     [[ -n "$local_ref" && -n "$local_oid" && -n "$remote_ref" && -n "$remote_oid" && -z "$extra" ]] || exit 1
     [[ ! "$remote_oid" =~ ^0+$ ]] || remote_oid=""
     if [[ "$local_oid" != "$RU_PUBLICATION_EXPECTED_HEAD" || "$remote_ref" != "$RU_PUBLICATION_EXPECTED_REF" || "$remote_oid" != "$RU_PUBLICATION_EXPECTED_OLD" ]]; then
-        printf '%s\n' 'ru: advertised receiver differs from scanned history; refusing push' >&2
+        printf '\''%s\n'\'' '\''ru: advertised receiver differs from scanned history; refusing push'\'' >&2
         exit 1
     fi
     update_count=$((update_count + 1))
 done < "$RU_PUBLICATION_INPUT"
 if [[ "$(git rev-parse --verify HEAD)" != "$RU_PUBLICATION_EXPECTED_HEAD" ]] ||
    [[ "$update_count" -eq 0 && "$RU_PUBLICATION_EXPECTED_OLD" != "$RU_PUBLICATION_EXPECTED_HEAD" ]]; then
-    printf '%s\n' 'ru: publication candidate changed or its update is missing; refusing push' >&2
+    printf '\''%s\n'\'' '\''ru: publication candidate changed or its update is missing; refusing push'\'' >&2
     exit 1
-fi
-HOOK
+fi' > "$guard_dir/hooks/pre-push"
             chmod +x "$guard_dir/hooks/pre-push" || return 1
             RU_PUBLICATION_INPUT="$guard_dir/advertised-updates" \
             RU_PUBLICATION_ORIGINAL_HOOK="$original_hooks/pre-push" \
@@ -4323,7 +4334,7 @@ execute_commit_plan() {
 
         local message commit_source
         message=$(echo "$commit_json" | jq -r '.message // empty' 2>/dev/null)
-        commit_source=$(jq -r '.source // "worktree"' <<< "$commit_json") || return 1
+        commit_source=$(run_with_input "$commit_json" jq -r '.source // "worktree"') || return 1
         if [[ -z "$message" ]]; then
             log_error "Commit $commit_index has no message"
             return 1
@@ -4353,14 +4364,14 @@ execute_commit_plan() {
 
     if [[ "$push_flag" == "true" ]]; then
         local output exit_code remote target_ref destination remote_sha remote_tip candidate_dir
-        remote=$(jq -r '.remote' <<< "$publication_target") || return 1
-        target_ref=$(jq -r '.ref' <<< "$publication_target") || return 1
+        remote=$(run_with_input "$publication_target" jq -r '.remote') || return 1
+        target_ref=$(run_with_input "$publication_target" jq -r '.ref') || return 1
         candidate_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-publication-candidate.XXXXXX") || return 1
         if [[ "$(get_commit_publication_target "$repo_path")" != "$publication_target" ]]; then
             log_error "Publication destinations changed during candidate execution"
             return 1
         fi
-        jq -j '.urls[] | ., "\u0000"' <<< "$publication_target" > "$candidate_dir/destinations" || return 1
+        run_with_input "$publication_target" jq -j '.urls[] | ., "\u0000"' > "$candidate_dir/destinations" || return 1
         local observed_tips='[]'
         # Inspect and scan every receiver before publishing to any of them.
         # ls-remote with a remote name would inspect its fetch URL instead.
@@ -4382,7 +4393,7 @@ execute_commit_plan() {
             if ! scan_commit_publication "$repo_path" "$remote_sha" "$expected_head"; then
                 return 1
             fi
-            observed_tips=$(jq -c --arg url "$destination" --arg sha "$remote_sha" '. + [{url:$url,sha:$sha}]' <<< "$observed_tips") || return 1
+            observed_tips=$(run_with_input "$observed_tips" jq -c --arg url "$destination" --arg sha "$remote_sha" '. + [{url:$url,sha:$sha}]') || return 1
         done < "$candidate_dir/destinations"
         if [[ "$(git -C "$repo_path" rev-parse HEAD)" != "$expected_head" ]] ||
            ! prepare_commit_plan_index "$plan_json" "$repo_path" "$candidate_dir/index" ||
@@ -4392,7 +4403,7 @@ execute_commit_plan() {
             return 1
         fi
         while IFS= read -r -d '' destination; do
-            remote_sha=$(jq -r --arg url "$destination" '[.[] | select(.url == $url)][0].sha' <<< "$observed_tips") || return 1
+            remote_sha=$(run_with_input "$observed_tips" jq -r --arg url "$destination" '[.[] | select(.url == $url)][0].sha') || return 1
             if ! remote_tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$target_ref") ||
                [[ "${remote_tip%%$'\t'*}" != "$remote_sha" ]]; then
                 log_error "A publication destination changed after its history scan"
@@ -4400,7 +4411,7 @@ execute_commit_plan() {
             fi
         done < "$candidate_dir/destinations"
         while IFS= read -r -d '' destination; do
-            remote_sha=$(jq -r --arg url "$destination" '[.[] | select(.url == $url)][0].sha' <<< "$observed_tips") || return 1
+            remote_sha=$(run_with_input "$observed_tips" jq -r --arg url "$destination" '[.[] | select(.url == $url)][0].sha') || return 1
             if output=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" push "$target_ref" "$expected_head" "$remote_sha" 2>&1); then
                 exit_code=0
             else
@@ -4964,8 +4975,8 @@ except Exception as e:
             local skip_arr deny_arr
             skip_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('skip_phases',[])))" 2>/dev/null)
             deny_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('denylist_extra',[])))" 2>/dev/null)
-            [[ -n "$skip_arr" ]] && mapfile -t AGENT_SWEEP_SKIP_PHASES <<< "$skip_arr"
-            [[ -n "$deny_arr" ]] && mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL <<< "$deny_arr"
+            [[ -n "$skip_arr" ]] && run_with_input "$skip_arr" mapfile -t AGENT_SWEEP_SKIP_PHASES
+            [[ -n "$deny_arr" ]] && run_with_input "$deny_arr" mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL
         fi
     elif ! $is_yaml && command -v jq &>/dev/null; then
         # jq for JSON
@@ -5018,8 +5029,8 @@ except Exception as e:
             local skip_arr deny_arr
             skip_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('skip_phases',[])))" 2>/dev/null)
             deny_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('denylist_extra',[])))" 2>/dev/null)
-            [[ -n "$skip_arr" ]] && mapfile -t AGENT_SWEEP_SKIP_PHASES <<< "$skip_arr"
-            [[ -n "$deny_arr" ]] && mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL <<< "$deny_arr"
+            [[ -n "$skip_arr" ]] && run_with_input "$skip_arr" mapfile -t AGENT_SWEEP_SKIP_PHASES
+            [[ -n "$deny_arr" ]] && run_with_input "$deny_arr" mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL
         fi
     fi
     # Apply CLI override (if provided)
@@ -5416,11 +5427,11 @@ save_agent_sweep_state() {
         # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
         completed_json=$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo '[]')
     elif command -v python3 &>/dev/null; then
-        completed_json=$(python3 -c "
+        completed_json=$(run_with_input "$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null)" python3 -c "
 import json, sys
 repos = [line.strip() for line in sys.stdin if line.strip()]
 print(json.dumps(repos))
-" <<<"$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null)" 2>/dev/null || echo '[]')
+" 2>/dev/null || echo '[]')
     else
         # Fallback: manual JSON array construction
         local first=true item
@@ -5448,20 +5459,19 @@ print(json.dumps(repos))
     current_repo_escaped=$(json_escape "$SWEEP_CURRENT_REPO")
 
     # Write state atomically
-    cat > "$tmp_file" <<EOF
-{
-  "run_id": "$run_id_escaped",
-  "status": "$status",
-  "started_at": "$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "with_release": $with_release_json,
-  "repos_completed": $completed_json,
-  "current_repo": "$current_repo_escaped",
-  "current_phase": $current_phase,
-  "success_count": $success_count,
-  "fail_count": $fail_count,
-  "skip_count": $skip_count
+    printf '{
+  "run_id": "%s",
+  "status": "%s",
+  "started_at": "%s",
+  "with_release": %s,
+  "repos_completed": %s,
+  "current_repo": "%s",
+  "current_phase": %s,
+  "success_count": %s,
+  "fail_count": %s,
+  "skip_count": %s
 }
-EOF
+' "$run_id_escaped" "$status" "$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)" "$with_release_json" "$completed_json" "$current_repo_escaped" "$current_phase" "$success_count" "$fail_count" "$skip_count" > "$tmp_file"
 
     mv "$tmp_file" "$state_file"
     log_verbose "Saved agent-sweep state: $status"
@@ -5525,7 +5535,7 @@ load_agent_sweep_state() {
         elif command -v python3 &>/dev/null; then
             while IFS= read -r repo; do
                 [[ -n "$repo" ]] && COMPLETED_REPOS+=("$repo")
-            done < <(python3 -c "import json,sys; [print(r) for r in json.loads(sys.stdin.read())]" <<<"$completed_json" 2>/dev/null)
+            done < <(run_with_input "$completed_json" python3 -c "import json,sys; [print(r) for r in json.loads(sys.stdin.read())]" 2>/dev/null)
         else
             log_warn "Cannot parse completed repos: neither jq nor python3 available"
             log_warn "Resume may re-process already completed repositories"
@@ -5736,20 +5746,20 @@ json_get_field() {
     # Best: jq (most reliable, handles all JSON types correctly)
     if command -v jq &>/dev/null; then
         # Note: Can't use `// empty` as it treats false as falsy
-        jq -r --arg f "$field" '
+        run_with_input "$json" jq -r --arg f "$field" '
             if has($f) then
                 .[$f] | if type == "null" then empty
                         elif type == "boolean" then (if . then "true" else "false" end)
                         else .
                         end
             else empty end
-        ' <<<"$json" 2>/dev/null
+        ' 2>/dev/null
         return 0
     fi
 
     # Fallback: python3 (widely available, handles complex JSON)
     if command -v python3 &>/dev/null; then
-        python3 -c "
+        run_with_input "$json" python3 -c "
 import json, sys
 try:
     data = json.loads(sys.stdin.read())
@@ -5766,13 +5776,13 @@ try:
         print(val)
 except:
     pass
-" "$field" <<<"$json" 2>/dev/null
+" "$field" 2>/dev/null
         return 0
     fi
 
     # Fallback: perl with JSON::PP (often available on Linux)
     if command -v perl &>/dev/null && perl -MJSON::PP -e1 2>/dev/null; then
-        perl -MJSON::PP -e '
+        run_with_input "$json" perl -MJSON::PP -e '
             my $field = shift;
             local $/; my $json = <STDIN>;
             my $data = eval { decode_json($json) };
@@ -5782,7 +5792,7 @@ except:
             if (ref($val)) { print encode_json($val); }
             elsif (JSON::PP::is_bool($val)) { print $val ? "true" : "false"; }
             else { print $val; }
-        ' "$field" <<<"$json" 2>/dev/null
+        ' "$field" 2>/dev/null
         return 0
     fi
 
@@ -5790,7 +5800,7 @@ except:
     # WARNING: This is fragile and won't handle nested objects, arrays,
     # escaped quotes, or boolean/numeric types correctly. Use with caution.
     local result
-    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"([^"\\]*(\\.[^"\\]*)*)".*/\1/p' <<<"$json" | head -n1)
+    result=$(run_with_input "$json" sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"([^"\\]*(\\.[^"\\]*)*)".*/\1/p' | head -n1)
     if [[ -n "$result" ]]; then
         printf '%s\n' "$result"
         return 0
@@ -5798,7 +5808,7 @@ except:
 
     # Try simple arrays first: extract ["item1","item2"] as-is (bd-kgg5)
     # This must come before unquoted values to avoid partial array matching
-    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*(\[[^]]*\]).*/\1/p' <<<"$json" | head -n1)
+    result=$(run_with_input "$json" sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*(\[[^]]*\]).*/\1/p' | head -n1)
     if [[ -n "$result" ]]; then
         printf '%s\n' "$result"
         return 0
@@ -5806,7 +5816,7 @@ except:
 
     # Try unquoted values (numbers, booleans)
     # Note: [^],}] puts ] first in negated class for correct literal matching
-    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*([^],}]+).*/\1/p' <<<"$json" | head -n1 | tr -d '[:space:]')
+    result=$(run_with_input "$json" sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*([^],}]+).*/\1/p' | head -n1 | tr -d '[:space:]')
     [[ -n "$result" ]] && printf '%s\n' "$result"
     return 0
 }
@@ -6208,9 +6218,9 @@ run_structured_workflow() {
         data_json=$(json_get_field "$payload" data)
         meta_json=$(json_get_field "$payload" _meta)
         if [[ -n "$meta_json" ]] && command -v jq >/dev/null 2>&1; then
-            meta_json=$(jq -c --argjson code "$code" '. + {exit_code:$code}' <<< "$meta_json")
+            meta_json=$(run_with_input "$meta_json" jq -c --argjson code "$code" '. + {exit_code:$code}')
         elif [[ -n "$meta_json" ]] && command -v python3 >/dev/null 2>&1; then
-            meta_json=$(python3 -c 'import json,sys; meta=json.load(sys.stdin); meta["exit_code"]=int(sys.argv[1]); print(json.dumps(meta))' "$code" <<< "$meta_json")
+            meta_json=$(run_with_input "$meta_json" python3 -c 'import json,sys; meta=json.load(sys.stdin); meta["exit_code"]=int(sys.argv[1]); print(json.dumps(meta))' "$code")
         else
             meta_json="{\"exit_code\":$code}"
         fi
@@ -6227,9 +6237,9 @@ run_structured_workflow() {
 structured_payload_is_object() {
     local payload="$1"
     if command -v jq >/dev/null 2>&1; then
-        jq -se 'length == 1 and (.[0] | type == "object")' <<< "$payload" >/dev/null
+        run_with_input "$payload" jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null
     elif command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import json,sys; sys.exit(0 if isinstance(json.load(sys.stdin), dict) else 1)' <<< "$payload"
+        run_with_input "$payload" python3 -c 'import json,sys; sys.exit(0 if isinstance(json.load(sys.stdin), dict) else 1)'
     else
         log_error "Structured workflow output requires jq or python3"
         return 1
@@ -6702,8 +6712,7 @@ show_version() {
 }
 
 show_help() {
-    cat >&2 << 'EOF'
-ru - Repo Updater
+    printf '%s\n' 'ru - Repo Updater
 
 A beautiful, automation-friendly CLI for synchronizing GitHub repositories.
 
@@ -6741,8 +6750,8 @@ GLOBAL OPTIONS:
     --schema             Output JSON schemas for command outputs (shortcut for robot-docs schemas)
 
 SYNC OPTIONS:
-    --clone-only         Only clone missing repos, don't pull
-    --pull-only          Only pull existing repos, don't clone
+    --clone-only         Only clone missing repos, don'\''t pull
+    --pull-only          Only pull existing repos, don'\''t clone
     --autostash          Stash changes before pull, pop after
     --rebase             Use git pull --rebase
     --dry-run            Show what would happen without making changes
@@ -6763,7 +6772,7 @@ ADD OPTIONS:
     --private            Add to private.txt instead of public.txt
     --from-cwd           Detect repo from current working directory
     --group NAME         Clone into a NAME/ subfolder of the layout path
-                         (writes 'owner/repo in NAME'; NAME may be nested: a/b)
+                         (writes '\''owner/repo in NAME'\''; NAME may be nested: a/b)
 
 LIST OPTIONS:
     --paths              Show local paths instead of URLs
@@ -6816,7 +6825,7 @@ REVIEW OPTIONS:
     --repos=PATTERN      Filter repos by pattern
     --priority=LEVEL     Min priority: all, critical, high, normal, low
     --skip-days=N        Skip repos reviewed within N days (default: 7)
-    --dry-run            Discovery only, don't start sessions
+    --dry-run            Discovery only, don'\''t start sessions
     --status             Show review lock/checkpoint status and exit
     --resume             Resume interrupted review from checkpoint
     --push               Allow pushing changes (with --apply)
@@ -6869,8 +6878,7 @@ EXIT CODES:
     4  Invalid arguments
     5  Interrupted sync detected (use --resume or --restart)
 
-More info: https://github.com/Dicklesworthstone/repo_updater
-EOF
+More info: https://github.com/Dicklesworthstone/repo_updater' >&2
 }
 
 # Show stylish quick menu when ru is run with no arguments
@@ -7106,12 +7114,10 @@ set_config_value() {
 
     # If config file doesn't exist, create it with header
     if [[ ! -f "$config_file" ]]; then
-        cat > "$config_file" << 'EOF'
-# ru configuration file
+        printf '%s\n' '# ru configuration file
 # See: https://github.com/Dicklesworthstone/repo_updater
 #
-# Configuration priority: CLI args > environment variables > this file > defaults
-EOF
+# Configuration priority: CLI args > environment variables > this file > defaults' > "$config_file"
     fi
 
     # Check if key already exists
@@ -7158,30 +7164,29 @@ ensure_config_exists() {
     # Create default config file
     local config_file="$RU_CONFIG_DIR/config"
     if [[ ! -f "$config_file" ]]; then
-        cat > "$config_file" << EOF
-# ru configuration file
+        printf '# ru configuration file
 # See: https://github.com/Dicklesworthstone/repo_updater
 #
 # Configuration priority: CLI args > environment variables > this file > defaults
 
 # Base directory for repositories
-PROJECTS_DIR=$DEFAULT_PROJECTS_DIR
+PROJECTS_DIR=%s
 
 # Directory layout: flat | owner-repo | full
-#   flat:       \$PROJECTS_DIR/repo
-#   owner-repo: \$PROJECTS_DIR/owner/repo
-#   full:       \$PROJECTS_DIR/github.com/owner/repo
-LAYOUT=$DEFAULT_LAYOUT
+#   flat:       $PROJECTS_DIR/repo
+#   owner-repo: $PROJECTS_DIR/owner/repo
+#   full:       $PROJECTS_DIR/github.com/owner/repo
+LAYOUT=%s
 
 # Update strategy: ff-only | rebase | merge
-UPDATE_STRATEGY=$DEFAULT_UPDATE_STRATEGY
+UPDATE_STRATEGY=%s
 
 # Auto-stash local changes before pull
-AUTOSTASH=$DEFAULT_AUTOSTASH
+AUTOSTASH=%s
 
 # Parallel operations (1 = serial)
-PARALLEL=$DEFAULT_PARALLEL
-EOF
+PARALLEL=%s
+' "$DEFAULT_PROJECTS_DIR" "$DEFAULT_LAYOUT" "$DEFAULT_UPDATE_STRATEGY" "$DEFAULT_AUTOSTASH" "$DEFAULT_PARALLEL" > "$config_file"
         created_any="true"
         log_verbose "Created config file: $config_file"
     fi
@@ -7189,8 +7194,7 @@ EOF
     # Create public.txt for public repositories
     local public_file="$repos_dir/public.txt"
     if [[ ! -f "$public_file" ]]; then
-        cat > "$public_file" << 'EOF'
-# Public repositories
+        printf '%s\n' '# Public repositories
 # Add one repository per line
 #
 # Supported formats:
@@ -7202,8 +7206,7 @@ EOF
 # Examples:
 #   charmbracelet/gum
 #   cli/cli@main
-#   koalaman/shellcheck
-EOF
+#   koalaman/shellcheck' > "$public_file"
         created_any="true"
         log_verbose "Created repos file: $public_file"
     fi
@@ -7701,7 +7704,7 @@ _is_safe_group_path() {
     [[ "$group" == /* || "$group" == */ || "$group" == *//* ]] && return 1
     local _gseg
     local -a _gsegs
-    IFS='/' read -r -a _gsegs <<< "$group"
+    IFS='/' run_with_input "$group" read -r -a _gsegs
     [[ ${#_gsegs[@]} -gt 0 ]] || return 1
     for _gseg in "${_gsegs[@]}"; do
         _is_safe_path_segment "$_gseg" || return 1
@@ -8098,7 +8101,7 @@ get_repo_status() {
         echo "STATUS=diverged AHEAD=-1 BEHIND=-1 DIRTY=$dirty FRESHNESS=$freshness BRANCH=$branch"
         return 0
     fi
-    read -r ahead behind <<< "$output"
+    run_with_input "$output" read -r ahead behind
 
     # Determine status based on ahead/behind
     local status
@@ -9648,9 +9651,8 @@ generate_json_report() {
     safe_strategy=$(json_escape "$UPDATE_STRATEGY")
 
     # Output data payload (envelope added by caller)
-    cat << EOF
-{"config":{"projects_dir":"$safe_projects_dir","layout":"$safe_layout","update_strategy":"$safe_strategy"},"summary":{"total":$total,"cloned":$cloned,"updated":$updated,"current":$current,"skipped":$skipped,"conflicts":$conflicts,"failed":$failed},"repos":$repos_json}
-EOF
+    printf '{"config":{"projects_dir":"%s","layout":"%s","update_strategy":"%s"},"summary":{"total":%s,"cloned":%s,"updated":%s,"current":%s,"skipped":%s,"conflicts":%s,"failed":%s},"repos":%s}
+' "$safe_projects_dir" "$safe_layout" "$safe_strategy" "$total" "$cloned" "$updated" "$current" "$skipped" "$conflicts" "$failed" "$repos_json"
 }
 
 # Compute appropriate exit code based on results
@@ -10155,7 +10157,7 @@ cmd_status() {
 
         local data_json
         data_json="$(printf '{"total":%d,"repos":%s}' "$total" "$repos_array")"
-        if jq -e 'any(.repos[]; .status == "fetch_failed")' <<< "$data_json" >/dev/null; then
+        if run_with_input "$data_json" jq -e 'any(.repos[]; .status == "fetch_failed")' >/dev/null; then
             status_exit=1
         fi
         emit_structured "$(build_json_envelope "status" "$data_json" "{\"exit_code\":$status_exit}")"
@@ -11560,7 +11562,7 @@ _prune_inspect_orphan() {
     out=$(_prune_git "$phys" config --file "$phys/.git/config" --includes --get-all remote.origin.url 2>/dev/null)
     rc=$?
     if [[ $rc -eq 0 ]]; then
-        mapfile -t raw_urls <<< "$out"
+        run_with_input "$out" mapfile -t raw_urls
     elif [[ $rc -ne 1 ]]; then
         printf 'error\tcannot read .git/config\n'
         return 0
@@ -11575,7 +11577,7 @@ _prune_inspect_orphan() {
     local u key
     if [[ ${#raw_urls[@]} -gt 0 && "$repo_ok" == "true" ]]; then
         if out=$(_prune_git "$phys" remote get-url --all origin 2>/dev/null); then
-            mapfile -t -O "${#raw_urls[@]}" raw_urls <<< "$out"
+            run_with_input "$out" mapfile -t -O "${#raw_urls[@]}" raw_urls
         fi
     fi
     for u in ${raw_urls[@]+"${raw_urls[@]}"}; do
@@ -11686,8 +11688,8 @@ _prune_inspect_worktree() {
         return 1
     fi
     local changed untracked
-    untracked=$(grep -c '^?? ' <<< "$out")
-    changed=$(grep -c -v -e '^?? ' -e '^$' <<< "$out")
+    untracked=$(run_with_input "$out" grep -c '^?? ')
+    changed=$(run_with_input "$out" grep -c -v -e '^?? ' -e '^$')
     ((changed > 0)) && printf 'unsaved\t%s%d uncommitted change(s)\n' "$prefix" "$changed"
     ((untracked > 0)) && printf 'unsaved\t%s%d untracked path(s)\n' "$prefix" "$untracked"
 
@@ -11729,8 +11731,8 @@ _prune_inspect_worktree() {
     fi
     # Stale entries (folder already gone) are 'prunable' and do not count
     local trees stale
-    trees=$(grep -c '^worktree ' <<< "$out")
-    stale=$(grep -c '^prunable' <<< "$out")
+    trees=$(run_with_input "$out" grep -c '^worktree ')
+    stale=$(run_with_input "$out" grep -c '^prunable')
     ((trees - stale > 1)) && printf 'unsaved\t%s%d linked worktree(s) depend on it\n' "$prefix" "$((trees - stale - 1))"
     return 0
 }
@@ -11755,7 +11757,7 @@ _prune_inspect_refs() {
         if out=$(_prune_git "$dir" ${gopts[@]+"${gopts[@]}"} stash list 2>/dev/null); then
             while IFS= read -r line; do
                 [[ -n "$line" ]] && ((stashes++))
-            done <<< "$out"
+            done < <(printf '%s\n' "$out")
         fi
         ((stashes < 1)) && stashes=1
         printf 'unsaved\t%s%d stash(es)\n' "$prefix" "$stashes"
@@ -12085,7 +12087,7 @@ cmd_prune() {
     local use_ids="false" id_out
     local -a id_list=()
     if [[ ${#maybe_orphans[@]} -gt 0 ]] && id_out=$(_prune_identity_keys ${id_paths[@]+"${id_paths[@]}"}); then
-        [[ -n "$id_out" ]] && mapfile -t id_list <<< "$id_out"
+        [[ -n "$id_out" ]] && run_with_input "$id_out" mapfile -t id_list
         if [[ ${#id_list[@]} -eq ${#id_paths[@]} ]]; then
             use_ids="true"
             for i in "${!id_paths[@]}"; do
@@ -12204,7 +12206,7 @@ cmd_prune() {
         if [[ -n "${orphan_precious[$orphan]:-}" ]]; then
             local -a precious_items=()
             local precious_list="" pi
-            mapfile -t precious_items <<< "${orphan_precious[$orphan]}"
+            run_with_input "${orphan_precious[$orphan]}" mapfile -t precious_items
             for pi in "${!precious_items[@]}"; do
                 if ((pi == 5)); then
                     precious_list+=", +$(( ${#precious_items[@]} - 5 )) more"
@@ -12243,7 +12245,7 @@ cmd_prune() {
                     [[ "$item_first" == "true" ]] || json_array+=","
                     item_first="false"
                     json_array+="\"$(json_escape "$item")\""
-                done <<< "${orphan_unsaved[$path]}"
+                done < <(printf '%s\n' "${orphan_unsaved[$path]}")
                 json_array+="]"
             fi
             if [[ -n "${orphan_precious[$path]:-}" ]]; then
@@ -12253,7 +12255,7 @@ cmd_prune() {
                     [[ "$p_first" == "true" ]] || json_array+=","
                     p_first="false"
                     json_array+="\"$(json_escape "$p_item")\""
-                done <<< "${orphan_precious[$path]}"
+                done < <(printf '%s\n' "${orphan_precious[$path]}")
                 json_array+="]"
             fi
             json_array+="}"
@@ -12672,7 +12674,8 @@ is_file_denied() {
     fi
     if [[ -n "${AGENT_SWEEP_DENYLIST_EXTRA:-}" ]]; then
         # Split space-separated extra patterns
-        read -ra extra <<<"$AGENT_SWEEP_DENYLIST_EXTRA"
+        local -a extra
+        run_with_input "$AGENT_SWEEP_DENYLIST_EXTRA" read -ra extra
         all_patterns+=("${extra[@]}")
     fi
 
@@ -12828,16 +12831,15 @@ load_review_driver() {
 # Returns: JSON object with capability flags
 driver_capabilities() {
     # Base implementation - drivers override this
-    cat <<EOF
-{
-  "name": "${LOADED_DRIVER:-unknown}",
+    printf '{
+  "name": "%s",
   "parallel_sessions": true,
   "activity_detection": false,
   "health_monitoring": false,
   "question_routing": true,
   "max_concurrent": 4
 }
-EOF
+' "${LOADED_DRIVER:-unknown}"
 }
 
 # Start a new Claude Code session in a worktree
@@ -12871,13 +12873,12 @@ driver_get_session_state() {
     local session_id="$1"
 
     # Stub - drivers must implement
-    cat <<EOF
-{
-  "session_id": "$session_id",
+    printf '{
+  "session_id": "%s",
   "state": "unknown",
   "error": "driver_get_session_state not implemented"
 }
-EOF
+' "$session_id"
     return 1
 }
 
@@ -12969,13 +12970,12 @@ local_driver_start_session() {
     fi
 
     # Initialize state file
-    cat > "$state_file" <<EOF
-{
-  "session_id": "$session_name",
+    printf '{
+  "session_id": "%s",
   "state": "starting",
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "started_at": "%s"
 }
-EOF
+' "$session_name" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state_file"
 
     # Build claude command with stream-json output (shell-escaped args)
     local -a claude_args=(claude -p "$prompt" --output-format stream-json)
@@ -12992,16 +12992,15 @@ EOF
     fi
 
     # Update state to running
-    cat > "$state_file" <<EOF
-{
-  "session_id": "$session_name",
+    printf '{
+  "session_id": "%s",
   "state": "generating",
-  "worktree": "$wt_path",
-  "log_file": "$log_file",
-  "event_pipe": "$event_pipe",
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "worktree": "%s",
+  "log_file": "%s",
+  "event_pipe": "%s",
+  "started_at": "%s"
 }
-EOF
+' "$session_name" "$wt_path" "$log_file" "$event_pipe" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state_file"
 
     # Return session info on stdout
     cat "$state_file"
@@ -13031,13 +13030,12 @@ local_driver_get_session_state() {
 
     # Check if tmux session exists
     if ! tmux has-session -t "$session_id" 2>/dev/null; then
-        cat <<EOF
-{
-  "session_id": "$session_id",
+        printf '{
+  "session_id": "%s",
   "state": "dead",
   "reason": "tmux session not found"
 }
-EOF
+' "$session_id"
         return 0
     fi
 
@@ -13046,13 +13044,12 @@ EOF
     pane_pid=$(tmux list-panes -t "$session_id" -F "#{pane_pid}" 2>/dev/null | head -1)
 
     if [[ -z "$pane_pid" ]]; then
-        cat <<EOF
-{
-  "session_id": "$session_id",
+        printf '{
+  "session_id": "%s",
   "state": "unknown",
   "reason": "no pane found"
 }
-EOF
+' "$session_id"
         return 0
     fi
 
@@ -13065,13 +13062,12 @@ EOF
         state="complete"
     fi
 
-    cat <<EOF
-{
-  "session_id": "$session_id",
-  "state": "$state",
-  "pane_pid": $pane_pid
+    printf '{
+  "session_id": "%s",
+  "state": "%s",
+  "pane_pid": %s
 }
-EOF
+' "$session_id" "$state" "$pane_pid"
     return 0
 }
 
@@ -14238,7 +14234,7 @@ monitor_sessions() {
             esac
 
             sessions["$session_id"]="$confirmed_state"
-        done <<< "$session_list"
+        done < <(printf '%s\n' "$session_list")
 
         # Start new sessions if governor allows
         if declare -f governor_update &>/dev/null; then
@@ -14312,7 +14308,7 @@ get_pending_repos_from_state() {
     local repo
     while IFS= read -r repo; do
         [[ -n "$repo" ]] && _out_arr+=("$repo")
-    done <<< "$repo_list"
+    done < <(printf '%s\n' "$repo_list")
 
     return 0
 }
@@ -14366,7 +14362,7 @@ start_next_queued_session() {
             while IFS= read -r line; do
                 # shellcheck disable=SC2190  # False positive: repo_items is indexed array, not associative
                 [[ -n "$line" ]] && repo_items+=("$line")
-            done <<< "$items_blob"
+            done < <(printf '%s\n' "$items_blob")
         fi
 
         local items_json="[]"
@@ -14529,7 +14525,7 @@ run_review_orchestration() {
     declare -A repo_items=()
     local item repo_id
     for item in "${work_items[@]}"; do
-        IFS='|' read -r repo_id _ <<< "$item"
+        IFS='|' run_with_input "$item" read -r repo_id _
         if [[ -n "$repo_id" && -z "${seen_repos[$repo_id]:-}" ]]; then
             seen_repos["$repo_id"]=1
             pending_repos+=("$repo_id")
@@ -15357,14 +15353,13 @@ ntm_driver_start_session() {
     local log_file="$ru_dir/session.log"
 
     # Initialize state file
-    cat > "$state_file" <<EOF
-{
-  "session_id": "$session_name",
+    printf '{
+  "session_id": "%s",
   "state": "starting",
   "driver": "ntm",
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "started_at": "%s"
 }
-EOF
+' "$session_name" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state_file"
 
     # Use ntm robot-spawn to create session
     local spawn_result
@@ -15382,17 +15377,16 @@ EOF
     fi
 
     # Update state to running
-    cat > "$state_file" <<EOF
-{
-  "session_id": "$session_name",
-  "pane_id": "${pane_id:-unknown}",
+    printf '{
+  "session_id": "%s",
+  "pane_id": "%s",
   "state": "generating",
   "driver": "ntm",
-  "worktree": "$wt_path",
-  "log_file": "$log_file",
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "worktree": "%s",
+  "log_file": "%s",
+  "started_at": "%s"
 }
-EOF
+' "$session_name" "${pane_id:-unknown}" "$wt_path" "$log_file" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state_file"
 
     cat "$state_file"
     return 0
@@ -15451,14 +15445,13 @@ ntm_driver_get_session_state() {
     local session_id="$1"
 
     if ! tmux has-session -t "$session_id" 2>/dev/null; then
-        cat <<EOF
-{
-  "session_id": "$session_id",
+        printf '{
+  "session_id": "%s",
   "state": "dead",
   "driver": "ntm",
   "reason": "session not found"
 }
-EOF
+' "$session_id"
         return 0
     fi
 
@@ -15476,27 +15469,25 @@ EOF
         confidence=$(echo "$activity_json" | jq -r '.confidence // 0')
         unified_state=$(ntm_map_state "$ntm_state")
 
-        cat <<EOF
-{
-  "session_id": "$session_id",
-  "pane_id": "$pane_id",
-  "state": "$unified_state",
+        printf '{
+  "session_id": "%s",
+  "pane_id": "%s",
+  "state": "%s",
   "driver": "ntm",
-  "ntm_state": "$ntm_state",
-  "velocity": $velocity,
-  "confidence": $confidence
+  "ntm_state": "%s",
+  "velocity": %s,
+  "confidence": %s
 }
-EOF
+' "$session_id" "$pane_id" "$unified_state" "$ntm_state" "$velocity" "$confidence"
     else
-        cat <<EOF
-{
-  "session_id": "$session_id",
-  "pane_id": "$pane_id",
+        printf '{
+  "session_id": "%s",
+  "pane_id": "%s",
   "state": "unknown",
   "driver": "ntm",
   "reason": "ntm activity query failed"
 }
-EOF
+' "$session_id" "$pane_id"
     fi
     return 0
 }
@@ -15594,8 +15585,7 @@ _enable_ntm_driver() {
     driver_session_alive() { ntm_driver_session_alive "$@"; }
 
     driver_capabilities() {
-        cat <<EOF
-{
+        printf '{
   "name": "ntm",
   "parallel_sessions": true,
   "activity_detection": true,
@@ -15604,7 +15594,7 @@ _enable_ntm_driver() {
   "velocity_based": true,
   "max_concurrent": 8
 }
-EOF
+'
     }
 }
 
@@ -15643,8 +15633,7 @@ _enable_local_driver() {
 
     # Update capabilities for local driver
     driver_capabilities() {
-        cat <<EOF
-{
+        printf '{
   "name": "local",
   "parallel_sessions": true,
   "activity_detection": false,
@@ -15652,7 +15641,7 @@ _enable_local_driver() {
   "question_routing": true,
   "max_concurrent": 4
 }
-EOF
+'
     }
 }
 
@@ -15896,18 +15885,17 @@ can_start_new_session() {
 
 # Get governor status as JSON for TUI display
 get_governor_status() {
-    cat <<EOF
-{
-  "github_remaining": ${GOVERNOR_STATE[github_remaining]},
-  "github_reset": ${GOVERNOR_STATE[github_reset]},
-  "model_in_backoff": ${GOVERNOR_STATE[model_in_backoff]},
-  "model_backoff_until": ${GOVERNOR_STATE[model_backoff_until]},
-  "effective_parallelism": ${GOVERNOR_STATE[effective_parallelism]},
-  "target_parallelism": ${GOVERNOR_STATE[target_parallelism]},
-  "circuit_breaker_open": ${GOVERNOR_STATE[circuit_breaker_open]},
-  "error_count": ${GOVERNOR_STATE[error_count_window]}
+    printf '{
+  "github_remaining": %s,
+  "github_reset": %s,
+  "model_in_backoff": %s,
+  "model_backoff_until": %s,
+  "effective_parallelism": %s,
+  "target_parallelism": %s,
+  "circuit_breaker_open": %s,
+  "error_count": %s
 }
-EOF
+' "${GOVERNOR_STATE[github_remaining]}" "${GOVERNOR_STATE[github_reset]}" "${GOVERNOR_STATE[model_in_backoff]}" "${GOVERNOR_STATE[model_backoff_until]}" "${GOVERNOR_STATE[effective_parallelism]}" "${GOVERNOR_STATE[target_parallelism]}" "${GOVERNOR_STATE[circuit_breaker_open]}" "${GOVERNOR_STATE[error_count_window]}"
 }
 
 # Background loop that continuously monitors and adjusts rate limits
@@ -16524,7 +16512,7 @@ show_patch_summary() {
         printf '  Changed files:\n'
         while IFS= read -r line; do
             printf '    %s\n' "$(truncate_string "$line" "$width")"
-        done <<< "$(echo "$diffstat" | head -n 6)"
+        done < <(printf '%s\n' "$(echo "$diffstat" | head -n 6)")
 
         if [[ -n "$shortstat" ]]; then
             printf '  Diff: %s\n' "$shortstat"
@@ -16563,7 +16551,7 @@ view_session_output() {
 
     local cols rows term_size max_lines
     term_size=$(get_terminal_size)
-    read -r cols rows <<< "$term_size"
+    run_with_input "$term_size" read -r cols rows
     max_lines=$((rows - 6))
     [[ $max_lines -lt 5 ]] && max_lines=5
 
@@ -16608,7 +16596,7 @@ open_drilldown() {
     while true; do
         local cols rows term_size width
         term_size=$(get_terminal_size)
-        read -r cols rows <<< "$term_size"
+        run_with_input "$term_size" read -r cols rows
         width=$((cols - 4))
         [[ $width -lt 20 ]] && width=20
 
@@ -16915,7 +16903,7 @@ render_question_entry() {
                 letter=$(printf '%c' $((97 + opt_index)))  # a, b, c...
                 opt_line+="${letter}) ${opt}  "
                 ((opt_index++))
-            done <<< "$options"
+            done < <(printf '%s\n' "$options")
             printf '%s\n' "$(truncate_string "$opt_line" "$cols")"
         fi
     fi
@@ -17065,7 +17053,7 @@ render_dashboard() {
 
     local cols rows term_size
     term_size=$(get_terminal_size)
-    read -r cols rows <<< "$term_size"
+    run_with_input "$term_size" read -r cols rows
 
     # Parse stats with fallbacks
     local completed_count issues prs commits progress_current progress_total
@@ -18048,21 +18036,20 @@ checkpoint_review_state() {
     local total=$((completed_count + pending_count))
 
     local checkpoint
-    checkpoint=$(cat <<EOF
-{
+    checkpoint=$(printf '{
   "version": 1,
-  "timestamp": "$now",
-  "run_id": "$run_id",
-  "mode": "$mode",
-  "config_hash": "$config_hash",
-  "repos_total": $total,
-  "repos_completed": $completed_count,
-  "repos_pending": $pending_count,
-  "questions_pending": $questions_pending,
-  "completed_repos": $completed_json,
-  "pending_repos": $pending_json
+  "timestamp": "%s",
+  "run_id": "%s",
+  "mode": "%s",
+  "config_hash": "%s",
+  "repos_total": %s,
+  "repos_completed": %s,
+  "repos_pending": %s,
+  "questions_pending": %s,
+  "completed_repos": %s,
+  "pending_repos": %s
 }
-EOF
+' "$now" "$run_id" "$mode" "$config_hash" "$total" "$completed_count" "$pending_count" "$questions_pending" "$completed_json" "$pending_json"
 )
 
     if ! with_state_lock write_json_atomic "$checkpoint_file" "$checkpoint"; then
@@ -18433,9 +18420,8 @@ init_metrics_file() {
         return 0
     fi
 
-    cat > "$metrics_file" <<EOF
-{
-  "period": "$period",
+    printf '{
+  "period": "%s",
   "reviews": {
     "total": 0,
     "repos_reviewed": 0,
@@ -18452,7 +18438,7 @@ init_metrics_file() {
     "by_type": {}
   }
 }
-EOF
+' "$period" > "$metrics_file"
 }
 
 record_decisions_from_plan() {
@@ -18715,7 +18701,7 @@ record_worktree_mapping() {
         local tmp_file="${mapping_file}.tmp.$$"
         [[ -z "$base_ref" ]] && base_ref="HEAD"
 
-        if jq --arg repo "$repo_id" \
+        if run_with_input "$prior_mapping" jq --arg repo "$repo_id" \
               --arg path "$wt_path" \
               --arg branch "$wt_branch" \
               --arg base "$base_ref" \
@@ -18726,7 +18712,7 @@ record_worktree_mapping() {
               --arg run "${REVIEW_RUN_ID:-}" \
               --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '.[$repo] = {"repo": $repo, "run_id": $run, "worktree_path": $path, "main_repo_path": $main, "branch": $branch, "base_ref": $base, "base_ref_full": $full, "base_sha": $sha, "origin_push_urls": $targets, "created_at": $created}' \
-              <<< "$prior_mapping" > "$tmp_file"; then
+ > "$tmp_file"; then
             if [[ -n "$main_repo_path" && -n "$base_sha" ]]; then
                 local original_mapping anchor_sha anchor_ref
                 original_mapping=$(jq -cS --arg repo "$repo_id" '.[$repo]' "$tmp_file") || {
@@ -18948,7 +18934,7 @@ prepare_review_worktrees() {
             # mapping onto an agent's already-modified worktree.
             local saved_mapping
             if ! saved_mapping=$(jq -ce --arg repo "$repo_id" '.[$repo]' "$worktrees_dir/mapping.json" 2>/dev/null) ||
-               [[ "$(jq -r '.worktree_path' <<< "$saved_mapping")" != "$wt_path" ]]; then
+               [[ "$(run_with_input "$saved_mapping" jq -r '.worktree_path')" != "$wt_path" ]]; then
                 log_error "Existing worktree lacks its original mapping: $wt_path"
                 ((failed++))
                 continue
@@ -19490,8 +19476,7 @@ score_and_sort_work_items() {
     while IFS= read -r tsv_line; do
         # Bash treats tabs as IFS whitespace and collapses empty label fields.
         # The producer already normalizes pipes in titles and label names.
-        IFS='|' read -r repo_id item_type number title labels created_at updated_at is_draft \
-            <<< "${tsv_line//$'\t'/|}"
+        IFS='|' run_with_input "${tsv_line//$'\t'/|}" read -r repo_id item_type number title labels created_at updated_at is_draft
         [[ -z "$repo_id" ]] && continue
 
         local score
@@ -19736,7 +19721,7 @@ show_discovery_summary_ansi() {
         local i=0
         for item in "${_ds_items[@]:0:$display_count}"; do
             ((i++))
-            IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+            IFS="|" run_with_input "$item" read -r repo_id item_type number title labels created_at updated_at is_draft
 
             # Calculate score and level for display
             local score level
@@ -19793,7 +19778,7 @@ show_discovery_summary_gum() {
         local i=0
         for item in "${_ds_items[@]:0:$display_count}"; do
             ((i++))
-            IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+            IFS="|" run_with_input "$item" read -r repo_id item_type number title labels created_at updated_at is_draft
 
             local score level badge_color
             score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft" "$repo_id" "$number")
@@ -19838,7 +19823,7 @@ show_discovery_summary_json() {
 
         local item_list=""
         for item in "${_ds_items[@]:0:$display_count}"; do
-            IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+            IFS="|" run_with_input "$item" read -r repo_id item_type number title labels created_at updated_at is_draft
 
             local score level
             score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft" "$repo_id" "$number")
@@ -19854,14 +19839,13 @@ show_discovery_summary_json() {
         items_json="[$item_list]"
     fi
 
-    cat <<EOF
-{
-  "total": $total,
-  "by_type": {"issues": $issues, "prs": $prs},
-  "by_priority": {"critical": $critical, "high": $high, "normal": $normal, "low": $low},
-  "top_items": $items_json
+    printf '{
+  "total": %s,
+  "by_type": {"issues": %s, "prs": %s},
+  "by_priority": {"critical": %s, "high": %s, "normal": %s, "low": %s},
+  "top_items": %s
 }
-EOF
+' "$total" "$issues" "$prs" "$critical" "$high" "$normal" "$low" "$items_json"
 }
 
 # Main discovery summary function
@@ -19881,7 +19865,7 @@ show_discovery_summary() {
     local issues=0 prs=0
 
     for item in "${items[@]}"; do
-        IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+        IFS="|" run_with_input "$item" read -r repo_id item_type number title labels created_at updated_at is_draft
 
         # Count by type
         case "$item_type" in
@@ -19940,7 +19924,7 @@ build_review_items_json() {
     local item_list=""
 
     for item in "${items[@]}"; do
-        IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+        IFS="|" run_with_input "$item" read -r repo_id item_type number title labels created_at updated_at is_draft
         [[ -z "$repo_id" ]] && continue
 
         local score level number_json labels_json
@@ -19986,7 +19970,7 @@ build_review_summary_json() {
     local -A unique_repos=()
 
     for item in "${items[@]}"; do
-        IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+        IFS="|" run_with_input "$item" read -r repo_id item_type number title labels created_at updated_at is_draft
         [[ -z "$repo_id" ]] && continue
         unique_repos["$repo_id"]=1
 
@@ -20074,7 +20058,7 @@ build_review_completion_json() {
     local -A unique_repos=()
     local item
     for item in "${items[@]}"; do
-        IFS="|" read -r repo_id _ _ _ _ _ _ _ <<< "$item"
+        IFS="|" run_with_input "$item" read -r repo_id _ _ _ _ _ _ _
         [[ -n "$repo_id" ]] && unique_repos["$repo_id"]=1
     done
 
@@ -20462,7 +20446,7 @@ cmd_review() {
         else
             # Use IFS+read to safely split without glob expansion
             local -a tokens
-            IFS=' ' read -ra tokens <<< "$REVIEW_INVALIDATE_CACHE"
+            IFS=' ' run_with_input "$REVIEW_INVALIDATE_CACHE" read -ra tokens
             local token
             for token in "${tokens[@]}"; do
                 invalidate_repos+=("$token")
@@ -20571,7 +20555,7 @@ cmd_review() {
     local -A pending_seen=()
     for item in "${work_items[@]}"; do
         local repo_id=""
-        IFS="|" read -r repo_id _ _ _ _ _ _ _ <<< "$item"
+        IFS="|" run_with_input "$item" read -r repo_id _ _ _ _ _ _ _
         if [[ -n "$repo_id" && -z "${pending_seen[$repo_id]:-}" ]]; then
             pending_seen["$repo_id"]=1
             pending_repos_list+="${repo_id} "
@@ -20727,7 +20711,7 @@ cmd_review_apply() {
     fi
     local mapping_snapshot
     if ! mapping_snapshot=$(cat "$mapping_file") ||
-       ! jq -e -s 'length == 1 and (.[0] | type == "object" and length > 0 and all(.[]; type == "object"))' <<< "$mapping_snapshot" >/dev/null 2>&1; then
+       ! run_with_input "$mapping_snapshot" jq -e -s 'length == 1 and (.[0] | type == "object" and length > 0 and all(.[]; type == "object"))' >/dev/null 2>&1; then
         log_error "Invalid or empty worktree mapping for run: $run_id"
         emit_review_apply_result 4 invalid_mapping
         return 4
@@ -20740,14 +20724,14 @@ cmd_review_apply() {
     local repo_id
     while IFS= read -r repo_id; do
         [[ -n "$repo_id" ]] && mapped_repos+=("$repo_id")
-    done < <(jq -r 'keys[]' <<< "$mapping_snapshot")
+    done < <(run_with_input "$mapping_snapshot" jq -r 'keys[]')
 
     # Apply outside the read loop so confirmations read the operator's TTY,
     # not the redirected stream of mapping keys.
     for repo_id in "${mapped_repos[@]}"; do
 
         local wt_path code=0 status row separator=""
-        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""' <<< "$mapping_snapshot") || wt_path=""
+        wt_path=$(run_with_input "$mapping_snapshot" jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""') || wt_path=""
         if [[ -z "$wt_path" || ! -d "$wt_path" ]]; then
             log_error "Missing or invalid worktree path for $repo_id (mapping.json)"
             code=4
@@ -20959,8 +20943,8 @@ push_worktree_changes() {
     candidate_sha=$(git -C "$wt_path" rev-parse HEAD) || return 1
     local original_base_ref original_mapping original_destinations
     original_mapping=$(git -C "$wt_path" cat-file blob "refs/ru/review-mappings/${REVIEW_RUN_ID}/${repo_id//\//_}") || return 1
-    original_base_ref=$(jq -r '.base_ref_full // empty' <<< "$original_mapping") || return 1
-    original_destinations=$(jq -ce '.origin_push_urls | reduce .[] as $url ([]; if index($url) != null then . else . + [$url] end) | select(length > 0)' <<< "$original_mapping") || {
+    original_base_ref=$(run_with_input "$original_mapping" jq -r '.base_ref_full // empty') || return 1
+    original_destinations=$(run_with_input "$original_mapping" jq -ce '.origin_push_urls | reduce .[] as $url ([]; if index($url) != null then . else . + [$url] end) | select(length > 0)') || {
         log_error "Original review has no publication destination for $repo_id"
         return 1
     }
@@ -21035,8 +21019,8 @@ push_worktree_changes() {
             fi
         fi
         scan_commit_publication "$main_repo" "$old_sha" "$candidate_sha" || return 1
-        publication_tips=$(jq -c --arg url "$destination" --arg sha "$old_sha" '. + [{url:$url,sha:$sha}]' <<< "$publication_tips") || return 1
-    done < <(jq -j '.[] | ., "\u0000"' <<< "$original_destinations")
+        publication_tips=$(run_with_input "$publication_tips" jq -c --arg url "$destination" --arg sha "$old_sha" '. + [{url:$url,sha:$sha}]') || return 1
+    done < <(run_with_input "$original_destinations" jq -j '.[] | ., "\u0000"')
 
     local original_branch
     original_branch=$(git -C "$main_repo" symbolic-ref --short HEAD 2>/dev/null || echo "")
@@ -21073,19 +21057,19 @@ push_worktree_changes() {
     fi
     local push_output publication_code=0
     while IFS= read -r receiver; do
-        destination=$(jq -r '.url' <<< "$receiver") || { publication_code=1; break; }
-        old_sha=$(jq -r '.sha' <<< "$receiver") || { publication_code=1; break; }
+        destination=$(run_with_input "$receiver" jq -r '.url') || { publication_code=1; break; }
+        old_sha=$(run_with_input "$receiver" jq -r '.sha') || { publication_code=1; break; }
         if ! tip=$(run_commit_publication_transport "$main_repo" origin "$destination" inspect "$original_base_ref") ||
            [[ "${tip%%$'\t'*}" != "$old_sha" ]]; then
             log_error "Prepared receiver changed after review checks for $repo_id"
             publication_code=1
             break
         fi
-    done < <(jq -c '.[]' <<< "$publication_tips")
+    done < <(run_with_input "$publication_tips" jq -c '.[]')
     if [[ "$publication_code" == 0 ]]; then
         while IFS= read -r receiver; do
-            destination=$(jq -r '.url' <<< "$receiver") || { publication_code=1; break; }
-            old_sha=$(jq -r '.sha' <<< "$receiver") || { publication_code=1; break; }
+            destination=$(run_with_input "$receiver" jq -r '.url') || { publication_code=1; break; }
+            old_sha=$(run_with_input "$receiver" jq -r '.sha') || { publication_code=1; break; }
             if ! validate_review_identity "$repo_id" "$wt_path" "$plan_file" ||
                [[ "$(review_plan_digest "$plan_file")" != "$approved_digest" ]] ||
                ! ensure_review_approval "$repo_id" "$wt_path" "$plan_file" ||
@@ -21100,7 +21084,7 @@ push_worktree_changes() {
                 publication_code=1
                 break
             fi
-        done < <(jq -c '.[]' <<< "$publication_tips")
+        done < <(run_with_input "$publication_tips" jq -c '.[]')
     fi
     if [[ "$publication_code" != 0 ]]; then
         git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
@@ -21165,15 +21149,15 @@ validate_review_identity() {
         push_urls=$(git -C "$main_real" remote get-url --push --all origin) || return 1
         origin_push_urls=$(printf '%s\n' "$push_urls" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
     fi
-    if [[ "$origin_push_urls" != "$(jq -c '.origin_push_urls' <<< "$mapping")" ]]; then
+    if [[ "$origin_push_urls" != "$(run_with_input "$mapping" jq -c '.origin_push_urls')" ]]; then
         log_error "Publication targets changed since review preparation for $repo_id"
         return 1
     fi
     local wt_branch base_ref base_ref_full base_sha head_sha main_sha actual_commits
     wt_branch=$(git -C "$wt_real" symbolic-ref --short HEAD 2>/dev/null) || return 1
-    base_ref=$(jq -r '.base_ref // empty' <<< "$mapping")
-    base_ref_full=$(jq -r '.base_ref_full // empty' <<< "$mapping")
-    base_sha=$(jq -r '.base_sha // empty' <<< "$mapping")
+    base_ref=$(run_with_input "$mapping" jq -r '.base_ref // empty')
+    base_ref_full=$(run_with_input "$mapping" jq -r '.base_ref_full // empty')
+    base_sha=$(run_with_input "$mapping" jq -r '.base_sha // empty')
     if [[ ! "$base_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
        { [[ "$base_ref_full" != "$base_sha" ]] &&
          { ! git check-ref-format "$base_ref_full" >/dev/null 2>&1 ||
@@ -21244,7 +21228,7 @@ ensure_review_approval() {
         log_error "Invalid review policy for $repo_id"
         return 1
     fi
-    [[ "$(jq -r '.require_approval' <<< "$policy")" == "false" ]] && return 0
+    [[ "$(run_with_input "$policy" jq -r '.require_approval')" == "false" ]] && return 0
     digest=$(review_plan_digest "$plan_file") || return 1
     head_sha=$(git -C "$wt_path" rev-parse HEAD) || return 1
     approval_file="$wt_path/.ru/review-approval.json"
@@ -21665,8 +21649,7 @@ get_review_plan_json_summary() {
 
 # Generate the "digest" prompt (writes/updates .ru/repo-digest.md)
 generate_digest_prompt() {
-  cat <<'EOF'
-First read ALL of AGENTS.md and README.md carefully.
+  printf '%s\n' 'First read ALL of AGENTS.md and README.md carefully.
 
 If a prior digest exists at `.ru/repo-digest.md`, read it first, then update it based on changes since the last review:
   - inspect `git log` since the last digest timestamp
@@ -21677,8 +21660,7 @@ If no digest exists, create a comprehensive digest covering:
   - key files/modules and their roles
   - conventions, quality gates, and how to run tests
 
-Write the updated digest to `.ru/repo-digest.md`.
-EOF
+Write the updated digest to `.ru/repo-digest.md`.'
 }
 
 # Generate the "review work items" prompt (must write .ru/review-plan.json)
@@ -21791,8 +21773,7 @@ init_review_policies() {
     fi
 
     # Create example policy file
-    cat > "$policy_dir/_default.example" << 'EOF'
-# Default Review Policy Configuration
+    printf '%s\n' '# Default Review Policy Configuration
 # Copy to _default (no extension) to activate
 # Or create repo-specific files: github.com_owner_repo
 
@@ -21822,8 +21803,7 @@ init_review_policies() {
 
 # Refuse application when the corresponding runner is absent
 # REQUIRE_TESTS=false
-# REQUIRE_LINT=false
-EOF
+# REQUIRE_LINT=false' > "$policy_dir/_default.example"
 
     [[ "$quiet" != "quiet" ]] && log_info "Created policy directory with example: $policy_dir"
     return 0
@@ -22139,7 +22119,8 @@ apply_policy_priority_boost() {
     if [[ -n "$label_boost_str" && -n "$labels" ]]; then
         # Parse label boosts into associative array
         local -A label_boosts
-        IFS=',' read -ra boost_pairs <<< "$label_boost_str"
+        local -a boost_pairs label_array
+        IFS=',' run_with_input "$label_boost_str" read -ra boost_pairs
         for pair in "${boost_pairs[@]}"; do
             local label="${pair%%=*}"
             local boost="${pair#*=}"
@@ -22147,7 +22128,7 @@ apply_policy_priority_boost() {
         done
 
         # Apply boosts for matching labels
-        IFS=',' read -ra label_array <<< "$labels"
+        IFS=',' run_with_input "$labels" read -ra label_array
         for label in "${label_array[@]}"; do
             label=$(echo "$label" | tr -d ' ')
             if [[ -n "${label_boosts[$label]:-}" ]]; then
@@ -22254,7 +22235,7 @@ get_fork_status() {
         printf '0\t0\tunknown\tfalse\n'
         return 1
     fi
-    read -r ahead behind <<< "$output"
+    run_with_input "$output" read -r ahead behind
 
     # Determine status
     local status
@@ -22469,7 +22450,7 @@ cmd_fork_status() {
             # Get status
             local status_line ahead behind fork_status has_changes
             status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch")
-            IFS=$'\t' read -r ahead behind fork_status has_changes <<< "$status_line"
+            IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status has_changes
 
             # Detect pollution
             local polluted="false"
@@ -22552,7 +22533,7 @@ cmd_fork_status() {
 
             local status_line ahead behind fork_status has_changes
             status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch")
-            IFS=$'\t' read -r ahead behind fork_status has_changes <<< "$status_line"
+            IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status has_changes
 
             local polluted="false"
             if detect_main_pollution "$local_path" "$upstream_remote" "$up_branch"; then
@@ -22665,7 +22646,7 @@ cmd_fork_sync() {
         # Check fork status
         local status_line ahead behind fork_status has_changes
         status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch")
-        IFS=$'\t' read -r ahead behind fork_status has_changes <<< "$status_line"
+        IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status has_changes
 
         if [[ "$fork_status" == "synced" ]]; then
             log_verbose "$repo_id is already synced"
@@ -23197,7 +23178,7 @@ cs_process_repo() {
         files_json=$(printf '%s\0' "${group_paths[@]}" | jq -Rs 'split("\u0000")[:-1]') || return 1
         commit_json=$(jq -cn --arg message "$msg" --arg source "$commit_source" --argjson files "$files_json" \
             '{message:$message,source:$source,files:$files}') || return 1
-        commits_json=$(jq -c --argjson commit "$commit_json" '. + [$commit]' <<< "$commits_json") || return 1
+        commits_json=$(run_with_input "$commits_json" jq -c --argjson commit "$commit_json" '. + [$commit]') || return 1
         commit_count=$((commit_count + 1))
         [[ "$execute_mode" == true ]] || log_step "$repo_name: $msg (${#group_paths[@]} file(s))"
     done
@@ -23811,7 +23792,7 @@ run_quality_gates() {
     # Load policy for this repo
     local policy_json
     if ! policy_json=$(load_policy_for_repo "$repo_id") ||
-       ! jq -e -s 'length == 1 and (.[0] | type == "object")' <<< "$policy_json" >/dev/null; then
+       ! run_with_input "$policy_json" jq -e -s 'length == 1 and (.[0] | type == "object")' >/dev/null; then
         log_error "Cannot load quality-gate policy"
         printf '{"overall_ok":false,"has_warning":false,"error":"invalid_policy","tests":null,"lint":null,"secrets":null}\n'
         return 1
@@ -23827,22 +23808,22 @@ run_quality_gates() {
     lint_result=$(run_lint_gate "$wt_path" "$lint_cmd")
     local lint_exit=$?
 
-    if ! jq -e -s 'length == 1 and (.[0] |
+    if ! run_with_input "$lint_result" jq -e -s 'length == 1 and (.[0] |
         type == "object" and
         ((.ran == true and (.ok | type == "boolean") and
           (.exit_code | type == "number" and floor == . and . >= 0 and . <= 255)) or
-         (.ran == false and .ok == null and .reason == "no_linter_found")))' <<< "$lint_result" >/dev/null; then
+         (.ran == false and .ok == null and .reason == "no_linter_found")))' >/dev/null; then
         lint_result=$(jq -n --argjson exit_code "$lint_exit" '{ran:false,ok:false,reason:"invalid_gate_result",exit_code:$exit_code}')
         overall_ok=false
         log_error "Lint gate returned an invalid result"
-    elif [[ $lint_exit -eq 2 ]] && jq -e '.ran == false' <<< "$lint_result" >/dev/null; then
-        if jq -e '.require_lint == true' <<< "$policy_json" >/dev/null; then
+    elif [[ $lint_exit -eq 2 ]] && run_with_input "$lint_result" jq -e '.ran == false' >/dev/null; then
+        if run_with_input "$policy_json" jq -e '.require_lint == true' >/dev/null; then
             overall_ok=false
             log_error "Required linter is not configured"
         else
             log_verbose "No optional linter configured"
         fi
-    elif [[ $lint_exit -ne 0 ]] || ! jq -e '.ran == true and .ok == true and .exit_code == 0' <<< "$lint_result" >/dev/null; then
+    elif [[ $lint_exit -ne 0 ]] || ! run_with_input "$lint_result" jq -e '.ran == true and .ok == true and .exit_code == 0' >/dev/null; then
         overall_ok=false
         log_error "Lint gate failed"
     else
@@ -23854,22 +23835,22 @@ run_quality_gates() {
     test_result=$(run_test_gate "$wt_path" "$test_cmd")
     local test_exit=$?
 
-    if ! jq -e -s 'length == 1 and (.[0] |
+    if ! run_with_input "$test_result" jq -e -s 'length == 1 and (.[0] |
         type == "object" and
         ((.ran == true and (.ok | type == "boolean") and
           (.exit_code | type == "number" and floor == . and . >= 0 and . <= 255)) or
-         (.ran == false and .ok == null and .reason == "no_tests_found")))' <<< "$test_result" >/dev/null; then
+         (.ran == false and .ok == null and .reason == "no_tests_found")))' >/dev/null; then
         test_result=$(jq -n --argjson exit_code "$test_exit" '{ran:false,ok:false,reason:"invalid_gate_result",exit_code:$exit_code}')
         overall_ok=false
         log_error "Test gate returned an invalid result"
-    elif [[ $test_exit -eq 2 ]] && jq -e '.ran == false' <<< "$test_result" >/dev/null; then
-        if jq -e '.require_tests == true' <<< "$policy_json" >/dev/null; then
+    elif [[ $test_exit -eq 2 ]] && run_with_input "$test_result" jq -e '.ran == false' >/dev/null; then
+        if run_with_input "$policy_json" jq -e '.require_tests == true' >/dev/null; then
             overall_ok=false
             log_error "Required tests are not configured"
         else
             log_verbose "No optional tests configured"
         fi
-    elif [[ $test_exit -ne 0 ]] || ! jq -e '.ran == true and .ok == true and .exit_code == 0' <<< "$test_result" >/dev/null; then
+    elif [[ $test_exit -ne 0 ]] || ! run_with_input "$test_result" jq -e '.ran == true and .ok == true and .exit_code == 0' >/dev/null; then
         overall_ok=false
         log_error "Test gate failed"
     else
@@ -23881,16 +23862,16 @@ run_quality_gates() {
     secret_result=$(run_secret_scan "$wt_path")
     local secret_exit=$?
 
-    if ! jq -e -s 'length == 1 and (.[0] | type == "object" and .ran == true and
+    if ! run_with_input "$secret_result" jq -e -s 'length == 1 and (.[0] | type == "object" and .ran == true and
         (.ok | type == "boolean") and (.warning | type == "boolean") and
-        (.findings | type == "array"))' <<< "$secret_result" >/dev/null; then
+        (.findings | type == "array"))' >/dev/null; then
         secret_result=$(jq -n --argjson exit_code "$secret_exit" '{ran:false,ok:false,warning:false,reason:"invalid_gate_result",exit_code:$exit_code,findings:[]}')
         overall_ok=false
         log_error "Secret scan returned an invalid result"
-    elif [[ $secret_exit -eq 2 ]] && jq -e '.warning == true' <<< "$secret_result" >/dev/null; then
+    elif [[ $secret_exit -eq 2 ]] && run_with_input "$secret_result" jq -e '.warning == true' >/dev/null; then
         has_warning=true
         log_warn "Secret scan warning - potential secrets detected"
-    elif [[ $secret_exit -ne 0 ]] || ! jq -e '.ok == true and .warning == false' <<< "$secret_result" >/dev/null; then
+    elif [[ $secret_exit -ne 0 ]] || ! run_with_input "$secret_result" jq -e '.ok == true and .warning == false' >/dev/null; then
         overall_ok=false
         log_error "Secret scan failed - secrets detected"
     else
@@ -25556,8 +25537,7 @@ cmd_robot_docs() {
 }
 
 _robot_docs_quickstart() {
-    cat << 'QSJSON'
-{
+    printf '%s\n' '{
   "description": "ru (repo_updater) synchronizes GitHub repositories to a local projects directory.",
   "install": "curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash",
   "first_run": [
@@ -25571,13 +25551,11 @@ _robot_docs_quickstart() {
   "projects_dir": "/data/projects (default, override with RU_PROJECTS_DIR)",
   "prerequisites": ["git", "gh (optional, for private repos)"],
   "optional_deps": ["gum (beautiful TUI)", "tru (TOON output format)"]
-}
-QSJSON
+}'
 }
 
 _robot_docs_commands() {
-    cat << 'CMDJSON'
-{
+    printf '%s\n' '{
   "commands": [
     {
       "name": "sync",
@@ -25617,7 +25595,7 @@ _robot_docs_commands() {
       "flags": [
         {"flag": "--private", "description": "Add to private.txt instead of public.txt"},
         {"flag": "--from-cwd", "description": "Detect repo from current working directory"},
-        {"flag": "--group NAME", "description": "Clone into a NAME/ subfolder of the layout path (writes 'owner/repo in NAME')"}
+        {"flag": "--group NAME", "description": "Clone into a NAME/ subfolder of the layout path (writes '\''owner/repo in NAME'\'')"}
       ]
     },
     {
@@ -25767,13 +25745,11 @@ _robot_docs_commands() {
     {"flag": "--verbose", "description": "Detailed output"},
     {"flag": "--non-interactive", "description": "Never prompt (for CI/automation)"}
   ]
-}
-CMDJSON
+}'
 }
 
 _robot_docs_examples() {
-    cat << 'EXJSON'
-{
+    printf '%s\n' '{
   "examples": [
     {
       "title": "Basic sync workflow",
@@ -25789,7 +25765,7 @@ _robot_docs_examples() {
         {"command": "ru status --json", "description": "Get repo status as JSON"},
         {"command": "ru list --json", "description": "Get repo list as JSON"},
         {"command": "ru sync --json", "description": "Get sync results as JSON"},
-        {"command": "ru status --json | jq '.data.repos[] | select(.dirty==true)'", "description": "Find dirty repos"}
+        {"command": "ru status --json | jq '\''.data.repos[] | select(.dirty==true)'\''", "description": "Find dirty repos"}
       ]
     },
     {
@@ -25823,7 +25799,7 @@ _robot_docs_examples() {
       "title": "Fork management",
       "commands": [
         {"command": "ru fork-status", "description": "Show fork sync status for all repos with upstream"},
-        {"command": "ru fork-status --repos='owner/*'", "description": "Check forks matching pattern"},
+        {"command": "ru fork-status --repos='\''owner/*'\''", "description": "Check forks matching pattern"},
         {"command": "ru fork-sync", "description": "Sync all forks with upstream (ff-only)"},
         {"command": "ru fork-sync --rebase", "description": "Rebase local work onto upstream"},
         {"command": "ru fork-clean", "description": "Clean main branch pollution (creates rescue branch)"},
@@ -25838,13 +25814,11 @@ _robot_docs_examples() {
       ]
     }
   ]
-}
-EXJSON
+}'
 }
 
 _robot_docs_exit_codes() {
-    cat << 'ECJSON'
-{
+    printf '%s\n' '{
   "exit_codes": [
     {"code": 0, "meaning": "Success", "description": "All operations completed without error"},
     {"code": 1, "meaning": "Partial failure", "description": "Some repos failed during sync/status (others succeeded)"},
@@ -25853,13 +25827,11 @@ _robot_docs_exit_codes() {
     {"code": 4, "meaning": "Invalid arguments", "description": "Bad command-line arguments, unknown command, or invalid options"},
     {"code": 5, "meaning": "Interrupted", "description": "Previous sync was interrupted; use --resume to continue or --restart to begin fresh"}
   ]
-}
-ECJSON
+}'
 }
 
 _robot_docs_formats() {
-    cat << 'FMJSON'
-{
+    printf '%s\n' '{
   "output_formats": [
     {
       "name": "text",
@@ -25894,8 +25866,7 @@ _robot_docs_formats() {
     {"var": "TOON_DEFAULT_FORMAT", "description": "Override default format with TOON preference"},
     {"var": "TOON_STATS", "description": "Set to 1 to show token stats on stderr"}
   ]
-}
-FMJSON
+}'
 }
 
 _robot_docs_schemas() {

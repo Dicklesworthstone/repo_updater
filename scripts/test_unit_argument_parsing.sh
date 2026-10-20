@@ -13,6 +13,7 @@
 #   - Positional arguments passed to ARGS
 #   - Short and long flag equivalence
 #   - Top-level startup code reads no heredoc or here-string
+#   - ru reads no heredoc anywhere, and no here-string outside run_with_input
 #
 set -uo pipefail
 
@@ -541,19 +542,24 @@ test_unknown_option_recognized() {
 }
 
 #==============================================================================
-# Tests: Startup Code
+# Tests: Heredocs and Here-Strings
 #==============================================================================
 
-# Top-level code runs before parse_args on every invocation. Bash writes a
-# small heredoc or here-string whole into a pipe before reading it back, and
-# macOS shrinks new pipes to 512 bytes when kernel pipe memory runs short, so
-# one of these at top level hangs every ru command on such a host.
+# Bash writes a small heredoc or here-string whole into a pipe before reading
+# it back, and macOS shrinks new pipes to 512 bytes when kernel pipe memory
+# runs short, so a longer one blocks forever. At top level that hangs every ru
+# command; inside a function it hangs that command. ru therefore uses printf
+# and run_with_input, whose own here-string only carries input that fits.
 
 # Print "LINE: text" for each top-level heredoc or here-string read from
-# stdin, then "depth=N" (0 when function tracking stayed balanced). Heredoc
-# bodies are skipped so their braces cannot end a function early.
+# stdin (or for every one, given "all"), then "depth=N" (0 when function
+# tracking stayed balanced). Only code counts: quoted text and comments are
+# blanked, while a $(...) inside double quotes is code again. Quote state
+# carries across lines, so a brace or "<<" inside a multi-line literal cannot
+# end a function early or look like a heredoc. Heredoc bodies are skipped for
+# the same reason.
 top_level_heredocs() {
-    awk -v q="'" '
+    awk -v q="'" -v all="${1:-}" '
         BEGIN { start = "<<-?[[:space:]]*[\"" q "]?[A-Za-z_][A-Za-z0-9_]*" }
         heredoc != "" {
             line = $0
@@ -561,18 +567,45 @@ top_level_heredocs() {
             if (line == heredoc) heredoc = ""
             next
         }
-        /^[[:space:]]*#/ { next }
-        /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/ && !/;[[:space:]]*\}[[:space:]]*$/ { depth++ }
         {
-            if (depth == 0 && ($0 ~ /<<</ || $0 ~ start)) print NR ": " $0
-            if ($0 !~ /<<</ && match($0, start)) {
+            # stack of open contexts: s = single quotes, d = double quotes,
+            # p = parentheses (code); code = this line with non-code blanked
+            plain = (stack == "")
+            code = ""
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                top = substr(stack, length(stack), 1)
+                if (top == "s") {
+                    if (c == q) stack = substr(stack, 1, length(stack) - 1)
+                    continue
+                }
+                if (top == "d") {
+                    if (c == "\\") i++
+                    else if (c == "\"") stack = substr(stack, 1, length(stack) - 1)
+                    else if (c == "$" && substr($0, i + 1, 1) == "(") { stack = stack "p"; code = code " "; i++ }
+                    continue
+                }
+                if (c == "\\") { code = code c substr($0, i + 1, 1); i++; continue }
+                if (c == q) { stack = stack "s"; code = code " "; continue }
+                if (c == "\"") { stack = stack "d"; code = code " "; continue }
+                if (c == "(") stack = stack "p"
+                else if (c == ")" && top == "p") stack = substr(stack, 1, length(stack) - 1)
+                else if (c == "#" && (i == 1 || substr($0, i - 1, 1) ~ /[[:space:]]/)) break
+                code = code c
+            }
+        }
+        plain && code ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/ && code !~ /;[[:space:]]*\}[[:space:]]*$/ { depth++ }
+        {
+            if ((depth == 0 || all != "") && code ~ /<</) print NR ": " $0
+            if (code ~ /<</ && code !~ /<<</ && match($0, start)) {
                 tok = substr($0, RSTART, RLENGTH)
                 strip_tabs = (tok ~ /^<<-/)
                 sub("^<<-?[[:space:]]*[\"" q "]?", "", tok)
                 heredoc = tok
             }
         }
-        /^}[[:space:]]*([#<>|&;].*)?$/ { if (depth > 0) depth--; else print "stray-brace " NR }
+        plain && code ~ /^}[[:space:]]*([<>|&;].*)?$/ { if (depth > 0) depth--; else print "stray-brace " NR }
         END { print "depth=" depth }
     '
 }
@@ -603,11 +636,35 @@ test_top_level_heredoc_scan_finds_only_top_level() {
 depth=0" "$report" "scan reports only the top-level heredoc and here-string"
 }
 
+test_heredoc_scan_all_mode_finds_function_bodies() {
+    local report
+    report=$(printf '%s\n' \
+        'f() {' \
+        "    cat <<'EOF'" \
+        '}' \
+        'EOF' \
+        '    jq . <<< "$json"' \
+        '}' | top_level_heredocs all)
+
+    assert_equals "2:     cat <<'EOF'
+5:     jq . <<< \"\$json\"
+depth=0" "$report" "scan in all mode reports heredocs and here-strings inside functions"
+}
+
 test_startup_runs_no_heredoc() {
     local report
     report=$(top_level_heredocs < "$RU_SCRIPT")
 
     assert_equals "depth=0" "$report" "ru top-level code reads no heredoc or here-string"
+}
+
+test_ru_reads_no_heredoc_or_long_herestring() {
+    # The one here-string left is run_with_input's own, which only carries
+    # input that fits in a 512-byte pipe.
+    local report
+    report=$(top_level_heredocs all < "$RU_SCRIPT" | grep -v -F '"$@" <<< "$_ru_input"')
+
+    assert_equals "depth=0" "$report" "ru reads no heredoc, and no here-string outside run_with_input"
 }
 
 #==============================================================================
@@ -685,9 +742,11 @@ run_test test_dir_with_spaces_quoted
 # Unknown options
 run_test test_unknown_option_recognized
 
-# Startup code
+# Heredocs and here-strings
 run_test test_top_level_heredoc_scan_finds_only_top_level
+run_test test_heredoc_scan_all_mode_finds_function_bodies
 run_test test_startup_runs_no_heredoc
+run_test test_ru_reads_no_heredoc_or_long_herestring
 
 print_results
 exit "$(get_exit_code)"

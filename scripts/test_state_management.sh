@@ -70,6 +70,10 @@ EXTRACT_FILE=$(mktemp)
 # Extract array_contains
 awk '/^array_contains\(\) \{/,/^}/' "$RU_SCRIPT" > "$EXTRACT_FILE"
 
+# Extract run_with_input (ru's stdin helper, used by the functions below)
+awk '/^_ru_input_bytes\(\) \{/,/^}/' "$RU_SCRIPT" >> "$EXTRACT_FILE"
+awk '/^run_with_input\(\) \{/,/^}/' "$RU_SCRIPT" >> "$EXTRACT_FILE"
+
 # Extract json functions
 awk '/^json_get_field\(\) \{/,/^}/' "$RU_SCRIPT" >> "$EXTRACT_FILE"
 awk '/^json_escape\(\) \{/,/^}/' "$RU_SCRIPT" >> "$EXTRACT_FILE"

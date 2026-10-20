@@ -1447,6 +1447,14 @@ source_ru_function() {
         TF_RU_LOCKS_LOADED="true"
     fi
 
+    # ru feeds stdin through run_with_input instead of here-strings.
+    if [[ -z "${TF_RU_INPUT_LOADED:-}" ]]; then
+        local input_body
+        input_body=$(sed -n '/^_ru_input_bytes()/,/^}/p;/^run_with_input()/,/^}/p' "$project_dir/ru")
+        eval "$input_body"
+        TF_RU_INPUT_LOADED="true"
+    fi
+
     # Extract and eval the function (eval preserves nameref bindings)
     local func_body
     func_body=$(sed -n "/^${func_name}()/,/^}/p" "$project_dir/ru")
