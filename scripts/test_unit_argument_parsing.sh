@@ -12,6 +12,7 @@
 #   - Subcommand options passed to ARGS
 #   - Positional arguments passed to ARGS
 #   - Short and long flag equivalence
+#   - Top-level startup code reads no heredoc or here-string
 #
 set -uo pipefail
 
@@ -540,6 +541,76 @@ test_unknown_option_recognized() {
 }
 
 #==============================================================================
+# Tests: Startup Code
+#==============================================================================
+
+# Top-level code runs before parse_args on every invocation. Bash writes a
+# small heredoc or here-string whole into a pipe before reading it back, and
+# macOS shrinks new pipes to 512 bytes when kernel pipe memory runs short, so
+# one of these at top level hangs every ru command on such a host.
+
+# Print "LINE: text" for each top-level heredoc or here-string read from
+# stdin, then "depth=N" (0 when function tracking stayed balanced). Heredoc
+# bodies are skipped so their braces cannot end a function early.
+top_level_heredocs() {
+    awk -v q="'" '
+        BEGIN { start = "<<-?[[:space:]]*[\"" q "]?[A-Za-z_][A-Za-z0-9_]*" }
+        heredoc != "" {
+            line = $0
+            if (strip_tabs) sub(/^\t+/, "", line)
+            if (line == heredoc) heredoc = ""
+            next
+        }
+        /^[[:space:]]*#/ { next }
+        /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/ && !/;[[:space:]]*\}[[:space:]]*$/ { depth++ }
+        {
+            if (depth == 0 && ($0 ~ /<<</ || $0 ~ start)) print NR ": " $0
+            if ($0 !~ /<<</ && match($0, start)) {
+                tok = substr($0, RSTART, RLENGTH)
+                strip_tabs = (tok ~ /^<<-/)
+                sub("^<<-?[[:space:]]*[\"" q "]?", "", tok)
+                heredoc = tok
+            }
+        }
+        /^}[[:space:]]*([#<>|&;].*)?$/ { if (depth > 0) depth--; else print "stray-brace " NR }
+        END { print "depth=" depth }
+    '
+}
+
+test_top_level_heredoc_scan_finds_only_top_level() {
+    # Function bodies (including a heredoc whose body ends in a brace, a
+    # one-line function, and a multi-line literal ending in }') are ignored;
+    # the top-level heredoc and here-string are reported.
+    local report
+    report=$(printf '%s\n' \
+        'one_liner() { true; }' \
+        'with_heredoc() {' \
+        "    cat <<'EOF'" \
+        '{' \
+        '}' \
+        'EOF' \
+        "    local json='{" \
+        "}'" \
+        '}' \
+        "read -r -d '' TOP << 'EOF_TOP'" \
+        'body' \
+        'EOF_TOP' \
+        'grep x <<< "$value"' \
+        'echo done' | top_level_heredocs)
+
+    assert_equals "10: read -r -d '' TOP << 'EOF_TOP'
+13: grep x <<< \"\$value\"
+depth=0" "$report" "scan reports only the top-level heredoc and here-string"
+}
+
+test_startup_runs_no_heredoc() {
+    local report
+    report=$(top_level_heredocs < "$RU_SCRIPT")
+
+    assert_equals "depth=0" "$report" "ru top-level code reads no heredoc or here-string"
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -613,6 +684,10 @@ run_test test_dir_with_spaces_quoted
 
 # Unknown options
 run_test test_unknown_option_recognized
+
+# Startup code
+run_test test_top_level_heredoc_scan_finds_only_top_level
+run_test test_startup_runs_no_heredoc
 
 print_results
 exit "$(get_exit_code)"
