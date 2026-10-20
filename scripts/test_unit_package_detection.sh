@@ -748,6 +748,9 @@ test_dep_scan_missing_tools_and_partial_results() {
         result=$(check_outdated_deps "$PROJECT_DIR"); rc=$?
         assert_dep_scan_result "$result" "$rc" 3 \
             '.total_outdated == 1 and .failed_managers == 1 and (.results | length == 2)' "mixed-manager failure preserves partial results"
+        # Command substitution isolates variables even in a broken scanner.
+        # Call directly so this assertion can actually detect the old leak.
+        check_outdated_deps "$PROJECT_DIR" >/dev/null; rc=$?
         assert_equals outer-sentinel "$manager" "scanner does not leak its loop variable"
         detect_package_managers() { printf '%s\n' '{"managers":["npm"]}'; return 42; }
         result=$(check_outdated_deps "$PROJECT_DIR"); rc=$?
@@ -794,6 +797,10 @@ test_dep_update_counts_scan_failure() {
         result=$(cmd_dep_update); rc=$?
         assert_dep_scan_result "$result" "$rc" 0 \
             '.skipped == 1 and .processed == 0 and (.results[0].reason | contains("only major"))' "default filter excludes major update"
+        scan_payload='{"example":{"current":"1.0.0-rc.1+b.5","wanted":"1.1.0-rc.2+b.6","latest":"1.1.0-rc.2+b.6"}}'
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.processed == 1 and .results[0].outdated.total_outdated == 1' "prerelease and build metadata are classifiable"
         ARGS=(--dry-run --major '--include=[' "--repo=$PROJECT_DIR")
         result=$(cmd_dep_update); rc=$?
         assert_dep_scan_result "$result" "$rc" 1 \
@@ -812,6 +819,47 @@ test_dep_update_counts_scan_failure() {
         assert_equals '' "$result" "dep-update emits no malformed payload without jq"
         [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
     )
+}
+
+# Optional argument supplies retained read-only fixtures to the focused helper
+# runner. The stock suite creates and cleans its own fixtures as usual.
+test_dep_scan_npm_lockfile_contract() {
+    local fixture_root="${1:-}" created_fixture=false
+    if [[ -z "$fixture_root" ]]; then
+        setup_test_env
+        fixture_root="$TEMP_DIR"
+        created_fixture=true
+        mkdir -p "$fixture_root/yarn" "$fixture_root/pnpm" "$fixture_root/npm"
+        printf '{}\n' > "$fixture_root/yarn/package.json"
+        printf '{}\n' > "$fixture_root/pnpm/package.json"
+        printf '{}\n' > "$fixture_root/npm/package.json"
+        touch "$fixture_root/yarn/yarn.lock" "$fixture_root/pnpm/pnpm-lock.yaml"
+    fi
+    (
+        local scan_failures_before=$TF_ASSERTIONS_FAILED result rc project_kind
+        npm() { printf '{}\n'; }
+        ntm() { return 92; }
+        claude() { return 93; }
+        spawn_ai_session() { printf 'UNEXPECTED session\n' >&2; return 94; }
+        local JSON_OUTPUT=true
+        for project_kind in yarn pnpm; do
+            local ARGS=(--dry-run --major "--repo=$fixture_root/$project_kind")
+            result=$(cmd_dep_update); rc=$?
+            assert_dep_scan_result "$result" "$rc" 1 \
+                '.failed == 1 and .skipped == 0 and .processed == 0
+                 and .results[0].scan.results[0].error_code == "unsupported_scan"' \
+                "$project_kind lockfile cannot use npm current result"
+        done
+        local ARGS=(--dry-run --major "--repo=$fixture_root/npm")
+        result=$(cmd_dep_update); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.failed == 0 and .skipped == 1 and .results[0].reason == "no outdated dependencies"' \
+            "plain npm project still accepts current result"
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
+    )
+    local result_rc=$?
+    if [[ "$created_fixture" == true ]]; then cleanup_test_env; fi
+    return "$result_rc"
 }
 
 #==============================================================================
@@ -871,6 +919,7 @@ main() {
     run_test test_dep_scan_other_manager_contracts
     run_test test_dep_scan_missing_tools_and_partial_results
     run_test test_dep_update_counts_scan_failure
+    run_test test_dep_scan_npm_lockfile_contract
 
     echo ""
     print_results

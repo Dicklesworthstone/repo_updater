@@ -2644,7 +2644,8 @@ partial results do not establish that all dependencies are current. The supporte
 adapters still require live project and test validation before a release.
 
 Detection currently chooses npm when `package.json` exists, even beside a Yarn
-or pnpm lockfile. Do not treat that selection as qualification of those managers.
+or pnpm lockfile. The npm scanner refuses those mixed inputs, so npm's view
+cannot classify a Yarn or pnpm project as current. Their own adapters remain pending.
 Python discovery cannot use a global `pip list` as proof about a project's manifest.
 
 ### Update Workflow

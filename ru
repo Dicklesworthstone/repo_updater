@@ -991,6 +991,13 @@ _check_outdated_for_manager() {
 
     case "$manager" in
         npm)
+            # Detection may choose package.json before a different manager's
+            # lockfile. npm's result cannot establish that project's currency.
+            if [[ -e "$repo_path/yarn.lock" || -L "$repo_path/yarn.lock" ||
+                  -e "$repo_path/pnpm-lock.yaml" || -L "$repo_path/pnpm-lock.yaml" ]]; then
+                _dep_scan_error "$manager" unsupported_scan "A Yarn or pnpm lockfile requires its own dependency scanner"
+                return 3
+            fi
             tool=npm
             scan_command=(npm outdated --json)
             # Workspace duplicates may be arrays; an uninstalled package may
@@ -2994,7 +3001,7 @@ _filter_major_updates() {
     filtered=$(echo "$json" | jq '
         def is_major_update:
             def major:
-                if type == "string" and test("^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$")
+                if type == "string" and test("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$")
                 then ltrimstr("v") | split(".")[0]
                 else error("Cannot classify non-semver dependency version") end;
             (.current | major) as $curr_major |
