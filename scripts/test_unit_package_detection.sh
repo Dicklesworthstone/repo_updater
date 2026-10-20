@@ -616,7 +616,9 @@ test_output_has_required_fields() {
 assert_dep_scan_result() {
     local result="$1" actual_rc="$2" expected_rc="$3" predicate="$4" message="$5"
     assert_equals "$expected_rc" "$actual_rc" "$message: exit status"
-    if jq -se "length == 1 and (.[0] | $predicate)" <<< "$result" >/dev/null; then
+    # Stream to a concurrent reader: a here-string can block in Bash's
+    # pre-exec heredoc write on this host even for a modest caller result.
+    if printf '%s\n' "$result" | jq -se "length == 1 and (.[0] | $predicate)" >/dev/null; then
         _tf_pass "$message: result"
     else
         _tf_fail "$message: result" "Got: $result"
@@ -902,7 +904,7 @@ test_cargo_workspace_test_command() {
             if [[ "${1:-}" == outdated ]]; then
                 printf '{"crate_name":"app","dependencies":[{"name":"example","project":"1.0.0","compat":"1.1.0","latest":"1.1.0","kind":"Normal","platform":null}]}\n'
             else
-                printf '%s\n' "$PWD" "$@" > "$RU_SCOPE_TRACE"
+                { pwd -P; printf '%s\n' "$@"; } > "$RU_SCOPE_TRACE"
                 printf 'controlled Cargo argv: %s\n' "$*"
                 printf 'controlled Cargo boundary\n' >&2
                 return "$RU_SCOPE_CARGO_RC"

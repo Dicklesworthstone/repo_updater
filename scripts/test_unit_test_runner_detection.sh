@@ -240,7 +240,7 @@ TOML
     local exit_code=$?
 
     assert_equals 0 "$exit_code" "Should return exit code 0 for Rust project"
-    assert_equals "cargo test" "$result" "Should return 'cargo test' for Cargo.toml"
+    assert_equals "cargo test --workspace" "$result" "Should test all workspace members for Cargo.toml"
 
     cleanup_test_env
 }
@@ -625,7 +625,7 @@ MAKE
     local result
     result=$(detect_test_command "$project_dir")
 
-    assert_equals "cargo test" "$result" "cargo test should take precedence over make test"
+    assert_equals "cargo test --workspace" "$result" "Workspace Cargo tests should take precedence over make test"
 
     cleanup_test_env
 }

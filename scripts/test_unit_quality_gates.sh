@@ -229,7 +229,7 @@ test_detect_test_command_cargo() {
     local rc=$?
 
     assert_equals 0 "$rc" "Should return success"
-    assert_equals "cargo test" "$result" "Should detect cargo test"
+    assert_equals "cargo test --workspace" "$result" "Should detect tests for all Cargo workspace members"
 
     cleanup_temp_dirs
     log_test_pass "$test_name"
