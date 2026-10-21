@@ -1736,6 +1736,43 @@ test_release_plan_changelog_warning() {
     assert_true "[[ \$has_warning == true ]]" "Should warn about missing version in changelog"
 }
 
+test_release_plan_tag_field_must_name_version() {
+    log_test_start "validate_release_plan: the prompt's tag field is used and must name the version"
+
+    require_jq_or_skip || return 0
+
+    local repo_path
+    repo_path=$(create_test_repo)
+
+    assert_success "A documented tag field naming the version is accepted" \
+        validate_release_plan '{"version": "1.2.0", "tag": "v1.2.0"}' "$repo_path"
+    assert_fails "A tag naming another version is rejected" \
+        validate_release_plan '{"version": "1.2.0", "tag": "v9.9.9"}' "$repo_path"
+    assert_contains "$VALIDATION_ERROR" "does not name version" "Error names the disagreement"
+    assert_fails "tag and tag_name must agree" \
+        validate_release_plan '{"version": "1.2.0", "tag": "v1.2.0", "tag_name": "1.2.0"}' "$repo_path"
+    git -C "$repo_path" tag v1.2.0
+    assert_fails "An existing tag given in the tag field is rejected" \
+        validate_release_plan '{"version": "1.2.0", "tag": "v1.2.0"}' "$repo_path"
+    assert_contains "$VALIDATION_ERROR" "already exists" "Error mentions the existing tag"
+}
+
+test_release_plan_null_version_declines_release() {
+    log_test_start "validate_release_plan: a null version declines a release unless release fields are set"
+
+    require_jq_or_skip || return 0
+
+    local repo_path
+    repo_path=$(create_test_repo)
+
+    assert_success "A plan declining a release is valid" \
+        validate_release_plan '{"version": null, "tag": null, "version_files": [], "checks": []}' "$repo_path"
+    assert_equals true "$RELEASE_PLAN_NO_RELEASE" "The declined release is reported"
+    assert_fails "Version files without a version are rejected" \
+        validate_release_plan '{"version": null, "version_files": [{"path": "README.md", "old": "1", "new": "2"}]}' "$repo_path"
+    assert_contains "$VALIDATION_ERROR" "version" "Error mentions the version"
+}
+
 #==============================================================================
 # Run tests
 #==============================================================================
@@ -1805,6 +1842,8 @@ run_test test_release_plan_rejects_shell_metachar_in_title
 run_test test_release_plan_rejects_denied_assets
 run_test test_release_plan_rejects_path_traversal_in_assets
 run_test test_release_plan_changelog_warning
+run_test test_release_plan_tag_field_must_name_version
+run_test test_release_plan_null_version_declines_release
 
 print_results
 exit "$(get_exit_code)"

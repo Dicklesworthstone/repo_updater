@@ -4201,9 +4201,12 @@ RU_RELEASE_PLAN_JSON_END
 Include:
 - "version": proposed version (or null if no release needed)
 - "tag": proposed tag (or null)
-- "changelog_entry": text to add to CHANGELOG
-- "version_files": files to update with new version
-- "checks": actions to verify before release (tests/CI)
+- "changelog_entry": text to add to CHANGELOG (a "## " section naming the version)
+- "version_files": every tracked file that declares the version, with its exact old and new text
+- "checks": any of "tests", "lint", "secrets", "ci" (wait for GitHub Actions on the release commit)
+  and "checksums" (verify release assets against their published SHA-256 files)
+ru applies the version files and changelog entry in one commit, runs the checks on it,
+and publishes the tag only after they pass.
 Use ultrathink.
 
 Expected schema:
@@ -5061,6 +5064,8 @@ run_commit_publication_transport() {
         -c "remote.$remote.url=" -c "remote.$remote.url=$transport_alias"
         -c "remote.$remote.pushurl=" -c "remote.$remote.pushurl=$transport_alias"
         -c "remote.$remote.mirror=false"
+        # Push only the one ref requested; followTags would add local tags.
+        -c "push.followTags=false"
     )
     resolved=$(git -C "$repo_path" "${transport_config[@]}" remote get-url --push --all "$remote") || return 1
     if [[ "$resolved" != "$destination" ]]; then
@@ -5069,9 +5074,13 @@ run_commit_publication_transport() {
     fi
     case "$operation" in
         inspect) run_network_command git -C "$repo_path" "${transport_config[@]}" ls-remote --heads "$remote" "$@" ;;
+        inspect-tag) run_network_command git -C "$repo_path" "${transport_config[@]}" ls-remote --tags --refs "$remote" "$@" ;;
         fetch) run_network_command git -C "$repo_path" "${transport_config[@]}" fetch --no-tags "$remote" "$@" ;;
         push)
+            # A release pushes its annotated tag object (source) while HEAD
+            # stays the tagged commit (candidate); a commit push uses neither.
             local target_ref="$1" expected_head="$2" expected_old="${3:-}"
+            local source="${4:-$2}" candidate="${5:-$2}"
             local guard_dir original_hooks hook
             guard_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-publication-guard.XXXXXX") || return 1
             original_hooks=$(git -C "$repo_path" rev-parse --git-path hooks) || return 1
@@ -5102,7 +5111,7 @@ while IFS='\'' '\'' read -r local_ref local_oid remote_ref remote_oid extra; do
     fi
     update_count=$((update_count + 1))
 done < "$RU_PUBLICATION_INPUT"
-if [[ "$(git rev-parse --verify HEAD)" != "$RU_PUBLICATION_EXPECTED_HEAD" ]] ||
+if [[ "$(git rev-parse --verify HEAD)" != "$RU_PUBLICATION_EXPECTED_CANDIDATE" ]] ||
    [[ "$update_count" -eq 0 && "$RU_PUBLICATION_EXPECTED_OLD" != "$RU_PUBLICATION_EXPECTED_HEAD" ]]; then
     printf '\''%s\n'\'' '\''ru: publication candidate changed or its update is missing; refusing push'\'' >&2
     exit 1
@@ -5112,8 +5121,9 @@ fi' > "$guard_dir/hooks/pre-push"
             RU_PUBLICATION_ORIGINAL_HOOK="$original_hooks/pre-push" \
             RU_PUBLICATION_EXPECTED_HEAD="$expected_head" RU_PUBLICATION_EXPECTED_REF="$target_ref" \
             RU_PUBLICATION_EXPECTED_OLD="$expected_old" RU_PUBLICATION_EXPECTED_DESTINATION="$destination" \
+            RU_PUBLICATION_EXPECTED_CANDIDATE="$candidate" \
                 run_network_command git -C "$repo_path" "${transport_config[@]}" \
-                -c core.hooksPath="$guard_dir/hooks" push "$remote" "$expected_head:$target_ref"
+                -c core.hooksPath="$guard_dir/hooks" push "$remote" "$source:$target_ref"
             ;;
         *) return 1 ;;
     esac
@@ -5299,25 +5309,44 @@ validate_release_plan() {
     fi
 
     # Extract required fields
-    local version tag_name title body files_json
+    local version tag_name title body files_json tag_field
+    RELEASE_PLAN_NO_RELEASE=false
     version=$(json_get_field "$plan_json" "version" || echo "")
     tag_name=$(json_get_field "$plan_json" "tag_name" || echo "")
+    tag_field=$(json_get_field "$plan_json" "tag" || echo "")
     title=$(json_get_field "$plan_json" "title" || echo "")
     body=$(json_get_field "$plan_json" "body" || echo "")
     files_json=$(json_get_field "$plan_json" "files" || echo "")
+    [[ "$tag_name" != null ]] || tag_name=""
+    [[ "$tag_field" != null ]] || tag_field=""
 
-    # 1. Validate version format (semver: vX.Y.Z or X.Y.Z)
+    # 1. Validate version format (semver: vX.Y.Z or X.Y.Z). The phase prompt
+    # asks for a null version when no release is warranted.
     if [[ -z "$version" || "$version" == "null" ]]; then
-        VALIDATION_ERROR="Missing version in release plan"
-        return 1
+        local declined_files declined_entry
+        declined_files=$(json_get_field "$plan_json" "version_files" || echo "")
+        declined_entry=$(json_get_field "$plan_json" "changelog_entry" || echo "")
+        if [[ -n "$tag_name" || -n "$tag_field" ]] ||
+           [[ -n "$declined_files" && "$declined_files" != null && "$declined_files" != "[]" ]] ||
+           [[ -n "$declined_entry" && "$declined_entry" != null ]]; then
+            VALIDATION_ERROR="Missing version in release plan"
+            return 1
+        fi
+        RELEASE_PLAN_NO_RELEASE=true
+        return 0
     fi
     if ! [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$ ]]; then
         VALIDATION_ERROR="Invalid version format: $version (expected semver like v1.2.3 or 1.2.3)"
         return 1
     fi
 
-    # 2. Validate tag_name
-    if [[ -z "$tag_name" || "$tag_name" == "null" ]]; then
+    # 2. Validate the tag: "tag" (the prompt's field) or the older "tag_name"
+    if [[ -n "$tag_field" && -n "$tag_name" && "$tag_field" != "$tag_name" ]]; then
+        VALIDATION_ERROR="Release plan tag ($tag_field) and tag_name ($tag_name) disagree"
+        return 1
+    fi
+    [[ -n "$tag_field" ]] && tag_name="$tag_field"
+    if [[ -z "$tag_name" ]]; then
         # Default to version if tag_name not provided
         tag_name="$version"
     fi
@@ -5325,14 +5354,42 @@ validate_release_plan() {
     if [[ "$version" == v* && "$tag_name" != v* ]]; then
         tag_name="v$tag_name"
     fi
-    # Check tag doesn't already exist
-    if git -C "$repo_path" rev-parse "refs/tags/$tag_name" >/dev/null 2>&1; then
+    # Check tag doesn't already exist, unless it is this release's own tag
+    # from an interrupted run that recorded it
+    if git -C "$repo_path" rev-parse "refs/tags/$tag_name" >/dev/null 2>&1 &&
+       ! release_state_resumes "$repo_path" "$tag_name"; then
         VALIDATION_ERROR="Tag already exists: $tag_name"
         return 1
     fi
     # Validate tag name characters (no shell metacharacters)
     if [[ "$tag_name" =~ [\;\&\|\$\`\(\)\{\}\<\>\'\"\!\#\*\?\\] ]]; then
         VALIDATION_ERROR="Tag name contains unsafe characters: $tag_name"
+        return 1
+    fi
+    if [[ "$tag_name" == -* ]] || ! git check-ref-format "refs/tags/$tag_name"; then
+        VALIDATION_ERROR="Invalid tag name: $tag_name"
+        return 1
+    fi
+    local plain_version="${version#v}"
+    if [[ "$tag_name" != "$plain_version" && "$tag_name" != "v$plain_version" ]]; then
+        VALIDATION_ERROR="Tag $tag_name does not name version $version"
+        return 1
+    fi
+
+    # 2a. Version files, changelog entry and checks are applied and run by
+    # execute_release_plan, so each must be exactly checkable here.
+    local action_field action_value actions_present=false
+    for action_field in version_files changelog_entry checks; do
+        action_value=$(json_get_field "$plan_json" "$action_field" || echo "")
+        [[ -n "$action_value" && "$action_value" != null ]] && actions_present=true
+    done
+    if [[ "$actions_present" == true ]]; then
+        if ! command -v jq &>/dev/null; then
+            VALIDATION_ERROR="jq is required to validate release version files and checks"
+            return 1
+        fi
+        validate_release_plan_actions "$plan_json" "$repo_path" "$plain_version" || return 1
+    elif ! release_version_file_agrees "$repo_path" "$plain_version"; then
         return 1
     fi
 
@@ -5425,10 +5482,661 @@ validate_release_plan() {
     return 0
 }
 
+# A tracked top-level VERSION file must name the released version, unless the
+# plan lists it in version_files (pass "listed" as $3). Sets VALIDATION_ERROR.
+release_version_file_agrees() {
+    local repo_path="$1" version="$2" listed="${3:-}" current
+    [[ "$listed" != listed && -f "$repo_path/VERSION" ]] || return 0
+    git -C "$repo_path" ls-files --error-unmatch -- VERSION >/dev/null 2>&1 || return 0
+    current=$(tr -d ' \t\r\n' < "$repo_path/VERSION") || return 1
+    if [[ "$current" != "$version" && "$current" != "v$version" ]]; then
+        VALIDATION_ERROR="VERSION says $current; a $version release must list it in version_files"
+        return 1
+    fi
+}
+
+# Check the version files, changelog entry and checks a release plan asks
+# execute_release_plan to apply. Sets VALIDATION_ERROR on failure.
+validate_release_plan_actions() {
+    local plan_json="$1" repo_path="$2" version="$3" path new entry unknown listed=""
+    if ! run_with_input "$plan_json" jq -e '
+        ((.version_files // []) | type == "array" and all(.[]; type == "object" and
+            (.path | type == "string" and length > 0) and
+            (.old | type == "string" and length > 0 and (contains("\n") | not)) and
+            (.new | type == "string" and length > 0 and (contains("\n") | not)))) and
+        ((.changelog_entry // "") | type == "string") and
+        ((.checks // []) | type == "array" and all(.[]; type == "string"))' >/dev/null 2>&1; then
+        VALIDATION_ERROR="Release plan version_files, changelog_entry or checks are malformed"
+        return 1
+    fi
+    unknown=$(run_with_input "$plan_json" jq -r '[(.checks // [])[] | select(. as $check |
+        any("tests", "test", "lint", "secrets", "secret-scan", "ci", "checksums"; . == $check) | not)] | join(", ")') || return 1
+    if [[ -n "$unknown" ]]; then
+        VALIDATION_ERROR="Unknown release check: $unknown"
+        return 1
+    fi
+
+    local seen=$'\n'
+    while IFS= read -r -d '' path && IFS= read -r -d '' new; do
+        path="${path#./}"
+        case "$path" in
+            ""|.|/*|..|../*|*/..|*/../*)
+                VALIDATION_ERROR="Unsafe version file path: $path"
+                return 1
+                ;;
+        esac
+        if is_file_denied "$path"; then
+            VALIDATION_ERROR="Denied version file: $path"
+            return 1
+        fi
+        if [[ ! -f "$repo_path/$path" || -L "$repo_path/$path" ]] ||
+           ! git -C "$repo_path" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+            VALIDATION_ERROR="Version file is not a tracked regular file: $path"
+            return 1
+        fi
+        if [[ "$new" != "$version" && "$new" != "v$version" ]]; then
+            VALIDATION_ERROR="Version file $path would be set to $new, not the released version $version"
+            return 1
+        fi
+        if [[ "$seen" == *$'\n'"$path"$'\n'* ]]; then
+            VALIDATION_ERROR="Version file listed twice: $path"
+            return 1
+        fi
+        seen+="$path"$'\n'
+    done < <(run_with_input "$plan_json" jq -j '(.version_files // [])[] | .path, "\u0000", .new, "\u0000"')
+    [[ "$seen" == *$'\n'VERSION$'\n'* ]] && listed=listed
+    release_version_file_agrees "$repo_path" "$version" "$listed" || return 1
+
+    entry=$(run_with_input "$plan_json" jq -r '.changelog_entry // empty') || return 1
+    if [[ -n "$entry" ]]; then
+        if [[ ${#entry} -gt 20000 ]]; then
+            VALIDATION_ERROR="Changelog entry too long: ${#entry} chars (max 20000)"
+            return 1
+        fi
+        if [[ "$entry" != *"$version"* ]]; then
+            VALIDATION_ERROR="Changelog entry does not name version $version"
+            return 1
+        fi
+        path=$(run_with_input "$plan_json" jq -r '.changelog // empty') || return 1
+        path="${path#./}"
+        if [[ -n "$path" ]]; then
+            case "$path" in
+                .|/*|..|../*|*/..|*/../*)
+                    VALIDATION_ERROR="Unsafe changelog path: $path"
+                    return 1
+                    ;;
+            esac
+            if is_file_denied "$path" || [[ -L "$repo_path/$path" ]]; then
+                VALIDATION_ERROR="Changelog path cannot be written: $path"
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RELEASE EXECUTION (bd-tr5y.7)
+#
+# A release plan is applied deterministically: its version files and changelog
+# entry are committed, its checks run on a clean checkout of that commit, and
+# only then are the branch and an annotated tag published to the receivers
+# commit plans use. The GitHub release, CI and checksums are observed, not
+# assumed. Each completed step is recorded in the repository's git directory,
+# so a retry continues without duplicating a commit, tag or release.
+#------------------------------------------------------------------------------
+
+# Where a release records its completed steps: inside the git directory, so
+# the record follows the clone and is never committed.
+release_state_file() {
+    local repo_path="$1" tag="$2" dir
+    dir=$(git -C "$repo_path" rev-parse --git-path ru-release) || return 1
+    [[ "$dir" == /* ]] || dir="$repo_path/$dir"
+    printf '%s/%s.json\n' "$dir" "${tag//\//%2F}"
+}
+
+# An existing local tag belongs to this release when an unfinished run
+# recorded creating exactly that tag object.
+release_state_resumes() {
+    local repo_path="$1" tag="$2" file object
+    command -v jq &>/dev/null || return 1
+    file=$(release_state_file "$repo_path" "$tag") || return 1
+    [[ -f "$file" ]] || return 1
+    object=$(git -C "$repo_path" rev-parse --verify --quiet "refs/tags/$tag") || return 1
+    jq -e --arg object "$object" '.tag_object == $object and .complete != true' "$file" >/dev/null 2>&1
+}
+
+# Apply a jq filter (after any jq options) to a release state file.
+release_state_set() {
+    local file="$1" filter="$2" current='{}'
+    shift 2
+    if [[ -f "$file" ]]; then
+        current=$(cat "$file") || return 1
+    fi
+    current=$(run_with_input "$current" jq -c "$@" "$filter | .updated_at = (now | todate)") || return 1
+    write_json_atomic "$file" "$current"
+}
+
+# awk helper shared by the version-file and changelog updates: count the
+# whole-word occurrences of s in line (a leading v or V is allowed) and set
+# FIRST to the position of the first.
+RU_RELEASE_AWK_COUNT='
+function count(line, s,    n, off, i, pre, post) {
+    n = 0; off = 0; FIRST = 0
+    while ((i = index(substr(line, off + 1), s)) > 0) {
+        i += off
+        pre = (i > 1) ? substr(line, i - 1, 1) : ""
+        if ((pre == "v" || pre == "V") && i > 2) pre = substr(line, i - 2, 1)
+        else if (pre == "v" || pre == "V") pre = ""
+        post = substr(line, i + length(s), 1)
+        if (pre !~ /[0-9A-Za-z._+-]/ && post !~ /[0-9A-Za-z._+-]/) {
+            n++
+            if (!FIRST) FIRST = i
+        }
+        off = i
+    }
+    return n
+}'
+
+# Change a version file from OLD to NEW on the one line that declares it.
+# VERSION files hold only the version; JSON files declare a "version" key and
+# TOML files a version in [package], [project], [tool.poetry] or
+# [workspace.package]. Elsewhere OLD must occur once as a whole word, or once
+# on a line that assigns a version. Prints "updated", or "current" when the
+# file already declares NEW. Returns 3 when no declaration is found and 4 when
+# more than one could be meant; the file is then unchanged.
+release_update_version_file() {
+    local repo_path="$1" path="$2" old="$3" new="$4"
+    local file="$repo_path/$path" tmp result rc=0 final_newline=1
+    [[ -f "$file" && ! -L "$file" ]] || return 3
+    [[ -s "$file" && -n "$(tail -c 1 "$file")" ]] && final_newline=0
+    tmp=$(mktemp_file) || return 1
+    result=$(RU_RELEASE_OLD="$old" RU_RELEASE_NEW="$new" awk -v base="${path##*/}" -v out="$tmp" \
+        -v final_newline="$final_newline" "$RU_RELEASE_AWK_COUNT"'
+        function declares(i) {
+            if (base ~ /\.json$/) return L[i] ~ /^[ \t]*"version"[ \t]*:/
+            if (base ~ /\.toml$/) {
+                return (S[i] == "[package]" || S[i] == "[project]" || S[i] == "[tool.poetry]" ||
+                        S[i] == "[workspace.package]") && L[i] ~ /^[ \t]*version[ \t]*=/
+            }
+            return L[i] ~ /[Vv][Ee][Rr][Ss][Ii][Oo][Nn][A-Za-z_"\047]*[ \t]*[:=]/
+        }
+        # The line declaring s: > 0, 0 when none, -1 when ambiguous.
+        function locate(s,    i, c, n, hit, total, assigned, assigned_hit, line) {
+            n = 0; total = 0; assigned = 0
+            for (i = 1; i <= N; i++) {
+                if (base == "VERSION" || base == "VERSION.txt") {
+                    line = L[i]; sub(/\r$/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line)
+                    if (NONBLANK == 1 && (line == s || line == "v" s)) { n++; hit = i }
+                    continue
+                }
+                c = count(L[i], s)
+                total += c
+                if (c == 1 && (base ~ /\.(json|toml)$/) && declares(i)) { n++; hit = i }
+                if (c == 1 && base !~ /\.(json|toml)$/) {
+                    n++; hit = i
+                    if (declares(i)) { assigned++; assigned_hit = i }
+                }
+            }
+            if (base == "VERSION" || base == "VERSION.txt" || base ~ /\.(json|toml)$/)
+                return n == 1 ? hit : (n == 0 ? 0 : -1)
+            if (total == 0) return 0
+            if (total == 1 && n == 1) return hit
+            return assigned == 1 ? assigned_hit : -1
+        }
+        {
+            L[NR] = $0
+            if ($0 ~ /^[ \t]*\[/) { section = $0; gsub(/[ \t\r]/, "", section) }
+            S[NR] = section
+            if ($0 !~ /^[ \t\r]*$/) NONBLANK++
+        }
+        END {
+            N = NR
+            old = ENVIRON["RU_RELEASE_OLD"]; new = ENVIRON["RU_RELEASE_NEW"]
+            k = locate(old)
+            if (k < 0) exit 4
+            if (k == 0) {
+                k = locate(new)
+                if (k < 0) exit 4
+                if (k == 0) exit 3
+                print "current"
+                exit 0
+            }
+            count(L[k], old)
+            L[k] = substr(L[k], 1, FIRST - 1) new substr(L[k], FIRST + length(old))
+            for (i = 1; i <= N; i++) printf "%s%s", L[i], (i < N || final_newline) ? "\n" : "" > out
+            print "updated"
+        }' "$file") || rc=$?
+    if [[ $rc -eq 0 && "$result" == updated ]]; then
+        cat "$tmp" > "$file" || rc=1
+    fi
+    rm -f "$tmp"
+    [[ $rc -eq 0 ]] || return "$rc"
+    printf '%s\n' "$result"
+}
+
+# Add a release's changelog entry above the newest release section (the first
+# "## " heading), or at the end when there is none; a missing changelog is
+# created. Prints "updated", or "current" when a heading already names this
+# version.
+release_update_changelog() {
+    local repo_path="$1" path="$2" entry="$3" version="$4"
+    local file="$repo_path/$path" tmp result rc=0
+    while [[ "$entry" == *$'\n' ]]; do entry="${entry%$'\n'}"; done
+    if [[ ! -e "$file" && ! -L "$file" ]]; then
+        mkdir -p "$(dirname "$file")" && printf '# Changelog\n\n%s\n' "$entry" > "$file" || return 1
+        printf '%s\n' updated
+        return 0
+    fi
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    tmp=$(mktemp_file) || return 1
+    result=$(RU_RELEASE_ENTRY="$entry" RU_RELEASE_VERSION="$version" awk -v out="$tmp" "$RU_RELEASE_AWK_COUNT"'
+        { L[NR] = $0 }
+        END {
+            entry = ENVIRON["RU_RELEASE_ENTRY"]; v = ENVIRON["RU_RELEASE_VERSION"]
+            for (i = 1; i <= NR; i++) if (L[i] ~ /^#/ && count(L[i], v) > 0) { print "current"; exit 0 }
+            at = 0
+            for (i = 1; i <= NR; i++) if (L[i] ~ /^## /) { at = i; break }
+            for (i = 1; i <= NR; i++) {
+                if (i == at) printf "%s\n\n", entry > out
+                print L[i] > out
+            }
+            if (!at) {
+                if (NR > 0 && L[NR] !~ /^[ \t\r]*$/) print "" > out
+                printf "%s\n", entry > out
+            }
+            print "updated"
+        }' "$file") || rc=$?
+    if [[ $rc -eq 0 && "$result" == updated ]]; then
+        cat "$tmp" > "$file" || rc=1
+    fi
+    rm -f "$tmp"
+    [[ $rc -eq 0 ]] || return "$rc"
+    printf '%s\n' "$result"
+}
+
+# The changelog a release entry goes into: the plan's "changelog", else the
+# first existing conventional file, else a new CHANGELOG.md.
+release_changelog_path() {
+    local repo_path="$1" plan_json="$2" path candidate
+    path=$(run_with_input "$plan_json" jq -r '.changelog // empty') || return 1
+    if [[ -n "$path" ]]; then
+        printf '%s\n' "${path#./}"
+        return 0
+    fi
+    for candidate in CHANGELOG.md CHANGELOG CHANGES.md HISTORY.md; do
+        if [[ -f "$repo_path/$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    printf '%s\n' CHANGELOG.md
+}
+
+# Put back release files this run changed. They were verified clean first, so
+# HEAD holds their previous bytes; a changelog this run created is removed.
+release_restore_paths() {
+    local repo_path="$1" created="$2" path
+    shift 2
+    for path in "$@"; do
+        if [[ "$path" == "$created" ]]; then
+            git -C "$repo_path" rm --cached --quiet --ignore-unmatch -- "$path" >/dev/null 2>&1
+            rm -f -- "${repo_path:?}/$path"
+        else
+            git -C "$repo_path" reset --quiet -- "$path" >/dev/null 2>&1
+            git -C "$repo_path" checkout --quiet HEAD -- "$path" >/dev/null 2>&1
+        fi
+    done
+}
+
+# Apply the plan's version files and changelog entry and commit exactly those
+# paths. Prints the release commit: the new commit, or HEAD when every change
+# is already present (a retry after an earlier run made the commit).
+release_prepare_commit() {
+    local repo_path="$1" plan_json="$2" tag="$3" version="$4" entry="$5"
+    local path old new result rc changelog="" created=""
+    local -a paths=() changed=()
+    while IFS= read -r -d '' path; do
+        paths+=("${path#./}")
+    done < <(run_with_input "$plan_json" jq -j '(.version_files // [])[] | .path, "\u0000"')
+    if [[ -n "$entry" ]]; then
+        changelog=$(release_changelog_path "$repo_path" "$plan_json") || return 1
+        paths+=("$changelog")
+    fi
+    # Only clean paths change, so the commit holds nothing the plan did not
+    # name and no edit in progress is overwritten.
+    for path in ${paths[@]+"${paths[@]}"}; do
+        if [[ -n "$(git -C "$repo_path" status --porcelain --untracked-files=all -- "$path")" ]]; then
+            log_error "Release file has uncommitted changes: $path"
+            return 1
+        fi
+    done
+
+    while IFS= read -r -d '' path && IFS= read -r -d '' old && IFS= read -r -d '' new; do
+        path="${path#./}"
+        rc=0
+        result=$(release_update_version_file "$repo_path" "$path" "$old" "$new") || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            case "$rc" in
+                3) log_error "$path does not declare version $old" ;;
+                4) log_error "$path could declare $old in more than one place; refusing to guess" ;;
+                *) log_error "Cannot update $path" ;;
+            esac
+            release_restore_paths "$repo_path" "" ${changed[@]+"${changed[@]}"}
+            return 1
+        fi
+        if [[ "$result" == updated ]]; then
+            changed+=("$path")
+            if [[ "$(git -C "$repo_path" diff --numstat -- "$path")" != $'1\t1\t'"$path" ]]; then
+                log_error "Updating $path changed more than its version line"
+                release_restore_paths "$repo_path" "" "${changed[@]}"
+                return 1
+            fi
+        fi
+    done < <(run_with_input "$plan_json" jq -j '(.version_files // [])[] | .path, "\u0000", .old, "\u0000", .new, "\u0000"')
+
+    if [[ -n "$changelog" ]]; then
+        [[ -e "$repo_path/$changelog" ]] || created="$changelog"
+        if ! result=$(release_update_changelog "$repo_path" "$changelog" "$entry" "$version"); then
+            log_error "Cannot add the changelog entry to $changelog"
+            release_restore_paths "$repo_path" "$created" ${changed[@]+"${changed[@]}"} "$changelog"
+            return 1
+        fi
+        [[ "$result" == updated ]] && changed+=("$changelog")
+    fi
+
+    if [[ ${#changed[@]} -eq 0 ]]; then
+        git -C "$repo_path" rev-parse --verify HEAD
+        return
+    fi
+    if ! git -C "$repo_path" add -- "${changed[@]}" ||
+       ! git -C "$repo_path" commit --quiet --only -m "chore(release): $tag" -- "${changed[@]}" >/dev/null; then
+        log_error "Cannot commit the release files"
+        release_restore_paths "$repo_path" "$created" "${changed[@]}"
+        return 1
+    fi
+    if [[ "$(git -C "$repo_path" -c core.quotePath=false diff-tree --no-commit-id --name-only -r HEAD | LC_ALL=C sort -u)" != \
+          "$(printf '%s\n' "${changed[@]}" | LC_ALL=C sort -u)" ]]; then
+        log_error "The release commit does not contain exactly the planned release files"
+        return 1
+    fi
+    git -C "$repo_path" rev-parse --verify HEAD
+}
+
+# Run the plan's checks on a clean checkout of the release commit, so what
+# passes is exactly what the tag will name. A requested check that finds
+# nothing to run fails: the plan asked for evidence that ru cannot produce.
+release_run_checks() {
+    local repo_path="$1" commit="$2" checks_json="$3" root check result rc failed=0
+    local -a checks=()
+    mapfile -t checks < <(run_with_input "$checks_json" jq -r '.[] |
+        select(. == "tests" or . == "test" or . == "lint" or . == "secrets" or . == "secret-scan")')
+    [[ ${#checks[@]} -gt 0 ]] || return 0
+    root=$(mktemp_dir) || return 1
+    if ! git -C "$repo_path" worktree add --quiet --detach "$root/candidate" "$commit" >/dev/null 2>&1; then
+        log_error "Cannot check out the release commit to run its checks"
+        return 1
+    fi
+    for check in "${checks[@]}"; do
+        rc=0
+        case "$check" in
+            tests|test) result=$(run_test_gate "$root/candidate" "" "${AGENT_SWEEP_RELEASE_CHECK_TIMEOUT:-1800}") || rc=$? ;;
+            lint) result=$(run_lint_gate "$root/candidate" "") || rc=$? ;;
+            *) result=$(run_secret_scan "$root/candidate") || rc=$? ;;
+        esac
+        if [[ $rc -eq 0 ]]; then
+            log_info "Release check passed: $check"
+        else
+            log_error "Release check failed: $check ($(run_with_input "$result" jq -r '.reason // .output_summary // ((.findings // []) | join("; "))' 2>/dev/null))"
+            failed=1
+        fi
+    done
+    git -C "$repo_path" worktree remove --force "$root/candidate" >/dev/null 2>&1 || true
+    rm -rf -- "${root:?}"
+    return "$failed"
+}
+
+# Every receiver the branch publishes to must lack TAG or already hold the
+# expected tag object (an earlier run of this release pushed it).
+release_receivers_accept_tag() {
+    local repo_path="$1" tag="$2" expected_object="$3" target remote destination tip
+    target=$(get_commit_publication_target "$repo_path") || {
+        log_error "Cannot determine where the release branch publishes"
+        return 1
+    }
+    remote=$(run_with_input "$target" jq -r '.remote') || return 1
+    while IFS= read -r -d '' destination; do
+        if ! tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect-tag "refs/tags/$tag"); then
+            log_error "Cannot inspect the tags of a release receiver"
+            return 1
+        fi
+        tip="${tip%%$'\t'*}"
+        if [[ -n "$tip" && "$tip" != "$expected_object" ]]; then
+            log_error "A release receiver already has a different $tag; refusing to replace it"
+            return 1
+        fi
+    done < <(run_with_input "$target" jq -j '.urls[] | ., "\u0000"')
+}
+
+# Publish the release commit to its branch and the annotated tag beside it on
+# every receiver the branch publishes to, through the transport that binds
+# each push to the receiver whose history was inspected and scanned. A push a
+# receiver already reflects is not repeated.
+release_publish() {
+    local repo_path="$1" commit="$2" tag="$3" tag_object="$4"
+    local target remote ref destination tip branch_tip tag_tip output i
+    local -a destinations=() branch_tips=() tag_tips=() branch_push=()
+    target=$(get_commit_publication_target "$repo_path") || {
+        log_error "Cannot determine where the release branch publishes"
+        return 1
+    }
+    remote=$(run_with_input "$target" jq -r '.remote') || return 1
+    ref=$(run_with_input "$target" jq -r '.ref') || return 1
+    while IFS= read -r -d '' destination; do
+        destinations+=("$destination")
+    done < <(run_with_input "$target" jq -j '.urls[] | ., "\u0000"')
+
+    # Inspect and scan every receiver before publishing to any of them.
+    for i in "${!destinations[@]}"; do
+        destination="${destinations[i]}"
+        if ! tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$ref"); then
+            log_error "Cannot inspect a release receiver"
+            return 1
+        fi
+        branch_tip="${tip%%$'\t'*}"
+        branch_push[i]=true
+        if [[ "$branch_tip" == "$commit" ]]; then
+            branch_push[i]=false
+        elif [[ -n "$branch_tip" ]]; then
+            if ! run_commit_publication_transport "$repo_path" "$remote" "$destination" fetch "$ref" >/dev/null 2>&1; then
+                log_error "Cannot fetch the release branch from a receiver"
+                return 1
+            fi
+            if git -C "$repo_path" merge-base --is-ancestor "$commit" "$branch_tip"; then
+                branch_push[i]=false
+            elif ! git -C "$repo_path" merge-base --is-ancestor "$branch_tip" "$commit"; then
+                log_error "The release would not fast-forward $ref on a receiver"
+                return 1
+            fi
+        fi
+        if [[ "${branch_push[i]}" == true ]] && ! scan_commit_publication "$repo_path" "$branch_tip" "$commit"; then
+            return 1
+        fi
+        if ! tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect-tag "refs/tags/$tag"); then
+            log_error "Cannot inspect the tags of a release receiver"
+            return 1
+        fi
+        tag_tip="${tip%%$'\t'*}"
+        if [[ -n "$tag_tip" && "$tag_tip" != "$tag_object" ]]; then
+            log_error "A release receiver already has a different $tag; refusing to replace it"
+            return 1
+        fi
+        branch_tips[i]="$branch_tip"
+        tag_tips[i]="$tag_tip"
+    done
+
+    for i in "${!destinations[@]}"; do
+        destination="${destinations[i]}"
+        if [[ "${branch_push[i]}" == true ]]; then
+            if ! output=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" push \
+                "$ref" "$commit" "${branch_tips[i]}" 2>&1); then
+                log_error "Release branch push failed: $output"
+                return 1
+            fi
+            if ! tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect "$ref") ||
+               [[ "${tip%%$'\t'*}" != "$commit" ]]; then
+                log_error "A release receiver does not show the pushed release commit"
+                return 1
+            fi
+        fi
+        if [[ -z "${tag_tips[i]}" ]]; then
+            if ! output=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" push \
+                "refs/tags/$tag" "$tag_object" "" "refs/tags/$tag" "$commit" 2>&1); then
+                log_error "Release tag push failed: $output"
+                return 1
+            fi
+        fi
+        if ! tip=$(run_commit_publication_transport "$repo_path" "$remote" "$destination" inspect-tag "refs/tags/$tag") ||
+           [[ "${tip%%$'\t'*}" != "$tag_object" ]]; then
+            log_error "A release receiver does not show the release tag $tag"
+            return 1
+        fi
+    done
+    log_info "Published $tag and its branch to ${#destinations[@]} receiver(s)"
+}
+
+# Create the GitHub release for a published tag, or find the one an earlier
+# run created, and confirm GitHub reports it for exactly this tag. Prints the
+# release URL.
+release_publish_github() {
+    local repo_path="$1" tag="$2" title="$3" body="$4" plan_json="$5" view output file
+    local -a gh_args=(release create "$tag" --verify-tag --title "$title")
+    if view=$(cd "$repo_path" && gh release view "$tag" --json tagName,url 2>/dev/null) &&
+       run_with_input "$view" jq -e --arg tag "$tag" '.tagName == $tag' >/dev/null 2>&1; then
+        log_info "GitHub release $tag already exists"
+    else
+        if [[ -n "$body" ]]; then
+            gh_args+=(--notes "$body")
+        else
+            gh_args+=(--generate-notes)
+        fi
+        while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            if [[ -f "$repo_path/${file#./}" ]]; then
+                gh_args+=("$repo_path/${file#./}")
+            else
+                log_warn "Release asset not found, skipping: $file"
+            fi
+        done < <(run_with_input "$plan_json" jq -r '(.files // [])[]')
+        if ! output=$(cd "$repo_path" && gh "${gh_args[@]}" 2>&1); then
+            log_error "Failed to create GitHub release: $output"
+            return 1
+        fi
+        if ! view=$(cd "$repo_path" && gh release view "$tag" --json tagName,url 2>&1) ||
+           ! run_with_input "$view" jq -e --arg tag "$tag" '.tagName == $tag' >/dev/null 2>&1; then
+            log_error "GitHub does not report a release for $tag after creating it"
+            return 1
+        fi
+    fi
+    run_with_input "$view" jq -r '.url // empty'
+}
+
+# Wait until GitHub Actions has finished every run for the release commit.
+# Success needs at least one successful run and no run that failed.
+release_await_ci() {
+    local repo_path="$1" commit="$2" timeout="${AGENT_SWEEP_RELEASE_CI_TIMEOUT:-1800}" deadline runs
+    deadline=$(( $(date +%s) + timeout ))
+    while true; do
+        if ! runs=$(cd "$repo_path" && gh run list --commit "$commit" --limit 100 --json name,status,conclusion 2>&1) ||
+           ! run_with_input "$runs" jq -e 'type == "array"' >/dev/null 2>&1; then
+            log_error "Cannot read the CI runs of the release commit: $runs"
+            return 1
+        fi
+        if run_with_input "$runs" jq -e 'length > 0 and all(.[]; .status == "completed")' >/dev/null; then
+            if run_with_input "$runs" jq -e 'any(.[]; .conclusion == "success") and
+                all(.[]; .conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral")' >/dev/null; then
+                log_info "Release CI passed"
+                return 0
+            fi
+            log_error "Release CI failed: $(run_with_input "$runs" jq -r '[.[] | select(.conclusion != "success" and
+                .conclusion != "skipped" and .conclusion != "neutral") | "\(.name)=\(.conclusion)"] | join(", ")')"
+            return 1
+        fi
+        if (( $(date +%s) >= deadline )); then
+            log_error "Release CI did not finish within ${timeout}s"
+            return 1
+        fi
+        sleep "${AGENT_SWEEP_RELEASE_CI_POLL_SECONDS:-15}"
+    done
+}
+
+# Download the release's assets and check each against a published SHA-256,
+# from a combined SHA256SUMS or checksums file or a per-asset .sha256 file.
+# Every asset that is not itself a checksum file must be covered and match.
+release_verify_checksums() {
+    local repo_path="$1" tag="$2" dir output asset name hash listed actual checked=0
+    local -A expected=()
+    local -a assets=()
+    dir=$(mktemp_dir) || return 1
+    if ! output=$(cd "$repo_path" && gh release download "$tag" --dir "$dir" 2>&1); then
+        log_error "Cannot download the assets of $tag: $output"
+        rm -rf -- "${dir:?}"
+        return 1
+    fi
+    for asset in "$dir"/*; do
+        [[ -f "$asset" ]] && assets+=("${asset##*/}")
+    done
+    for name in ${assets[@]+"${assets[@]}"}; do
+        case "$name" in
+            *.sha256)
+                hash="" listed=""
+                read -r hash listed < "$dir/$name" || [[ -n "$hash" ]]
+                listed="${listed#\*}"
+                [[ -n "$listed" ]] || listed="${name%.sha256}"
+                [[ -n "$hash" ]] && expected["${listed##*/}"]="$hash"
+                ;;
+            SHA256SUMS*|*CHECKSUMS*|*checksums*.txt)
+                while read -r hash listed || [[ -n "$hash" ]]; do
+                    listed="${listed#\*}"
+                    [[ -n "$hash" && -n "$listed" ]] && expected["${listed##*/}"]="$hash"
+                done < "$dir/$name"
+                ;;
+        esac
+    done
+    for name in ${assets[@]+"${assets[@]}"}; do
+        case "$name" in *.sha256|SHA256SUMS*|*CHECKSUMS*|*checksums*.txt) continue ;; esac
+        if [[ -z "${expected[$name]:-}" ]]; then
+            log_error "Release asset $name has no published checksum"
+            rm -rf -- "${dir:?}"
+            return 1
+        fi
+        if command -v sha256sum &>/dev/null; then
+            actual=$(sha256sum "$dir/$name") || actual=""
+        else
+            actual=$(shasum -a 256 "$dir/$name") || actual=""
+        fi
+        actual="${actual%% *}"
+        if [[ -z "$actual" || "${actual,,}" != "${expected[$name],,}" ]]; then
+            log_error "Release asset $name does not match its published checksum"
+            rm -rf -- "${dir:?}"
+            return 1
+        fi
+        checked=$((checked + 1))
+    done
+    rm -rf -- "${dir:?}"
+    if [[ $checked -eq 0 ]]; then
+        log_error "Release $tag has no assets whose checksums could be verified"
+        return 1
+    fi
+    log_info "Verified the checksums of $checked release asset(s)"
+}
+
 # Execute release plan after validation.
 # Args: $1=release_plan_json, $2=repo_path
-# Returns: 0=success, 1=failure
-# Side effects: Creates git tag, pushes to remote, creates GitHub release
+# Returns: 0=success (or no release requested or allowed), 1=failure
+# Side effects: commits version files and changelog, creates and publishes an
+# annotated tag and its branch, creates a GitHub release; records progress in
+# release_state_file
 execute_release_plan() {
     local plan_json="$1"
     local repo_path="$2"
@@ -5455,10 +6163,29 @@ execute_release_plan() {
         return 1
     fi
 
+    local strategy
+    strategy=$(get_release_strategy "$repo_path")
+    case "$strategy" in
+        never)
+            log_info "Release strategy is 'never', skipping release for $repo_path"
+            return 0
+            ;;
+        auto|gh-release|tag-only) ;;
+        *)
+            log_error "Unknown release strategy '$strategy' (expected never, auto, tag-only or gh-release)"
+            return 1
+            ;;
+    esac
+
     # Validate the plan first
+    RELEASE_PLAN_NO_RELEASE=false
     if ! validate_release_plan "$plan_json" "$repo_path"; then
         log_error "Release plan validation failed: ${VALIDATION_ERROR:-unknown error}"
         return 1
+    fi
+    if [[ "${RELEASE_PLAN_NO_RELEASE:-false}" == true ]]; then
+        log_info "Release plan requests no release for $repo_path"
+        return 0
     fi
 
     # Log any warnings
@@ -5468,129 +6195,116 @@ execute_release_plan() {
         log_warn "$warning"
     done
 
-    # Extract fields
-    local version tag_name title body
-    version=$(echo "$plan_json" | jq -r '.version // empty' 2>/dev/null)
-    tag_name=$(echo "$plan_json" | jq -r '.tag_name // empty' 2>/dev/null)
-    title=$(echo "$plan_json" | jq -r '.title // empty' 2>/dev/null)
-    body=$(echo "$plan_json" | jq -r '.body // empty' 2>/dev/null)
-
-    # Default tag_name to version if not specified
-    [[ -z "$tag_name" ]] && tag_name="$version"
-    # Ensure tag starts with v if version does
+    local version tag_name title body entry checks_json plain_version
+    version=$(run_with_input "$plan_json" jq -r '.version // empty') || return 1
+    tag_name=$(run_with_input "$plan_json" jq -r '.tag // .tag_name // empty') || return 1
+    title=$(run_with_input "$plan_json" jq -r '.title // empty') || return 1
+    entry=$(run_with_input "$plan_json" jq -r '.changelog_entry // empty') || return 1
+    body=$(run_with_input "$plan_json" jq -r '.body // .changelog_entry // empty') || return 1
+    checks_json=$(run_with_input "$plan_json" jq -c '.checks // []') || return 1
+    plain_version="${version#v}"
+    [[ -n "$tag_name" ]] || tag_name="$version"
     [[ "$version" == v* && "$tag_name" != v* ]] && tag_name="v$tag_name"
-
-    # Default title to tag_name if not specified
-    [[ -z "$title" ]] && title="Release $tag_name"
-
-    # Check release strategy
-    local strategy
-    strategy=$(get_release_strategy "$repo_path")
-    case "$strategy" in
-        never)
-            log_info "Release strategy is 'never', skipping release for $repo_path"
-            return 0
-            ;;
-        tag-only)
-            log_info "Release strategy is 'tag-only', will create tag but no GitHub release"
-            ;;
-    esac
-
-    # Step 1: Create git tag locally
-    log_info "Creating tag: $tag_name"
-    local tag_output tag_exit
-    if tag_output=$(git -C "$repo_path" tag -a "$tag_name" -m "$title" 2>&1); then
-        tag_exit=0
-    else
-        tag_exit=$?
+    [[ -n "$title" ]] || title="Release $tag_name"
+    if [[ "$strategy" == tag-only ]]; then
+        log_info "Release strategy is 'tag-only', will create tag but no GitHub release"
     fi
 
-    if [[ $tag_exit -ne 0 ]]; then
-        log_error "Failed to create tag: $tag_output"
+    # Refuse what cannot finish before anything changes.
+    if [[ "$strategy" == tag-only ]] && run_with_input "$checks_json" jq -e 'index(["checksums"]) != null' >/dev/null; then
+        log_error "Release checksums need a GitHub release, which the tag-only strategy does not create"
         return 1
     fi
-
-    # Step 2: Push tag to origin
-    log_info "Pushing tag to origin..."
-    local push_output push_exit
-    if push_output=$(git -C "$repo_path" push origin "$tag_name" 2>&1); then
-        push_exit=0
-    else
-        push_exit=$?
-    fi
-
-    if [[ $push_exit -ne 0 ]]; then
-        log_error "Failed to push tag: $push_output"
-        # Cleanup: delete local tag
-        git -C "$repo_path" tag -d "$tag_name" 2>/dev/null || true
-        return 1
-    fi
-
-    # If tag-only strategy, we're done
-    if [[ "$strategy" == "tag-only" ]]; then
-        log_info "Tag $tag_name created and pushed successfully"
-        return 0
-    fi
-
-    # Step 3: Check gh CLI availability
     if ! command -v gh &>/dev/null; then
-        log_warn "gh CLI not available, cannot create GitHub release"
-        log_info "Tag $tag_name created and pushed, but GitHub release skipped"
-        return 0
+        if [[ "$strategy" == gh-release ]] ||
+           run_with_input "$checks_json" jq -e 'any(.[]; . == "ci" or . == "checksums")' >/dev/null; then
+            log_error "gh is required for this release (strategy $strategy, checks $checks_json) but is not installed"
+            return 1
+        fi
     fi
-
-    # Step 4: Create GitHub release
-    log_info "Creating GitHub release..."
-    local -a gh_args=("release" "create" "$tag_name")
-    gh_args+=("--title" "$title")
-
-    if [[ -n "$body" ]]; then
-        gh_args+=("--notes" "$body")
-    else
-        gh_args+=("--generate-notes")
-    fi
-
-    # Add release assets
-    local -a files=()
-    local files_json
-    files_json=$(echo "$plan_json" | jq -c '.files // []' 2>/dev/null || echo "[]")
-    if [[ "$files_json" != "[]" ]]; then
-        mapfile -t files < <(echo "$files_json" | jq -r '.[]' 2>/dev/null)
-        for file in "${files[@]}"; do
-            [[ -z "$file" ]] && continue
-            local asset_path="$repo_path/${file#./}"
-            if [[ -f "$asset_path" ]]; then
-                gh_args+=("$asset_path")
-            else
-                log_warn "Release asset not found, skipping: $file"
-            fi
-        done
-    fi
-
-    # Execute gh release create
-    local gh_output gh_exit
-    if gh_output=$(cd "$repo_path" && gh "${gh_args[@]}" 2>&1); then
-        gh_exit=0
-    else
-        gh_exit=$?
-    fi
-
-    if [[ $gh_exit -ne 0 ]]; then
-        log_error "Failed to create GitHub release: $gh_output"
-        # Note: We don't delete the tag here since it's already pushed
-        # The user can retry or manually create the release
+    if ! git -C "$repo_path" symbolic-ref --quiet HEAD >/dev/null; then
+        log_error "A release needs a checked-out branch; HEAD is detached"
         return 1
     fi
 
-    # Extract release URL from output
-    local release_url
-    release_url=$(echo "$gh_output" | grep -oE 'https://github.com/[^[:space:]]+' | head -1)
-    if [[ -n "$release_url" ]]; then
-        log_info "Release created: $release_url"
+    local state_file tag_object="" commit="" output
+    state_file=$(release_state_file "$repo_path" "$tag_name") || return 1
+    if tag_object=$(git -C "$repo_path" rev-parse --verify --quiet "refs/tags/$tag_name"); then
+        # validate_release_plan accepted the tag only because an unfinished
+        # run of this release recorded creating it.
+        commit=$(jq -r '.commit // empty' "$state_file") || return 1
+        if [[ -z "$commit" || "$(git -C "$repo_path" rev-parse --verify --quiet "refs/tags/$tag_name^{commit}")" != "$commit" ]]; then
+            log_error "Tag $tag_name does not name the recorded release commit"
+            return 1
+        fi
+        log_info "Resuming release $tag_name of $commit"
     else
-        log_info "Release $tag_name created successfully"
+        tag_object=""
+    fi
+    release_receivers_accept_tag "$repo_path" "$tag_name" "$tag_object" || return 1
+
+    if [[ -z "$commit" ]]; then
+        commit=$(release_prepare_commit "$repo_path" "$plan_json" "$tag_name" "$plain_version" "$entry") || return 1
+        release_state_set "$state_file" '.tag = $tag | .version = $version | .commit = $commit | .complete = false' \
+            --arg tag "$tag_name" --arg version "$version" --arg commit "$commit" || return 1
     fi
 
+    if ! jq -e --arg commit "$commit" '.steps.checks == {commit: $commit, result: "passed"}' "$state_file" >/dev/null 2>&1; then
+        if ! release_run_checks "$repo_path" "$commit" "$checks_json"; then
+            release_state_set "$state_file" '.steps.checks = {commit: $commit, result: "failed"}' --arg commit "$commit" || true
+            log_error "Release checks failed; release commit $commit stays local and unpublished"
+            return 1
+        fi
+        release_state_set "$state_file" '.steps.checks = {commit: $commit, result: "passed"}' --arg commit "$commit" || return 1
+    fi
+
+    if [[ -z "$tag_object" ]]; then
+        log_info "Creating tag: $tag_name"
+        if ! output=$(git -C "$repo_path" tag -a "$tag_name" -m "$title" "$commit" 2>&1); then
+            log_error "Failed to create tag: $output"
+            return 1
+        fi
+        tag_object=$(git -C "$repo_path" rev-parse --verify "refs/tags/$tag_name") || return 1
+        release_state_set "$state_file" '.tag_object = $object' --arg object "$tag_object" || return 1
+    fi
+
+    if ! release_publish "$repo_path" "$commit" "$tag_name" "$tag_object"; then
+        release_state_set "$state_file" '.steps.publish = "failed"' || true
+        return 1
+    fi
+    release_state_set "$state_file" '.steps.publish = "done"' || return 1
+
+    if [[ "$strategy" != tag-only ]]; then
+        if ! command -v gh &>/dev/null; then
+            log_warn "gh CLI not available; $tag_name is published but no GitHub release was created"
+        else
+            local release_url
+            if ! release_url=$(release_publish_github "$repo_path" "$tag_name" "$title" "$body" "$plan_json"); then
+                release_state_set "$state_file" '.steps.github_release = "failed"' || true
+                return 1
+            fi
+            release_state_set "$state_file" '.steps.github_release = $url' --arg url "$release_url" || return 1
+            log_info "Release created: ${release_url:-$tag_name}"
+        fi
+    fi
+
+    if run_with_input "$checks_json" jq -e 'index(["ci"]) != null' >/dev/null; then
+        if ! release_await_ci "$repo_path" "$commit"; then
+            release_state_set "$state_file" '.steps.ci = "failed"' || true
+            return 1
+        fi
+        release_state_set "$state_file" '.steps.ci = "passed"' || return 1
+    fi
+    if run_with_input "$checks_json" jq -e 'index(["checksums"]) != null' >/dev/null; then
+        if ! release_verify_checksums "$repo_path" "$tag_name"; then
+            release_state_set "$state_file" '.steps.checksums = "failed"' || true
+            return 1
+        fi
+        release_state_set "$state_file" '.steps.checksums = "verified"' || return 1
+    fi
+
+    release_state_set "$state_file" '.complete = true' || return 1
+    log_info "Release $tag_name of $commit is complete"
     return 0
 }
 

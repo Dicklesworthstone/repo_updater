@@ -6,6 +6,7 @@
 # - dry-run listing of dirty repos
 # - json dry-run output
 # - single repo success with ntm/tmux mocks
+# - --with-release: the published tag holds the planned version files and changelog
 # - preflight rebase detection
 # - --repos glob vs plain-text selection, -j forms, --show-denylist, --debug/-d
 # - ai-sync: a leading --dry-run stays a dry run; --include/--exclude globs
@@ -149,6 +150,45 @@ test_agent_sweep_json_run_is_one_object() {
         fail "stdout is exactly one JSON object" "Got: $(printf '%s' "$out" | head -c 300)"
     fi
     assert_equals "1" "$(printf '%s\n' "$out" | jq -r '.data.summary.succeeded // empty' 2>/dev/null)" "the summary reports the successful repo"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
+test_agent_sweep_with_release_publishes_versioned_tag() {
+    local test_name="agent-sweep --with-release: the published tag carries the planned version files and changelog"
+    log_test_start "$test_name"
+
+    e2e_setup
+    e2e_create_mock_ntm ok_with_release
+    e2e_init_ru
+    # tag-only never needs GitHub; any gh call fails the run loudly.
+    printf '#!/usr/bin/env bash\necho "gh $*" >> "%s/gh_calls.log"\nexit 1\n' "$E2E_TEMP_DIR" > "$E2E_MOCK_BIN/gh"
+    chmod +x "$E2E_MOCK_BIN/gh"
+    mkdir -p "$XDG_CONFIG_HOME/ru/agent-sweep.d"
+    printf 'AGENT_SWEEP_RELEASE_STRATEGY=tag-only\n' > "$XDG_CONFIG_HOME/ru/agent-sweep.d/testrepo.conf"
+
+    local repo_dir remote_dir
+    repo_dir=$(create_dirty_repo "testrepo")
+    remote_dir="$E2E_TEMP_DIR/remotes/testrepo.git"
+    printf '1.0.0\n' > "$repo_dir/VERSION"
+    printf '# Changelog\n\n## v1.0.0\n\n- First\n' > "$repo_dir/CHANGELOG.md"
+    printf 'test:\n\ttest "$$(cat VERSION)" = 1.1.0\n' > "$repo_dir/Makefile"
+    git -C "$repo_dir" add VERSION CHANGELOG.md Makefile
+    git -C "$repo_dir" commit --quiet -m "Version 1.0.0"
+    git -C "$repo_dir" push --quiet origin HEAD 2>/dev/null
+    e2e_add_repo "example/testrepo"
+
+    local out exit_code=0
+    out=$("$E2E_RU_SCRIPT" agent-sweep --with-release --json 2>"$E2E_TEMP_DIR/release.stderr") || exit_code=$?
+    assert_equals "0" "$exit_code" "agent-sweep --with-release exits 0"
+    assert_equals "1.1.0" "$(git -C "$repo_dir" show v1.1.0:VERSION 2>/dev/null)" "The tag's VERSION is the planned release"
+    assert_equals "## v1.1.0" "$(git -C "$repo_dir" show v1.1.0:CHANGELOG.md 2>/dev/null | grep -m1 '^## ')" "The tag's changelog leads with the planned entry"
+    assert_equals "dirty" "$(git -C "$repo_dir" show v1.1.0:modified.txt 2>/dev/null)" "The swept commit is part of the release"
+    assert_equals "$(git -C "$repo_dir" rev-parse v1.1.0 2>/dev/null)" "$(git -C "$remote_dir" rev-parse --verify --quiet refs/tags/v1.1.0)" "The receiver has the annotated tag"
+    assert_equals "$(git -C "$repo_dir" rev-parse 'v1.1.0^{commit}' 2>/dev/null)" "$(git -C "$remote_dir" rev-parse --verify --quiet HEAD)" "The receiver's branch is the release commit"
+    assert_true "[[ ! -s \"$E2E_TEMP_DIR/gh_calls.log\" ]]" "tag-only never calls gh"
+    assert_equals "1" "$(printf '%s\n' "$out" | jq -r '.data.summary.succeeded // empty' 2>/dev/null)" "The summary reports the released repo"
 
     e2e_cleanup
     log_test_pass "$test_name"
@@ -323,6 +363,7 @@ run_test test_agent_sweep_json_dry_run
 run_test test_agent_sweep_single_repo_success
 run_test test_preflight_rebase_in_progress
 run_test test_agent_sweep_json_run_is_one_object
+run_test test_agent_sweep_with_release_publishes_versioned_tag
 run_test test_agent_sweep_repos_glob_selects_matching
 run_test test_agent_sweep_parallel_flags_reach_sweep
 run_test test_agent_sweep_show_denylist

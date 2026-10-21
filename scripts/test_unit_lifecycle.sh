@@ -398,6 +398,340 @@ test_release_plan_tag_only_strategy() {
 }
 
 #==============================================================================
+# Tests: execute_release_plan applies and publishes a release (bd-tr5y.7)
+#
+# Real Git repositories publish to real bare receivers. Only GitHub is
+# controlled: release_gh_mock answers release, run and download requests from
+# files under $RELEASE_GH_DIR, and checks --verify-tag against the receiver.
+#==============================================================================
+
+eval "lifecycle_$(declare -f gh)"
+
+release_gh_mock() {
+    printf '%s\n' "$*" >> "$RELEASE_GH_DIR/calls"
+    local arg dir=""
+    case "${1:-} ${2:-}" in
+        "release view")
+            [[ -f "$RELEASE_GH_DIR/release-$3" ]] || { printf 'release not found\n' >&2; return 1; }
+            jq -cn --arg tag "$3" '{tagName: $tag, url: ("https://github.com/owner/repo/releases/tag/" + $tag)}'
+            ;;
+        "release create")
+            if [[ -f "$RELEASE_GH_DIR/create-fails" ]]; then
+                rm -f "$RELEASE_GH_DIR/create-fails"
+                printf 'HTTP 502: Bad Gateway\n' >&2
+                return 1
+            fi
+            [[ " $* " == *" --verify-tag "* ]] || return 98
+            git -C "$RELEASE_REMOTE" rev-parse --verify --quiet "refs/tags/$3" >/dev/null || {
+                printf 'tag %s does not exist on the remote\n' "$3" >&2
+                return 1
+            }
+            : > "$RELEASE_GH_DIR/release-$3"
+            printf 'https://github.com/owner/repo/releases/tag/%s\n' "$3"
+            ;;
+        "run list") cat "$RELEASE_GH_DIR/runs.json" ;;
+        "release download")
+            for arg in "$@"; do
+                [[ "$dir" == next ]] && dir="$arg"
+                [[ "$arg" == --dir ]] && dir=next
+            done
+            cp "$RELEASE_GH_DIR"/assets/* "$dir"/
+            ;;
+        *) printf 'unexpected gh %s\n' "$*" >&2; return 99 ;;
+    esac
+}
+
+# A repository at 1.1.0 with a VERSION file, package.json, changelog and a
+# make test target, pushed to a bare receiver. The test target passes only
+# when RELEASE_TEST_OK=yes and the checked-out VERSION is the release.
+setup_release_test() {
+    local strategy="${1:-auto}"
+    setup_lifecycle_test
+    source_ru_function "validate_release_plan"
+    source_ru_function "get_release_strategy"
+    source_ru_function "has_release_workflow"
+    RELEASE_GH_DIR="$TEST_DIR/gh"
+    mkdir -p "$RELEASE_GH_DIR/assets"
+    gh() { release_gh_mock "$@"; }
+    log_error() { printf '%s\n' "$*" >> "$TEST_DIR/errors"; }
+    RELEASE_REPO=$(create_real_git_repo "release-repo" 1)
+    RELEASE_REMOTE="$TEST_DIR/receiver.git"
+    git init --bare --quiet "$RELEASE_REMOTE"
+    git -C "$RELEASE_REMOTE" symbolic-ref HEAD refs/heads/main
+    printf '1.1.0\n' > "$RELEASE_REPO/VERSION"
+    printf '{\n  "name": "fixture",\n  "version": "1.1.0",\n  "dependencies": {\n    "left-pad": "^1.1.0"\n  }\n}\n' > "$RELEASE_REPO/package.json"
+    printf '# Changelog\n\n## v1.1.0\n\n- Initial release\n' > "$RELEASE_REPO/CHANGELOG.md"
+    printf 'test:\n\ttest "$$RELEASE_TEST_OK" = yes\n\ttest "$$(cat VERSION)" = 1.2.0\n' > "$RELEASE_REPO/Makefile"
+    mkdir -p "$RELEASE_REPO/.ru"
+    printf 'AGENT_SWEEP_RELEASE_STRATEGY=%s\n' "$strategy" > "$RELEASE_REPO/.ru/agent-sweep.conf"
+    git -C "$RELEASE_REPO" add VERSION package.json CHANGELOG.md Makefile
+    git -C "$RELEASE_REPO" commit --quiet -m "Version 1.1.0"
+    git -C "$RELEASE_REPO" remote add origin "$RELEASE_REMOTE"
+    git -C "$RELEASE_REPO" push --quiet -u origin main 2>/dev/null
+    RELEASE_BASE=$(git -C "$RELEASE_REPO" rev-parse HEAD)
+    export RELEASE_TEST_OK=yes
+}
+
+teardown_release_test() {
+    gh() { lifecycle_gh "$@"; }
+    log_error() { :; }
+    unset RELEASE_TEST_OK
+}
+
+release_plan_json() {
+    jq -cn --argjson checks "${1:-[\"tests\"]}" '{
+        version: "1.2.0", tag: "v1.2.0",
+        changelog_entry: "## v1.2.0\n\n- Releases are applied, checked and verified",
+        version_files: [{path: "VERSION", old: "1.1.0", new: "1.2.0"},
+                        {path: "package.json", old: "1.1.0", new: "1.2.0"}],
+        checks: $checks}'
+}
+
+test_release_applies_version_files_changelog_and_publishes() {
+    log_test_start "execute_release_plan: tags a commit holding the version files and changelog, then publishes it"
+    setup_release_test auto
+    # A common setting that would send the new tag along with the branch push
+    git -C "$RELEASE_REPO" config push.followTags true
+    printf 'unrelated staged work\n' > "$RELEASE_REPO/notes.txt"
+    git -C "$RELEASE_REPO" add notes.txt
+
+    local rc=0 commit tag_object
+    execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 0 "$rc" "A valid release plan succeeds"
+    commit=$(git -C "$RELEASE_REPO" rev-parse --verify --quiet 'v1.2.0^{commit}')
+    tag_object=$(git -C "$RELEASE_REPO" rev-parse --verify --quiet refs/tags/v1.2.0)
+    assert_equals tag "$(git -C "$RELEASE_REPO" cat-file -t v1.2.0 2>/dev/null)" "The release tag is annotated"
+    assert_equals 1.2.0 "$(git -C "$RELEASE_REPO" show v1.2.0:VERSION 2>/dev/null)" "The tagged VERSION names the release"
+    assert_equals 1.2.0 "$(git -C "$RELEASE_REPO" show v1.2.0:package.json 2>/dev/null | jq -r .version)" "The tagged package.json names the release"
+    assert_equals '^1.1.0' "$(git -C "$RELEASE_REPO" show v1.2.0:package.json 2>/dev/null | jq -r '.dependencies["left-pad"]')" "A dependency that shares the old version is untouched"
+    assert_equals '## v1.2.0' "$(git -C "$RELEASE_REPO" show v1.2.0:CHANGELOG.md 2>/dev/null | grep -m1 '^## ')" "The changelog entry is the newest section"
+    assert_contains "$(git -C "$RELEASE_REPO" show v1.2.0:CHANGELOG.md 2>/dev/null)" '## v1.1.0' "Earlier changelog sections remain"
+    assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REPO" rev-parse "$commit^" 2>/dev/null)" "Exactly one release commit sits on the previous HEAD"
+    assert_equals $'CHANGELOG.md\nVERSION\npackage.json' "$(git -C "$RELEASE_REPO" diff-tree --no-commit-id --name-only -r "$commit" | LC_ALL=C sort)" "The release commit holds only the release files"
+    assert_equals notes.txt "$(git -C "$RELEASE_REPO" diff --cached --name-only)" "Unrelated staged work stays staged and out of the release"
+    assert_equals "$commit" "$(git -C "$RELEASE_REMOTE" rev-parse --verify --quiet refs/heads/main)" "The receiver's branch is the release commit"
+    assert_equals "$tag_object" "$(git -C "$RELEASE_REMOTE" rev-parse --verify --quiet refs/tags/v1.2.0)" "The receiver has the same annotated tag"
+    assert_contains "$(cat "$RELEASE_GH_DIR/calls")" 'release create v1.2.0 --verify-tag' "The GitHub release requires the published tag"
+    assert_success "The recorded release is complete" jq -e --arg commit "$commit" \
+        '.complete == true and .commit == $commit and .steps.checks.result == "passed" and .steps.publish == "done"' \
+        "$(release_state_file "$RELEASE_REPO" v1.2.0)"
+    teardown_release_test
+    log_test_pass "execute_release_plan: tags a commit holding the version files and changelog, then publishes it"
+}
+
+test_release_failed_check_publishes_nothing_and_retry_continues() {
+    log_test_start "execute_release_plan: a failed check publishes nothing; the retry reuses the release commit"
+    setup_release_test auto
+    local rc=0 first_commit
+    RELEASE_TEST_OK=no execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 1 "$rc" "A failing requested check fails the release"
+    assert_equals "" "$(git -C "$RELEASE_REPO" tag -l v1.2.0)" "No tag is created before the checks pass"
+    assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REMOTE" rev-parse refs/heads/main)" "The receiver's branch is unchanged"
+    assert_equals "" "$(git -C "$RELEASE_REMOTE" tag -l)" "The receiver has no tag"
+    assert_equals "" "$(cat "$RELEASE_GH_DIR/calls" 2>/dev/null)" "GitHub is not asked for anything"
+    first_commit=$(git -C "$RELEASE_REPO" rev-parse HEAD)
+    assert_equals 1.2.0 "$(git -C "$RELEASE_REPO" show HEAD:VERSION)" "The checked release commit stays local for inspection"
+
+    rc=0
+    execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 0 "$rc" "The retry succeeds once the check passes"
+    assert_equals "$first_commit" "$(git -C "$RELEASE_REPO" rev-parse 'v1.2.0^{commit}')" "The retry tags the same release commit"
+    assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REPO" rev-parse "$first_commit^")" "The retry adds no second release commit"
+    assert_equals "$first_commit" "$(git -C "$RELEASE_REMOTE" rev-parse refs/heads/main)" "The retry publishes the release commit"
+    teardown_release_test
+    log_test_pass "execute_release_plan: a failed check publishes nothing; the retry reuses the release commit"
+}
+
+test_release_resumes_after_github_release_failure() {
+    log_test_start "execute_release_plan: a retry after a failed GitHub release resumes instead of refusing the tag"
+    setup_release_test auto
+    : > "$RELEASE_GH_DIR/create-fails"
+    local rc=0 commit tag_object
+    execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 1 "$rc" "A failed GitHub release fails the run"
+    commit=$(git -C "$RELEASE_REPO" rev-parse 'v1.2.0^{commit}')
+    tag_object=$(git -C "$RELEASE_REPO" rev-parse refs/tags/v1.2.0)
+    assert_equals "$tag_object" "$(git -C "$RELEASE_REMOTE" rev-parse --verify --quiet refs/tags/v1.2.0)" "The tag was already published"
+    assert_success "The record shows publication done and the release failed" jq -e \
+        '.steps.publish == "done" and .steps.github_release == "failed" and .complete == false' \
+        "$(release_state_file "$RELEASE_REPO" v1.2.0)"
+
+    rc=0
+    execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 0 "$rc" "The retry resumes and succeeds"
+    assert_equals "$tag_object" "$(git -C "$RELEASE_REPO" rev-parse refs/tags/v1.2.0)" "The retry keeps the same tag object"
+    assert_equals "$commit" "$(git -C "$RELEASE_REPO" rev-parse HEAD)" "The retry adds no commit"
+    assert_equals 2 "$(grep -c '^release create v1.2.0' "$RELEASE_GH_DIR/calls")" "The release is created once, after the one failed attempt"
+    rc=0
+    execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 1 "$rc" "A completed release is not released again"
+    teardown_release_test
+    log_test_pass "execute_release_plan: a retry after a failed GitHub release resumes instead of refusing the tag"
+}
+
+test_release_null_version_is_no_release() {
+    log_test_start "execute_release_plan: a plan with no version releases nothing and succeeds"
+    setup_release_test auto
+    local rc=0
+    execute_release_plan '{"version": null, "tag": null, "changelog_entry": "", "version_files": [], "checks": []}' "$RELEASE_REPO" || rc=$?
+    assert_equals 0 "$rc" "Declining a release is a successful outcome"
+    assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REPO" rev-parse HEAD)" "No commit is made"
+    assert_equals "" "$(git -C "$RELEASE_REPO" tag -l)" "No tag is made"
+    teardown_release_test
+    log_test_pass "execute_release_plan: a plan with no version releases nothing and succeeds"
+}
+
+test_release_refusals_leave_repository_unchanged() {
+    log_test_start "execute_release_plan: refused plans change no commit, file, tag or receiver"
+    local name plan rc expected
+    for name in ambiguous-file wrong-new-version version-file-not-listed dirty-version-file \
+        unknown-check foreign-receiver-tag; do
+        setup_release_test auto
+        plan=$(release_plan_json)
+        case "$name" in
+            ambiguous-file)
+                printf 'release 1.1.0\nminimum 1.1.0\n' > "$RELEASE_REPO/config.txt"
+                git -C "$RELEASE_REPO" add config.txt
+                git -C "$RELEASE_REPO" commit --quiet -m "Add config"
+                git -C "$RELEASE_REPO" push --quiet origin main 2>/dev/null
+                RELEASE_BASE=$(git -C "$RELEASE_REPO" rev-parse HEAD)
+                plan=$(run_with_input "$plan" jq -c '.version_files += [{path: "config.txt", old: "1.1.0", new: "1.2.0"}]')
+                ;;
+            wrong-new-version) plan=$(run_with_input "$plan" jq -c '.version_files[1].new = "1.3.0"') ;;
+            version-file-not-listed) plan=$(run_with_input "$plan" jq -c '.version_files = [.version_files[1]]') ;;
+            dirty-version-file) printf '{"edited": true}\n' > "$RELEASE_REPO/package.json" ;;
+            unknown-check) plan=$(release_plan_json '["tests", "fuzz"]') ;;
+            foreign-receiver-tag)
+                git -C "$RELEASE_REPO" tag -a v1.2.0 -m "Someone else's" "$RELEASE_BASE"
+                git -C "$RELEASE_REPO" push --quiet origin v1.2.0 2>/dev/null
+                git -C "$RELEASE_REPO" tag -d v1.2.0 >/dev/null
+                ;;
+        esac
+        expected=$(git -C "$RELEASE_REPO" status --porcelain; cat "$RELEASE_REPO/VERSION" "$RELEASE_REPO/package.json" "$RELEASE_REPO/CHANGELOG.md")
+        rc=0
+        execute_release_plan "$plan" "$RELEASE_REPO" || rc=$?
+        assert_equals 1 "$rc" "$name is refused"
+        assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REPO" rev-parse HEAD)" "$name makes no commit"
+        assert_equals "$expected" "$(git -C "$RELEASE_REPO" status --porcelain; cat "$RELEASE_REPO/VERSION" "$RELEASE_REPO/package.json" "$RELEASE_REPO/CHANGELOG.md")" "$name leaves every file as it was"
+        assert_equals "" "$(git -C "$RELEASE_REPO" tag -l)" "$name creates no local tag"
+        assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REMOTE" rev-parse refs/heads/main)" "$name leaves the receiver's branch"
+        case "$name" in
+            ambiguous-file) expected="could declare 1.1.0 in more than one place" ;;
+            wrong-new-version) expected="would be set to 1.3.0" ;;
+            version-file-not-listed) expected="VERSION says 1.1.0" ;;
+            dirty-version-file) expected="uncommitted changes: package.json" ;;
+            unknown-check) expected="Unknown release check: fuzz" ;;
+            foreign-receiver-tag) expected="already has a different v1.2.0" ;;
+        esac
+        assert_contains "$(cat "$TEST_DIR/errors" 2>/dev/null)" "$expected" "$name is refused for its own reason"
+        teardown_release_test
+    done
+    log_test_pass "execute_release_plan: refused plans change no commit, file, tag or receiver"
+}
+
+test_release_tag_only_publishes_without_github() {
+    log_test_start "execute_release_plan: tag-only publishes the release commit and tag and never calls GitHub"
+    setup_release_test tag-only
+    local rc=0 commit
+    execute_release_plan "$(release_plan_json)" "$RELEASE_REPO" || rc=$?
+    assert_equals 0 "$rc" "A tag-only release succeeds"
+    commit=$(git -C "$RELEASE_REPO" rev-parse 'v1.2.0^{commit}')
+    assert_equals 1.2.0 "$(git -C "$RELEASE_REPO" show v1.2.0:VERSION)" "The tag-only release still carries its version files"
+    assert_equals "$commit" "$(git -C "$RELEASE_REMOTE" rev-parse refs/heads/main)" "The release commit is published"
+    assert_equals "$(git -C "$RELEASE_REPO" rev-parse refs/tags/v1.2.0)" "$(git -C "$RELEASE_REMOTE" rev-parse refs/tags/v1.2.0)" "The tag is published"
+    assert_equals "" "$(cat "$RELEASE_GH_DIR/calls" 2>/dev/null)" "GitHub is never called"
+    rc=0
+    execute_release_plan "$(release_plan_json '["tests", "checksums"]')" "$RELEASE_REPO" || rc=$?
+    assert_equals 1 "$rc" "tag-only refuses checksums, which need a GitHub release"
+    teardown_release_test
+    log_test_pass "execute_release_plan: tag-only publishes the release commit and tag and never calls GitHub"
+}
+
+test_release_gh_release_requires_gh() {
+    log_test_start "execute_release_plan: gh-release without gh refuses before changing anything"
+    setup_release_test gh-release
+    local bin="$TEST_DIR/no-gh-bin" tool tool_path rc=0
+    mkdir -p "$bin"
+    for tool in git jq awk sed grep sort tr tail head cut cat mktemp mkdir rm dirname basename date env bash make test; do
+        tool_path=$(type -P "$tool") && ln -sf "$tool_path" "$bin/$tool"
+    done
+    (
+        unset -f gh
+        PATH="$bin"
+        execute_release_plan "$(release_plan_json)" "$RELEASE_REPO"
+    ) || rc=$?
+    assert_equals 1 "$rc" "gh-release fails when gh is not installed"
+    assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REPO" rev-parse HEAD)" "No release commit is made"
+    assert_equals "" "$(git -C "$RELEASE_REPO" tag -l)" "No tag is made"
+    teardown_release_test
+    log_test_pass "execute_release_plan: gh-release without gh refuses before changing anything"
+}
+
+test_release_ci_and_checksums_are_observed() {
+    log_test_start "execute_release_plan: requested CI and checksums must be observed to pass"
+    local scenario rc
+    for scenario in pass ci-failed checksum-mismatch; do
+        setup_release_test auto
+        export AGENT_SWEEP_RELEASE_CI_POLL_SECONDS=0
+        printf 'release payload\n' > "$RELEASE_GH_DIR/assets/ru.tar.gz"
+        if command -v sha256sum &>/dev/null; then
+            sha256sum "$RELEASE_GH_DIR/assets/ru.tar.gz" | sed 's#  .*/#  #' > "$RELEASE_GH_DIR/assets/SHA256SUMS"
+        else
+            shasum -a 256 "$RELEASE_GH_DIR/assets/ru.tar.gz" | sed 's#  .*/#  #' > "$RELEASE_GH_DIR/assets/SHA256SUMS"
+        fi
+        printf '[{"name":"release","status":"completed","conclusion":"success"}]\n' > "$RELEASE_GH_DIR/runs.json"
+        case "$scenario" in
+            ci-failed) printf '[{"name":"release","status":"completed","conclusion":"failure"}]\n' > "$RELEASE_GH_DIR/runs.json" ;;
+            checksum-mismatch) printf 'tampered payload\n' > "$RELEASE_GH_DIR/assets/ru.tar.gz" ;;
+        esac
+        rc=0
+        execute_release_plan "$(release_plan_json '["tests", "ci", "checksums"]')" "$RELEASE_REPO" || rc=$?
+        if [[ "$scenario" == pass ]]; then
+            assert_equals 0 "$rc" "Passing CI and matching checksums complete the release"
+            assert_success "The record shows CI and checksums" jq -e '.steps.ci == "passed" and .steps.checksums == "verified" and .complete == true' \
+                "$(release_state_file "$RELEASE_REPO" v1.2.0)"
+        else
+            assert_equals 1 "$rc" "$scenario fails the release"
+            assert_success "$scenario leaves the release incomplete" jq -e '.complete == false' "$(release_state_file "$RELEASE_REPO" v1.2.0)"
+        fi
+        assert_contains "$(cat "$RELEASE_GH_DIR/calls")" "run list --commit $(git -C "$RELEASE_REPO" rev-parse 'v1.2.0^{commit}')" "$scenario reads the release commit's CI runs"
+        unset AGENT_SWEEP_RELEASE_CI_POLL_SECONDS
+        teardown_release_test
+    done
+    log_test_pass "execute_release_plan: requested CI and checksums must be observed to pass"
+}
+
+test_release_version_file_formats() {
+    log_test_start "release_update_version_file: changes only the line that declares the version"
+    setup_lifecycle_test
+    local repo rc result
+    repo=$(create_real_git_repo "version-formats" 1)
+    printf '[package]\nname = "x"\nversion = "1.1.0"\n\n[dependencies]\nserde = { version = "1.1.0" }\n\n[dependencies.other]\nversion = "1.1.0"\n' > "$repo/Cargo.toml"
+    printf '#!/usr/bin/env bash\nVERSION="1.1.0"\n# 1.1.0 added flags\n' > "$repo/tool"
+    printf 'v1.1.0' > "$repo/VERSION"
+    printf 'see 1.1.0 and 1.1.0\n' > "$repo/notes.txt"
+    result=$(release_update_version_file "$repo" Cargo.toml 1.1.0 1.2.0)
+    assert_equals updated "$result" "A TOML package version is updated"
+    assert_equals 'version = "1.2.0"' "$(sed -n 3p "$repo/Cargo.toml")" "Only the [package] version changes"
+    assert_equals 2 "$(grep -c '1\.1\.0' "$repo/Cargo.toml")" "Dependency versions keep the old number"
+    result=$(release_update_version_file "$repo" tool 1.1.0 1.2.0)
+    assert_equals 'VERSION="1.2.0"' "$(sed -n 2p "$repo/tool")" "A script's version assignment is chosen over a comment"
+    assert_contains "$(cat "$repo/tool")" '# 1.1.0 added flags' "The comment keeps its text"
+    result=$(release_update_version_file "$repo" VERSION 1.1.0 1.2.0)
+    assert_equals v1.2.0 "$(cat "$repo/VERSION")" "A v-prefixed VERSION keeps its prefix and missing final newline"
+    result=$(release_update_version_file "$repo" VERSION 1.1.0 1.2.0)
+    assert_equals current "$result" "A file already at the new version is reported current"
+    rc=0
+    result=$(release_update_version_file "$repo" notes.txt 1.1.0 1.2.0) || rc=$?
+    assert_equals 4 "$rc" "Two equal candidates are ambiguous"
+    assert_equals 'see 1.1.0 and 1.1.0' "$(cat "$repo/notes.txt")" "An ambiguous file is unchanged"
+    rc=0
+    result=$(release_update_version_file "$repo" Cargo.toml 9.9.9 1.3.0) || rc=$?
+    assert_equals 3 "$rc" "A missing old version is reported"
+    log_test_pass "release_update_version_file: changes only the line that declares the version"
+}
+
+#==============================================================================
 # Tests: execute_gh_actions orchestrator
 #==============================================================================
 
@@ -1304,6 +1638,15 @@ run_test test_release_plan_invalid_repo
 run_test test_release_plan_plan_mode
 run_test test_release_plan_never_strategy
 run_test test_release_plan_tag_only_strategy
+run_test test_release_applies_version_files_changelog_and_publishes
+run_test test_release_failed_check_publishes_nothing_and_retry_continues
+run_test test_release_resumes_after_github_release_failure
+run_test test_release_null_version_is_no_release
+run_test test_release_refusals_leave_repository_unchanged
+run_test test_release_tag_only_publishes_without_github
+run_test test_release_gh_release_requires_gh
+run_test test_release_ci_and_checksums_are_observed
+run_test test_release_version_file_formats
 
 # GH actions orchestrator
 run_test test_gh_actions_no_actions

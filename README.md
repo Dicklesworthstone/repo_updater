@@ -2224,10 +2224,13 @@ Each repository goes through a structured three-phase workflow that separates pl
 - Optionally pushes to remote
 
 **Phase 3: Release** (`--phase3-timeout`, default 300s, requires `--with-release`)
-- Analyzes commit history since last tag
-- Determines appropriate version bump (patch/minor/major)
-- Creates git tag and optionally GitHub release
-- Respects per-repo release strategy configuration
+- The agent proposes a version, tag, changelog entry, version files and checks; a null version means no release
+- ru commits the version-file edits and the changelog entry together as `chore(release): <tag>`, touching no other path
+- Requested checks (`tests`, `lint`, `secrets`) run on a clean checkout of that commit; a failure publishes nothing
+- The branch and an annotated tag are pushed to the receivers commit plans use, and each receiver is re-read afterwards
+- `auto` and `gh-release` then create the GitHub release with `--verify-tag`; `ci` waits for the commit's Actions runs and `checksums` downloads the assets and checks their SHA-256 files
+- Progress is recorded in `.git/ru-release/<tag>.json`, so rerunning a failed release continues it without a second commit, tag or release
+- Respects per-repo release strategy configuration (`never`, `auto`, `tag-only`, `gh-release`)
 
 **Execution modes:**
 
@@ -2387,10 +2390,14 @@ unrelated branches in the planned publication.
 
 | Check | Validation | Failure Behavior |
 |-------|------------|------------------|
-| Version format | Matches semver (X.Y.Z) | Reject plan |
-| Tag availability | Tag doesn't already exist | Reject plan |
-| Release strategy | Matches configured strategy | Adjust to match |
-| Changelog presence | Release notes provided | Warn, use default |
+| Version format | Matches semver (X.Y.Z), or null for no release | Reject plan |
+| Tag | Names the version (`1.2.0` or `v1.2.0`); not already local or on a receiver, unless it is this release resuming | Reject plan |
+| Version files | Tracked regular files whose new text is the version; the old text must be found on exactly one declaring line (a VERSION file's content, a JSON `"version"` key, a TOML `[package]`/`[project]` version, or else one whole-word match) | Reject plan, files unchanged |
+| VERSION file | A tracked top-level `VERSION` must already name the version or be listed in `version_files` | Reject plan |
+| Uncommitted edits | Version files and the changelog must have no uncommitted changes | Reject plan |
+| Checks | Only `tests`, `lint`, `secrets`, `ci`, `checksums`; `checksums` needs a GitHub release, and `ci`, `checksums` and `gh-release` need `gh` | Reject plan |
+| Release strategy | `never`, `auto`, `tag-only` or `gh-release` | `never` skips; anything else is rejected |
+| Changelog entry | Must name the version; it is added above the newest `## ` section of `CHANGELOG.md` (or the plan's `changelog`), which is created if missing | Reject plan if it omits the version; no entry means no changelog change |
 
 **Why structured output with markers?**
 
