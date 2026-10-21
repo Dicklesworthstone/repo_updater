@@ -339,9 +339,16 @@ dir_lock_try_acquire() {
     (
         set -o noclobber
         : > "$lifecycle_guard" 2>/dev/null || exit 1
+        # Also removed explicitly; see dir_lock_release.
         trap 'rm -f -- "$lifecycle_guard"' EXIT
-        mkdir "$lock_dir" 2>/dev/null || exit 1
-        printf '%s\n' "$owner_pid" > "$lock_dir/owner" 2>/dev/null
+        local acquire_rc=0
+        if mkdir "$lock_dir" 2>/dev/null; then
+            printf '%s\n' "$owner_pid" > "$lock_dir/owner" 2>/dev/null || acquire_rc=$?
+        else
+            acquire_rc=1
+        fi
+        rm -f -- "$lifecycle_guard"
+        exit "$acquire_rc"
     ) 2>/dev/null
 }
 
@@ -361,16 +368,24 @@ dir_lock_release() {
             sleep 0.1
         done
         [[ "$acquired" == true ]] || exit 1
+        # The guard is removed explicitly as well: before Bash 5, a subshell
+        # started inside the caller's EXIT trap (a sweep releasing its lock on
+        # exit) never runs its own EXIT trap, and the leftover guard made every
+        # later acquisition report another running instance.
         trap 'rm -f -- "$lifecycle_guard"' EXIT
+        local release_rc=0
         if [[ -e "$lock_dir/owner" ]]; then
-            IFS= read -r owner_pid < "$lock_dir/owner" || exit 1
-            [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || exit 1
-            if [[ "$owner_pid" != "$caller_pid" ]] && kill -0 "$owner_pid" 2>/dev/null; then
-                exit 1
+            if ! IFS= read -r owner_pid < "$lock_dir/owner" || [[ ! "$owner_pid" =~ ^[1-9][0-9]*$ ]]; then
+                release_rc=1
+            elif [[ "$owner_pid" != "$caller_pid" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+                release_rc=1
+            elif ! rm -f "$lock_dir/owner" 2>/dev/null; then
+                release_rc=1
             fi
-            rm -f "$lock_dir/owner" 2>/dev/null || exit 1
         fi
-        rmdir "$lock_dir" 2>/dev/null || true
+        [[ $release_rc -ne 0 ]] || rmdir "$lock_dir" 2>/dev/null || true
+        rm -f -- "$lifecycle_guard"
+        exit "$release_rc"
     )
 }
 

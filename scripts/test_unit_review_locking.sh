@@ -387,6 +387,34 @@ test_acquire_review_lock_fails_when_held() {
     log_test_pass "$test_name"
 }
 
+test_lock_release_from_exit_trap_leaves_no_guard() {
+    local test_name="a lock released from an EXIT trap can be taken again"
+    log_test_start "$test_name"
+    local test_env lock rc
+    test_env=$(create_test_env)
+    lock="$test_env/instance.lock"
+
+    # A child shell takes the lock and releases it from its EXIT trap, as
+    # agent-sweep and review do. Before Bash 5, a subshell started inside an
+    # EXIT trap never runs its own EXIT trap, so a cleanup that depends on one
+    # leaves the lifecycle guard behind. This discriminates only when the
+    # suite's bash is older than 5.
+    rc=0
+    bash -c "$(declare -f dir_lock_try_acquire dir_lock_release)
+        dir_lock_try_acquire '$lock' || exit 9
+        trap \"dir_lock_release '$lock'\" EXIT" || rc=$?
+    assert_equals 0 "$rc" "The child shell acquires the lock"
+    assert_file_not_exists "$lock.lifecycle" "No lifecycle guard is left behind"
+    assert_dir_not_exists "$lock" "The lock directory is released"
+    if dir_lock_try_acquire "$lock"; then
+        pass "The lock can be acquired again"
+        dir_lock_release "$lock"
+    else
+        fail "The lock can be acquired again"
+    fi
+    log_test_pass "$test_name"
+}
+
 test_lock_acquire_release_cycle() {
     local test_name="lock acquire-release cycle works correctly"
     log_test_start "$test_name"
@@ -525,6 +553,7 @@ run_test test_check_stale_lock_valid_lock
 
 # Concurrent access tests
 run_test test_acquire_review_lock_fails_when_held
+run_test test_lock_release_from_exit_trap_leaves_no_guard
 run_test test_lock_acquire_release_cycle
 
 # Lock info content tests
