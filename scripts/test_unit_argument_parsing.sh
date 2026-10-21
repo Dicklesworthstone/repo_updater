@@ -606,6 +606,59 @@ test_import_github_flags_reach_import() {
     done
 }
 
+test_readme_examples_parse() {
+    # Every `ru ...` line in a README shell block must get past parse_args:
+    # documented forms such as `ru config --set PARALLEL=4` and
+    # `ru agent-sweep --show-denylist` were once rejected as unknown options.
+    # Lines that use pipes, substitutions, redirections or placeholders are
+    # skipped. Command-level option parsers are not exercised here.
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip_test "README example extraction needs python3"
+        return 0
+    fi
+    local extractor='
+import re, shlex, sys
+fence = shell = False
+for n, raw in enumerate(open(sys.argv[1], encoding="utf-8").read().split("\n"), 1):
+    s = raw.strip()
+    if s.startswith("```"):
+        if fence:
+            fence = shell = False
+        else:
+            fence, shell = True, s[3:].strip() in ("", "bash", "sh", "shell", "console")
+        continue
+    if not (fence and shell):
+        continue
+    line = s[2:] if s.startswith("$ ") else s
+    if not line.startswith("ru "):
+        continue
+    if any(t in line for t in ("|", "$(", "`", "&&", ";", " > ", " < ", ">>")) or re.search(r"<[A-Za-z_-]+>|\.\.\.|\[[A-Z]", line):
+        continue
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        args = list(lexer)[1:]
+    except ValueError:
+        continue
+    sys.stdout.write(str(n) + "\x1f" + "\x1f".join(args) + "\x00")
+'
+    local record lineno rc examples=0 rejected=""
+    local -a fields args
+    while IFS= read -r -d '' record; do
+        IFS=$'\x1f' read -r -a fields <<< "$record"
+        lineno="${fields[0]}"
+        args=("${fields[@]:1}")
+        examples=$((examples + 1))
+        rc=0
+        (reset_globals; parse_args "${args[@]}") >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 4 ]] && rejected+=" README:$lineno(ru ${args[*]})"
+    done < <(python3 -c "$extractor" "$PROJECT_DIR/README.md")
+
+    assert_true "[[ $examples -ge 50 ]]" "README examples were found ($examples)"
+    assert_equals "" "$rejected" "Every README example is accepted by parse_args"
+}
+
 test_command_specific_flags_rejected_elsewhere() {
     local flag rc
     for flag in --debug -d --show-denylist --stars --org=acme --set; do
@@ -837,6 +890,7 @@ run_test test_config_set_requires_key_value
 run_test test_agent_sweep_flags_reach_agent_sweep
 run_test test_import_github_flags_reach_import
 run_test test_command_specific_flags_rejected_elsewhere
+run_test test_readme_examples_parse
 
 # Unknown options
 run_test test_unknown_option_recognized
