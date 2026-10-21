@@ -29,6 +29,8 @@ source_ru_function "get_review_state_dir"
 source_ru_function "acquire_state_lock"
 source_ru_function "release_state_lock"
 source_ru_function "read_state_json"
+source_ru_function "mktemp_file"
+source_ru_function "mktemp_dir"
 
 # Set up required environment for locking
 STATE_LOCK_FD=201
@@ -593,7 +595,7 @@ test_read_state_json_returns_default_for_missing() {
     local result
     result=$(read_state_json "$nonexistent" '{"default":true}')
 
-    assert_contains "$result" '"default":true' "Should return default value"
+    assert_equals '{"default":true}' "$result" "Should return the default value exactly"
 
     unset RU_STATE_DIR
     log_test_pass "$test_name"
@@ -616,6 +618,36 @@ test_read_state_json_default_empty_object() {
     assert_equals "{}" "$result" "Should default to empty object"
 
     unset RU_STATE_DIR
+    log_test_pass "$test_name"
+}
+
+#==============================================================================
+# Tests: mktemp_file / mktemp_dir
+#==============================================================================
+
+test_mktemp_helpers_honor_tmpdir() {
+    local test_name="mktemp_file and mktemp_dir create inside TMPDIR or fail"
+    log_test_start "$test_name"
+    local test_env made rc
+    test_env=$(create_test_env)
+    mkdir -p "$test_env/tmp"
+
+    # Each call runs the real mktemp, not the framework's wrapper.
+    made=$(unset -f mktemp; TMPDIR="$test_env/tmp/" mktemp_file)
+    assert_equals "$test_env/tmp" "${made%/*}" "mktemp_file creates its file in TMPDIR"
+    assert_file_exists "$made" "mktemp_file returns a file that exists"
+    made=$(unset -f mktemp; TMPDIR="$test_env/tmp" mktemp_dir)
+    assert_equals "$test_env/tmp" "${made%/*}" "mktemp_dir creates its directory in TMPDIR"
+    assert_dir_exists "$made" "mktemp_dir returns a directory that exists"
+
+    rc=0
+    made=$(unset -f mktemp; TMPDIR="$test_env/missing" mktemp_file) || rc=$?
+    assert_not_equals 0 "$rc" "mktemp_file fails when TMPDIR is missing"
+    assert_equals "" "$made" "mktemp_file does not fall back to another directory"
+    rc=0
+    made=$(unset -f mktemp; TMPDIR="$test_env/missing" mktemp_dir) || rc=$?
+    assert_not_equals 0 "$rc" "mktemp_dir fails when TMPDIR is missing"
+    assert_equals "" "$made" "mktemp_dir does not fall back to another directory"
     log_test_pass "$test_name"
 }
 
@@ -668,6 +700,9 @@ run_test test_write_json_atomic_overwrites_existing
 run_test test_read_state_json_returns_content
 run_test test_read_state_json_returns_default_for_missing
 run_test test_read_state_json_default_empty_object
+
+# mktemp helper tests
+run_test test_mktemp_helpers_honor_tmpdir
 
 echo ""
 print_results

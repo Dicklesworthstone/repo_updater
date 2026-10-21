@@ -6519,25 +6519,16 @@ agent_sweep_backoff_active() {
     [[ "$pause_until" -gt "$now" ]]
 }
 
-# mktemp compatibility: BSD (macOS) mktemp requires a template or -t.
+# An explicit template makes GNU and BSD mktemp both honor TMPDIR; macOS
+# mktemp without one ignores TMPDIR and uses the per-user temp directory.
 mktemp_file() {
-    local tmp
-    if tmp=$(mktemp 2>/dev/null); then
-        printf '%s\n' "$tmp"
-        return 0
-    fi
-    tmp=$(mktemp -t ru 2>/dev/null) || return 1
-    printf '%s\n' "$tmp"
+    local dir="${TMPDIR:-/tmp}"
+    mktemp "${dir%/}/ru.XXXXXXXXXX" 2>/dev/null
 }
 
 mktemp_dir() {
-    local tmp
-    if tmp=$(mktemp -d 2>/dev/null); then
-        printf '%s\n' "$tmp"
-        return 0
-    fi
-    tmp=$(mktemp -d -t ru 2>/dev/null) || return 1
-    printf '%s\n' "$tmp"
+    local dir="${TMPDIR:-/tmp}"
+    mktemp -d "${dir%/}/ru.XXXXXXXXXX" 2>/dev/null
 }
 
 # Expand a leading "~" (bash doesn't expand tildes in variables)
@@ -18828,7 +18819,7 @@ write_json_atomic() {
 # Returns: file contents on stdout (or default if file doesn't exist)
 read_state_json() {
     local file="$1"
-    local default="${2:-{}}"
+    local default="${2:-"{}"}"
 
     acquire_state_lock || { echo "$default"; return 1; }
 
