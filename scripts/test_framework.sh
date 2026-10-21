@@ -23,6 +23,28 @@
 
 set -uo pipefail
 
+# Work in the physical temporary directory. On macOS $TMPDIR (/var/folders)
+# and /tmp are symlinks, while ru records the physical paths it resolves with
+# `pwd -P`, so expectations built under the logical path would never match.
+if _tf_physical_tmp=$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P); then
+    export TMPDIR="$_tf_physical_tmp"
+fi
+unset _tf_physical_tmp
+
+# macOS mktemp ignores $TMPDIR unless it is given a template, so resolve
+# whatever it returns: every temporary path a test builds is then physical.
+# Because this is a function, `command -v mktemp` now prints "mktemp"; use
+# `type -P mktemp` where a test needs the executable's path.
+mktemp() {
+    local made
+    made=$(command mktemp "$@") || return
+    if [[ "$made" == */* ]] && [[ -d "${made%/*}" ]]; then
+        printf '%s/%s\n' "$(cd "${made%/*}" && pwd -P)" "${made##*/}"
+    else
+        printf '%s\n' "$made"
+    fi
+}
+
 #==============================================================================
 # Configuration
 #==============================================================================
@@ -1288,7 +1310,7 @@ run_parallel_tests() {
     max_jobs="${max_jobs:-$(nproc 2>/dev/null || echo 4)}"
 
     local tmpdir
-    tmpdir=$(mktemp -d "/tmp/tf-parallel-XXXXXX")
+    tmpdir=$(mktemp -d "$TMPDIR/tf-parallel-XXXXXX")
     TF_TEMP_DIRS+=("$tmpdir")
 
     local pids=()
@@ -1323,7 +1345,7 @@ run_parallel_tests() {
                 # Fallback: brief sleep then recount (less efficient but compatible)
                 sleep 0.1
             fi
-            running_jobs=$(jobs -r | wc -l)
+            running_jobs=$(jobs -r | wc -l | tr -d ' ')
         done
 
         # Run test in subshell with isolated env
@@ -1455,9 +1477,38 @@ source_ru_function() {
         TF_RU_INPUT_LOADED="true"
     fi
 
-    # Extract and eval the function (eval preserves nameref bindings)
+    # Extract and eval the function (eval preserves nameref bindings). The
+    # function ends at the first column-0 "}" outside quotes: a JSON template
+    # or help text in a multi-line printf literal also has lines that start
+    # with "}", and stopping at one of those would leave a truncated function.
     local func_body
-    func_body=$(sed -n "/^${func_name}()/,/^}/p" "$project_dir/ru")
+    func_body=$(awk -v name="$func_name" -v q="'" '
+        BEGIN { header = "^" name "\\(\\)[[:space:]]*\\{" }
+        !on && $0 ~ header { on = 1 }
+        on {
+            print
+            if (stack == "" && $0 ~ /^}[[:space:]]*([<>|&;#].*)?$/ && started) exit
+            started = 1
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                top = substr(stack, length(stack), 1)
+                if (top == "s") { if (c == q) stack = substr(stack, 1, length(stack) - 1); continue }
+                if (top == "d") {
+                    if (c == "\\") i++
+                    else if (c == "\"") stack = substr(stack, 1, length(stack) - 1)
+                    else if (c == "$" && substr($0, i + 1, 1) == "(") { stack = stack "p"; i++ }
+                    continue
+                }
+                if (c == "\\") { i++; continue }
+                if (c == q) { stack = stack "s"; continue }
+                if (c == "\"") { stack = stack "d"; continue }
+                if (c == "(") stack = stack "p"
+                else if (c == ")" && top == "p") stack = substr(stack, 1, length(stack) - 1)
+                else if (c == "#" && (i == 1 || substr($0, i - 1, 1) ~ /[[:space:]]/)) break
+            }
+        }
+    ' "$project_dir/ru")
     eval "$func_body"
 }
 
@@ -1690,7 +1741,7 @@ create_namespaced_temp_dir() {
     local safe_name
     safe_name=$(echo "$test_name" | tr -c '[:alnum:]_-' '-')
     local temp_dir
-    temp_dir=$(mktemp -d "/tmp/ru-test-${safe_name}-XXXXXX")
+    temp_dir=$(mktemp -d "$TMPDIR/ru-test-${safe_name}-XXXXXX")
     TF_TEMP_DIRS+=("$temp_dir")
     echo "$temp_dir"
 }

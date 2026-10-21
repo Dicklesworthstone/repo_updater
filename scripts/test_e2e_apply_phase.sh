@@ -423,6 +423,9 @@ exit 0
     printf 'TEST_COMMAND=exit 0\nLINT_COMMAND=exit 0\n' > "$RU_CONFIG_DIR/review-policies.d/_default"
     # Use real terminal stdin/stderr and redirected structured stdout. Answer
     # after the prompt appears: Gum may discard input queued before startup.
+    # The restricted PATH keeps the bash running this suite: on macOS
+    # /usr/bin/env bash would otherwise find the system Bash 3.2, which ru refuses.
+    ln -sf "$(command -v bash)" "$E2E_MOCK_BIN/bash"
     env PATH="$E2E_MOCK_BIN:/usr/bin:/bin" TERM=dumb \
         python3 - "$E2E_RU_SCRIPT" "$E2E_LOG_DIR/interactive-result.json" "$E2E_LOG_DIR/interactive.typescript" <<'PY' \
         > "$E2E_LOG_DIR/interactive.stdout" 2> "$E2E_LOG_DIR/interactive.stderr" || rc=$?

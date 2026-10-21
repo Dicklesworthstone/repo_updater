@@ -1655,7 +1655,7 @@ assert_ai_preflight_common_failure() {
             mkdir -p "$restricted_path" || return 1
             for tool in jq mktemp; do
                 if [[ "$tool" == jq && ( "$mode" == missing_jq || "$mode" == no_jq_escaped ) ]]; then continue; fi
-                ln -s "$(command -v "$tool")" "$restricted_path/$tool" || return 1
+                ln -s "$(type -P "$tool")" "$restricted_path/$tool" || return 1
             done
             for tool in ntm tmux codex; do
                 if [[ "$mode" == missing_ntm && "$tool" == ntm ]] || [[ "$mode" == missing_tmux && "$tool" == tmux ]] || [[ "$mode" == missing_provider && "$tool" == codex ]]; then continue; fi

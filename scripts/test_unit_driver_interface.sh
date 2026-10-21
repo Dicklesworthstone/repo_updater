@@ -112,7 +112,7 @@ EOF
     fi
 
     local children
-    children=$(pgrep -P "$pane_pid" 2>/dev/null | wc -l)
+    children=$(pgrep -P "$pane_pid" 2>/dev/null | wc -l | tr -d ' ')
 
     local state="generating"
     if [[ "$children" -eq 0 ]]; then

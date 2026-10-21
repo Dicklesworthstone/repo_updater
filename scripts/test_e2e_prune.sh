@@ -150,7 +150,7 @@ test_prune_archive_mode() {
     # Verify archive contains the repo with timestamp
     local archived_count=0
     # Use find instead of ls | grep to handle non-alphanumeric filenames safely
-    archived_count=$(/usr/bin/find "$XDG_STATE_HOME/ru/archived" -maxdepth 1 -type d -name "orphan-to-archive*" 2>/dev/null | wc -l)
+    archived_count=$(/usr/bin/find "$XDG_STATE_HOME/ru/archived" -maxdepth 1 -type d -name "orphan-to-archive*" 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$archived_count" -eq 1 ]]; then
         pass "Orphan archived with timestamp"
     else

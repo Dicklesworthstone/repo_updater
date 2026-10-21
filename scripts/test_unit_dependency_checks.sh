@@ -36,7 +36,12 @@ source_dependency_functions() {
     eval "$(sed -n '/^check_gh_auth()/,/^}/p' "$RU_SCRIPT")"
     eval "$(sed -n '/^detect_os()/,/^}/p' "$RU_SCRIPT")"
 
-    # For ensure_dependencies, we need supporting functions
+    # For ensure_dependencies, we need supporting functions. The log helpers
+    # use ru's color variables, which ru only sets at startup; without them
+    # set -u ends this whole file the first time a log line is printed.
+    # shellcheck disable=SC2034  # read by the eval'd ru log helpers below
+    RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' DIM='' RESET=''
+    QUIET="${QUIET:-false}"
     eval "$(sed -n '/^log_info()/,/^}/p' "$RU_SCRIPT")"
     eval "$(sed -n '/^log_error()/,/^}/p' "$RU_SCRIPT")"
     eval "$(sed -n '/^log_success()/,/^}/p' "$RU_SCRIPT")"

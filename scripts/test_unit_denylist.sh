@@ -403,7 +403,7 @@ test_filter_returns_code_on_deny() {
 test_get_denylist_patterns_returns_all() {
     local patterns count
     patterns=$(get_denylist_patterns)
-    count=$(echo "$patterns" | wc -l)
+    count=$(echo "$patterns" | wc -l | tr -d ' ')
 
     if [[ $count -ge 30 ]]; then
         pass "get_denylist_patterns returns $count patterns"

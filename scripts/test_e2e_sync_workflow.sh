@@ -276,7 +276,7 @@ test_fresh_sync_to_empty_directory() {
 
     # Verify projects dir is empty
     local project_count
-    project_count=$(find "$E2E_TEMP_DIR/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    project_count=$(find "$E2E_TEMP_DIR/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
     assert_equals "0" "$project_count" "Projects dir starts empty"
 
     # Run sync

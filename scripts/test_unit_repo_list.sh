@@ -834,7 +834,9 @@ test_configured_commands_reject_list_failure() {
     test_env=$(create_test_env)
     local command_name result rc
     for command_name in cmd_sync cmd_status get_dirty_repos cmd_ai_sync cmd_dep_update cmd_fork_status cmd_fork_sync cmd_fork_clean cmd_commit_sweep cmd_list count_github_repos get_config_hash; do
-        result=$(
+        # Redirect a group: on `result=$(...) 2> file` bash expands the command
+        # substitution before applying the redirection, so nothing is captured.
+        { result=$(
             source_ru_function "get_dirty_repos"
             source_ru_function "$command_name"
             source_ru_function "_fork_parse_args"
@@ -848,7 +850,7 @@ test_configured_commands_reject_list_failure() {
             ntm() { return 98; }
             claude() { return 98; }
             "$command_name"
-        ) 2> "$test_env/$command_name.stderr"
+        ); } 2> "$test_env/$command_name.stderr"
         rc=$?
         assert_equals "3" "$rc" "$command_name must report a configuration error"
         assert_equals "" "$result" "$command_name must not output a successful empty result"
@@ -895,17 +897,19 @@ test_checkpoints_preserve_state_on_list_failure() {
     log_test_start "$test_name"
     local test_env
     test_env=$(create_test_env)
-    local state_file="$test_env/checkpoint.json"
-    printf '%s\n' '{"run_id":"original","pending":["owner/repo"]}' > "$state_file"
+    # Not "state_file": save_sync_state declares its own local of that name,
+    # which would shadow this one inside the stubs it calls.
+    local fixture_checkpoint="$test_env/checkpoint.json"
+    printf '%s\n' '{"run_id":"original","pending":["owner/repo"]}' > "$fixture_checkpoint"
     local original result rc checkpoint_command
-    original=$(cat "$state_file")
+    original=$(cat "$fixture_checkpoint")
     for checkpoint_command in save_sync_state checkpoint_review_state; do
         result=$(
             source_ru_function "$checkpoint_command"
             get_all_repos() { return 42; }
             source_ru_function "get_config_hash"
-            get_sync_state_file() { printf '%s\n' "$state_file"; }
-            get_checkpoint_file() { printf '%s\n' "$state_file"; }
+            get_sync_state_file() { printf '%s\n' "$fixture_checkpoint"; }
+            get_checkpoint_file() { printf '%s\n' "$fixture_checkpoint"; }
             ensure_dir() { :; }
             local -a completed=() pending=()
             if [[ "$checkpoint_command" == save_sync_state ]]; then
@@ -917,7 +921,7 @@ test_checkpoints_preserve_state_on_list_failure() {
         rc=$?
         assert_equals "3" "$rc" "$checkpoint_command must reject incomplete configuration"
         assert_equals "" "$result" "$checkpoint_command must not output a successful result"
-        assert_equals "$original" "$(cat "$state_file")" "$checkpoint_command must preserve the prior checkpoint"
+        assert_equals "$original" "$(cat "$fixture_checkpoint")" "$checkpoint_command must preserve the prior checkpoint"
     done
     log_test_pass "$test_name"
 }

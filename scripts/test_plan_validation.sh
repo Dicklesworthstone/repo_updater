@@ -84,7 +84,7 @@ create_python_only_path() {
     local parent_dir="$1" tool tool_path
     mkdir -p "$parent_dir/python-only-bin"
     for tool in python3 git stat file grep mktemp mkdir head paste cat awk sed bash tr dirname date env; do
-        tool_path=$(command -v "$tool") || return 1
+        tool_path=$(type -P "$tool") || return 1
         ln -s "$tool_path" "$parent_dir/python-only-bin/$tool" || return 1
     done
     printf '%s\n' "$parent_dir/python-only-bin"
@@ -107,7 +107,7 @@ create_commit_sweep_cli_fixture() {
     git -C "$repo_path" commit -q -m 'CLI fixture baseline'
     git -C "$repo_path" checkout -q -b feature/bd-sweep-fixture
     for tool in bash git jq python3 stat file grep mktemp mkdir head paste cat awk sed tr dirname date env basename sort tail ln chmod cp mv rm find touch wc sleep timeout readlink uname; do
-        tool_path=$(command -v "$tool") || return 1
+        tool_path=$(type -P "$tool") || return 1
         ln -s "$tool_path" "$env_root/cli-bin/$tool" || return 1
     done
     printf '%s\n' "$repo_path"

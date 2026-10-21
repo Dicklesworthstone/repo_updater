@@ -398,7 +398,7 @@ test_save_state_atomic_write() {
     save_agent_sweep_state "in_progress"
 
     local tmp_files
-    tmp_files=$(find "${AGENT_SWEEP_STATE_DIR}" -name "*.tmp.*" 2>/dev/null | wc -l)
+    tmp_files=$(find "${AGENT_SWEEP_STATE_DIR}" -name "*.tmp.*" 2>/dev/null | wc -l | tr -d ' ')
     assert_equals "0" "$tmp_files" "No temp files should remain"
 }
 
@@ -688,7 +688,7 @@ test_artifacts_activity_log() {
     assert_file_exists "${artifact_dir}/activity.ndjson"
 
     local lines
-    lines=$(wc -l < "${artifact_dir}/activity.ndjson")
+    lines=$(wc -l < "${artifact_dir}/activity.ndjson" | tr -d ' ')
     assert_equals "2" "$lines"
 }
 

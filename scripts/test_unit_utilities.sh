@@ -519,7 +519,7 @@ test_write_json_atomic_no_partial_writes() {
 
     # Check for any .tmp files
     local tmp_files
-    tmp_files=$(find "$test_env" -name "*.tmp.*" 2>/dev/null | wc -l)
+    tmp_files=$(find "$test_env" -name "*.tmp.*" 2>/dev/null | wc -l | tr -d ' ')
 
     assert_equals "0" "$tmp_files" "No temp files should remain after failure"
 

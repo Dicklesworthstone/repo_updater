@@ -345,7 +345,7 @@ test_log_activity_snapshot_appends() {
     local artifact_dir
     artifact_dir=$(setup_repo_artifact_dir "$TEST_REPO")
     local count
-    count=$(wc -l < "${artifact_dir}/activity.ndjson")
+    count=$(wc -l < "${artifact_dir}/activity.ndjson" | tr -d ' ')
 
     [[ "$count" -eq 2 ]] || {
         echo "Expected 2 lines, got $count"

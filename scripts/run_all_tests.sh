@@ -308,6 +308,9 @@ main() {
     total_start_time=$(date +%s)
     local test_num=0
     local tmpdir
+    # Tests compare paths with ones ru resolves physically; give every test
+    # file the physical temporary directory (macOS links /var and /tmp)
+    if TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P); then export TMPDIR; else exit 1; fi
     tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ru-test-results.XXXXXXXX") || exit 1
     echo "Full test logs: $tmpdir" >&2
 

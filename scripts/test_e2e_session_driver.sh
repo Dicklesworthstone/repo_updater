@@ -276,7 +276,7 @@ test_parallel_sessions() {
 
     # Verify sessions are distinct
     local unique_count
-    unique_count=$(printf '%s\n' "${sessions[@]}" | sort -u | wc -l)
+    unique_count=$(printf '%s\n' "${sessions[@]}" | sort -u | wc -l | tr -d ' ')
     assert_equals "${#sessions[@]}" "$unique_count" "All sessions have unique IDs"
 
     # Cleanup all sessions
