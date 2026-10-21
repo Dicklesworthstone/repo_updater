@@ -11895,7 +11895,7 @@ cmd_status() {
 cmd_init() {
     log_step "Initializing ru configuration..."
 
-    local created
+    local created example_added=false
     created=$(ensure_config_exists)
 
     if [[ "$created" == "true" ]]; then
@@ -11911,6 +11911,7 @@ cmd_init() {
                 # Overwrite the template public.txt with example content
                 cp "$example_file" "$public_file"
                 log_success "Added example repos from $example_file"
+                example_added=true
             else
                 log_warn "Example file not found: $example_file"
             fi
@@ -11926,6 +11927,10 @@ cmd_init() {
         log_info "  Config:  $RU_CONFIG_DIR/config"
         log_info "  Repos:   $RU_CONFIG_DIR/repos.d/public.txt"
     fi
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        emit_structured "$(build_json_envelope init "$(printf '{"config_dir":"%s","created":%s,"example_added":%s}' \
+            "$(json_escape "$RU_CONFIG_DIR")" "$([[ "$created" == true ]] && echo true || echo false)" "$example_added")" '{"exit_code":0}')"
+    fi
 }
 
 cmd_add() {
@@ -11935,6 +11940,7 @@ cmd_add() {
     local add_group=""
     local expect_group="false"
     local repo_args=()
+    local -a added_json=() existing_json=() invalid_json=()
 
     for arg in "${ARGS[@]}"; do
         if [[ "$expect_group" == "true" ]]; then
@@ -11947,17 +11953,19 @@ cmd_add() {
             --from-cwd) from_cwd="true" ;;
             --group) expect_group="true" ;;
             --group=*) add_group="${arg#--group=}"
-                [[ -n "$add_group" ]] || { log_error "--group requires a value"; exit 4; } ;;
+                [[ -n "$add_group" ]] || { log_error "--group requires a value"; emit_command_refusal add missing_group_value 4; exit 4; } ;;
             *) repo_args+=("$arg") ;;
         esac
     done
 
     if [[ "$expect_group" == "true" ]]; then
         log_error "--group requires a value"
+        emit_command_refusal add missing_group_value 4
         exit 4
     fi
     if [[ -n "$add_group" ]] && ! _is_safe_group_path "$add_group"; then
         log_error "Invalid group: $add_group (use folder names separated by '/', e.g. illo or clients/acme)"
+        emit_command_refusal add invalid_group 4
         exit 4
     fi
 
@@ -11965,12 +11973,14 @@ cmd_add() {
     if [[ "$from_cwd" == "true" ]]; then
         if ! is_git_repo "."; then
             log_error "Current directory is not a git repository"
+            emit_command_refusal add not_a_git_repository 4
             exit 4
         fi
         local remote_url
         remote_url=$(git remote get-url origin 2>/dev/null)
         if [[ -z "$remote_url" ]]; then
             log_error "No 'origin' remote found in current directory"
+            emit_command_refusal add no_origin_remote 4
             exit 4
         fi
         repo_args+=("$remote_url")
@@ -11984,6 +11994,7 @@ cmd_add() {
         log_info "  ru add --from-cwd          # Add current directory's repo"
         log_info "  ru add --private owner/repo  # Add to private list"
         log_info "  ru add --group illo owner/repo  # Clone into a shared subfolder"
+        emit_command_refusal add missing_repository 4
         exit 4
     fi
 
@@ -12012,6 +12023,7 @@ cmd_add() {
         if [[ -n "$add_group" ]]; then
             if [[ -n "$spec_group" && "$spec_group" != "$add_group" ]]; then
                 log_error "Conflicting groups for $repo: spec says '$spec_group', --group says '$add_group'"
+                invalid_json+=("$(printf '{"repo":"%s","reason":"conflicting_group"}' "$(json_escape "$repo")")")
                 continue
             fi
             if [[ -z "$spec_group" ]]; then
@@ -12024,6 +12036,7 @@ cmd_add() {
         fi
         if [[ -n "$spec_group" ]] && ! _is_safe_group_path "$spec_group"; then
             log_error "Invalid group in spec: $repo"
+            invalid_json+=("$(printf '{"repo":"%s","reason":"invalid_group"}' "$(json_escape "$repo")")")
             continue
         fi
 
@@ -12031,6 +12044,7 @@ cmd_add() {
         local host owner repo_name
         if ! parse_repo_url "$spec_url" host owner repo_name; then
             log_error "Invalid repo format: $repo"
+            invalid_json+=("$(printf '{"repo":"%s","reason":"invalid_format"}' "$(json_escape "$repo")")")
             continue
         fi
 
@@ -12069,6 +12083,8 @@ cmd_add() {
             else
                 log_warn "Already configured: $repo (matches: $matching_line)"
             fi
+            existing_json+=("$(printf '{"repo":"%s","matches":"%s","list":"%s"}' "$(json_escape "$repo")" \
+                "$(json_escape "$matching_line")" "$([[ "$use_private" == true ]] && echo private || echo public)")")
             continue
         fi
 
@@ -12093,6 +12109,8 @@ cmd_add() {
                     local existing_canonical="${existing_host}/${existing_owner}/${existing_repo}"
                     if [[ "$canonical" == "$existing_canonical" ]]; then
                         log_warn "Already configured in $other_label list: $line"
+                        existing_json+=("$(printf '{"repo":"%s","matches":"%s","list":"%s"}' "$(json_escape "$repo")" \
+                            "$(json_escape "$line")" "$other_label")")
                         already_exists="true"
                         break
                     fi
@@ -12109,7 +12127,31 @@ cmd_add() {
         local file_label=""
         [[ "$use_private" == "true" ]] && file_label=" (private)"
         log_success "Added: $repo$file_label"
+        added_json+=("$(printf '{"repo":"%s","list":"%s"}' "$(json_escape "$repo")" \
+            "$([[ "$use_private" == true ]] && echo private || echo public)")")
     done
+
+    # An invalid spec is a bad argument; when other repos were added it is a
+    # partial failure. Already-configured repos are not failures.
+    local exit_code=0
+    if [[ ${#invalid_json[@]} -gt 0 ]]; then
+        exit_code=4
+        [[ ${#added_json[@]} -eq 0 ]] || exit_code=1
+    fi
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local IFS=,
+        emit_structured "$(build_json_envelope add "$(printf '{"list":"%s","added":[%s],"already_configured":[%s],"invalid":[%s]}' \
+            "$([[ "$use_private" == true ]] && echo private || echo public)" \
+            "${added_json[*]-}" "${existing_json[*]-}" "${invalid_json[*]-}")" "{\"exit_code\":$exit_code}")"
+    fi
+    return "$exit_code"
+}
+
+# Print a refusal of add, remove or import as the command's one JSON result.
+# Args: command reason exit_code
+emit_command_refusal() {
+    [[ "$JSON_OUTPUT" == true ]] || return 0
+    emit_structured "$(build_json_envelope "$1" "{\"error\":{\"reason\":\"$2\"}}" "{\"exit_code\":$3}")"
 }
 
 # Import repos from files with auto public/private detection
@@ -12135,16 +12177,19 @@ cmd_import() {
 
     if [[ "$force_public" == "true" && "$force_private" == "true" ]]; then
         log_error "--public and --private are mutually exclusive"
+        emit_command_refusal import conflicting_visibility_flags 4
         exit 4
     fi
     if [[ -n "$import_limit" && ! "$import_limit" =~ ^[1-9][0-9]*$ ]]; then
         log_error "--limit must be a positive integer: $import_limit"
+        emit_command_refusal import invalid_limit 4
         exit 4
     fi
     local source_name
     for source_name in "${import_orgs[@]}" "${import_users[@]}"; do
         if [[ ! "$source_name" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
             log_error "Invalid GitHub account name: '$source_name'"
+            emit_command_refusal import invalid_account_name 4
             exit 4
         fi
     done
@@ -12152,6 +12197,7 @@ cmd_import() {
     [[ "$import_stars" == "true" ]] && ((github_sources++))
     if [[ -n "$import_limit" && $github_sources -eq 0 ]]; then
         log_error "--limit applies to --stars, --org or --user"
+        emit_command_refusal import limit_without_github_source 4
         exit 4
     fi
 
@@ -12174,6 +12220,7 @@ cmd_import() {
         log_info "  owner/repo"
         log_info "  https://github.com/owner/repo"
         log_info "  git@github.com:owner/repo.git"
+        emit_command_refusal import missing_source 4
         exit 4
     fi
 
@@ -12187,9 +12234,11 @@ cmd_import() {
     if [[ $github_sources -gt 0 ]]; then
         if ! command -v gh &>/dev/null || ! gh auth status &>/dev/null; then
             log_error "--stars, --org and --user need the GitHub CLI (gh), installed and authenticated"
+            emit_command_refusal import github_cli_unavailable 3
             exit 3
         fi
-        import_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-import.XXXXXX") || exit 3
+        import_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-import.XXXXXX") ||
+            { emit_command_refusal import temporary_directory_failed 3; exit 3; }
         local -a source_kinds=() source_values=()
         [[ "$import_stars" == "true" ]] && { source_kinds+=(stars); source_values+=(""); }
         for source_name in "${import_orgs[@]}"; do source_kinds+=(org); source_values+=("$source_name"); done
@@ -12217,6 +12266,7 @@ cmd_import() {
                 log_error "Could not list $listed_label (gh exit $list_rc); nothing was imported"
                 [[ -s "$list_err" ]] && log_error "  $(head -n 1 "$list_err")"
                 rm -rf "$import_tmp_dir"
+                emit_command_refusal import github_listing_failed 3
                 exit 3
             fi
             : > "$listed_file"
@@ -12247,6 +12297,7 @@ cmd_import() {
         log_warn "GitHub CLI (gh) not available or not authenticated"
         log_warn "Cannot auto-detect public/private status"
         log_info "Use --public or --private to specify, or authenticate gh"
+        emit_command_refusal import visibility_unknown 3
         exit 3
     fi
 
@@ -12254,6 +12305,7 @@ cmd_import() {
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_error "No configuration found. Run: ru init"
         [[ -n "$import_tmp_dir" ]] && rm -rf "$import_tmp_dir"
+        emit_command_refusal import no_configuration 3
         exit 3
     fi
 
@@ -12464,10 +12516,21 @@ cmd_import() {
     fi
 
     # Exit with appropriate code
-    if [[ $skipped_invalid -gt 0 || $skipped_error -gt 0 ]]; then
-        exit 1  # Partial failure
+    local exit_code=0
+    [[ $skipped_invalid -eq 0 && $skipped_error -eq 0 ]] || exit_code=1  # Partial failure
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local item invalid_list="" error_list=""
+        for item in ${invalid_repos[@]+"${invalid_repos[@]}"}; do
+            invalid_list+="${invalid_list:+,}\"$(json_escape "$item")\""
+        done
+        for item in ${error_repos[@]+"${error_repos[@]}"}; do
+            error_list+="${error_list:+,}$(printf '{"repo":"%s","error":"%s"}' "$(json_escape "${item%%|*}")" "$(json_escape "${item#*|}")")"
+        done
+        emit_structured "$(build_json_envelope import "$(printf '{"dry_run":%s,"imported":{"public":%d,"private":%d},"duplicates":%d,"invalid":[%s],"errors":[%s],"total_lines":%d}' \
+            "$([[ "$DRY_RUN" == true ]] && echo true || echo false)" "$imported_public" "$imported_private" \
+            "$skipped_duplicate" "$invalid_list" "$error_list" "$total_lines")" "{\"exit_code\":$exit_code}")"
     fi
-    exit 0
+    exit "$exit_code"
 }
 
 cmd_remove() {
@@ -12476,22 +12539,26 @@ cmd_remove() {
         log_info "Examples:"
         log_info "  ru remove owner/repo"
         log_info "  ru remove https://github.com/owner/repo"
+        emit_command_refusal remove missing_repository 4
         exit 4
     fi
 
     # Ensure config exists
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_error "No configuration found. Run: ru init"
+        emit_command_refusal remove no_configuration 3
         exit 3
     fi
 
     local repos_dir="$RU_CONFIG_DIR/repos.d"
     if [[ ! -d "$repos_dir" ]]; then
         log_error "No repositories configured"
+        emit_command_refusal remove no_repositories 3
         exit 3
     fi
 
     local removed=0 not_found=0
+    local -a removed_json=() not_found_json=() invalid_json=()
 
     for repo in "${ARGS[@]}"; do
         # Normalize the repo URL for matching (accept @branch / "as name")
@@ -12502,6 +12569,7 @@ cmd_remove() {
         local host owner repo_name
         if ! parse_repo_url "$spec_url" host owner repo_name; then
             log_error "Invalid repo format: $repo"
+            invalid_json+=("$(printf '{"repo":"%s","reason":"invalid_format"}' "$(json_escape "$repo")")")
             continue
         fi
 
@@ -12552,6 +12620,7 @@ cmd_remove() {
                 log_success "Removed: $repo (from $file_name)"
                 found_in_any="true"
                 ((removed++))
+                removed_json+=("$(printf '{"repo":"%s","list":"%s"}' "$(json_escape "$repo")" "$(json_escape "$file_name")")")
             else
                 rm -f "$tmp_file"
             fi
@@ -12560,12 +12629,25 @@ cmd_remove() {
         if [[ "$found_in_any" != "true" ]]; then
             log_warn "Not found in any list: $repo"
             ((not_found++))
+            not_found_json+=("$(printf '"%s"' "$(json_escape "$repo")")")
         fi
     done
 
-    if [[ $removed -eq 0 && $not_found -gt 0 ]]; then
-        exit 1
+    # Removing nothing that was asked for fails (1). An invalid spec is a bad
+    # argument (4), or a partial failure (1) beside other outcomes.
+    local exit_code=0
+    if [[ ${#invalid_json[@]} -gt 0 ]]; then
+        exit_code=4
+        [[ $removed -eq 0 && $not_found -eq 0 ]] || exit_code=1
+    elif [[ $removed -eq 0 && $not_found -gt 0 ]]; then
+        exit_code=1
     fi
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local IFS=,
+        emit_structured "$(build_json_envelope remove "$(printf '{"removed":[%s],"not_found":[%s],"invalid":[%s]}' \
+            "${removed_json[*]-}" "${not_found_json[*]-}" "${invalid_json[*]-}")" "{\"exit_code\":$exit_code}")"
+    fi
+    return "$exit_code"
 }
 
 cmd_list() {
@@ -27747,7 +27829,11 @@ _robot_docs_schemas() {
         {"if":{"properties":{"command":{"const":"fork-status"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/fork-status/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
         {"if":{"properties":{"command":{"const":"fork-sync"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/fork-sync/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
         {"if":{"properties":{"command":{"const":"fork-clean"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/fork-clean/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
-        {"if":{"properties":{"command":{"const":"commit-sweep"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/commit-sweep/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}}
+        {"if":{"properties":{"command":{"const":"commit-sweep"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/commit-sweep/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"init"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/init/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"add"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/add/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"remove"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/remove/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"import"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/import/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}}
       ]}
     ]}
   ],
@@ -28015,6 +28101,50 @@ _robot_docs_schemas() {
             "planned_commits":{"type":"integer","minimum":0},"commits_succeeded":{"type":"integer","minimum":0},"commits_failed":{"type":"integer","minimum":0}
           }},
           "mode":{"enum":["dry-run","execute"]}
+        }
+      }
+    },
+    "init": {
+      "description":"The configuration directory and whether this run created it",
+      "data_schema":{
+        "type":"object","required":["config_dir","created","example_added"],
+        "properties":{"config_dir":{"type":"string","minLength":1},"created":{"type":"boolean"},"example_added":{"type":"boolean"}}
+      }
+    },
+    "add": {
+      "description":"Repositories added, already configured, or rejected as invalid specs",
+      "data_schema":{
+        "type":"object","required":["list","added","already_configured","invalid"],
+        "properties":{
+          "list":{"enum":["public","private"]},
+          "added":{"type":"array","items":{"type":"object","required":["repo","list"],"properties":{"repo":{"type":"string"},"list":{"enum":["public","private"]}}}},
+          "already_configured":{"type":"array","items":{"type":"object","required":["repo","matches","list"],"properties":{"repo":{"type":"string"},"matches":{"type":"string"},"list":{"enum":["public","private"]}}}},
+          "invalid":{"type":"array","items":{"type":"object","required":["repo","reason"],"properties":{"repo":{"type":"string"},"reason":{"enum":["invalid_format","invalid_group","conflicting_group"]}}}}
+        }
+      }
+    },
+    "remove": {
+      "description":"Repositories removed, not found in any list, or rejected as invalid specs",
+      "data_schema":{
+        "type":"object","required":["removed","not_found","invalid"],
+        "properties":{
+          "removed":{"type":"array","items":{"type":"object","required":["repo","list"],"properties":{"repo":{"type":"string"},"list":{"type":"string"}}}},
+          "not_found":{"type":"array","items":{"type":"string"}},
+          "invalid":{"type":"array","items":{"type":"object","required":["repo","reason"],"properties":{"repo":{"type":"string"},"reason":{"const":"invalid_format"}}}}
+        }
+      }
+    },
+    "import": {
+      "description":"Imported counts by visibility, duplicates, invalid lines and lookup errors, including dry runs",
+      "data_schema":{
+        "type":"object","required":["dry_run","imported","duplicates","invalid","errors","total_lines"],
+        "properties":{
+          "dry_run":{"type":"boolean"},
+          "imported":{"type":"object","required":["public","private"],"properties":{"public":{"type":"integer","minimum":0},"private":{"type":"integer","minimum":0}}},
+          "duplicates":{"type":"integer","minimum":0},
+          "invalid":{"type":"array","items":{"type":"string"}},
+          "errors":{"type":"array","items":{"type":"object","required":["repo","error"],"properties":{"repo":{"type":"string"},"error":{"type":"string"}}}},
+          "total_lines":{"type":"integer","minimum":0}
         }
       }
     },

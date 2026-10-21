@@ -92,6 +92,60 @@ test_add_invalid_format() {
     e2e_cleanup
 }
 
+test_add_and_remove_invalid_specs_fail() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    local repos_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt" exit_code
+
+    exit_code=0
+    "$E2E_RU_SCRIPT" add "invalid-format" >/dev/null 2>&1 || exit_code=$?
+    assert_equals "4" "$exit_code" "add with only an invalid spec is a bad argument"
+    exit_code=0
+    "$E2E_RU_SCRIPT" add owner/good "invalid-format" >/dev/null 2>&1 || exit_code=$?
+    assert_equals "1" "$exit_code" "add with a valid and an invalid spec is a partial failure"
+    assert_file_contains "$repos_file" "owner/good" "the valid repo is still added"
+    exit_code=0
+    "$E2E_RU_SCRIPT" remove "invalid-format" >/dev/null 2>&1 || exit_code=$?
+    assert_equals "4" "$exit_code" "remove with only an invalid spec is a bad argument"
+    exit_code=0
+    "$E2E_RU_SCRIPT" remove owner/good "invalid-format" >/dev/null 2>&1 || exit_code=$?
+    assert_equals "1" "$exit_code" "remove with a valid and an invalid spec is a partial failure"
+
+    e2e_cleanup
+}
+
+test_config_commands_print_one_json_result() {
+    e2e_setup
+    local out exit_code
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json init 2>/dev/null) || exit_code=$?
+    assert_equals "0 init true 0" "$exit_code $(printf '%s\n' "$out" | jq -r '"\(.command) \(.data.created) \(._meta.exit_code)"' 2>/dev/null)" "init reports the created configuration"
+    out=$("$E2E_RU_SCRIPT" --json init 2>/dev/null)
+    assert_equals "false" "$(printf '%s\n' "$out" | jq -r '.data.created' 2>/dev/null)" "a second init reports the existing configuration"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json add owner/one "invalid-format" 2>/dev/null) || exit_code=$?
+    assert_equals "1" "$(printf '%s\n' "$out" | jq -s 'length' 2>/dev/null)" "add prints exactly one JSON document"
+    assert_equals "1 owner/one invalid_format 1" \
+        "$exit_code $(printf '%s\n' "$out" | jq -r '"\(.data.added[0].repo) \(.data.invalid[0].reason) \(._meta.exit_code)"' 2>/dev/null)" \
+        "add reports the added and the invalid spec with the exit code"
+    out=$("$E2E_RU_SCRIPT" --json add owner/one 2>/dev/null)
+    assert_equals "owner/one public 0" "$(printf '%s\n' "$out" | jq -r '"\(.data.already_configured[0].repo) \(.data.already_configured[0].list) \(._meta.exit_code)"' 2>/dev/null)" \
+        "a repeated add reports the repo as already configured"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json remove owner/one owner/missing 2>/dev/null) || exit_code=$?
+    assert_equals "0 owner/one owner/missing 0" \
+        "$exit_code $(printf '%s\n' "$out" | jq -r '"\(.data.removed[0].repo) \(.data.not_found[0]) \(._meta.exit_code)"' 2>/dev/null)" \
+        "remove reports the removed and the missing repo"
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json add 2>/dev/null) || exit_code=$?
+    assert_equals "4 missing_repository 4" "$exit_code $(printf '%s\n' "$out" | jq -r '"\(.data.error.reason) \(._meta.exit_code)"' 2>/dev/null)" \
+        "an add without a repo prints its refusal as JSON"
+
+    e2e_cleanup
+}
+
 test_add_https_url() {
     e2e_setup
 
@@ -468,6 +522,16 @@ test_import_github_argument_validation() {
         assert_equals "4" "$exit_code" "ru import $args exits 4"
     done
 
+    local out
+    out=$("$E2E_RU_SCRIPT" --json import --stars --limit=0 2>/dev/null)
+    assert_equals "invalid_limit 4" "$(printf '%s\n' "$out" | jq -r '"\(.data.error.reason) \(._meta.exit_code)"' 2>/dev/null)" \
+        "a refused import prints its reason as JSON"
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json import --stars --dry-run 2>/dev/null) || exit_code=$?
+    assert_equals "1" "$(printf '%s\n' "$out" | jq -s 'length' 2>/dev/null)" "an import prints exactly one JSON document"
+    assert_equals "$exit_code true import" "$(printf '%s\n' "$out" | jq -r '"\(._meta.exit_code) \(.data.dry_run) \(.command)"' 2>/dev/null)" \
+        "the import result carries the dry run and the exit code"
+
     e2e_cleanup
 }
 
@@ -479,6 +543,8 @@ run_test test_add_single_repo
 run_test test_add_multiple_repos
 run_test test_add_duplicate_repo
 run_test test_add_invalid_format
+run_test test_add_and_remove_invalid_specs_fail
+run_test test_config_commands_print_one_json_result
 run_test test_add_https_url
 run_test test_add_no_args
 run_test test_list_shows_repos

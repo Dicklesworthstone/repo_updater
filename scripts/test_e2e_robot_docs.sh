@@ -260,7 +260,7 @@ test_schemas_has_command_schemas() {
     output=$("$E2E_RU_SCRIPT" robot-docs schemas 2>/dev/null)
 
     for cmd in status list sync doctor config prune review agent-sweep ai-sync dep-update robot-docs \
-        fork-status fork-sync fork-clean commit-sweep error; do
+        fork-status fork-sync fork-clean commit-sweep init add remove import error; do
         if echo "$output" | python3 -c "
 import sys,json
 cmds = json.load(sys.stdin)['data']['content']['commands']
@@ -398,6 +398,42 @@ test_configured_read_failure_schemas() {
     assert_success "Known selected file does not require directory listing" jq -e \
         '.data.total == 1 and .data.repos[0].repo == "owner/one"' "$E2E_LOG_DIR/searchable-selected-public.stdout"
     chmod 755 "$RU_CONFIG_DIR/repos.d" || fail "Could not restore the owned fixture permissions"
+    cleanup_structured_conformance
+}
+
+# init, add, remove and import in an empty configuration, with and without
+# invalid specs: every result validates against its own advertised schema,
+# and the add schema rejects a result that drops its invalid specs.
+test_actual_config_command_schemas() {
+    setup_structured_conformance
+    assert_cli_schema created-init 0 init init --json
+    assert_cli_schema existing-init 0 init init --json
+    assert_cli_schema partial-add 1 add add owner/first invalid-format --json
+    assert_cli_schema repeated-add 0 add add owner/first --json
+    assert_cli_schema refused-add 4 add add --json
+    assert_cli_schema partial-remove 0 remove remove owner/first owner/absent --json
+    assert_cli_schema invalid-remove 4 remove remove invalid-format --json
+    printf 'owner/second\nnot a repo\nowner/second\n' > "$E2E_TEMP_DIR/import.txt"
+    assert_cli_schema dry-import 1 import import --public --dry-run "$E2E_TEMP_DIR/import.txt" --json
+    assert_success "The dry import counts one repo, one duplicate and one invalid line" \
+        jq -e '.data.imported.public == 1 and .data.duplicates == 1 and .data.invalid == ["not a repo"]' "$E2E_LOG_DIR/dry-import.stdout"
+    assert_cli_schema refused-import 4 import import --stars --limit=0 --json
+    jq 'del(.data.invalid)' "$E2E_LOG_DIR/partial-add.stdout" > "$E2E_LOG_DIR/add-without-invalid.json"
+    if python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/add-without-invalid.json" <<'PY'
+import json, sys
+from jsonschema import Draft202012Validator, FormatChecker
+with open(sys.argv[1]) as stream:
+    schema = json.load(stream)["data"]["content"]
+with open(sys.argv[2]) as stream:
+    result = json.load(stream)
+errors = list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(result))
+sys.exit(0 if errors else 1)
+PY
+    then
+        pass "The add schema rejects a result without its invalid specs"
+    else
+        fail "The add schema accepts a result without its invalid specs"
+    fi
     cleanup_structured_conformance
 }
 
@@ -813,6 +849,7 @@ run_test test_schema_shortcut
 run_test test_version_matches
 run_test test_actual_empty_and_failure_schemas
 run_test test_configured_read_failure_schemas
+run_test test_actual_config_command_schemas
 run_test test_actual_fork_schemas
 run_test test_actual_populated_and_dry_schemas
 run_test test_structured_workflow_source_api
