@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/version-1.2.0-blue?style=for-the-badge" alt="Version" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blueviolet?style=for-the-badge" alt="Platform" />
-  <img src="https://img.shields.io/badge/shell-Bash%204.0+-purple?style=for-the-badge" alt="Shell" />
+  <img src="https://img.shields.io/badge/shell-Bash%204.4+-purple?style=for-the-badge" alt="Shell" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License" />
 </p>
 
@@ -3654,7 +3654,7 @@ for f in scripts/test_e2e_*.sh; do "$f"; done
 **E2E tests** run full CLI flows in isolated XDG roots and capture detailed logs.
 
 **Required tools:**
-- `bash` 4.0+, `git`
+- `bash` 4.4+, `git`
 - `jq` for JSON-oriented tests (skips when missing)
 - `gh` for tests that exercise GitHub auth behavior (skips when missing or unauthenticated)
 - `ntm`/`tmux` only for agent-sweep tests (mocked by default in E2E)
@@ -3837,7 +3837,7 @@ The test suite follows these principles:
 3. **Deterministic results** — Same input always produces same output
 4. **Fast execution** — Unit tests complete in milliseconds
 5. **Clear failures** — Assertion messages explain what went wrong
-6. **Bash 4.0 compatible** — Uses `${arr[@]+"${arr[@]}"}` pattern for empty arrays
+6. **Bash 4.4+** — Matches ru's own minimum; tests still use `${arr[@]+"${arr[@]}"}` for empty arrays
 
 ---
 
@@ -4024,7 +4024,7 @@ All checks passed!
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| Bash | 4.0+ | Script runtime |
+| Bash | 4.4+ | Script runtime (namerefs need 4.3; earlier Bash treats an empty `"${array[@]}"` as unbound under `set -u`) |
 | git | 2.0+ | Repository operations |
 | gh | 2.0+ | GitHub CLI for cloning |
 | curl | any | Installation and updates |

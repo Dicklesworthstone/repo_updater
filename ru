@@ -67,9 +67,13 @@ set -uo pipefail
 # Basic sanity: this script relies heavily on $HOME for defaults.
 : "${HOME:?ru: HOME must be set}"
 
-# Bash >= 4.0 is required (associative arrays). macOS ships Bash 3.2 by default.
-if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 )); then
-    printf 'ru: Bash >= 4.0 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
+# Bash >= 4.4 is required. ru uses namerefs (Bash 4.3) and expands arrays that
+# may be empty under set -u, which Bash before 4.4 reports as unbound: with
+# real Bash 4.2.53 and 4.3.30, `ru list` stops with "ARGS[@]: unbound variable".
+# This check itself must keep parsing in Bash 3.2, which macOS ships.
+if [[ -z "${BASH_VERSINFO[*]:-}" ]] ||
+   (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf 'ru: Bash >= 4.4 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
 
     # Check if we're on macOS and can offer to install via Homebrew
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -110,7 +114,7 @@ if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 )); then
             printf 'Then run: $(brew --prefix)/bin/bash %s\n' "${BASH_SOURCE[0]}" >&2
         fi
     else
-        printf 'ru: Install Bash 4.0+ from your package manager\n' >&2
+        printf 'ru: Install Bash 4.4+ from your package manager\n' >&2
     fi
     exit 3
 fi
