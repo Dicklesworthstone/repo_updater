@@ -4231,8 +4231,9 @@ Include:
 - "version_files": every tracked file that declares the version, with its exact old and new text
 - "checks": any of "tests", "lint", "secrets", "ci" (wait for GitHub Actions on the release commit)
   and "checksums" (verify release assets against their published SHA-256 files)
-ru applies the version files and changelog entry in one commit, runs the checks on it,
-and publishes the tag only after they pass.
+ru applies the version files and changelog entry in one commit, runs tests, lint and
+secrets on it, and publishes the tag only after they pass; ci and checksums are
+verified after publication.
 Use ultrathink.
 
 Expected schema:
@@ -5481,6 +5482,12 @@ validate_release_plan() {
                     VALIDATION_ERROR="Denied file in release assets: $normalized"
                     return 1
                 fi
+                # An uploaded asset must be the repository's own file, not
+                # whatever a symbolic link on its path points to.
+                if ! release_path_has_no_symlink "$repo_path" "$normalized"; then
+                    VALIDATION_ERROR="Release asset path contains a symbolic link: $normalized"
+                    return 1
+                fi
 
                 # Verify file exists
                 if [[ ! -f "$repo_path/$normalized" ]]; then
@@ -5490,10 +5497,14 @@ validate_release_plan() {
         fi
     fi
 
-    # 6. Validate changelog if specified
-    local changelog
+    # 6. Validate changelog if specified. A plan with a changelog_entry has
+    # execute_release_plan add the entry (or create the file), so neither
+    # warning would be true for it.
+    local changelog planned_entry
     changelog=$(json_get_field "$plan_json" "changelog" || echo "")
-    if [[ -n "$changelog" && "$changelog" != "null" ]]; then
+    planned_entry=$(json_get_field "$plan_json" "changelog_entry" || echo "")
+    [[ "$planned_entry" != null ]] || planned_entry=""
+    if [[ -n "$changelog" && "$changelog" != "null" && -z "$planned_entry" ]]; then
         if [[ ! -f "$repo_path/$changelog" ]]; then
             VALIDATION_WARNINGS+=("Changelog file not found: $changelog")
         else
@@ -5506,6 +5517,19 @@ validate_release_plan() {
     fi
 
     return 0
+}
+
+# Succeed when no existing component of the repository-relative PATH is a
+# symbolic link, so writing or uploading it cannot reach outside the repo.
+release_path_has_no_symlink() {
+    local repo_path="$1" rest="$2" prefix="" part
+    while [[ -n "$rest" ]]; do
+        part="${rest%%/*}"
+        if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+        [[ -n "$part" ]] || continue
+        prefix+="${prefix:+/}$part"
+        [[ ! -L "$repo_path/$prefix" ]] || return 1
+    done
 }
 
 # A tracked top-level VERSION file must name the released version, unless the
@@ -5592,7 +5616,7 @@ validate_release_plan_actions() {
                     return 1
                     ;;
             esac
-            if is_file_denied "$path" || [[ -L "$repo_path/$path" ]]; then
+            if is_file_denied "$path" || ! release_path_has_no_symlink "$repo_path" "$path"; then
                 VALIDATION_ERROR="Changelog path cannot be written: $path"
                 return 1
             fi
@@ -5712,7 +5736,7 @@ release_update_version_file() {
         }
         {
             L[NR] = $0
-            if ($0 ~ /^[ \t]*\[/) { section = $0; gsub(/[ \t\r]/, "", section) }
+            if ($0 ~ /^[ \t]*\[/) { section = $0; sub(/#.*/, "", section); gsub(/[ \t\r]/, "", section) }
             S[NR] = section
             if ($0 !~ /^[ \t\r]*$/) NONBLANK++
         }
@@ -5742,13 +5766,14 @@ release_update_version_file() {
 }
 
 # Add a release's changelog entry above the newest release section (the first
-# "## " heading), or at the end when there is none; a missing changelog is
-# created. Prints "updated", or "current" when a heading already names this
-# version.
+# "## " heading other than "## [Unreleased]"), or at the end when there is
+# none; a missing changelog is created. Prints "updated", or "current" when a
+# heading already names this version.
 release_update_changelog() {
     local repo_path="$1" path="$2" entry="$3" version="$4"
     local file="$repo_path/$path" tmp result rc=0
     while [[ "$entry" == *$'\n' ]]; do entry="${entry%$'\n'}"; done
+    release_path_has_no_symlink "$repo_path" "$path" || return 1
     if [[ ! -e "$file" && ! -L "$file" ]]; then
         mkdir -p "$(dirname "$file")" && printf '# Changelog\n\n%s\n' "$entry" > "$file" || return 1
         printf '%s\n' updated
@@ -5762,7 +5787,8 @@ release_update_changelog() {
             entry = ENVIRON["RU_RELEASE_ENTRY"]; v = ENVIRON["RU_RELEASE_VERSION"]
             for (i = 1; i <= NR; i++) if (L[i] ~ /^#/ && count(L[i], v) > 0) { print "current"; exit 0 }
             at = 0
-            for (i = 1; i <= NR; i++) if (L[i] ~ /^## /) { at = i; break }
+            # Keep a Changelog keeps "## [Unreleased]" above every release.
+            for (i = 1; i <= NR; i++) if (L[i] ~ /^## / && L[i] !~ /^## \[?[Uu]nreleased/) { at = i; break }
             for (i = 1; i <= NR; i++) {
                 if (i == at) printf "%s\n\n", entry > out
                 print L[i] > out
@@ -5853,7 +5879,7 @@ release_prepare_commit() {
         fi
         if [[ "$result" == updated ]]; then
             changed+=("$path")
-            if [[ "$(git -C "$repo_path" diff --numstat -- "$path")" != $'1\t1\t'"$path" ]]; then
+            if [[ "$(git -C "$repo_path" -c core.quotePath=false diff --numstat -- "$path")" != $'1\t1\t'"$path" ]]; then
                 log_error "Updating $path changed more than its version line"
                 release_restore_paths "$repo_path" "" "${changed[@]}"
                 return 1
@@ -5908,7 +5934,16 @@ release_run_checks() {
         case "$check" in
             tests|test) result=$(run_test_gate "$root/candidate" "" "${AGENT_SWEEP_RELEASE_CHECK_TIMEOUT:-1800}") || rc=$? ;;
             lint) result=$(run_lint_gate "$root/candidate" "") || rc=$? ;;
-            *) result=$(run_secret_scan "$root/candidate") || rc=$? ;;
+            *)
+                # Scan every blob of the release commit. A scan of the clean
+                # checkout itself only sees its diff against HEAD, which is empty.
+                result=""
+                if GIT_INDEX_FILE="$root/secret-index" git -C "$repo_path" read-tree "$commit"; then
+                    result=$(run_secret_scan "$repo_path" candidate "$root/secret-index") || rc=$?
+                else
+                    rc=3
+                fi
+                ;;
         esac
         if [[ $rc -eq 0 ]]; then
             log_info "Release check passed: $check"
@@ -6071,6 +6106,12 @@ release_publish_github() {
 # Success needs at least one successful run and no run that failed.
 release_await_ci() {
     local repo_path="$1" commit="$2" timeout="${AGENT_SWEEP_RELEASE_CI_TIMEOUT:-1800}" deadline runs
+    # Without a workflow nothing can ever run; waiting out the timeout would
+    # only delay the same failure.
+    if [[ -z "$(git -C "$repo_path" ls-tree --name-only "$commit" .github/workflows/ 2>/dev/null)" ]]; then
+        log_error "CI was requested, but the release commit has no .github/workflows to run"
+        return 1
+    fi
     deadline=$(( $(date +%s) + timeout ))
     while true; do
         if ! runs=$(cd "$repo_path" && gh run list --commit "$commit" --limit 100 --json name,status,conclusion 2>&1) ||
@@ -6114,6 +6155,8 @@ release_verify_checksums() {
     done
     for name in ${assets[@]+"${assets[@]}"}; do
         case "$name" in
+            # Signatures verify other assets and are not listed in checksums.
+            *.minisig|*.sig|*.asc) ;;
             *.sha256)
                 hash="" listed=""
                 read -r hash listed < "$dir/$name" || [[ -n "$hash" ]]
@@ -6130,7 +6173,7 @@ release_verify_checksums() {
         esac
     done
     for name in ${assets[@]+"${assets[@]}"}; do
-        case "$name" in *.sha256|SHA256SUMS*|*CHECKSUMS*|*checksums*.txt) continue ;; esac
+        case "$name" in *.minisig|*.sig|*.asc|*.sha256|SHA256SUMS*|*CHECKSUMS*|*checksums*.txt) continue ;; esac
         if [[ -z "${expected[$name]:-}" ]]; then
             log_error "Release asset $name has no published checksum"
             rm -rf -- "${dir:?}"

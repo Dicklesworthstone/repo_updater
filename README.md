@@ -2230,9 +2230,9 @@ Each repository goes through a structured three-phase workflow that separates pl
 **Phase 3: Release** (`--phase3-timeout`, default 300s, requires `--with-release`)
 - The agent proposes a version, tag, changelog entry, version files and checks; a null version means no release
 - ru commits the version-file edits and the changelog entry together as `chore(release): <tag>`, touching no other path
-- Requested checks (`tests`, `lint`, `secrets`) run on a clean checkout of that commit; a failure publishes nothing
+- Requested checks (`tests`, `lint`, `secrets`) run on a clean checkout of that commit; `secrets` scans every file in it, and a failure publishes nothing
 - The branch and an annotated tag are pushed to the receivers commit plans use, and each receiver is re-read afterwards
-- `auto` and `gh-release` then create the GitHub release with `--verify-tag`; `ci` waits for the commit's Actions runs and `checksums` downloads the assets and checks their SHA-256 files
+- `auto` and `gh-release` then create the GitHub release with `--verify-tag`; `ci` waits for the commit's Actions runs (failing at once when the commit has no workflows) and `checksums` downloads the assets and checks each against its SHA-256 file (signature files such as `.minisig` are exempt)
 - Progress is recorded in `.git/ru-release/<tag>.json`, so rerunning a failed release continues it without a second commit, tag or release
 - Respects per-repo release strategy configuration (`never`, `auto`, `tag-only`, `gh-release`)
 
@@ -2401,7 +2401,8 @@ unrelated branches in the planned publication.
 | Uncommitted edits | Version files and the changelog must have no uncommitted changes | Reject plan |
 | Checks | Only `tests`, `lint`, `secrets`, `ci`, `checksums`; `checksums` needs a GitHub release, and `ci`, `checksums` and `gh-release` need `gh` | Reject plan |
 | Release strategy | `never`, `auto`, `tag-only` or `gh-release` | `never` skips; anything else is rejected |
-| Changelog entry | Must name the version; it is added above the newest `## ` section of `CHANGELOG.md` (or the plan's `changelog`), which is created if missing | Reject plan if it omits the version; no entry means no changelog change |
+| Changelog entry | Must name the version; it is added above the newest release section (below `## [Unreleased]`) of `CHANGELOG.md`, or of the plan's `changelog`, which is created if missing and may not lie behind a symbolic link | Reject plan if it omits the version; no entry means no changelog change |
+| Release assets | Plan `files` must be relative, not denied, and not reached through a symbolic link | Reject plan |
 
 **Why structured output with markers?**
 

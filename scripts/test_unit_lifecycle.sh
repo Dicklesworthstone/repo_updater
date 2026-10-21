@@ -585,7 +585,7 @@ test_release_refusals_leave_repository_unchanged() {
     log_test_start "execute_release_plan: refused plans change no commit, file, tag or receiver"
     local name plan rc expected
     for name in ambiguous-file wrong-new-version version-file-not-listed dirty-version-file \
-        unknown-check foreign-receiver-tag; do
+        unknown-check foreign-receiver-tag symlinked-changelog-dir symlinked-asset; do
         setup_release_test auto
         plan=$(release_plan_json)
         case "$name" in
@@ -606,6 +606,18 @@ test_release_refusals_leave_repository_unchanged() {
                 git -C "$RELEASE_REPO" push --quiet origin v1.2.0 2>/dev/null
                 git -C "$RELEASE_REPO" tag -d v1.2.0 >/dev/null
                 ;;
+            symlinked-changelog-dir)
+                mkdir -p "$TEST_DIR/outside"
+                printf 'someone else\x27s file\n' > "$TEST_DIR/outside/CHANGELOG.md"
+                ln -s "$TEST_DIR/outside" "$RELEASE_REPO/docs"
+                plan=$(run_with_input "$plan" jq -c '.changelog = "docs/CHANGELOG.md"')
+                ;;
+            symlinked-asset)
+                mkdir -p "$TEST_DIR/outside"
+                printf 'not part of the repository\n' > "$TEST_DIR/outside/asset.txt"
+                ln -s "$TEST_DIR/outside" "$RELEASE_REPO/release"
+                plan=$(run_with_input "$plan" jq -c '.files = ["release/asset.txt"]')
+                ;;
         esac
         expected=$(git -C "$RELEASE_REPO" status --porcelain; cat "$RELEASE_REPO/VERSION" "$RELEASE_REPO/package.json" "$RELEASE_REPO/CHANGELOG.md")
         rc=0
@@ -622,11 +634,43 @@ test_release_refusals_leave_repository_unchanged() {
             dirty-version-file) expected="uncommitted changes: package.json" ;;
             unknown-check) expected="Unknown release check: fuzz" ;;
             foreign-receiver-tag) expected="already has a different v1.2.0" ;;
+            symlinked-changelog-dir) expected="Changelog path cannot be written: docs/CHANGELOG.md" ;;
+            symlinked-asset) expected="Release asset path contains a symbolic link: release/asset.txt" ;;
         esac
         assert_contains "$(cat "$TEST_DIR/errors" 2>/dev/null)" "$expected" "$name is refused for its own reason"
+        if [[ "$name" == symlinked-changelog-dir ]]; then
+            assert_equals "CHANGELOG.md" "$(ls -A "$TEST_DIR/outside")" "Nothing is created through the symbolic link"
+            assert_equals "someone else's file" "$(cat "$TEST_DIR/outside/CHANGELOG.md")" "The file outside the repository is not modified"
+        fi
         teardown_release_test
     done
     log_test_pass "execute_release_plan: refused plans change no commit, file, tag or receiver"
+}
+
+test_release_secrets_check_scans_the_release_commit() {
+    log_test_start "execute_release_plan: the secrets check scans every file of the release commit"
+    local rc
+    setup_release_test auto
+    rc=0
+    execute_release_plan "$(release_plan_json '["secrets"]')" "$RELEASE_REPO" || rc=$?
+    assert_equals 0 "$rc" "A release commit without secret patterns passes the secrets check"
+    teardown_release_test
+
+    setup_release_test auto
+    mkdir -p "$RELEASE_REPO/config"
+    printf 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' > "$RELEASE_REPO/config/aws.txt"
+    git -C "$RELEASE_REPO" add config/aws.txt
+    git -C "$RELEASE_REPO" commit --quiet -m "Add deployment settings"
+    git -C "$RELEASE_REPO" push --quiet origin main 2>/dev/null
+    RELEASE_BASE=$(git -C "$RELEASE_REPO" rev-parse HEAD)
+    rc=0
+    execute_release_plan "$(release_plan_json '["secrets"]')" "$RELEASE_REPO" || rc=$?
+    assert_equals 1 "$rc" "A committed secret fails the secrets check"
+    assert_contains "$(cat "$TEST_DIR/errors" 2>/dev/null)" "Release check failed: secrets" "The secrets check names itself as the failure"
+    assert_equals "" "$(git -C "$RELEASE_REPO" tag -l)" "No tag is created"
+    assert_equals "$RELEASE_BASE" "$(git -C "$RELEASE_REMOTE" rev-parse refs/heads/main)" "Nothing is published"
+    teardown_release_test
+    log_test_pass "execute_release_plan: the secrets check scans every file of the release commit"
 }
 
 test_release_tag_only_publishes_without_github() {
@@ -670,15 +714,24 @@ test_release_gh_release_requires_gh() {
 test_release_ci_and_checksums_are_observed() {
     log_test_start "execute_release_plan: requested CI and checksums must be observed to pass"
     local scenario rc
-    for scenario in pass ci-failed checksum-mismatch; do
+    for scenario in pass ci-failed checksum-mismatch no-workflows; do
         setup_release_test auto
-        export AGENT_SWEEP_RELEASE_CI_POLL_SECONDS=0
+        export AGENT_SWEEP_RELEASE_CI_POLL_SECONDS=0 AGENT_SWEEP_RELEASE_CI_TIMEOUT=5
+        if [[ "$scenario" != no-workflows ]]; then
+            mkdir -p "$RELEASE_REPO/.github/workflows"
+            printf 'name: release\non: push\njobs: {}\n' > "$RELEASE_REPO/.github/workflows/release.yml"
+            git -C "$RELEASE_REPO" add .github/workflows/release.yml
+            git -C "$RELEASE_REPO" commit --quiet -m "Add release workflow"
+            git -C "$RELEASE_REPO" push --quiet origin main 2>/dev/null
+        fi
         printf 'release payload\n' > "$RELEASE_GH_DIR/assets/ru.tar.gz"
         if command -v sha256sum &>/dev/null; then
             sha256sum "$RELEASE_GH_DIR/assets/ru.tar.gz" | sed 's#  .*/#  #' > "$RELEASE_GH_DIR/assets/SHA256SUMS"
         else
             shasum -a 256 "$RELEASE_GH_DIR/assets/ru.tar.gz" | sed 's#  .*/#  #' > "$RELEASE_GH_DIR/assets/SHA256SUMS"
         fi
+        # A signature is an asset too, and checksum files never list it.
+        printf 'untrusted comment: signature\n' > "$RELEASE_GH_DIR/assets/ru.tar.gz.minisig"
         printf '[{"name":"release","status":"completed","conclusion":"success"}]\n' > "$RELEASE_GH_DIR/runs.json"
         case "$scenario" in
             ci-failed) printf '[{"name":"release","status":"completed","conclusion":"failure"}]\n' > "$RELEASE_GH_DIR/runs.json" ;;
@@ -694,8 +747,13 @@ test_release_ci_and_checksums_are_observed() {
             assert_equals 1 "$rc" "$scenario fails the release"
             assert_success "$scenario leaves the release incomplete" jq -e '.complete == false' "$(release_state_file "$RELEASE_REPO" v1.2.0)"
         fi
-        assert_contains "$(cat "$RELEASE_GH_DIR/calls")" "run list --commit $(git -C "$RELEASE_REPO" rev-parse 'v1.2.0^{commit}')" "$scenario reads the release commit's CI runs"
-        unset AGENT_SWEEP_RELEASE_CI_POLL_SECONDS
+        if [[ "$scenario" == no-workflows ]]; then
+            assert_contains "$(cat "$TEST_DIR/errors" 2>/dev/null)" "has no .github/workflows" "Requested CI without a workflow fails at once"
+            assert_not_contains "$(cat "$RELEASE_GH_DIR/calls")" "run list" "No CI runs are awaited"
+        else
+            assert_contains "$(cat "$RELEASE_GH_DIR/calls")" "run list --commit $(git -C "$RELEASE_REPO" rev-parse 'v1.2.0^{commit}')" "$scenario reads the release commit's CI runs"
+        fi
+        unset AGENT_SWEEP_RELEASE_CI_POLL_SECONDS AGENT_SWEEP_RELEASE_CI_TIMEOUT
         teardown_release_test
     done
     log_test_pass "execute_release_plan: requested CI and checksums must be observed to pass"
@@ -728,6 +786,17 @@ test_release_version_file_formats() {
     rc=0
     result=$(release_update_version_file "$repo" Cargo.toml 9.9.9 1.3.0) || rc=$?
     assert_equals 3 "$rc" "A missing old version is reported"
+    mkdir -p "$repo/commented"
+    printf '[package] # crate metadata\nname = "y"\nversion = "1.1.0"\n' > "$repo/commented/Cargo.toml"
+    rc=0
+    result=$(release_update_version_file "$repo" commented/Cargo.toml 1.1.0 1.2.0) || rc=$?
+    assert_equals "0 updated" "$rc $result" "A section header with a trailing comment is still [package]"
+
+    printf '# Changelog\n\n## [Unreleased]\n\n- Not yet released\n\n## v1.1.0\n\n- First\n' > "$repo/CHANGELOG.md"
+    result=$(release_update_changelog "$repo" CHANGELOG.md $'## v1.2.0\n\n- Second' 1.2.0)
+    assert_equals updated "$result" "The changelog entry is added"
+    assert_equals $'## [Unreleased]\n## v1.2.0\n## v1.1.0' "$(grep '^## ' "$repo/CHANGELOG.md")" "Unreleased stays above the new release, which stays above the old one"
+    assert_contains "$(cat "$repo/CHANGELOG.md")" '- Not yet released' "Unreleased notes are kept"
     log_test_pass "release_update_version_file: changes only the line that declares the version"
 }
 
@@ -1646,6 +1715,7 @@ run_test test_release_refusals_leave_repository_unchanged
 run_test test_release_tag_only_publishes_without_github
 run_test test_release_gh_release_requires_gh
 run_test test_release_ci_and_checksums_are_observed
+run_test test_release_secrets_check_scans_the_release_commit
 run_test test_release_version_file_formats
 
 # GH actions orchestrator

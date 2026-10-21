@@ -1734,6 +1734,10 @@ test_release_plan_changelog_warning() {
     done
 
     assert_true "[[ \$has_warning == true ]]" "Should warn about missing version in changelog"
+
+    # A planned changelog_entry adds that header, so the warning would be false.
+    validate_release_plan '{"version": "v1.0.0", "tag_name": "v1.0.0", "changelog": "CHANGELOG.md", "changelog_entry": "## v1.0.0\n\n- First"}' "$repo_path"
+    assert_equals 0 "${#VALIDATION_WARNINGS[@]}" "A planned changelog entry is not reported as missing"
 }
 
 test_release_plan_tag_field_must_name_version() {
