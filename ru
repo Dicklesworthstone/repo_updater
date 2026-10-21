@@ -246,9 +246,35 @@ GIT_TIMEOUT_ENV="${GIT_TIMEOUT:-}"
 GIT_TIMEOUT="${GIT_TIMEOUT:-30}"  # Seconds before aborting slow operations
 GIT_LOW_SPEED_LIMIT="${GIT_LOW_SPEED_LIMIT:-1000}"  # Bytes/second threshold
 
-# Optional TOON helpers (tru-backed). If missing, TOON output falls back to JSON.
+# Optional TOON helpers. A toon.sh helper that defines toon_available and
+# toon_encode wins; otherwise ru calls the toon_rust CLI itself, installed as
+# "toon" since v0.2 and as "tru" before. Without either, TOON falls back to JSON.
 # shellcheck disable=SC1090
 source "${TOON_SH_PATH:-$HOME/.local/lib/toon.sh}" 2>/dev/null || true
+if ! declare -F toon_encode >/dev/null 2>&1; then
+    # Print the first installed toon_rust CLI, checked by its --version name.
+    toon_cli() {
+        local cli
+        for cli in tru toon; do
+            command -v "$cli" >/dev/null 2>&1 || continue
+            if [[ "$("$cli" --version 2>/dev/null)" =~ ^(tru|toon)\ [0-9] ]]; then
+                printf '%s\n' "$cli"
+                return 0
+            fi
+        done
+        return 1
+    }
+    toon_available() { toon_cli >/dev/null; }
+    toon_encode() {
+        local cli
+        local -a args=(--encode)
+        cli=$(toon_cli) || return 1
+        [[ -z "${TOON_STATS:-}" ]] || args+=(--stats)
+        [[ -z "${TOON_INDENT:-}" ]] || args+=(--indent "$TOON_INDENT")
+        [[ "${TOON_KEY_FOLDING:-}" != safe ]] || args+=(--key-folding safe)
+        "$cli" "${args[@]}"
+    }
+fi
 
 #==============================================================================
 # SECTION 4: CORE UTILITIES
@@ -7642,15 +7668,8 @@ emit_structured() {
         return 0
     fi
 
-    if ! declare -f toon_encode >/dev/null 2>&1; then
-        log_warn "toon.sh not available; falling back to JSON"
-        json_str="${json_str/\"output_format\": \"toon\"/\"output_format\": \"json\"}"
-        printf '%s\n' "$json_str"
-        return 0
-    fi
-
-    if ! toon_available >/dev/null 2>&1; then
-        log_warn "tru not available; falling back to JSON"
+    if ! declare -F toon_encode >/dev/null 2>&1 || ! toon_available >/dev/null 2>&1; then
+        log_warn "No TOON encoder (toon or tru from toon_rust) found; falling back to JSON"
         json_str="${json_str/\"output_format\": \"toon\"/\"output_format\": \"json\"}"
         printf '%s\n' "$json_str"
         return 0
@@ -27314,7 +27333,7 @@ _robot_docs_quickstart() {
   "repo_lists": "~/.config/ru/repos.d/*.txt",
   "projects_dir": "/data/projects (default, override with RU_PROJECTS_DIR)",
   "prerequisites": ["git", "gh (optional, for private repos)"],
-  "optional_deps": ["gum (beautiful TUI)", "tru (TOON output format)"]
+  "optional_deps": ["gum (beautiful TUI)", "toon or tru from toon_rust (TOON output format)"]
 }'
 }
 
@@ -27642,10 +27661,10 @@ _robot_docs_formats() {
     },
     {
       "name": "toon",
-      "description": "Token-Optimized Object Notation (binary, requires tru)",
+      "description": "Token-Optimized Object Notation (requires the toon_rust CLI: toon, or tru before v0.2)",
       "flag": "--format toon",
       "stream": "stdout for encoded data, stderr for diagnostics",
-      "notes": "Falls back to JSON if tru binary not available. Use --stats to compare token counts."
+      "notes": "ru calls the installed CLI directly; a TOON_SH_PATH helper defining toon_encode overrides it. Falls back to JSON with a warning when neither toon nor tru is installed. Use --stats to compare token counts."
     }
   ],
   "environment_variables": [

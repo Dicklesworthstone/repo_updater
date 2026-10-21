@@ -31,6 +31,19 @@ source "$SCRIPT_DIR/test_e2e_framework.sh"
 # This is a test dependency, not a ru runtime dependency; CI must install it.
 # Missing jsonschema fails the named conformance proof rather than skipping it.
 STRUCTURED_TOON_SH="${TOON_SH_PATH:-${HOME}/.local/lib/toon.sh}"
+# The toon_rust CLI decodes TOON in these checks: "toon" since v0.2, "tru" before.
+STRUCTURED_TOON_CLI=$(type -P tru || type -P toon || echo tru)
+
+# PATH without any directory that holds a TOON encoder.
+path_without_toon_encoder() {
+    local dir kept=""
+    local IFS=:
+    for dir in $PATH; do
+        [[ -x "$dir/tru" || -x "$dir/toon" ]] && continue
+        kept+="${kept:+:}$dir"
+    done
+    printf '%s\n' "$kept"
+}
 
 assert_cli_schema() {
     local label="$1" expected_code="$2" command_name="$3"
@@ -565,7 +578,7 @@ test_structured_workflow_source_api() {
 # without explicit stdin forwarding; no provider or GitHub service is invoked.
 test_structured_dispatcher_preserves_actual_tty_approval() {
     e2e_setup
-    if TOON_SH_PATH="$STRUCTURED_TOON_SH" python3 - "$E2E_RU_SCRIPT" "$E2E_LOG_DIR" <<'PY'
+    if TOON_SH_PATH="$STRUCTURED_TOON_SH" RU_TEST_TOON_CLI="$STRUCTURED_TOON_CLI" python3 - "$E2E_RU_SCRIPT" "$E2E_LOG_DIR" <<'PY'
 import json, os, pty, select, subprocess, sys, time
 
 script = r'''
@@ -646,7 +659,7 @@ def run_case(mode, output_format):
         return None
     assert approval_sent and proc.returncode == 0, (proc.returncode, output, diagnostics)
     if output_format == "toon":
-        decoded = subprocess.run(["tru", "--decode"], input=output, capture_output=True, check=True)
+        decoded = subprocess.run([os.environ["RU_TEST_TOON_CLI"], "--decode"], input=output, capture_output=True, check=True)
         output = decoded.stdout
     result = json.loads(output)
     assert result["command"] == "review" and result["output_format"] == output_format, result
@@ -677,7 +690,7 @@ test_actual_workflow_toon_and_fallback() {
     local code=0
     TOON_SH_PATH="$STRUCTURED_TOON_SH" "$E2E_RU_SCRIPT" agent-sweep --dry-run --format toon > "$E2E_LOG_DIR/actual.toon" 2> "$E2E_LOG_DIR/actual-toon.stderr" || code=$?
     assert_equals 0 "$code" "Actual encoder workflow preserves success exit"
-    if tru --decode < "$E2E_LOG_DIR/actual.toon" > "$E2E_LOG_DIR/decoded.json" 2> "$E2E_LOG_DIR/decode.stderr" &&
+    if "$STRUCTURED_TOON_CLI" --decode < "$E2E_LOG_DIR/actual.toon" > "$E2E_LOG_DIR/decoded.json" 2> "$E2E_LOG_DIR/decode.stderr" &&
        jq -e '.output_format == "toon" and .command == "agent-sweep"' "$E2E_LOG_DIR/decoded.json" >/dev/null &&
        jq -ne --argjson original "$(cat "$E2E_LOG_DIR/json-sweep-control.stdout")" --argjson decoded "$(cat "$E2E_LOG_DIR/decoded.json")" '$original.data == $decoded.data and $original._meta == $decoded._meta' >/dev/null; then
         pass "Actual TOON decode preserves the JSON command payload and metadata"
@@ -685,8 +698,10 @@ test_actual_workflow_toon_and_fallback() {
         fail "Actual TOON round trip did not preserve the command result"
         cat "$E2E_LOG_DIR/actual-toon.stderr" "$E2E_LOG_DIR/decode.stderr" >&2
     fi
+    # ru calls an installed encoder itself, so the fallback needs both the
+    # helper and every encoder to be absent.
     export TOON_SH_PATH="$E2E_TEMP_DIR/missing-toon.sh"
-    assert_cli_schema missing-encoder-fallback 0 agent-sweep agent-sweep --dry-run --format toon
+    PATH="$(path_without_toon_encoder)" assert_cli_schema missing-encoder-fallback 0 agent-sweep agent-sweep --dry-run --format toon
     assert_file_contains "$E2E_LOG_DIR/missing-encoder-fallback.stderr" 'falling back to JSON' "Missing encoder fallback is explicit on stderr"
     assert_success "Fallback preserves the same actual dirty-repository payload" jq -ne --argjson original "$(cat "$E2E_LOG_DIR/json-sweep-control.stdout")" --argjson fallback "$(cat "$E2E_LOG_DIR/missing-encoder-fallback.stdout")" '$original.data == $fallback.data'
     unset TOON_SH_PATH

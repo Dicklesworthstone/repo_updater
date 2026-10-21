@@ -59,6 +59,10 @@ ru sync --dry-run --json
 # Status only (no fetch)
 ru status --no-fetch --json
 
+# Same envelope as TOON, which uses fewer tokens (needs toon_rust's `toon` CLI,
+# or `tru` before v0.2; without one, ru warns and prints JSON)
+ru status --no-fetch --format toon
+
 # Machine-readable CLI documentation
 ru robot-docs                   # All topics as JSON
 ru robot-docs commands          # Command/flag reference
@@ -3655,8 +3659,10 @@ for f in scripts/test_e2e_*.sh; do "$f"; done
 - `ntm`/`tmux` only for agent-sweep tests (mocked by default in E2E)
 
 The structured-output conformance tests require Python 3 with `jsonschema==4.19.2`
-and `rfc3339-validator==0.1.4`, plus the actual `tru` encoder and a Bash helper
-selected by `TOON_SH_PATH` (default: `~/.local/lib/toon.sh`). Missing prerequisites
+and `rfc3339-validator==0.1.4`, plus the actual toon_rust encoder (`toon`, or `tru`
+before v0.2). ru calls that CLI itself for `--format toon`; a Bash helper at
+`TOON_SH_PATH` (default: `~/.local/lib/toon.sh`) that defines `toon_encode` and
+`toon_available` takes precedence. Missing prerequisites
 fail this conformance check. They are test dependencies; ordinary ru commands do
 not require Python or jsonschema. CI installs them explicitly, verifies the pinned
 TOON release archive, and uses a test adapter that calls the real encoder.

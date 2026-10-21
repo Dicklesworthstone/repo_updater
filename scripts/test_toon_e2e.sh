@@ -38,10 +38,9 @@ log ""
 # Phase 1: Prerequisites
 log "--- Phase 1: Prerequisites ---"
 
-for cmd in ru tru jq; do
+for cmd in ru jq; do
     if command -v "$cmd" &>/dev/null; then
         case "$cmd" in
-            tru) version=$("$cmd" --version 2>/dev/null | head -1 || echo "available") ;;
             jq)  version=$("$cmd" --version 2>/dev/null | head -1 || echo "available") ;;
             ru)  version="available" ;;  # ru has no --version flag
             *)   version="available" ;;
@@ -53,6 +52,14 @@ for cmd in ru tru jq; do
         [[ "$cmd" == "ru" ]] && exit 1
     fi
 done
+# The toon_rust CLI: "toon" since v0.2, "tru" before.
+TOON_CLI=$(type -P tru || type -P toon || true)
+if [[ -n "$TOON_CLI" ]]; then
+    log_info "TOON CLI: $("$TOON_CLI" --version 2>/dev/null | head -1)"
+    record_pass "toon_rust CLI available"
+else
+    record_fail "toon_rust CLI (toon or tru) not found"
+fi
 log ""
 
 # Phase 2: Format Flag Tests
@@ -87,15 +94,32 @@ if toon_output=$(ru --format toon list 2>/dev/null); then
         toon_bytes=$(echo -n "$toon_output" | wc -c)
         log_info "  TOON output: $toon_bytes bytes"
     else
-        # Might be JSON fallback
+        # Might be JSON fallback, which is a failure once an encoder is installed
         if echo "$toon_output" | jq . >/dev/null 2>&1; then
-            record_skip "--format toon fell back to JSON"
+            if [[ -n "$TOON_CLI" ]]; then
+                record_fail "--format toon fell back to JSON although $TOON_CLI is installed"
+            else
+                record_skip "--format toon fell back to JSON"
+            fi
         else
             record_fail "--format toon invalid output"
         fi
     fi
 else
     record_skip "ru --format toon list error"
+fi
+
+log_info "Test 2.3: ru --format toon list without a toon.sh helper"
+if [[ -n "$TOON_CLI" ]]; then
+    if helperless=$(TOON_SH_PATH="$TOON_TEST_ROOT/no-helper.sh" ru --format toon list 2>/dev/null) &&
+       helperless_json=$(printf '%s\n' "$helperless" | "$TOON_CLI" --decode 2>/dev/null) &&
+       printf '%s\n' "$helperless_json" | jq -e '.command == "list" and .output_format == "toon" and .data.total == 2' >/dev/null; then
+        record_pass "ru encodes with the installed toon_rust CLI when no toon.sh helper exists"
+    else
+        record_fail "ru did not encode TOON with the installed toon_rust CLI and no toon.sh helper"
+    fi
+else
+    record_skip "TOON without a helper (no toon_rust CLI installed)"
 fi
 log ""
 
@@ -105,7 +129,7 @@ log "--- Phase 3: Round-trip Verification ---"
 if [[ -n "${json_output:-}" && -n "${toon_output:-}" ]]; then
     # Handle both tabular format [N]{...} and key: value format
     if [[ "$toon_output" =~ ^\[([0-9]+)\]\{ ]] || [[ "${toon_output:0:1}" != "{" ]]; then
-        if decoded=$(echo "$toon_output" | tru --decode 2>/dev/null); then
+        if decoded=$(echo "$toon_output" | "$TOON_CLI" --decode 2>/dev/null); then
             # TOON tabular format may have different structure
             # Just verify it decodes to valid JSON
             if echo "$decoded" | jq . >/dev/null 2>&1; then
@@ -119,7 +143,7 @@ if [[ -n "${json_output:-}" && -n "${toon_output:-}" ]]; then
                 record_fail "Round-trip decode invalid"
             fi
         else
-            record_fail "tru --decode failed"
+            record_fail "${TOON_CLI:-toon} --decode failed"
         fi
     else
         record_skip "Round-trip (TOON fell back to JSON)"
