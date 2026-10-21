@@ -339,6 +339,18 @@ test_status_requested_fetch_failure_is_visible() {
     assert_equals fetch_failed "$(jq -r '.data.repos[0].status' <<< "$output")" "Failure is typed in JSON"
     assert_equals failed "$(jq -r '.data.repos[0].freshness' <<< "$output")" "Cached refs are not certified as fresh"
     assert_equals "$before" "$(git -C "$repo" rev-parse HEAD)" "Status failure preserves HEAD"
+    # jq is optional: without it, the failed fetch must still fail status.
+    local nojq_bin="$E2E_TEMP_DIR/no-jq-bin" tool tool_path
+    mkdir -p "$nojq_bin"
+    for tool in bash git cat sed awk grep sort tr head tail cut mktemp mkdir rm mv cp ls date dirname basename \
+        wc find env uname id sleep tee xargs stat readlink touch chmod ln comm uniq paste diff cmp od printf rmdir \
+        ps hostname python3; do
+        tool_path=$(type -P "$tool") && ln -sf "$tool_path" "$nojq_bin/$tool"
+    done
+    rc=0
+    output=$(PATH="$E2E_MOCK_BIN:$nojq_bin" "$E2E_RU_SCRIPT" status --fetch --json --non-interactive 2> "$E2E_LOG_DIR/fetch-failure-nojq.stderr") || rc=$?
+    assert_equals 1 "$rc" "Without jq, a failed requested fetch still makes status fail"
+    assert_not_contains "$(cat "$E2E_LOG_DIR/fetch-failure-nojq.stderr")" "jq: command not found" "Status does not call a missing jq"
     rc=0
     output=$("$E2E_RU_SCRIPT" status --no-fetch --json --non-interactive 2> "$E2E_LOG_DIR/cached-status.stderr") || rc=$?
     assert_equals 0 "$rc" "Explicit cached status succeeds without fetching"

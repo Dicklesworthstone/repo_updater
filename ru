@@ -11839,7 +11839,9 @@ cmd_status() {
 
         local data_json
         data_json="$(printf '{"total":%d,"repos":%s}' "$total" "$repos_array")"
-        if run_with_input "$data_json" jq -e 'any(.repos[]; .status == "fetch_failed")' >/dev/null; then
+        # ru wrote every row above with escaped strings, so this exact field
+        # text marks a failed fetch; jq is optional and must not decide it.
+        if [[ "$data_json" == *'"status":"fetch_failed"'* ]]; then
             status_exit=1
         fi
         emit_structured "$(build_json_envelope "status" "$data_json" "{\"exit_code\":$status_exit}")"
