@@ -27696,7 +27696,11 @@ _robot_docs_schemas() {
         {"if":{"properties":{"command":{"const":"agent-sweep"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/agent-sweep/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
         {"if":{"properties":{"command":{"const":"ai-sync"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/ai-sync/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
         {"if":{"properties":{"command":{"const":"dep-update"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/dep-update/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
-        {"if":{"properties":{"command":{"const":"robot-docs"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/robot-docs/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}}
+        {"if":{"properties":{"command":{"const":"robot-docs"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/robot-docs/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"fork-status"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/fork-status/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"fork-sync"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/fork-sync/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"fork-clean"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/fork-clean/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}},
+        {"if":{"properties":{"command":{"const":"commit-sweep"}}},"then":{"properties":{"data":{"anyOf":[{"$ref":"#/commands/commit-sweep/data_schema"},{"$ref":"#/commands/error/data_schema"}]}}}}
       ]}
     ]}
   ],
@@ -27905,6 +27909,66 @@ _robot_docs_schemas() {
         "type":"object","required":["schema_version","topic"],
         "properties":{"schema_version":{"const":"1.0.0"},"topic":{"enum":["quickstart","commands","examples","exit-codes","formats","schemas","all"]}},
         "oneOf":[{"required":["content"],"properties":{"topic":{"not":{"const":"all"}},"content":{"type":"object"}}},{"required":["quickstart","commands","examples","exit_codes","formats","schemas"],"properties":{"topic":{"const":"all"}}}]
+      }
+    },
+    "fork-status": {
+      "description":"Fork position against upstream for each configured repository with an upstream remote",
+      "data_schema":{
+        "type":"object","required":["total","checked","skipped","synced","behind","diverged","polluted","repos"],
+        "properties":{
+          "total":{"type":"integer","minimum":0},"checked":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},
+          "synced":{"type":"integer","minimum":0},"behind":{"type":"integer","minimum":0},"diverged":{"type":"integer","minimum":0},"polluted":{"type":"integer","minimum":0},
+          "repos":{"type":"array","items":{"type":"object","required":["repo","path","upstream_branch","ahead","behind","status","dirty","polluted"],"properties":{
+            "repo":{"type":"string"},"path":{"type":"string"},"upstream_branch":{"type":"string"},"ahead":{"type":"integer","minimum":0},"behind":{"type":"integer","minimum":0},
+            "status":{"type":"string"},"dirty":{"type":"boolean"},"polluted":{"type":"boolean"}
+          }}}
+        }
+      }
+    },
+    "fork-sync": {
+      "description":"Fork synchronization counts and the recorded outcome of each repository, including dry runs",
+      "data_schema":{
+        "type":"object","required":["total","checked","synced","skipped","failed","dry_run","strategy","upstream_remote","repos"],
+        "properties":{
+          "total":{"type":"integer","minimum":0},"checked":{"type":"integer","minimum":0},"synced":{"type":"integer","minimum":0},
+          "skipped":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"dry_run":{"type":"boolean"},
+          "strategy":{"type":"string"},"upstream_remote":{"type":"string"},
+          "repos":{"type":"array","items":{"type":"object","required":["repo","path","action","status","message"],"properties":{
+            "repo":{"type":"string"},"path":{"type":"string"},"action":{"const":"fork-sync"},
+            "status":{"enum":["dry-run","synced","current","skipped","failed"]},"message":{"type":"string"}
+          }}}
+        }
+      }
+    },
+    "fork-clean": {
+      "description":"Fork cleanup summary and the recorded outcome of each repository, including dry runs",
+      "data_schema":{
+        "type":"object","required":["summary","dry_run","results","error"],
+        "properties":{
+          "summary":{"type":"object","required":["configured","checked","cleaned","rescued","failed","skipped","removed_commits","retained_commits","counts_complete"],"properties":{
+            "configured":{"type":"integer","minimum":0},"checked":{"type":"integer","minimum":0},"cleaned":{"type":"integer","minimum":0},
+            "rescued":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},
+            "removed_commits":{"type":"integer","minimum":0},"retained_commits":{"type":"integer","minimum":0},"counts_complete":{"type":"boolean"}
+          }},
+          "dry_run":{"type":"boolean"},
+          "results":{"type":"array","items":{"type":"object","required":["repo","path","action","status","message"],"properties":{
+            "repo":{"type":"string"},"path":{"type":"string"},"action":{"const":"fork-clean"},"status":{"type":"string"},"message":{"type":"string"}
+          }}},
+          "error":{"type":["string","null"]}
+        }
+      }
+    },
+    "commit-sweep": {
+      "description":"Dirty-repository scan and planned or executed commit counts",
+      "data_schema":{
+        "type":"object","required":["summary","mode"],
+        "properties":{
+          "summary":{"type":"object","required":["repos_scanned","repos_dirty","repos_clean","planned_commits","commits_succeeded","commits_failed"],"properties":{
+            "repos_scanned":{"type":"integer","minimum":0},"repos_dirty":{"type":"integer","minimum":0},"repos_clean":{"type":"integer","minimum":0},
+            "planned_commits":{"type":"integer","minimum":0},"commits_succeeded":{"type":"integer","minimum":0},"commits_failed":{"type":"integer","minimum":0}
+          }},
+          "mode":{"enum":["dry-run","execute"]}
+        }
       }
     },
     "error": {

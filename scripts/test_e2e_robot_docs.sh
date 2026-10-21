@@ -259,7 +259,8 @@ test_schemas_has_command_schemas() {
     local output
     output=$("$E2E_RU_SCRIPT" robot-docs schemas 2>/dev/null)
 
-    for cmd in status list sync doctor config prune review agent-sweep ai-sync dep-update robot-docs error; do
+    for cmd in status list sync doctor config prune review agent-sweep ai-sync dep-update robot-docs \
+        fork-status fork-sync fork-clean commit-sweep error; do
         if echo "$output" | python3 -c "
 import sys,json
 cmds = json.load(sys.stdin)['data']['content']['commands']
@@ -333,6 +334,10 @@ test_actual_empty_and_failure_schemas() {
     assert_cli_schema empty-config 0 config config --json
     assert_cli_schema empty-doctor 0 doctor doctor --json
     assert_cli_schema empty-agent-sweep 4 agent-sweep agent-sweep --dry-run --json
+    assert_cli_schema empty-fork-status 0 fork-status fork-status --json
+    assert_cli_schema empty-fork-sync 0 fork-sync fork-sync --dry-run --json
+    assert_cli_schema empty-fork-clean 0 fork-clean fork-clean --dry-run --json
+    assert_cli_schema empty-commit-sweep 0 commit-sweep commit-sweep --dry-run --json
     assert_cli_schema failed-ai-option 4 ai-sync ai-sync '--unknown="quoted"' --json
     assert_cli_schema failed-dep-option 4 dep-update dep-update --unknown --format json
     assert_cli_schema failed-dep-agent 4 dep-update dep-update --agent=unknown --json
@@ -393,6 +398,52 @@ test_configured_read_failure_schemas() {
     assert_success "Known selected file does not require directory listing" jq -e \
         '.data.total == 1 and .data.repos[0].repo == "owner/one"' "$E2E_LOG_DIR/searchable-selected-public.stdout"
     chmod 755 "$RU_CONFIG_DIR/repos.d" || fail "Could not restore the owned fixture permissions"
+    cleanup_structured_conformance
+}
+
+# A real fork one commit behind its upstream: each fork command and
+# commit-sweep must validate against its own advertised data schema, and the
+# schema must reject a fork-sync result that drops its per-repo outcomes.
+test_actual_fork_schemas() {
+    setup_structured_conformance
+    local upstream="$E2E_TEMP_DIR/upstream.git" seed="$E2E_TEMP_DIR/seed" fork="$RU_PROJECTS_DIR/forkrepo"
+    git init -q --bare -b main "$upstream"
+    git clone -q "$upstream" "$seed" 2>/dev/null
+    printf 'one\n' > "$seed/README.md"
+    git -C "$seed" add README.md
+    git -C "$seed" -c user.name=Fork -c user.email=fork@example.invalid commit -qm one
+    git -C "$seed" push -q origin HEAD:main 2>/dev/null
+    git clone -q "$upstream" "$fork" 2>/dev/null
+    git -C "$fork" remote add upstream "$upstream"
+    printf 'two\n' >> "$seed/README.md"
+    git -C "$seed" -c user.name=Fork -c user.email=fork@example.invalid commit -qam two
+    git -C "$seed" push -q origin HEAD:main 2>/dev/null
+    git -C "$fork" fetch -q upstream
+    printf 'owner/forkrepo\n' > "$RU_CONFIG_DIR/repos.d/public.txt"
+
+    assert_cli_schema populated-fork-status 0 fork-status fork-status --no-fetch --json
+    assert_success "fork-status reports the fork one commit behind" jq -e '.data.repos[0].status == "behind" and .data.repos[0].behind == 1' "$E2E_LOG_DIR/populated-fork-status.stdout"
+    assert_cli_schema dry-fork-sync 0 fork-sync fork-sync --dry-run --no-fetch --json
+    assert_cli_schema dry-fork-clean 0 fork-clean fork-clean --dry-run --no-fetch --json
+    assert_cli_schema dry-commit-sweep 0 commit-sweep commit-sweep --dry-run --json
+    assert_cli_schema actual-fork-sync 0 fork-sync fork-sync --no-fetch --json
+    assert_success "fork-sync reports the actual synced repository" jq -e '.data.synced == 1 and .data.repos[0].status == "synced"' "$E2E_LOG_DIR/actual-fork-sync.stdout"
+    jq 'del(.data.repos)' "$E2E_LOG_DIR/actual-fork-sync.stdout" > "$E2E_LOG_DIR/fork-sync-without-repos.json"
+    if python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/fork-sync-without-repos.json" <<'PY'
+import json, sys
+from jsonschema import Draft202012Validator, FormatChecker
+with open(sys.argv[1]) as stream:
+    schema = json.load(stream)["data"]["content"]
+with open(sys.argv[2]) as stream:
+    result = json.load(stream)
+errors = list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(result))
+sys.exit(0 if errors else 1)
+PY
+    then
+        pass "The fork-sync schema rejects a result without its per-repo outcomes"
+    else
+        fail "The fork-sync schema accepts a result without its per-repo outcomes"
+    fi
     cleanup_structured_conformance
 }
 
@@ -762,6 +813,7 @@ run_test test_schema_shortcut
 run_test test_version_matches
 run_test test_actual_empty_and_failure_schemas
 run_test test_configured_read_failure_schemas
+run_test test_actual_fork_schemas
 run_test test_actual_populated_and_dry_schemas
 run_test test_structured_workflow_source_api
 run_test test_structured_dispatcher_preserves_actual_tty_approval
