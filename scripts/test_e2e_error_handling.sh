@@ -275,7 +275,7 @@ test_interrupted_operation_resume() {
     e2e_setup
 
     # Create mock gh with some data
-    local graphql_response='{"data":{"repo0":{"nameWithOwner":"owner/repo0","isArchived":false,"isFork":false,"updatedAt":"2026-01-01T00:00:00Z","issues":{"nodes":[{"number":1,"title":"Test","createdAt":"2025-12-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","labels":{"nodes":[]}}]},"pullRequests":{"nodes":[]}}}}'
+    local graphql_response='{"data":{"repo0":{"nameWithOwner":"owner/repo0","isArchived":false,"isFork":false,"updatedAt":"2026-01-01T00:00:00Z","issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"number":1,"title":"Test","createdAt":"2025-12-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","labels":{"totalCount":0,"nodes":[]}}]},"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}'
     e2e_create_mock_gh 0 "$graphql_response"
 
     # Initialize ru

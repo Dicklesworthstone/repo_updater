@@ -42,6 +42,9 @@ source_ru_function "get_review_state_dir"
 # Mock log functions
 log_warn() { :; }
 log_verbose() { :; }
+# The real log_error prints ru's color variables, which ru only sets at
+# startup; without them set -u ends this file at the first error line.
+RED='' RESET=''
 
 test_retry_preserves_process_outcomes() {
     log_test_start "retry_with_backoff: real exits and capture streams"
@@ -192,7 +195,10 @@ EOF
     else
         fail "No work items discovered"
     fi
-    
+
+    # Later tests call the real batch and repository functions.
+    source_ru_function "gh_api_graphql_repo_batch"
+    source_ru_function "get_all_repos"
     cleanup_temp_dirs
 }
 

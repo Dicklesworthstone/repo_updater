@@ -703,7 +703,7 @@ if [[ "${1:-}" == auth ]]; then exit 0; fi
 if [[ "${1:-}" == api && "${2:-}" == graphql ]]; then
     : > "$STRUCTURED_READY_FILE"
     sleep 1
-    printf '{"data":{}}\n'
+    printf '%s\n' '{"data":{"repo0":{"nameWithOwner":"owner/repo0","isArchived":false,"isFork":false,"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}'
     exit 0
 fi
 printf 'Unexpected controlled gh invocation\n' >&2

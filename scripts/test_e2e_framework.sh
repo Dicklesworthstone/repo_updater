@@ -226,7 +226,7 @@ e2e_get_log_dir() {
 #   e2e_create_mock_gh 0 "$(e2e_graphql_response_with_items)"
 e2e_create_mock_gh() {
     local auth_exit_code="${1:-0}"
-    local graphql_json="${2:-{}}"
+    local graphql_json="${2:-"{}"}"
 
     e2e_log_operation "create_mock_gh" "auth_exit=$auth_exit_code" "setup"
 
@@ -375,17 +375,19 @@ e2e_graphql_repo_with_items() {
   "isFork": false,
   "updatedAt": "2026-01-01T00:00:00Z",
   "issues": {
+    "pageInfo": { "hasNextPage": false, "endCursor": null },
     "nodes": [
       {
         "number": 42,
         "title": "Test issue",
         "createdAt": "2025-12-01T00:00:00Z",
         "updatedAt": "2026-01-02T00:00:00Z",
-        "labels": { "nodes": [ { "name": "bug" } ] }
+        "labels": { "totalCount": 1, "nodes": [ { "name": "bug" } ] }
       }
     ]
   },
   "pullRequests": {
+    "pageInfo": { "hasNextPage": false, "endCursor": null },
     "nodes": [
       {
         "number": 7,
@@ -393,7 +395,7 @@ e2e_graphql_repo_with_items() {
         "createdAt": "2025-12-15T00:00:00Z",
         "updatedAt": "2026-01-03T00:00:00Z",
         "isDraft": false,
-        "labels": { "nodes": [ { "name": "enhancement" } ] }
+        "labels": { "totalCount": 1, "nodes": [ { "name": "enhancement" } ] }
       }
     ]
   }
@@ -411,8 +413,8 @@ e2e_graphql_repo_empty() {
   "isArchived": false,
   "isFork": false,
   "updatedAt": "2026-01-01T00:00:00Z",
-  "issues": { "nodes": [] },
-  "pullRequests": { "nodes": [] }
+  "issues": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] },
+  "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
 }
 REPO_JSON
 }

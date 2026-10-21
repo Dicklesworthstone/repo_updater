@@ -104,17 +104,19 @@ graphql_review_response_with_items() {
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
       "issues": {
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
         "nodes": [
           {
             "number": 42,
             "title": "Test issue",
             "createdAt": "2025-12-01T00:00:00Z",
             "updatedAt": "2026-01-02T00:00:00Z",
-            "labels": { "nodes": [ { "name": "bug" } ] }
+            "labels": { "totalCount": 1, "nodes": [ { "name": "bug" } ] }
           }
         ]
       },
       "pullRequests": {
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
         "nodes": [
           {
             "number": 7,
@@ -122,7 +124,7 @@ graphql_review_response_with_items() {
             "createdAt": "2025-12-15T00:00:00Z",
             "updatedAt": "2026-01-03T00:00:00Z",
             "isDraft": false,
-            "labels": { "nodes": [ { "name": "enhancement" } ] }
+            "labels": { "totalCount": 1, "nodes": [ { "name": "enhancement" } ] }
           }
         ]
       }
@@ -141,8 +143,8 @@ graphql_review_response_empty() {
       "isArchived": false,
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
-      "issues": { "nodes": [] },
-      "pullRequests": { "nodes": [] }
+      "issues": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] },
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     }
   }
 }
@@ -389,21 +391,23 @@ if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
       "issues": {
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
         "nodes": [
-          { "number": 1, "title": "Bug in repo1", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }
+          { "number": 1, "title": "Bug in repo1", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } }
         ]
       },
-      "pullRequests": { "nodes": [] }
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     },
     "repo1": {
       "nameWithOwner": "owner/repo2",
       "isArchived": false,
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
-      "issues": { "nodes": [] },
+      "issues": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] },
       "pullRequests": {
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
         "nodes": [
-          { "number": 10, "title": "Feature for repo2", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] }, "isDraft": false }
+          { "number": 10, "title": "Feature for repo2", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] }, "isDraft": false }
         ]
       }
     },
@@ -413,12 +417,13 @@ if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
       "issues": {
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
         "nodes": [
-          { "number": 5, "title": "Issue in repo3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } },
-          { "number": 6, "title": "Another issue in repo3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }
+          { "number": 5, "title": "Issue in repo3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } },
+          { "number": 6, "title": "Another issue in repo3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } }
         ]
       },
-      "pullRequests": { "nodes": [] }
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     }
   }
 }
@@ -675,13 +680,14 @@ if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
       "issues": {
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
         "nodes": [
-          { "number": 1, "title": "P0 Critical", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [{"name": "P0"}] } },
-          { "number": 2, "title": "P1 High", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [{"name": "priority:high"}] } },
-          { "number": 3, "title": "Low priority", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }
+          { "number": 1, "title": "P0 Critical", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 1, "nodes": [{"name": "P0"}] } },
+          { "number": 2, "title": "P1 High", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 1, "nodes": [{"name": "priority:high"}] } },
+          { "number": 3, "title": "Low priority", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } }
         ]
       },
-      "pullRequests": { "nodes": [] }
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     }
   }
 }
@@ -733,24 +739,24 @@ if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
       "isArchived": false,
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
-      "issues": { "nodes": [{ "number": 1, "title": "Issue 1", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }] },
-      "pullRequests": { "nodes": [] }
+      "issues": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [{ "number": 1, "title": "Issue 1", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } }] },
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     },
     "repo1": {
       "nameWithOwner": "owner/repo2",
       "isArchived": false,
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
-      "issues": { "nodes": [{ "number": 2, "title": "Issue 2", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }] },
-      "pullRequests": { "nodes": [] }
+      "issues": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [{ "number": 2, "title": "Issue 2", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } }] },
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     },
     "repo2": {
       "nameWithOwner": "owner/repo3",
       "isArchived": false,
       "isFork": false,
       "updatedAt": "2026-01-01T00:00:00Z",
-      "issues": { "nodes": [{ "number": 3, "title": "Issue 3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }] },
-      "pullRequests": { "nodes": [] }
+      "issues": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [{ "number": 3, "title": "Issue 3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "totalCount": 0, "nodes": [] } }] },
+      "pullRequests": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
     }
   }
 }

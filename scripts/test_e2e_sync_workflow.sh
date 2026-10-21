@@ -661,7 +661,11 @@ test_sync_can_change_a_detached_pin() {
         preserved=$(cat "$clone/file1.txt")
         printf '%s\n' pins/changing-tag@file1.txt > "$config"
         run_ru_sync "--parallel=$parallel" --json
-        assert_equals 1 "$RU_EXIT_CODE" "A missing path-like ref remains a failure after a real tag install"
+        # An existing clone whose pin cannot be checked out is a branch
+        # conflict (exit 2), as test_sync_missing_ref_preserves_clone_and_checkpoint
+        # establishes; a fresh clone with a missing pin is a failure (exit 1).
+        assert_equals 2 "$RU_EXIT_CODE" "A missing path-like ref is refused after a real tag install"
+        assert_equals branch_error "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "The refusal is the missing-ref branch error"
         assert_equals "$old_sha" "$(git -C "$clone" rev-parse HEAD)" "Missing ref preserves exact installed tag"
         assert_equals "$preserved" "$(cat "$clone/file1.txt")" "Missing ref preserves tracked bytes"
 
