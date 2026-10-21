@@ -2203,7 +2203,9 @@ kill_ai_session() {
     fi
 
     if is_session_active "$session_name"; then
-        ntm kill "$session_name" --force 2>/dev/null
+        # ntm reports "Killed session ..." on stdout, which would corrupt a
+        # --json result; only the status matters here
+        ntm kill "$session_name" --force >/dev/null 2>&1
         return $?
     fi
     return 0
@@ -15376,8 +15378,9 @@ ntm_wait_completion() {
 ntm_kill_session() {
     local session="${1:-}"
     [[ -z "$session" ]] && return 0
-    # -f flag prevents confirmation prompt
-    ntm kill "$session" -f 2>/dev/null || true
+    # -f flag prevents confirmation prompt. ntm reports "Killed session ..."
+    # on stdout, which would corrupt agent-sweep's --json result.
+    ntm kill "$session" -f >/dev/null 2>&1 || true
     return 0
 }
 
@@ -15388,7 +15391,7 @@ ntm_kill_session() {
 ntm_interrupt_session() {
     local session="${1:-}"
     [[ -z "$session" ]] && return 1
-    ntm --robot-interrupt="$session" 2>/dev/null || return 1
+    ntm --robot-interrupt="$session" >/dev/null 2>&1 || return 1
     return 0
 }
 

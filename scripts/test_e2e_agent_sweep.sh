@@ -126,6 +126,34 @@ test_preflight_rebase_in_progress() {
     log_test_pass "$test_name"
 }
 
+test_agent_sweep_json_run_is_one_object() {
+    local test_name="agent-sweep: a real --json run prints exactly one JSON result"
+    log_test_start "$test_name"
+
+    # ntm prints "Killed session ..." on stdout when ru removes a finished
+    # session (the mock prints "killed"); that used to corrupt the result,
+    # so a successful sweep reported invalid_structured_output and exit 3.
+    e2e_setup
+    e2e_create_mock_ntm
+    e2e_init_ru
+
+    create_dirty_repo "testrepo" >/dev/null
+    e2e_add_repo "example/testrepo"
+
+    local out exit_code=0
+    out=$("$E2E_RU_SCRIPT" agent-sweep --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "real --json sweep exits 0"
+    if printf '%s\n' "$out" | jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1; then
+        pass "stdout is exactly one JSON object"
+    else
+        fail "stdout is exactly one JSON object" "Got: $(printf '%s' "$out" | head -c 300)"
+    fi
+    assert_equals "1" "$(printf '%s\n' "$out" | jq -r '.data.summary.succeeded // empty' 2>/dev/null)" "the summary reports the successful repo"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
 # The README's documented agent-sweep flags, run through the full CLI. Globs
 # are passed as quoted arguments, never word-split by this shell.
 test_agent_sweep_repos_glob_selects_matching() {
@@ -294,6 +322,7 @@ run_test test_agent_sweep_dry_run_lists_repo
 run_test test_agent_sweep_json_dry_run
 run_test test_agent_sweep_single_repo_success
 run_test test_preflight_rebase_in_progress
+run_test test_agent_sweep_json_run_is_one_object
 run_test test_agent_sweep_repos_glob_selects_matching
 run_test test_agent_sweep_parallel_flags_reach_sweep
 run_test test_agent_sweep_show_denylist
