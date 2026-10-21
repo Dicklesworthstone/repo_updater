@@ -510,7 +510,7 @@ ru [command] [options]
 | `agent-sweep` | Orchestrate AI agents across dirty repos |
 | `ai-sync` | Auto-commit dirty repos using AI agents (via ntm) |
 | `dep-update` | AI-powered dependency updates across repos |
-| `import` | Import repos from GitHub stars or org |
+| `import` | Import repos from files, your GitHub stars, an org or a user |
 | `robot-docs` | Machine-readable CLI documentation (JSON) |
 
 ### Global Options
@@ -607,7 +607,7 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | `--basic` | Use basic TUI instead of terminal multiplexer |
 | `--mode=MODE` | Session driver: `auto`, `ntm`, or `local` |
 | `--parallel N`, `-j N` | Run N review sessions concurrently (default: 4) |
-| `--repos=PATTERN` | Filter repos by pattern (glob or regex) |
+| `--repos=PATTERN` | Filter repos: a glob (`*`, `?`, `[`) matches the repo name or owner/repo; plain text matches as a substring |
 | `--priority=LEVEL` | Minimum priority threshold: `critical`, `high`, `normal`, `low`, `all` |
 | `--skip-days=N` | Skip items reviewed within N days (default: 7) |
 | `--max-repos=N` | Limit number of repos to review (cost budget) |
@@ -621,7 +621,7 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | `--stars` | Import from your GitHub stars |
 | `--org=NAME` | Import from an organization |
 | `--user=NAME` | Import from a user's repos |
-| `--limit=N` | Maximum repos to import |
+| `--limit=N` | Read at most N repos from each GitHub source |
 | `--private` | Add to private repos list |
 
 **`ru agent-sweep`**
@@ -629,7 +629,8 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 |------|-------------|
 | `--dry-run` | Preview which repos would be processed |
 | `--parallel N`, `-jN` | Process N repos concurrently (default: 1) |
-| `--repos=PATTERN` | Filter repos by glob pattern |
+| `--repos=PATTERN` | Filter repos by glob pattern (plain text matches as a substring) |
+| `--show-denylist` | List the active denylist patterns and exit |
 | `--with-release` | Include release step after commit |
 | `--resume` | Resume an interrupted sweep |
 | `--restart` | Clear previous state and start fresh |
@@ -2583,8 +2584,8 @@ The `ai-sync` subcommand scans for dirty repositories and launches the selected 
 ```bash
 ru ai-sync                        # Process all dirty repos
 ru ai-sync --dry-run              # Show what would be processed
-ru ai-sync --include=my-project   # Only process matching repos
-ru ai-sync --exclude=test-*       # Skip matching repos
+ru ai-sync --include=my-project   # Only process repos whose path contains this
+ru ai-sync --exclude='test-*'     # Skip repos whose name matches this glob
 ru ai-sync --timeout=1200         # Allow 20 minutes per repo
 ru ai-sync --no-push              # Commit but don't push
 ru ai-sync --agent=codex          # Use a different AI agent

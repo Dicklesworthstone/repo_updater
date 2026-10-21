@@ -634,6 +634,26 @@ get_repo_name() {
     basename "${input%%@*}"
 }
 
+# Does a repository match a user's --repos/--include/--exclude PATTERN?
+# A pattern containing *, ? or [ is a glob that must match one of the given
+# names whole (pass the repo name, owner/repo, spec or path). Any other
+# pattern keeps the substring match these filters always used, against the
+# first name only, so plain filters select exactly what they did before.
+# Usage: repo_matches_filter PATTERN NAME [NAME...]
+repo_matches_filter() {
+    local pattern="$1" candidate
+    shift
+    [[ -z "$pattern" ]] && return 0
+    if [[ "$pattern" == *[*?[]* ]]; then
+        for candidate in "$@"; do
+            # shellcheck disable=SC2053  # the pattern is a glob on purpose
+            [[ -n "$candidate" && "$candidate" == $pattern ]] && return 0
+        done
+        return 1
+    fi
+    [[ "${1:-}" == *"$pattern"* ]]
+}
+
 #------------------------------------------------------------------------------
 # PACKAGE MANAGER DETECTION
 # Detect which package manager(s) a repository uses for dep-update feature.
@@ -2576,23 +2596,26 @@ cmd_ai_sync() {
 
     # Convert to array
     local -a dirty_repos=()
+    local repo_dir_name repo_owner_name
     while IFS= read -r repo_path; do
         [[ -z "$repo_path" ]] && continue
+        repo_dir_name="${repo_path##*/}"
+        repo_owner_name="${repo_path%/*}"
+        repo_owner_name="${repo_owner_name##*/}/$repo_dir_name"
 
-        # Apply include filter
-        if [[ -n "$include_pattern" ]]; then
-            if [[ ! "$repo_path" == *"$include_pattern"* ]]; then
-                log_debug "Skipping (not matching include): $repo_path"
-                continue
-            fi
+        # Apply include filter (a glob matches the repo name, owner/repo or
+        # path; plain text matches anywhere in the path)
+        if [[ -n "$include_pattern" ]] &&
+            ! repo_matches_filter "$include_pattern" "$repo_path" "$repo_dir_name" "$repo_owner_name"; then
+            log_debug "Skipping (not matching include): $repo_path"
+            continue
         fi
 
         # Apply exclude filter
-        if [[ -n "$exclude_pattern" ]]; then
-            if [[ "$repo_path" == *"$exclude_pattern"* ]]; then
-                log_debug "Skipping (matching exclude): $repo_path"
-                continue
-            fi
+        if [[ -n "$exclude_pattern" ]] &&
+            repo_matches_filter "$exclude_pattern" "$repo_path" "$repo_dir_name" "$repo_owner_name"; then
+            log_debug "Skipping (matching exclude): $repo_path"
+            continue
         fi
 
         dirty_repos+=("$repo_path")
@@ -2825,6 +2848,7 @@ cmd_dep_update() {
         log_error "dep-update requires jq for dependency scanning"
         return 3
     fi
+
     if ! command -v ntm &>/dev/null; then
         log_error "dep-update requires ntm (Named Tmux Manager)"
         log_error "Install from: https://github.com/Dicklesworthstone/ntm"
@@ -6730,7 +6754,7 @@ COMMANDS:
     self-update     Update ru to the latest version
     config          Show or set configuration values
     prune           Find and manage orphan repositories
-    import <file>   Import repos from file with auto visibility detection
+    import          Import repos from files or GitHub (stars, org, user)
     review          Review GitHub issues and PRs using Claude Code
     fork-status     Show fork sync status against upstream
     fork-sync       Sync fork with upstream remote
@@ -6990,7 +7014,7 @@ show_quick_menu() {
         printf '%b\n' "    ${GREEN}add${RESET} <repo>      Add a repository to your list" >&2
         printf '%b\n' "    ${GREEN}remove${RESET} <repo>   Remove a repository from your list" >&2
         printf '%b\n' "    ${GREEN}list${RESET}           Show configured repositories" >&2
-        printf '%b\n' "    ${BOLD}${MAGENTA}import${RESET} <file>   ${MAGENTA}Import repos from file (auto-detects visibility)${RESET}" >&2
+        printf '%b\n' "    ${BOLD}${MAGENTA}import${RESET}          ${MAGENTA}Import repos from files or GitHub (auto-detects visibility)${RESET}" >&2
         printf '\n' >&2
 
         # Fork management
@@ -8951,6 +8975,24 @@ parse_args() {
     local -a pending_review_args=()
     local -a pending_global_args=()
 
+    # Find the command first, so each option is routed for the command it
+    # belongs to wherever it appears: `ru --dry-run ai-sync` must reach
+    # ai-sync's own --dry-run exactly as `ru ai-sync --dry-run` does. Options
+    # that take a separate value skip it, so a value is never the command.
+    local -a scan_args=("$@")
+    local scan_i command_seen=false
+    for ((scan_i = 0; scan_i < ${#scan_args[@]}; scan_i++)); do
+        case "${scan_args[scan_i]}" in
+            --format|--dir|--timeout|--parallel|-j|--group|--set|--mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions|--invalidate-cache|--auto-answer)
+                ((scan_i++))
+                ;;
+            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep|ai-sync|dep-update|robot-docs|fork-status|fork-sync|fork-clean|commit-sweep)
+                COMMAND="${scan_args[scan_i]}"
+                break
+                ;;
+        esac
+    done
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
@@ -8964,6 +9006,12 @@ parse_args() {
                 exit 0
                 ;;
             -v|--version)
+                # agent-sweep documents -v as its verbose flag
+                if [[ "$1" == "-v" && "$COMMAND" == "agent-sweep" ]]; then
+                    ARGS+=("$1")
+                    shift
+                    continue
+                fi
                 show_version
                 exit 0
                 ;;
@@ -9156,7 +9204,7 @@ parse_args() {
                 shift
                 ;;
             -j)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     if [[ $# -lt 2 ]]; then
                         log_error "-j requires a number"
                         exit 4
@@ -9180,7 +9228,7 @@ parse_args() {
                 fi
                 ;;
             -j[0-9]*)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
@@ -9194,7 +9242,46 @@ parse_args() {
                 shift
                 ;;
             sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep|ai-sync|dep-update|robot-docs|fork-status|fork-sync|fork-clean|commit-sweep)
-                COMMAND="$1"
+                # The first command word is the command (found above); a
+                # later one is an argument, e.g. a repository named "status".
+                if [[ "$command_seen" == false ]]; then
+                    command_seen=true
+                    COMMAND="$1"
+                else
+                    ARGS+=("$1")
+                fi
+                shift
+                ;;
+            --set)
+                # Documented form: ru config --set KEY=VALUE
+                if [[ "$COMMAND" != "config" ]]; then
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                if [[ $# -lt 2 || "$2" != *=* ]]; then
+                    log_error "--set requires KEY=VALUE"
+                    exit 4
+                fi
+                ARGS+=("--set=$2")
+                shift 2
+                ;;
+            --debug|-d|--show-denylist)
+                if [[ "$COMMAND" != "agent-sweep" ]]; then
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                ARGS+=("$1")
+                shift
+                ;;
+            --stars|--org=*|--user=*|--limit=*)
+                if [[ "$COMMAND" != "import" ]]; then
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                ARGS+=("$1")
                 shift
                 ;;
             --group|--group=*)
@@ -10450,12 +10537,18 @@ cmd_import() {
     local force_public="false"
     local force_private="false"
     local file_args=()
+    local import_stars="false" import_limit=""
+    local -a import_orgs=() import_users=()
 
     # Parse import-specific options from ARGS
     for arg in "${ARGS[@]}"; do
         case "$arg" in
             --public)  force_public="true" ;;
             --private) force_private="true" ;;
+            --stars)   import_stars="true" ;;
+            --org=*)   import_orgs+=("${arg#--org=}") ;;
+            --user=*)  import_users+=("${arg#--user=}") ;;
+            --limit=*) import_limit="${arg#--limit=}" ;;
             *)         file_args+=("$arg") ;;
         esac
     done
@@ -10464,17 +10557,38 @@ cmd_import() {
         log_error "--public and --private are mutually exclusive"
         exit 4
     fi
+    if [[ -n "$import_limit" && ! "$import_limit" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "--limit must be a positive integer: $import_limit"
+        exit 4
+    fi
+    local source_name
+    for source_name in "${import_orgs[@]}" "${import_users[@]}"; do
+        if [[ ! "$source_name" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+            log_error "Invalid GitHub account name: '$source_name'"
+            exit 4
+        fi
+    done
+    local github_sources=$(( ${#import_orgs[@]} + ${#import_users[@]} ))
+    [[ "$import_stars" == "true" ]] && ((github_sources++))
+    if [[ -n "$import_limit" && $github_sources -eq 0 ]]; then
+        log_error "--limit applies to --stars, --org or --user"
+        exit 4
+    fi
 
-    if [[ ${#file_args[@]} -eq 0 ]]; then
-        log_error "Usage: ru import [--dry-run] [--public|--private] <file> [file2] ..."
+    if [[ ${#file_args[@]} -eq 0 && $github_sources -eq 0 ]]; then
+        log_error "Usage: ru import [--dry-run] [--public|--private] [--stars] [--org=NAME] [--user=NAME] [--limit=N] [file ...]"
         log_info ""
-        log_info "Import repositories from files into your ru configuration."
+        log_info "Import repositories from files or from GitHub into your ru configuration."
         log_info "By default, uses GitHub API to auto-detect public/private status."
         log_info ""
         log_info "Options:"
-        log_info "  --dry-run   Preview changes without modifying config files"
-        log_info "  --public    Force all repos to be added as public"
-        log_info "  --private   Force all repos to be added as private"
+        log_info "  --dry-run     Preview changes without modifying config files"
+        log_info "  --public      Force all repos to be added as public"
+        log_info "  --private     Force all repos to be added as private"
+        log_info "  --stars       Import the repos you starred on GitHub"
+        log_info "  --org=NAME    Import an organization's repos (repeatable)"
+        log_info "  --user=NAME   Import a user's repos (repeatable)"
+        log_info "  --limit=N     Read at most N repos from each GitHub source"
         log_info ""
         log_info "Supported formats in files:"
         log_info "  owner/repo"
@@ -10482,6 +10596,66 @@ cmd_import() {
         log_info "  git@github.com:owner/repo.git"
         exit 4
     fi
+
+    # List each GitHub source before changing anything, so a failed listing
+    # never leaves a partial import. Each listing becomes an input file of
+    # owner/repo lines, and the visibility GitHub reports for each repo is
+    # kept so it needs no lookup of its own.
+    local -a inputs=() input_labels=()
+    local -A listed_private=()
+    local import_tmp_dir=""
+    if [[ $github_sources -gt 0 ]]; then
+        if ! command -v gh &>/dev/null || ! gh auth status &>/dev/null; then
+            log_error "--stars, --org and --user need the GitHub CLI (gh), installed and authenticated"
+            exit 3
+        fi
+        import_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ru-import.XXXXXX") || exit 3
+        local -a source_kinds=() source_values=()
+        [[ "$import_stars" == "true" ]] && { source_kinds+=(stars); source_values+=(""); }
+        for source_name in "${import_orgs[@]}"; do source_kinds+=(org); source_values+=("$source_name"); done
+        for source_name in "${import_users[@]}"; do source_kinds+=(user); source_values+=("$source_name"); done
+        local idx listing listed_file listed_label listed_repo listed_flag list_rc list_err
+        local gh_limit="${import_limit:-100000}"
+        for idx in "${!source_kinds[@]}"; do
+            listed_file="$import_tmp_dir/source-$idx.txt"
+            list_err="$import_tmp_dir/source-$idx.err"
+            list_rc=0
+            case "${source_kinds[idx]}" in
+                stars)
+                    listed_label="GitHub stars"
+                    listing=$(gh api --paginate 'user/starred?per_page=100' \
+                        --jq '.[] | [.full_name, (.private | tostring)] | @tsv' 2> "$list_err") || list_rc=$?
+                    ;;
+                *)
+                    listed_label="GitHub ${source_kinds[idx]} ${source_values[idx]}"
+                    listing=$(gh repo list "${source_values[idx]}" --limit "$gh_limit" \
+                        --json nameWithOwner,isPrivate \
+                        --jq '.[] | [.nameWithOwner, (.isPrivate | tostring)] | @tsv' 2> "$list_err") || list_rc=$?
+                    ;;
+            esac
+            if [[ $list_rc -ne 0 ]]; then
+                log_error "Could not list $listed_label (gh exit $list_rc); nothing was imported"
+                [[ -s "$list_err" ]] && log_error "  $(head -n 1 "$list_err")"
+                rm -rf "$import_tmp_dir"
+                exit 3
+            fi
+            : > "$listed_file"
+            local listed_count=0
+            while IFS=$'\t' read -r listed_repo listed_flag; do
+                [[ -z "$listed_repo" ]] && continue
+                [[ -n "$import_limit" && $listed_count -ge $import_limit ]] && break
+                printf '%s\n' "$listed_repo" >> "$listed_file"
+                listed_private["github.com/$listed_repo"]="$listed_flag"
+                ((listed_count++))
+            done < <(printf '%s\n' "$listing")
+            inputs+=("$listed_file")
+            input_labels+=("$listed_label")
+        done
+    fi
+    for source_name in "${file_args[@]}"; do
+        inputs+=("$source_name")
+        input_labels+=("$source_name")
+    done
 
     # Check if we can auto-detect visibility (only works for github.com repos)
     local can_detect_visibility="false"
@@ -10499,6 +10673,7 @@ cmd_import() {
     # Ensure config exists
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_error "No configuration found. Run: ru init"
+        [[ -n "$import_tmp_dir" ]] && rm -rf "$import_tmp_dir"
         exit 3
     fi
 
@@ -10546,8 +10721,11 @@ cmd_import() {
     local invalid_repos=()
     local error_repos=()
 
-    # Process each file
-    for input_file in "${file_args[@]}"; do
+    # Process each input: GitHub listings first, then files
+    local input_idx input_file input_label
+    for input_idx in "${!inputs[@]}"; do
+        input_file="${inputs[input_idx]}"
+        input_label="${input_labels[input_idx]}"
         if [[ ! -f "$input_file" ]]; then
             log_error "File not found: $input_file"
             ((skipped_error++))
@@ -10555,7 +10733,7 @@ cmd_import() {
             continue
         fi
 
-        log_info "Processing: $input_file"
+        log_info "Processing: $input_label"
         local file_line_count=0
 
         while IFS= read -r line || [[ -n "$line" ]]; do
@@ -10604,6 +10782,9 @@ cmd_import() {
                 is_private="true"
             elif [[ "$force_public" == "true" ]]; then
                 is_private="false"
+            elif [[ -n "${listed_private[$canonical_id]:-}" ]]; then
+                # Reported by the GitHub listing this repo came from
+                is_private="${listed_private[$canonical_id]}"
             elif [[ "$can_detect_visibility" == "true" && "$host" == "github.com" ]]; then
                 # Use GitHub API to detect visibility (only works for github.com)
                 local api_response
@@ -10641,8 +10822,9 @@ cmd_import() {
 
         done < "$input_file"
 
-        log_info "  Processed $file_line_count entries from $(basename "$input_file")"
+        log_info "  Processed $file_line_count entries from ${input_label##*/}"
     done
+    [[ -n "$import_tmp_dir" ]] && rm -rf "$import_tmp_dir"
 
     # Print summary
     echo "" >&2
@@ -12739,9 +12921,13 @@ get_denylist_patterns() {
         printf '%s\n' "${AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]}"
     fi
     if [[ -n "${AGENT_SWEEP_DENYLIST_EXTRA:-}" ]]; then
-        # shellcheck disable=SC2086  # Intentional word splitting for space-separated patterns
-        printf '%s\n' $AGENT_SWEEP_DENYLIST_EXTRA
+        # Split the space-separated patterns as is_file_denied does, without
+        # letting a pattern such as *.log expand to files in the current dir.
+        local -a extra
+        run_with_input "$AGENT_SWEEP_DENYLIST_EXTRA" read -ra extra
+        [[ ${#extra[@]} -gt 0 ]] && printf '%s\n' "${extra[@]}"
     fi
+    return 0
 }
 
 # Detect which review driver to use
@@ -19561,8 +19747,16 @@ discover_work_items() {
         return 0
     fi
 
+    # --repos=PATTERN and positional repo arguments: keep a repo that matches
+    # any of the space-separated patterns
+    local -a repo_patterns=()
+    if [[ -n "${REVIEW_REPOS_PATTERN:-}" ]]; then
+        run_with_input "$REVIEW_REPOS_PATTERN" read -ra repo_patterns
+    fi
+
     # Convert to GitHub IDs (filter non-GitHub repos)
     local -a github_repos=()
+    local repo_pattern repo_selected
     for spec in "${all_repos[@]}"; do
         local github_id
         github_id=$(repo_spec_to_github_id "$spec")
@@ -19570,12 +19764,26 @@ discover_work_items() {
             if [[ ${#allowed_repo_map[@]} -gt 0 && -z "${allowed_repo_map[$github_id]:-}" ]]; then
                 continue
             fi
+            if [[ ${#repo_patterns[@]} -gt 0 ]]; then
+                repo_selected=false
+                for repo_pattern in "${repo_patterns[@]}"; do
+                    if repo_matches_filter "$repo_pattern" "$github_id" "${github_id##*/}" "$spec"; then
+                        repo_selected=true
+                        break
+                    fi
+                done
+                [[ "$repo_selected" == true ]] || continue
+            fi
             github_repos+=("$github_id")
         fi
     done
 
     if [[ ${#github_repos[@]} -eq 0 ]]; then
-        log_verbose "No GitHub repos configured"
+        if [[ ${#repo_patterns[@]} -gt 0 ]]; then
+            log_warn "No configured GitHub repos match: ${REVIEW_REPOS_PATTERN}"
+        else
+            log_verbose "No GitHub repos configured"
+        fi
         return 0
     fi
 
@@ -24574,12 +24782,14 @@ cmd_agent_sweep() {
     local phase1_timeout="${AGENT_SWEEP_PHASE1_TIMEOUT:-300}"
     local phase2_timeout="${AGENT_SWEEP_PHASE2_TIMEOUT:-600}"
     local phase3_timeout="${AGENT_SWEEP_PHASE3_TIMEOUT:-300}"
+    local show_denylist=false
 
     # Parse agent-sweep specific arguments
     local arg
     for arg in "${ARGS[@]}"; do
         case "$arg" in
             --with-release) with_release=true ;;
+            --show-denylist) show_denylist=true ;;
             -j[0-9]*) parallel="${arg#-j}" ;;
             --parallel=*) parallel="${arg#--parallel=}" ;;
             --repos=*) repos_filter="${arg#--repos=}" ;;
@@ -24601,6 +24811,12 @@ cmd_agent_sweep() {
             *) log_error "Unknown agent-sweep option: $arg"; return 4 ;;
         esac
     done
+
+    # List the active denylist patterns, one per line, and stop
+    if [[ "$show_denylist" == true ]]; then
+        get_denylist_patterns
+        return 0
+    fi
 
     # Validate parallel count
     if ! [[ "$parallel" =~ ^[1-9][0-9]*$ ]]; then
@@ -24697,7 +24913,10 @@ cmd_agent_sweep() {
     for repo_spec in "${repos[@]}"; do
         repo_path=$(repo_spec_to_path "$repo_spec")
         if [[ -d "$repo_path" ]] && has_uncommitted_changes "$repo_path"; then
-            if [[ -z "$repos_filter" ]] || [[ "$repo_spec" == *"$repos_filter"* ]]; then
+            # A glob matches the repo name, owner/repo, spec or local path;
+            # plain text matches anywhere in the spec.
+            if repo_matches_filter "$repos_filter" "$repo_spec" "$(get_repo_name "$repo_spec")" \
+                "${repo_path##*/}" "$(repo_spec_to_github_id "$repo_spec")" "$repo_path"; then
                 dirty_repos+=("$repo_spec")
                 log_debug "Found dirty repo: $(get_repo_name "$repo_spec")"
             fi
@@ -24725,6 +24944,7 @@ cmd_agent_sweep() {
             for repo_spec in "${dirty_repos[@]}"; do
                 log_info "  - $(get_repo_name "$repo_spec")"
             done
+            log_info "Would run up to $parallel agents in parallel"
         fi
         release_lock
         return 0
@@ -25643,9 +25863,13 @@ _robot_docs_commands() {
     },
     {
       "name": "import",
-      "description": "Import repos from file with auto visibility detection",
-      "args": ["<file>"],
+      "description": "Import repos from files or GitHub with auto visibility detection",
+      "args": ["[file...]"],
       "flags": [
+        {"flag": "--stars", "description": "Import the repos you starred on GitHub"},
+        {"flag": "--org=NAME", "description": "Import the repos of an organization (repeatable)"},
+        {"flag": "--user=NAME", "description": "Import the repos of a user (repeatable)"},
+        {"flag": "--limit=N", "description": "Read at most N repos from each GitHub source"},
         {"flag": "--public", "description": "Force all repos as public"},
         {"flag": "--private", "description": "Force all repos as private"},
         {"flag": "--dry-run", "description": "Preview import without modifying config"}
@@ -25679,7 +25903,26 @@ _robot_docs_commands() {
     },
     {
       "name": "agent-sweep",
-      "description": "Automated multi-agent review sweep across repos"
+      "description": "Automated multi-agent review sweep across repos",
+      "flags": [
+        {"flag": "--dry-run", "description": "Preview which repos would be processed"},
+        {"flag": "--parallel N, -jN", "description": "Process N repos concurrently (default: 1)"},
+        {"flag": "--repos=PATTERN", "description": "Filter repos: a glob, or plain text matched as a substring"},
+        {"flag": "--with-release", "description": "Include release step after commit"},
+        {"flag": "--resume", "description": "Resume an interrupted sweep"},
+        {"flag": "--restart", "description": "Clear previous state and start fresh"},
+        {"flag": "--keep-sessions", "description": "Keep tmux sessions after completion"},
+        {"flag": "--keep-sessions-on-fail", "description": "Keep sessions only on failure"},
+        {"flag": "--attach-on-fail", "description": "Attach to session on failure"},
+        {"flag": "--execution-mode=MODE", "description": "plan, apply or agent (default: agent)"},
+        {"flag": "--secret-scan=MODE", "description": "none, warn or block (default: warn)"},
+        {"flag": "--phase1-timeout=N", "description": "Phase 1 timeout in seconds (default: 300)"},
+        {"flag": "--phase2-timeout=N", "description": "Phase 2 timeout in seconds (default: 600)"},
+        {"flag": "--phase3-timeout=N", "description": "Phase 3 timeout in seconds (default: 300)"},
+        {"flag": "--show-denylist", "description": "List the active denylist patterns and exit"},
+        {"flag": "--verbose, -v", "description": "Verbose output"},
+        {"flag": "--debug, -d", "description": "Debug output (implies verbose)"}
+      ]
     },
     {
       "name": "fork-status",

@@ -12,6 +12,8 @@
 #   - Subcommand options passed to ARGS
 #   - Positional arguments passed to ARGS
 #   - Short and long flag equivalence
+#   - Options before or after a command select the same behavior
+#   - Documented command-specific flags (config --set, agent-sweep, import)
 #   - Top-level startup code reads no heredoc or here-string
 #   - ru reads no heredoc anywhere, and no here-string outside run_with_input
 #
@@ -528,6 +530,92 @@ test_dir_with_spaces_quoted() {
 }
 
 #==============================================================================
+# Tests: Option Placement and Command-Specific Flags
+#==============================================================================
+
+test_dry_run_before_ai_sync_reaches_ai_sync() {
+    # A leading --dry-run used to set only the global flag, which ai-sync
+    # ignores, so `ru --dry-run ai-sync` ran for real.
+    reset_globals
+    parse_args --dry-run ai-sync
+
+    assert_equals "ai-sync" "$COMMAND" "Command is found after a leading option"
+    assert_contains "${ARGS[*]}" "--dry-run" "Leading --dry-run reaches ai-sync's own options"
+}
+
+test_option_placement_is_equivalent() {
+    local cmd before after
+    for cmd in ai-sync dep-update agent-sweep review; do
+        reset_globals
+        parse_args --dry-run "$cmd"
+        before="$COMMAND|${ARGS[*]}|$DRY_RUN"
+        reset_globals
+        parse_args "$cmd" --dry-run
+        after="$COMMAND|${ARGS[*]}|$DRY_RUN"
+        assert_equals "$after" "$before" "--dry-run before or after $cmd parses the same"
+    done
+}
+
+test_option_value_is_not_the_command() {
+    reset_globals
+    parse_args --dir status sync
+
+    assert_equals "sync" "$COMMAND" "A --dir value that names a command is not the command"
+}
+
+test_second_command_word_is_an_argument() {
+    reset_globals
+    parse_args add status
+
+    assert_equals "add" "$COMMAND" "The first command word is the command"
+    assert_contains "${ARGS[*]}" "status" "A later command word is passed on as an argument"
+}
+
+test_config_set_space_form() {
+    reset_globals
+    parse_args config --set LAYOUT=owner-repo
+
+    assert_contains "${ARGS[*]}" "--set=LAYOUT=owner-repo" "--set KEY=VALUE reaches config as --set=KEY=VALUE"
+}
+
+test_config_set_requires_key_value() {
+    local rc=0
+    (reset_globals; parse_args config --set LAYOUT) >/dev/null 2>&1 || rc=$?
+
+    assert_equals "4" "$rc" "--set without KEY=VALUE exits 4"
+}
+
+test_agent_sweep_flags_reach_agent_sweep() {
+    reset_globals
+    parse_args agent-sweep --debug -d --show-denylist -v -j4 -j 3
+
+    local flag
+    for flag in --debug -d --show-denylist -v -j4 -j3; do
+        assert_contains " ${ARGS[*]} " " $flag " "agent-sweep receives $flag"
+    done
+    assert_equals "1" "$PARALLEL" "agent-sweep -j leaves the global PARALLEL alone"
+}
+
+test_import_github_flags_reach_import() {
+    reset_globals
+    parse_args import --stars --org=acme --user=someone --limit=5
+
+    local flag
+    for flag in --stars --org=acme --user=someone --limit=5; do
+        assert_contains " ${ARGS[*]} " " $flag " "import receives $flag"
+    done
+}
+
+test_command_specific_flags_rejected_elsewhere() {
+    local flag rc
+    for flag in --debug -d --show-denylist --stars --org=acme --set; do
+        rc=0
+        (reset_globals; parse_args sync "$flag" KEY=VALUE) >/dev/null 2>&1 || rc=$?
+        assert_equals "4" "$rc" "sync rejects $flag"
+    done
+}
+
+#==============================================================================
 # Tests: Unknown Options
 #==============================================================================
 
@@ -738,6 +826,17 @@ run_test test_empty_args
 run_test test_only_positional
 run_test test_flags_order_independence
 run_test test_dir_with_spaces_quoted
+
+# Option placement and command-specific flags
+run_test test_dry_run_before_ai_sync_reaches_ai_sync
+run_test test_option_placement_is_equivalent
+run_test test_option_value_is_not_the_command
+run_test test_second_command_word_is_an_argument
+run_test test_config_set_space_form
+run_test test_config_set_requires_key_value
+run_test test_agent_sweep_flags_reach_agent_sweep
+run_test test_import_github_flags_reach_import
+run_test test_command_specific_flags_rejected_elsewhere
 
 # Unknown options
 run_test test_unknown_option_recognized

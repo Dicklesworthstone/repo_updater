@@ -276,6 +276,33 @@ test_config_command() {
     log_test_pass "$test_name"
 }
 
+test_config_set_documented_forms() {
+    local test_name="Config --set accepts the documented KEY=VALUE forms"
+    log_test_start "$test_name"
+
+    config_test_setup
+    run_ru_command init
+    local config_file="$XDG_CONFIG_HOME/ru/config"
+
+    # README form: ru config --set LAYOUT=owner-repo
+    run_ru_command config --set LAYOUT=owner-repo
+    assert_equals "0" "$RU_EXIT_CODE" "config --set KEY=VALUE exits 0"
+    assert_file_contains "$config_file" "LAYOUT=owner-repo" "config --set KEY=VALUE writes the value"
+
+    run_ru_command config --set=UPDATE_STRATEGY=rebase
+    assert_equals "0" "$RU_EXIT_CODE" "config --set=KEY=VALUE still exits 0"
+    assert_file_contains "$config_file" "UPDATE_STRATEGY=rebase" "config --set=KEY=VALUE writes the value"
+
+    local before
+    before=$(cat "$config_file")
+    run_ru_command config --set LAYOUT
+    assert_equals "4" "$RU_EXIT_CODE" "config --set without =VALUE exits 4"
+    assert_equals "$before" "$(cat "$config_file")" "a rejected --set leaves the config unchanged"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Test: Invalid config value handling
 #==============================================================================
@@ -411,6 +438,7 @@ run_test test_env_var_override
 run_test test_xdg_path_compliance
 run_test test_home_fallback
 run_test test_config_command
+run_test test_config_set_documented_forms
 run_test test_invalid_config
 run_test test_repos_d_multiple_files
 run_test test_config_affects_sync

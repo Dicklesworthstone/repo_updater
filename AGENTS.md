@@ -83,7 +83,7 @@ This is a **pure Bash project**. The main script `ru` and `install.sh` are shell
 - **No global `cd`** — always use `git -C "$repo_path"` instead
 - **Stream separation** — stderr for human-readable output, stdout for structured data (JSON, paths)
 - **Explicit error handling** — capture exit codes with `if output=$(cmd 2>&1); then ... else exit_code=$?; fi`
-- **No heredocs or here-strings in `ru`** — print text with `printf` and feed stdin with `run_with_input "$value" cmd args...`. Bash 5.1+ writes a heredoc or here-string whole into a pipe before reading it, and macOS hands out 512-byte pipes when kernel pipe memory runs short, so a longer one hangs forever. `scripts/test_unit_argument_parsing.sh` enforces this
+- **No heredocs or here-strings in `ru`** — print text with `printf` and feed stdin with `run_with_input "$value" cmd args...`. Bash 5.1+ writes a heredoc or here-string whole into a pipe before reading it, and macOS hands out 512-byte pipes when kernel pipe memory runs short, so a longer one hangs forever. `scripts/test_unit_argument_parsing.sh` enforces this. Long texts (help, robot docs, hooks) are single-quoted `printf` literals: write an apostrophe inside one as `'\''`, or `bash -n ru` fails
 
 ### Key Dependencies
 

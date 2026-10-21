@@ -114,6 +114,9 @@ extract_functions() {
     eval "$(sed -n '/^is_binary_file()/,/^}/p' "$RU_SCRIPT")"
     eval "$(sed -n '/^is_binary_allowed()/,/^}/p' "$RU_SCRIPT")"
 
+    # Extract repo_matches_filter (--repos/--include/--exclude matching)
+    eval "$(sed -n '/^repo_matches_filter()/,/^}/p' "$RU_SCRIPT")"
+
     # Extract write_result
     eval "$(sed -n '/^write_result()/,/^}/p' "$RU_SCRIPT")"
 }
@@ -727,6 +730,39 @@ test_is_binary_allowed_patterns() {
     AGENT_SWEEP_ALLOW_BINARY_PATTERNS=""
 }
 
+test_repo_matches_filter() {
+    echo -e "${BLUE}Test:${RESET} repo_matches_filter globs and substrings"
+
+    # pattern | expected (0 match, 1 no match) | names...
+    local -a cases=(
+        "|0|/p/acme/demo|demo|acme/demo"
+        "dem*|0|/p/acme/demo|demo|acme/demo"
+        "emo*|1|/p/acme/demo|demo|acme/demo"
+        "acme/*|0|/p/acme/demo|demo|acme/demo"
+        "test-*|1|/p/acme/demo|demo|acme/demo"
+        "d?mo|0|/p/acme/demo|demo|acme/demo"
+        "[a-c]emo|1|/p/acme/demo|demo|acme/demo"
+        "[d]emo|0|/p/acme/demo|demo|acme/demo"
+        "emo|0|/p/acme/demo|demo|acme/demo"
+        "acme|0|/p/acme/demo|demo|acme/demo"
+        "probe|1|/p/acme/demo|probe/demo"
+    )
+    local entry pattern expected rc
+    local -a fields
+    for entry in "${cases[@]}"; do
+        IFS='|' read -ra fields <<< "$entry"
+        pattern="${fields[0]}"
+        expected="${fields[1]}"
+        rc=0
+        repo_matches_filter "$pattern" "${fields[@]:2}" || rc=$?
+        if [[ "$rc" == "$expected" ]]; then
+            pass "pattern '$pattern' against ${fields[*]:2} -> $rc"
+        else
+            fail "pattern '$pattern' against ${fields[*]:2}: expected $expected, got $rc"
+        fi
+    done
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -812,6 +848,10 @@ echo ""
 test_is_binary_file_detection
 echo ""
 test_is_binary_allowed_patterns
+echo ""
+
+# repository filter matching
+test_repo_matches_filter
 echo ""
 
 echo "============================================"

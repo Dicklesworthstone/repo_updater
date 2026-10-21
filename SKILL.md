@@ -196,7 +196,7 @@ ru review -j 4 --plan          # Parallel sessions
 ru review --max-repos=10 --plan       # Limit repos
 ru review --max-runtime=30 --plan     # Minutes budget
 ru review --skip-days=14 --plan       # Skip recently reviewed
-ru review --repos=PATTERN --plan      # Filter by regex
+ru review --repos=PATTERN --plan      # Filter by glob (or substring)
 ru review --analytics                 # View past review stats
 ```
 

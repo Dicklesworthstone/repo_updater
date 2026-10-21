@@ -13,6 +13,8 @@
 #   - ru remove removes repos from public.txt
 #   - ru remove matches by owner/repo (not substring)
 #   - ru remove handles not-found gracefully
+#   - ru import --stars/--org/--user/--limit (controlled gh stub): visibility
+#     routing, limits, --private, dry run, fail-closed listing, validation
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
 # shellcheck disable=SC1091  # Sourced files checked separately
@@ -346,6 +348,130 @@ test_remove_from_private() {
 }
 
 #==============================================================================
+# Tests: ru import from GitHub (--stars, --org, --user, --limit)
+# A controlled gh stub stands in for GitHub: it proves the CLI wiring,
+# selection, limits, visibility routing and failure handling, not live API
+# behavior. Any call the stub does not expect exits 99.
+#==============================================================================
+
+create_import_gh_stub() {
+    e2e_create_mock_gh_custom '
+case "$*" in
+    "auth status"*) exit 0 ;;
+    "api --paginate user/starred?per_page=100 "*)
+        printf "%s\t%s\n" starowner/public-one false starowner/secret-two true starowner/public-three false
+        exit 0 ;;
+    "repo list acme "*)
+        printf "%s\t%s\n" acme/alpha false acme/beta false acme/gamma true
+        exit 0 ;;
+    "repo list missing "*)
+        echo "GraphQL: Could not resolve to a User with the login of missing" >&2
+        exit 1 ;;
+esac
+echo "unexpected gh call: $*" >&2
+exit 99'
+}
+
+test_import_stars_routes_by_visibility() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    create_import_gh_stub
+    local public_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    local private_file="$XDG_CONFIG_HOME/ru/repos.d/private.txt"
+
+    local output exit_code=0
+    output=$("$E2E_RU_SCRIPT" import --stars 2>&1) || exit_code=$?
+
+    assert_equals "0" "$exit_code" "ru import --stars exits 0"
+    assert_file_contains "$public_file" "starowner/public-one" "public starred repo goes to public.txt"
+    assert_file_contains "$public_file" "starowner/public-three" "second public starred repo goes to public.txt"
+    assert_file_contains "$private_file" "starowner/secret-two" "private starred repo goes to private.txt"
+    assert_false "grep -q 'secret-two' '$public_file'" "private starred repo is not in public.txt"
+    assert_false "grep -q '^.* gh api repos/' '$E2E_LOG_DIR/gh_calls.log'" "visibility comes from the listing, not per-repo lookups"
+    assert_not_contains "$output" "unexpected gh call" "only expected gh calls are made"
+
+    e2e_cleanup
+}
+
+test_import_org_limit_and_private() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    create_import_gh_stub
+    local public_file="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    local private_file="$XDG_CONFIG_HOME/ru/repos.d/private.txt"
+
+    local exit_code=0
+    "$E2E_RU_SCRIPT" import --org=acme --limit=2 >/dev/null 2>&1 || exit_code=$?
+    assert_equals "0" "$exit_code" "ru import --org=acme --limit=2 exits 0"
+    assert_file_contains "$public_file" "acme/alpha" "first org repo imported"
+    assert_file_contains "$public_file" "acme/beta" "second org repo imported"
+    assert_false "grep -q 'acme/gamma' '$public_file' '$private_file'" "--limit=2 stops after two repos"
+
+    exit_code=0
+    "$E2E_RU_SCRIPT" import --org=acme --private >/dev/null 2>&1 || exit_code=$?
+    assert_equals "0" "$exit_code" "ru import --org=acme --private exits 0"
+    assert_file_contains "$private_file" "acme/gamma" "--private forces the remaining repo into private.txt"
+
+    e2e_cleanup
+}
+
+test_import_dry_run_writes_nothing() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    create_import_gh_stub
+    local repos_dir="$XDG_CONFIG_HOME/ru/repos.d"
+    local before after
+    before=$(cat "$repos_dir"/*.txt 2>/dev/null)
+
+    local output exit_code=0
+    output=$("$E2E_RU_SCRIPT" import --stars --dry-run 2>&1) || exit_code=$?
+    after=$(cat "$repos_dir"/*.txt 2>/dev/null)
+
+    assert_equals "0" "$exit_code" "ru import --stars --dry-run exits 0"
+    assert_contains "$output" "Import Preview" "dry run shows a preview"
+    assert_equals "$before" "$after" "dry run leaves the repo lists unchanged"
+
+    e2e_cleanup
+}
+
+test_import_failed_listing_imports_nothing() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    create_import_gh_stub
+    local repos_dir="$XDG_CONFIG_HOME/ru/repos.d"
+    local before after
+    before=$(cat "$repos_dir"/*.txt 2>/dev/null)
+
+    # acme lists fine, but missing fails: nothing may be imported
+    local output exit_code=0
+    output=$("$E2E_RU_SCRIPT" import --org=acme --user=missing 2>&1) || exit_code=$?
+    after=$(cat "$repos_dir"/*.txt 2>/dev/null)
+
+    assert_equals "3" "$exit_code" "a failed GitHub listing exits 3"
+    assert_contains "$output" "Could not list GitHub user missing" "the failing source is named"
+    assert_contains "$output" "Could not resolve" "gh's error is shown"
+    assert_equals "$before" "$after" "nothing is imported when any listing fails"
+
+    e2e_cleanup
+}
+
+test_import_github_argument_validation() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    create_import_gh_stub
+
+    local args exit_code
+    for args in "--stars --limit=0" "--stars --limit=two" "--org=bad.name" "--limit=3"; do
+        exit_code=0
+        # shellcheck disable=SC2086  # each case is a list of separate flags
+        "$E2E_RU_SCRIPT" import $args >/dev/null 2>&1 || exit_code=$?
+        assert_equals "4" "$exit_code" "ru import $args exits 4"
+    done
+
+    e2e_cleanup
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -367,5 +493,10 @@ run_test test_add_private_repo
 run_test test_list_public_filter
 run_test test_list_private_filter
 run_test test_remove_from_private
+run_test test_import_stars_routes_by_visibility
+run_test test_import_org_limit_and_private
+run_test test_import_dry_run_writes_nothing
+run_test test_import_failed_listing_imports_nothing
+run_test test_import_github_argument_validation
 
 print_results
