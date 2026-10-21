@@ -815,7 +815,7 @@ test_dep_scan_cargo_workspace_contract() {
         detect_package_managers() { printf '%s\n' '{"managers":["cargo"]}'; }
         ntm() { return 92; }
         claude() { return 93; }
-        spawn_ai_session() { printf 'UNEXPECTED session\n' >&2; return 94; }
+        run_dep_update_transactions() { printf 'UNEXPECTED transaction\n' >&2; return 94; }
         local JSON_OUTPUT=true ARGS=(--dry-run "--repo=$PROJECT_DIR")
         scan_payload="$workspace"
         result=$(cmd_dep_update); rc=$?
@@ -911,30 +911,15 @@ test_cargo_workspace_test_command() {
         }
         ntm() { return 92; }
         claude() { return 93; }
-        _fetch_changelogs_for_outdated() { :; }
-        generate_depupdate_prompt_combined() { printf 'Test command: %s\n' "$3"; }
-        write_prompt_to_file() {
-            local file
-            file=$(mktemp "$fixture_root/prompt.XXXXXX") || return 1
-            printf '%s\n' "$1" > "$file" || return 1
-            printf '%s\n' "$file"
-        }
-        spawn_ai_session() {
-            local repo="$1" prompt_file="$2" argument command='' no_push=false
-            shift 2
-            for argument in "$@"; do
-                case "$argument" in
-                    --test-command=*) command="${argument#*=}" ;;
-                    --no-push) no_push=true ;;
-                esac
-            done
+        run_dep_update_transactions() {
+            local repo="$1" plan="$2" command="$3" no_push="$6"
             # Stop at this boundary; never fabricate completed work or tests.
             jq -cn --arg repo "$(cd "$repo" && pwd -P)" --arg command "$command" \
-                --arg prompt "$(cat "$prompt_file")" --argjson no_push "$no_push" \
-                '{schema_version:1,repo:$repo,status:"failed",exit_code:2,
-                  transport:{status:"failed"},work:{status:"failed",commits:[],remaining_paths:[]},
+                --argjson plan "$plan" --argjson no_push "$no_push" \
+                '{repo:$repo,status:"failed",exit_code:2,deps_updated:0,dependencies:[],
+                  deps_outdated_before:$plan.total_outdated,
                   publication:{no_push:$no_push,status:"not_requested"},
-                  error:"Controlled session boundary",observed_command:$command,observed_prompt:$prompt}'
+                  error:"Controlled transaction boundary",observed_command:$command,observed_plan:$plan}'
             return 2
         }
         for kind in standalone rooted virtual rooted/member; do
@@ -944,9 +929,10 @@ test_cargo_workspace_test_command() {
             ARGS=(--major --no-push "--repo=$fixture_root/$kind")
             result=$(cmd_dep_update); rc=$?
             assert_dep_scan_result "$result" "$rc" 1 \
-                '.failed == 1 and .updated == 0 and .results[0].error == "Controlled session boundary"
+                '.failed == 1 and .updated == 0 and .results[0].error == "Controlled transaction boundary"
                  and .results[0].observed_command == "cargo test --workspace"
-                 and .results[0].observed_prompt == "Test command: cargo test --workspace"
+                 and .results[0].observed_plan.total_outdated == 1
+                 and .results[0].observed_plan.results[0].manager == "cargo"
                  and .results[0].publication.no_push == true' "$kind caller forwards automatic command"
         done
         result=$(detect_test_command "$fixture_root/npm-mixed"); rc=$?
@@ -961,8 +947,8 @@ test_cargo_workspace_test_command() {
         ARGS=(--major --no-push '--test-cmd=printf explicit-test' "--repo=$fixture_root/rooted")
         result=$(cmd_dep_update); rc=$?
         assert_dep_scan_result "$result" "$rc" 1 \
-            '.results[0].error == "Controlled session boundary" and .results[0].observed_command == "printf explicit-test"
-             and .results[0].observed_prompt == "Test command: printf explicit-test"' "explicit command overrides automatic workspace command"
+            '.results[0].error == "Controlled transaction boundary" and .results[0].observed_command == "printf explicit-test"
+             and .results[0].observed_plan.total_outdated == 1' "explicit command overrides automatic workspace command"
         ARGS=(--major --no-push --test-cmd= "--repo=$fixture_root/rooted")
         result=$(cmd_dep_update); rc=$?
         assert_dep_scan_result "$result" "$rc" 1 \
@@ -1057,29 +1043,14 @@ test_dep_update_manager_test_selection() {
         }
         ntm() { return 92; }
         claude() { return 93; }
-        _fetch_changelogs_for_outdated() { :; }
-        generate_depupdate_prompt_combined() { printf 'Test command: %s\n' "$3"; }
-        write_prompt_to_file() {
-            local file
-            file=$(mktemp "$fixture_root/prompt.XXXXXX") || return 1
-            printf '%s\n' "$1" > "$file" || return 1
-            printf '%s\n' "$file"
-        }
-        spawn_ai_session() {
-            local repo="$1" prompt_file="$2" argument command='' no_push=false
-            shift 2
-            for argument in "$@"; do
-                case "$argument" in
-                    --test-command=*) command="${argument#*=}" ;;
-                    --no-push) no_push=true ;;
-                esac
-            done
+        run_dep_update_transactions() {
+            local repo="$1" plan="$2" command="$3" no_push="$6"
             jq -cn --arg repo "$(cd "$repo" && pwd -P)" --arg command "$command" \
-                --arg prompt "$(cat "$prompt_file")" --argjson no_push "$no_push" \
-                '{schema_version:1,repo:$repo,status:"failed",exit_code:2,
-                  transport:{status:"failed"},work:{status:"failed",commits:[],remaining_paths:[]},
+                --argjson plan "$plan" --argjson no_push "$no_push" \
+                '{repo:$repo,status:"failed",exit_code:2,deps_updated:0,dependencies:[],
+                  deps_outdated_before:$plan.total_outdated,
                   publication:{no_push:$no_push,status:"not_requested"},
-                  error:"Controlled session boundary",observed_command:$command,observed_prompt:$prompt}'
+                  error:"Controlled transaction boundary",observed_command:$command,observed_plan:$plan}'
             return 2
         }
         result=$(detect_test_command "$fixture_root/project"); rc=$?
@@ -1104,7 +1075,7 @@ test_dep_update_manager_test_selection() {
         result=$(cmd_dep_update); rc=$?
         assert_dep_scan_result "$result" "$rc" 1 \
             '.failed == 1 and .updated == 0 and .results[0].observed_command == "npm test && cargo test --workspace && go test ./... && composer test"
-             and .results[0].observed_prompt == "Test command: npm test && cargo test --workspace && go test ./... && composer test"
+             and .results[0].observed_plan.total_outdated == 4
              and .results[0].publication.no_push == true' "mixed updates forward all four suites once"
         compound=$(printf '%s\n' "$result" | jq -r '.results[0].observed_command')
         ARGS=(--major --no-push --manager=cargo "--repo=$fixture_root/project")
@@ -1233,7 +1204,7 @@ test_dep_update_counts_scan_failure() {
         local scan_failures_before=$TF_ASSERTIONS_FAILED
         ntm() { printf 'UNEXPECTED ntm execution\n' >&2; return 92; }
         claude() { printf 'UNEXPECTED agent execution\n' >&2; return 93; }
-        spawn_ai_session() { printf 'UNEXPECTED session\n' >&2; return 94; }
+        run_dep_update_transactions() { printf 'UNEXPECTED transaction\n' >&2; return 94; }
         detect_package_managers() { printf '%s\n' '{"managers":["npm"]}'; }
         npm() { printf '%s' "$scan_payload"; return "$scan_tool_rc"; }
         local JSON_OUTPUT=true ARGS=(--dry-run --major "--repo=$PROJECT_DIR")
@@ -1301,7 +1272,7 @@ test_dep_scan_npm_lockfile_contract() {
         npm() { printf '{}\n'; }
         ntm() { return 92; }
         claude() { return 93; }
-        spawn_ai_session() { printf 'UNEXPECTED session\n' >&2; return 94; }
+        run_dep_update_transactions() { printf 'UNEXPECTED transaction\n' >&2; return 94; }
         local JSON_OUTPUT=true
         for project_kind in yarn pnpm; do
             local ARGS=(--dry-run --major "--repo=$fixture_root/$project_kind")
@@ -1323,8 +1294,8 @@ test_dep_scan_npm_lockfile_contract() {
     return "$result_rc"
 }
 
-# The actual caller and common result validator run. Discovery, prompt-file,
-# and AI boundaries are controlled; no project test or AI session is executed.
+# The actual caller runs. Discovery and the transaction boundary are controlled;
+# no project test, completed update or AI session is fabricated.
 test_dep_update_requires_test_command() {
     (
         local scan_failures_before=$TF_ASSERTIONS_FAILED result rc
@@ -1340,35 +1311,15 @@ test_dep_update_requires_test_command() {
             return 1
         }
         detect_test_command() { printf '%s' "$detection_output"; return "$detection_exit"; }
-        _fetch_changelogs_for_outdated() { printf 'Controlled changelog\n'; }
-        generate_depupdate_prompt_combined() {
-            [[ "$3" == "$expected_test_command" ]] || return 71
-            printf 'Controlled prompt\n'
-        }
-        write_prompt_to_file() {
-            # Supply an existing readable file; never create/clean a prompt.
-            [[ "$1" == 'Controlled prompt' ]] || return 72
-            printf '%s\n' "$PROJECT_DIR/README.md"
-        }
-        spawn_ai_session() {
-            local session_no_push=false session_arg forwarded_test_command=''
-            for session_arg in "$@"; do
-                case "$session_arg" in
-                    --no-push) session_no_push=true ;;
-                    --push) return 73 ;;
-                    --test-command=*) forwarded_test_command="${session_arg#*=}" ;;
-                esac
-            done
-            [[ "$session_no_push" == true ]] || return 74
-            [[ "$forwarded_test_command" == "$expected_test_command" ]] || return 75
-            jq -cn --arg repo "$(cd "$PROJECT_DIR" && pwd -P)" --arg command "$forwarded_test_command" \
-                '{schema_version:1,repo:$repo,status:"success",exit_code:0,
-                  transport:{status:"idle"},
-                  work:{status:"success",after_head:"0123456789abcdef0123456789abcdef01234567",commits:["0123456789abcdef0123456789abcdef01234567"],remaining_paths:[],
-                    unpreserved_requests:[],requested_content_policy:"edit",requested_content_verified:false},
-                  tests:{required:true,status:"success",command:$command,ran:true,ok:true,
-                    exit_code:0,work_unchanged:true,verified_head:"0123456789abcdef0123456789abcdef01234567"},
-                  publication:{no_push:true,status:"not_requested"},deps_updated:999}'
+        run_dep_update_transactions() {
+            [[ "$6" == true ]] || return 74
+            [[ "$3" == "$expected_test_command" ]] || return 75
+            jq -cn --arg repo "$(cd "$1" && pwd -P)" --arg command "$3" --argjson plan "$2" \
+                '{repo:$repo,status:"failed",exit_code:2,deps_updated:0,dependencies:[],
+                  deps_outdated_before:$plan.total_outdated,
+                  publication:{no_push:true,status:"not_requested"},
+                  error:"Controlled transaction boundary",observed_command:$command,observed_plan:$plan}'
+            return 2
         }
 
         result=$(cmd_dep_update); rc=$?
@@ -1376,8 +1327,6 @@ test_dep_update_requires_test_command() {
             '.failed == 1 and .updated == 0 and .results[0].error_code == "test_command_unavailable"
              and .results[0].test_detection_exit == 1' "missing test command blocks updates"
 
-        # Contain the old caller's fallback too: the control must reach its
-        # false-success session, not fail for an unrelated prompt mismatch.
         detection_output='npm test' detection_exit=42 expected_test_command='npm test'
         result=$(cmd_dep_update); rc=$?
         assert_dep_scan_result "$result" "$rc" 1 \
@@ -1403,23 +1352,25 @@ test_dep_update_requires_test_command() {
         ARGS=(--major --no-push "--repo=$PROJECT_DIR")
         detection_output='npm test' detection_exit=0
         result=$(cmd_dep_update); rc=$?
-        assert_dep_scan_result "$result" "$rc" 0 \
-            '.updated == 1 and .failed == 0 and .results[0].publication.no_push == true' "detected command reaches validated session boundary"
-        assert_dep_scan_result "$result" "$rc" 0 \
-            '.results[0].deps_outdated_before == 1 and (.results[0] | has("deps_updated") | not)' \
-            "discovery count is not a verified update count"
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.updated == 0 and .failed == 1 and .results[0].publication.no_push == true
+             and .results[0].observed_command == "npm test"
+             and .results[0].error == "Controlled transaction boundary"' "detected command reaches the transaction boundary"
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.results[0].deps_outdated_before == 1 and .results[0].deps_updated == 0' \
+            "discovery is not counted as a verified update"
 
         detection_output='' detection_exit=42 expected_test_command='make check'
         ARGS+=(--test-cmd=make\ check)
         result=$(cmd_dep_update); rc=$?
-        assert_dep_scan_result "$result" "$rc" 0 \
-            '.updated == 1 and .failed == 0 and .results[0].deps_outdated_before == 1
-             and (.results[0] | has("deps_updated") | not)' "explicit command overrides failed automatic detection"
+        assert_dep_scan_result "$result" "$rc" 1 \
+            '.updated == 0 and .failed == 1 and .results[0].deps_outdated_before == 1
+             and .results[0].deps_updated == 0 and .results[0].observed_command == "make check"' "explicit command overrides failed automatic detection"
         result=$(_robot_docs_schemas); rc=$?
         assert_dep_scan_result "$result" "$rc" 0 \
             '.commands["dep-update"].data_schema.properties.results.items.properties |
-             .deps_outdated_before.type == "integer" and (has("deps_updated") | not)' \
-            "advertised schema describes the discovery count"
+             .deps_outdated_before.type == "integer" and .deps_updated.type == "integer"' \
+            "advertised schema distinguishes discovery and verified update counts"
         [[ "$TF_ASSERTIONS_FAILED" -eq "$scan_failures_before" ]]
     )
 }

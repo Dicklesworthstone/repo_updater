@@ -375,6 +375,8 @@ create_ai_cli_fixture() {
     printf 'baseline CLI bytes\n' > "$repo_path/base.txt"
     if [[ "$command" == dep-update ]]; then
         printf '%s\n' '{"name":"fixture","dependencies":{"example-package":"1.0.0"}}' > "$repo_path/package.json"
+        printf '%s\n' '{"name":"fixture","lockfileVersion":3,"requires":true,"packages":{"":{"name":"fixture","dependencies":{"example-package":"1.0.0"}},"node_modules/example-package":{"version":"1.0.0"}}}' > "$repo_path/package-lock.json"
+        printf 'node_modules/\n' > "$repo_path/.gitignore"
     fi
     git -C "$repo_path" add --all || return 1
     git -C "$repo_path" commit -qm 'CLI fixture baseline' || return 1
@@ -392,6 +394,40 @@ fi
 HOOK
     chmod +x "$env_root/receiver.git/hooks/pre-receive" || return 1
     cp "$SCRIPT_DIR/test_bin/ntm" "$env_root/controlled-bin/ntm" || return 1
+    if [[ "$command" == dep-update ]]; then
+        # The dependency agent must act in the actual isolated clone selected
+        # by ru. Keep the ordinary ai-sync transport fixture unchanged.
+        cp "$SCRIPT_DIR/test_bin/ntm" "$env_root/controlled-bin/ntm.endpoint" || return 1
+        cat > "$env_root/controlled-bin/ntm" <<'DEP_NTM'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${1:-}" == spawn ]]; then
+    printf '%s\n' "$NTM_PROJECTS_BASE/$2" > "$NTM_MOCK_STATE_FILE.repo"
+fi
+if [[ -f "$NTM_MOCK_STATE_FILE.repo" ]]; then
+    NTM_MOCK_REPO=$(cat "$NTM_MOCK_STATE_FILE.repo") || exit 2
+    export NTM_MOCK_REPO
+fi
+if [[ "${1:-}" == --robot-wait=* && " $* " == *' --transition '* &&
+      "${NTM_MOCK_SCENARIO:-}" == session_work ]]; then
+    jq --arg name "$NTM_MOCK_PACKAGE_NAME" --arg version "$NTM_MOCK_PACKAGE_VERSION" \
+        '.packages[""].dependencies[$name]=$version | .packages["node_modules/"+$name].version=$version' \
+        "$NTM_MOCK_REPO/package-lock.json" > "$NTM_MOCK_STATE_FILE.lock" || exit 2
+    cp "$NTM_MOCK_STATE_FILE.lock" "$NTM_MOCK_REPO/package-lock.json" || exit 2
+    git -C "$NTM_MOCK_REPO" add -- package-lock.json || exit 2
+fi
+exec "$(dirname "$0")/ntm.endpoint" "$@"
+DEP_NTM
+        cat > "$env_root/dependency-test.sh" <<'DEP_TEST'
+#!/usr/bin/env bash
+set -uo pipefail
+version=$(jq -r '.version' node_modules/example-package/package.json) || exit 8
+[[ "$version" == 1.0.1 ]] || exit 7
+head=$(git rev-parse HEAD) || exit 8
+printf '%s\n' "$head" > "$NTM_MOCK_STATE_FILE.tested"
+printf 'Verified installed example-package %s at %s\n' "$version" "$head"
+DEP_TEST
+    fi
     printf '#!/usr/bin/env bash\nexit 0\n' > "$env_root/controlled-bin/codex"
     cat > "$env_root/controlled-bin/tmux" <<'TMUX'
 #!/usr/bin/env bash
@@ -407,12 +443,20 @@ TMUX
     cat > "$env_root/controlled-bin/npm" <<'NPM'
 #!/usr/bin/env bash
 set -uo pipefail
-if [[ "${1:-}" != outdated || "${2:-}" != --json ]]; then
-    printf 'Controlled npm endpoint received unsupported arguments\n' >&2
-    exit 2
-fi
-printf '%s\n' '{"example-package":{"current":"1.0.0","wanted":"1.0.1","latest":"1.0.1","type":"dependencies"}}'
-exit 1
+case "${1:-}" in
+    outdated)
+        [[ "${2:-}" == --json ]] || exit 2
+        printf '%s\n' '{"example-package":{"current":"1.0.0","wanted":"1.0.1","latest":"1.0.1","type":"dependencies"}}'
+        exit 1 ;;
+    ls)
+        jq -c '{name:.name,dependencies:{"example-package":{version:.packages["node_modules/example-package"].version}}}' package-lock.json ;;
+    ci)
+        version=$(jq -r '.packages["node_modules/example-package"].version' package-lock.json) || exit 2
+        mkdir -p node_modules/example-package || exit 2
+        jq -cn --arg version "$version" '{name:"example-package",version:$version}' > node_modules/example-package/package.json || exit 2
+        pwd -P >> "$NTM_MOCK_STATE_FILE.install" ;;
+    *) printf 'Controlled npm endpoint received unsupported arguments\n' >&2; exit 2 ;;
+esac
 NPM
     cat > "$env_root/controlled-bin/curl" <<'CURL'
 #!/usr/bin/env bash
@@ -429,12 +473,14 @@ CURL
 run_ai_cli_fixture() {
     local env_root="$1" command="$2" scenario="$3" reject="$4"
     shift 4
-    local work_file=planned.txt package_name="" repo_path="$env_root/projects/repo"
+    local work_file=planned.txt package_name="" repo_path="$env_root/projects/repo" test_script
     local -a command_args=()
     if [[ "$command" == dep-update ]]; then
         work_file=package.json
         package_name=example-package
-        command_args=("--repo=$repo_path" --manager=npm --major --test-cmd=true)
+        printf -v test_script '%q' "$env_root/dependency-test.sh"
+        command_args=(--manager=npm --major "--test-cmd=bash $test_script")
+        [[ "${AI_CLI_USE_CONFIGURED:-false}" == true ]] || command_args+=("--repo=$repo_path")
     fi
     env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
         XDG_CONFIG_HOME="$env_root/config" XDG_STATE_HOME="$env_root/state" XDG_CACHE_HOME="$env_root/cache" \
@@ -498,7 +544,58 @@ assert_ai_cli_common_results() {
 }
 
 test_ai_sync_cli_common_results() { assert_ai_cli_common_results ai-sync; }
-test_dep_update_cli_common_results() { assert_ai_cli_common_results dep-update; }
+test_dep_update_cli_common_results() {
+    local scenario env_root repo_path before after result transaction dependency session rc evidence session_evidence
+    for scenario in session_work ok timeout; do
+        env_root=$(create_ai_cli_fixture dep-update) || return 1
+        repo_path="$env_root/projects/repo"
+        before=$(git -C "$repo_path" rev-parse HEAD) || return 1
+        rc=0
+        run_ai_cli_fixture "$env_root" dep-update "$scenario" false --no-push || rc=$?
+        cat "$env_root/cli.stderr" >&2
+        result=$(cat "$env_root/cli.stdout")
+        assert_success "Dependency CLI stdout contains exactly one JSON value" jq -e -s 'length == 1' <<< "$result"
+        transaction=$(jq -c '.data.results[0]' <<< "$result")
+        dependency=$(jq -c '.dependencies[0]' <<< "$transaction")
+        evidence=$(jq -r '.evidence_dir' <<< "$transaction")
+        session=$(cat "$evidence/1/session.stdout") || return 1
+        session_evidence=$(jq -r '.evidence_dir' <<< "$session")
+        assert_equals 1 "$(jq -r '.schema_version' <<< "$session")" "Dependency attempt retains the common session schema"
+        assert_equals true "$(jq -r '.publication.no_push' <<< "$transaction")" "Dependency transaction retains explicit no-push status"
+        assert_equals not_requested "$(jq -r '.publication.status' <<< "$transaction")" "Dependency transaction requests no host publication"
+        assert_equals "$repo_path" "$(jq -r '.repo' <<< "$transaction")" "Dependency transaction retains the actual original repository identity"
+        assert_not_equals "$repo_path" "$(jq -r '.repo' <<< "$session")" "Dependency agent runs in a separate repository"
+        assert_file_exists "$evidence/requests.json" "Dependency transaction preserves its exact request inventory"
+        assert_file_exists "$session_evidence/prompt.txt" "Dependency attempt preserves its exact agent request"
+        assert_file_exists "$session_evidence/ready.stdout" "Dependency attempt preserves readiness diagnostics"
+        if [[ "$scenario" != timeout ]]; then
+            assert_file_exists "$session_evidence/wait.stdout" "Dependency attempt preserves transition diagnostics"
+        fi
+        assert_not_contains "$(cat "$env_root/git.trace")" ' push ' "Dependency no-push makes zero host push invocations"
+        assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "Dependency no-push preserves the receiver"
+        after=$(git -C "$repo_path" rev-parse HEAD) || return 1
+        if [[ "$scenario" == session_work ]]; then
+            assert_equals 0 "$rc" "Dependency CLI accepts the individually verified update"
+            assert_equals success "$(jq -r '.status' <<< "$transaction")" "Dependency transaction reports success"
+            assert_equals 1 "$(jq -r '.deps_updated' <<< "$transaction")" "Dependency count reflects one verified promoted update"
+            assert_equals updated "$(jq -r '.status' <<< "$dependency")" "Per-dependency receipt reports a retained update"
+            assert_equals "$after" "$(jq -r '.commit' <<< "$dependency")" "Dependency receipt binds the actual promoted commit"
+            assert_equals "$after" "$(cat "$env_root/ntm.state.tested")" "Real host test completed on the exact promoted commit"
+            assert_equals 1.0.1 "$(git -C "$repo_path" show HEAD:package.json | jq -r '.dependencies["example-package"]')" "Dependency update commits the actual target manifest version"
+            assert_equals 1.0.1 "$(git -C "$repo_path" show HEAD:package-lock.json | jq -r '.packages["node_modules/example-package"].version')" "Dependency update commits the actual target lock version"
+            assert_equals 1.0.1 "$(jq -r '.installed.actual_version' <<< "$dependency")" "Installed-payload evidence records the actual target version"
+        else
+            assert_not_equals 0 "$rc" "Dependency no-op and timeout are failures"
+            assert_not_equals updated "$(jq -r '.status' <<< "$dependency")" "Unverified work is never a successful dependency update"
+            assert_equals 0 "$(jq -r '.deps_updated' <<< "$transaction")" "Uncompleted dependency attempts do not inflate update counts"
+            assert_equals failed "$(jq -r '.work.status' <<< "$session")" "Dependency attempt preserves actual Git-work failure"
+            assert_equals "$before" "$after" "Failed dependency attempt preserves the original branch"
+            if [[ "$scenario" == timeout ]]; then
+                assert_equals timeout "$(jq -r '.transport.status' <<< "$session")" "Dependency attempt preserves transport timeout"
+            fi
+        fi
+    done
+}
 
 test_ai_sync_cli_requested_content_is_not_replaceable() {
     local scenario env_root repo_path before after result session rc evidence
@@ -573,8 +670,15 @@ test_ai_cli_host_publication_success_and_refusal() {
             assert_success "Full $command publication stdout remains one JSON value" jq -e -s 'length == 1' <<< "$result"
             session=$(jq -c --arg key "$key" '.data[$key][0]' <<< "$result")
             after=$(git -C "$repo_path" rev-parse HEAD)
-            assert_equals success "$(jq -r '.work.status' <<< "$session")" "$command preserves verified local work across publication results"
-            assert_equals "$after" "$(jq -r '.work.commits[0]' <<< "$session")" "$command preserves the actual local candidate SHA"
+            if [[ "$command" == dep-update ]]; then
+                assert_equals updated "$(jq -r '.dependencies[0].status' <<< "$session")" "Dependency publication retains individually verified local work"
+                assert_equals 1 "$(jq -r '.deps_updated' <<< "$session")" "Dependency publication retains the verified update count"
+                assert_equals "$after" "$(jq -r '.dependencies[0].commit' <<< "$session")" "Dependency publication retains the actual promoted commit"
+                assert_equals "$after" "$(cat "$env_root/ntm.state.tested")" "Dependency publication follows host testing of the exact candidate"
+            else
+                assert_equals success "$(jq -r '.work.status' <<< "$session")" "$command preserves verified local work across publication results"
+                assert_equals "$after" "$(jq -r '.work.commits[0]' <<< "$session")" "$command preserves the actual local candidate SHA"
+            fi
             assert_equals false "$(jq -r '.publication.no_push' <<< "$session")" "$command explicitly requested host publication"
             assert_file_exists "$env_root/receiver.git/received-updates" "$command invokes the real receiver hook"
             if [[ "$mode" == false ]]; then
@@ -583,7 +687,11 @@ test_ai_cli_host_publication_success_and_refusal() {
                 assert_equals "$after" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "$command publishes the exact actual candidate"
             else
                 assert_not_equals 0 "$rc" "$command fails when the actual receiver rejects publication"
-                assert_equals failed "$(jq -r '.status' <<< "$session")" "$command never hides a rejected publication"
+                if [[ "$command" == dep-update ]]; then
+                    assert_equals partial "$(jq -r '.status' <<< "$session")" "Dependency publication refusal retains explicit partial success"
+                else
+                    assert_equals failed "$(jq -r '.status' <<< "$session")" "$command never hides a rejected publication"
+                fi
                 assert_equals failed "$(jq -r '.publication.status' <<< "$session")" "$command preserves typed publication failure"
                 assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "$command refusal preserves the actual receiver ref"
                 assert_contains "$(cat "$(jq -r '.evidence_dir' <<< "$session")/publication.stderr")" 'Controlled CLI receiver refuses' "$command retains actual receiver refusal diagnostics"
@@ -631,10 +739,39 @@ test_dep_update_cli_relative_repo_preserves_physical_identity() {
     assert_equals 0 "$rc" "Documented relative --repo path accepts verified actual work"
     assert_equals success "$(jq -r '.status' <<< "$session")" "Relative identity cannot turn completed work into a failure"
     assert_equals "$repo_path" "$(jq -r '.repo' <<< "$session")" "Consumer binds the actual physical repository identity"
-    assert_equals "$after" "$(jq -r '.work.commits[0]' <<< "$session")" "Relative-path consumer preserves the exact actual commit SHA"
+    assert_equals "$after" "$(jq -r '.dependencies[0].commit' <<< "$session")" "Relative-path consumer preserves the exact actual commit SHA"
+    assert_equals "$after" "$(cat "$env_root/ntm.state.tested")" "Relative-path update passes a real host test on the promoted commit"
+    assert_equals 1.0.1 "$(git -C "$repo_path" show HEAD:package-lock.json | jq -r '.packages["node_modules/example-package"].version')" "Relative-path update commits the verified lock version"
     assert_equals true "$(jq -r '.publication.no_push' <<< "$session")" "Relative-path consumer preserves explicit no-push evidence"
     assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "Relative-path no-push preserves the actual receiver"
     assert_not_contains "$(cat "$env_root/git.trace")" ' push ' "Relative-path no-push invokes no host Git push"
+}
+
+test_dep_update_cli_configured_repo_uses_verified_transactions() {
+    local env_root repo_path before after rc=0 result transaction
+    env_root=$(create_ai_cli_fixture dep-update) || return 1
+    repo_path="$env_root/projects/repo"
+    before=$(git -C "$repo_path" rev-parse HEAD) || return 1
+    AI_CLI_USE_CONFIGURED=true run_ai_cli_fixture "$env_root" dep-update session_work false --no-push || rc=$?
+    cat "$env_root/cli.stderr" >&2
+    result=$(cat "$env_root/cli.stdout")
+    assert_success "Configured-repository CLI stdout is exactly one JSON value" jq -e -s 'length == 1' <<< "$result"
+    assert_equals 0 "$rc" "Configured-repository dependency update succeeds"
+    assert_equals 1 "$(jq '.data.results | length' <<< "$result")" "Configured selection accounts for exactly one repository"
+    transaction=$(jq -c '.data.results[0]' <<< "$result")
+    after=$(git -C "$repo_path" rev-parse HEAD) || return 1
+    assert_not_equals "$before" "$after" "Configured selection promotes actual dependency work"
+    assert_equals "$repo_path" "$(jq -r '.repo' <<< "$transaction")" "Configured selection binds the physical repository"
+    assert_equals success "$(jq -r '.status' <<< "$transaction")" "Configured selection returns verified transaction success"
+    assert_equals 1 "$(jq -r '.deps_updated' <<< "$transaction")" "Configured selection counts the individually verified update"
+    assert_equals updated "$(jq -r '.dependencies[0].status' <<< "$transaction")" "Configured selection includes a retained dependency receipt"
+    assert_equals "$after" "$(jq -r '.dependencies[0].commit' <<< "$transaction")" "Configured receipt binds the promoted commit"
+    assert_equals "$after" "$(cat "$env_root/ntm.state.tested")" "Configured selection runs host tests on the exact promoted commit"
+    assert_equals 1.0.1 "$(git -C "$repo_path" show HEAD:package.json | jq -r '.dependencies["example-package"]')" "Configured selection commits the actual manifest version"
+    assert_equals 1.0.1 "$(git -C "$repo_path" show HEAD:package-lock.json | jq -r '.packages["node_modules/example-package"].version')" "Configured selection commits the actual lock version"
+    assert_equals true "$(jq -r '.publication.no_push' <<< "$transaction")" "Configured selection retains no-push protection"
+    assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "Configured no-push preserves the receiver"
+    assert_not_contains "$(cat "$env_root/git.trace")" ' push ' "Configured no-push invokes no host push"
 }
 
 # Run tests
@@ -651,6 +788,7 @@ run_test test_dep_update_cli_common_results
 run_test test_ai_cli_host_publication_success_and_refusal
 run_test test_ai_cli_dry_run_is_read_only
 run_test test_dep_update_cli_relative_repo_preserves_physical_identity
+run_test test_dep_update_cli_configured_repo_uses_verified_transactions
 
 print_results
 exit "$(get_exit_code)"

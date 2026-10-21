@@ -2614,7 +2614,9 @@ Before starting the agent, ru retains the original index and raw dirty files. AI
 
 ## 📦 Dependency Updates
 
-The `dep-update` subcommand uses AI agents to automatically update dependencies across your repositories. It analyzes changelogs for breaking changes, creates migration plans, updates dependencies one at a time, runs tests, and commits successful updates.
+The `dep-update` subcommand asks AI agents to update dependencies one at a time.
+RU independently checks the actual manifest, locked resolution, installed target
+and required tests before retaining each update in the original repository.
 
 ### Prerequisites
 
@@ -2664,7 +2666,9 @@ still have planned updates after name/major filtering. A mixed npm/Cargo
 update runs `npm test && cargo test --workspace`; a Cargo-only update selects
 the Cargo suite even when `package.json` also exists. Go and Composer suites
 are included when their dependencies are updated, with each manager tested
-once. If an updated manager has no detected test command, the update stops
+once in the combined command after every accepted dependency candidate.
+The locked environments for all selected managers are installed in each fresh
+attempt repository. If an updated manager has no detected test command, the update stops
 before session setup; provide `--test-cmd` for a project-specific or combined
 suite. An explicit command replaces the automatic selection. Other quality
 gate callers retain the existing general detection precedence.
@@ -2676,49 +2680,89 @@ Python discovery cannot use a global `pip list` as proof about a project's manif
 
 An actual update requires a successfully detected, nonempty test command or
 an explicit `--test-cmd`. Failed detection and blank commands fail the repository
-before changelog requests or AI session setup. `--dry-run` remains a discovery
+before AI session setup. `--dry-run` remains a discovery
 preview and does not require or claim test execution.
 
-After the AI session stops and its commits pass work validation, ru executes
-that exact test command itself. Complete stdout/stderr and the command's exit
-status remain in the session's `evidence_dir`. Tests and the subsequent Git
-inspection share the original session deadline. A failed test, incomplete
-result, changed commit/branch, or remaining repository changes prevents
-publication and also prevents `--no-push` from reporting success. Generated
-build files should use the project's existing ignore rules or an external
-output directory; ru preserves any remaining files for inspection.
+### Verified Update Scope
 
-Successful session records report `deps_outdated_before`, the discovery count.
-They omit `deps_updated`: the initial count and an agent's reported count do
-not establish how many dependencies actually changed. Host-run tests validate
-the final candidate; per-dependency updates and the agent's claimed intermediate
-test/fix/rollback sequence still need their own validation.
+Discovery support and automatic update verification are separate contracts:
+
+| Manager | Automatically verifiable update scope |
+|---------|---------------------------------------|
+| npm | One root project with tracked `package.json` and v2/v3 `package-lock.json`; no workspaces, shrinkwrap, alternate lockfiles, aliases or linked direct dependencies. Native lock validation and physical installed `package.json` must agree on the requested name/version. |
+| Cargo | A direct member/kind/platform dependency resolved by `cargo metadata --locked --offline`. Only lockfile updates within existing manifest requirements are accepted; tracked Cargo manifests stay unchanged. The required resolution must already be available to the offline reader. |
+| Go | A root module with tracked `go.mod` and `go.sum`, an unambiguous native read-only module graph, and target archive/module checksums. Workspaces and replacement-based resolutions require manual handling. |
+| Composer | One direct locked package with native manifest/lock validation and the standard `vendor` layout. Installed package metadata must agree with the requested package and locked version. |
+
+Unrelated direct dependencies and manifest settings must remain unchanged.
+The target requirement may remain unchanged when its range already permits the
+new locked version. A lockfile change and a changed resolved version are
+required. Necessary transitive lock changes are recorded but do not inflate the
+count of requested updates. Changes to source files, test commands, file types
+or unsupported manifest layouts are refused. A Cargo update that must advance
+another direct member/kind/platform edge is also refused.
+
+RU runs `npm ci` with lifecycle scripts disabled, `composer install` with scripts
+and plugins disabled, `cargo fetch --locked`, or `go mod download` before tests.
+Projects requiring those disabled installation hooks need a separately reviewed
+workflow. Tests run in a fresh clone, so ignored local files and pre-existing
+installed packages are not copied from the original project. Project build
+outputs need appropriate ignore rules; unexpected tracked or untracked changes
+invalidate the candidate. An npm tarball whose embedded package version differs
+from its lockfile is refused even if `npm ci` and `npm ls` accept it.
+
+Each repository result includes `deps_outdated_before` for the filtered discovery
+count and `deps_updated` for updates actually verified, tested and promoted into
+the original branch. The `dependencies` array retains manager, name, requested
+version, authoritative before/actual versions, exact tested commit,
+installation/test receipts, publication status and evidence directory.
+
+| Dependency status | Meaning |
+|-------------------|---------|
+| `updated` | Native dependency evidence and host tests passed; the exact single commit entered the original branch. Publication has a separate result. |
+| `skipped` | The authoritative baseline already contains the requested version. No new update or test success is counted. |
+| `failed` | The request did not produce a completed valid update, including an agent no-op. |
+| `reverted` | A changed attempt failed validation or tests and remains isolated; the original branch retains its preceding verified state. |
+| `unverified` | Evidence, supported scope, ownership, installed version, deadline or promotion could not be established. |
+
+Failed attempts and raw stdout/stderr remain available for inspection. Rollback
+means keeping that attempt out of the original repository; RU never resets or
+cleans the original branch. Earlier verified updates remain there, and valid
+updates may be published even when other dependencies fail. Such a run reports
+`partial` and exits nonzero. A timeout blocks remaining updates and publication;
+already promoted local updates remain available. An uncertain or failed push
+also returns nonzero and retains verified local commits.
+
+`--no-push` performs no receiver inspection or host publication. Attempt clones
+have an unusable publication remote and the existing NTM protocol restriction.
+These controls do not constitute an operating-system sandbox for arbitrary
+provider tools or project scripts. Repository identity, branch, clean state and
+publication destination are checked before promotion and publication; concurrent
+changes cause refusal rather than a forced reset. A per-repository ownership
+lock prevents overlapping RU dependency transactions. Inherited Git repository
+and namespace overrides are refused before ownership inspection or cloning.
 
 ### Update Workflow
 
-The AI agent follows this workflow for each repository:
+1. Discover and filter updates, then resolve all required manager test suites.
+2. Capture the original branch, revision and publication destination. Prepare an independent clone for one requested dependency.
+3. Read native before/after dependency snapshots around the owned AI session. Refuse no-ops, wrong versions, inconsistent locks and unrelated changes.
+4. Replace the agent's private intermediate history with one host-created commit containing only the verified final tree. Intermediate failed commits cannot become ancestors of the published update.
+5. Install the locked environments, verify the installed target, execute the exact required tests, then reinspect the installed target and Git state. Test evidence binds to the exact commit being accepted.
+6. Fast-forward the original branch only while its ownership and clean baseline still match. Retain failed attempts separately and proceed with other requests within the remaining deadline.
+7. Publish only accepted commits through the original captured destination, unless `--no-push` was specified. Report every request separately, including partial failure.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. ANALYZE                                                          │
-│     ├─ Detect package manager(s)                                     │
-│     ├─ List outdated dependencies                                    │
-│     ├─ Fetch changelogs for breaking changes                         │
-│     └─ Create risk-assessed migration plan                           │
-├─────────────────────────────────────────────────────────────────────┤
-│  2. UPDATE (for each dependency)                                     │
-│     ├─ Update single dependency                                      │
-│     ├─ Run test suite                                                │
-│     ├─ If tests fail: attempt automated fix (up to N iterations)     │
-│     ├─ If fix succeeds: commit with descriptive message              │
-│     └─ If fix fails: roll back and report                           │
-├─────────────────────────────────────────────────────────────────────┤
-│  3. REPORT                                                           │
-│     ├─ Summary of successful updates                                 │
-│     ├─ List of dependencies that couldn't be updated                 │
-│     └─ Recommendations for manual intervention                       │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The original `--timeout` budget is shared by isolation, all dependency sessions,
+native inspection, installation, host tests, promotion and requested publication;
+it is not restarted for each dependency. `--max-fix-attempts` remains the requested
+repair budget inside an agent session; the host independently accepts or rejects
+the final candidate regardless of what that agent reports.
+
+Deterministic fixtures exercise actual local Git state and controlled provider
+responses. Native manager fixtures cover only the specific layouts and tools
+they execute. These checks do not establish public-registry or live-provider
+execution, all supported project layouts or release qualification. Issue #19
+remains open for that broader qualification and the unsupported scopes above.
 
 ### Basic Usage
 

@@ -950,6 +950,349 @@ detect_dep_update_test_command() {
 }
 
 #------------------------------------------------------------------------------
+# DEPENDENCY UPDATE EVIDENCE
+# Independently read native manifest/lock state, never the agent's account of it.
+# Unsupported layouts remain explicit non-successes.
+#------------------------------------------------------------------------------
+
+_dep_update_evidence_error() {
+    jq -cn --arg manager "$1" --arg name "$2" --arg code "$3" --arg error "$4" \
+        '{status:"unverified",manager:$manager,name:$name,error_code:$code,error:$error}'
+    return 3
+}
+
+# A symlink, path traversal or pathspec is not a file this transaction owns.
+_dep_update_evidence_file() {
+    local repo="$1" relative="$2" original="$2" tracked="${3:-true}" component current="$1"
+    [[ -n "$relative" && "$relative" != /* && "$relative" != *$'\n'* && "$relative" != *$'\r'* ]] || return 1
+    while [[ -n "$relative" ]]; do
+        component="${relative%%/*}"
+        [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+        current+="/$component"
+        [[ ! -L "$current" ]] || return 1
+        if [[ "$relative" == */* ]]; then relative="${relative#*/}"; else relative=""; fi
+    done
+    [[ -f "$current" ]] || return 1
+    [[ "$tracked" == true ]] || return 0
+    git --literal-pathspecs -C "$repo" ls-files --error-unmatch -- "$original" >/dev/null 2>&1
+}
+
+# Usage: dep_update_snapshot <repo> <single dependency JSON>
+# Native readers inherit the session deadline. They must not rewrite files.
+dep_update_snapshot() {
+    local repo="$1" request="$2" manager name manifest_path lock_path state native manifest lock rc=0
+    local files hashes='{}' initial_hashes='{}' relative hash manifests='{}' member_path physical_repo
+    if ! manager=$(printf '%s\n' "$request" | jq -ers '
+        if length == 1 and (.[0] | type == "object" and
+            (.manager | type == "string") and (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+            (.latest | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)))
+        then .[0].manager else error("Expected one dependency request") end'); then
+        _dep_update_evidence_error "" "" invalid_request "One named dependency and requested version are required"
+        return 3
+    fi
+    name=$(printf '%s\n' "$request" | jq -r '.name') || return 3
+    repo=$(cd "$repo" && pwd -P) || { _dep_update_evidence_error "$manager" "$name" invalid_repo "Dependency repository is unavailable"; return 3; }
+    case "$manager" in
+        npm) manifest_path=package.json; lock_path="package-lock.json" ;;
+        cargo) manifest_path=Cargo.toml; lock_path=Cargo.lock ;;
+        go) manifest_path=go.mod; lock_path=go.sum ;;
+        composer) manifest_path=composer.json; lock_path=composer.lock ;;
+        *) _dep_update_evidence_error "$manager" "$name" unsupported_update "No authoritative evidence adapter for this manager"; return 3 ;;
+    esac
+    if ! command -v "$manager" >/dev/null 2>&1; then
+        _dep_update_evidence_error "$manager" "$name" missing_tool "$manager is required to verify dependency resolution"
+        return 3
+    fi
+    for relative in "$manifest_path" "$lock_path"; do
+        if ! _dep_update_evidence_file "$repo" "$relative"; then
+            _dep_update_evidence_error "$manager" "$name" missing_lockfile "Regular tracked manifest and lockfile are required"
+            return 3
+        fi
+        hash=$(git -C "$repo" hash-object -- "$relative") || return 3
+        initial_hashes=$(jq -cn --argjson hashes "$initial_hashes" --arg path "$relative" --arg hash "$hash" '$hashes + {($path):$hash}') || return 3
+    done
+    files=$(jq -cn --arg manifest "$manifest_path" --arg lock "$lock_path" '[$manifest,$lock]') || return 3
+    case "$manager" in
+        npm)
+            if [[ -e "$repo/npm-shrinkwrap.json" || -L "$repo/npm-shrinkwrap.json" ||
+                  -e "$repo/yarn.lock" || -L "$repo/yarn.lock" || -e "$repo/pnpm-lock.yaml" || -L "$repo/pnpm-lock.yaml" ]]; then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Alternate npm lockfiles need their own evidence adapter"
+                return 3
+            fi
+            manifest=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("Invalid package.json") end' "$repo/package.json") || return 3
+            lock=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("Invalid package lock") end' "$repo/package-lock.json") || return 3
+            native=$(cd "$repo" && npm ls --package-lock-only --depth=0 --json --ignore-scripts \
+                --include=dev --include=optional --include=peer --workspaces=false --global=false) || rc=$?
+            if [[ "$rc" -ne 0 ]] || ! native=$(printf '%s\n' "$native" | jq -cse '
+                if length == 1 and (.[0] | type == "object" and .error == null and ((.problems // []) | length == 0))
+                then .[0] else error("Invalid native npm resolution") end'); then
+                _dep_update_evidence_error "$manager" "$name" manager_validation_failed "npm rejected the locked direct dependency graph"
+                return 3
+            fi
+            if ! state=$(jq -cne --arg name "$name" --argjson m "$manifest" --argjson l "$lock" --argjson n "$native" '
+                def scopes: ["dependencies","devDependencies","optionalDependencies","peerDependencies"];
+                def declarations($x): reduce scopes[] as $s ({}; .[$s] = ($x[$s] // {}));
+                if ($name | test("^(?:@[A-Za-z0-9._-]+/)?[A-Za-z0-9_-][A-Za-z0-9._-]*$")) and
+                    $m.workspaces == null and ($l.lockfileVersion == 2 or $l.lockfileVersion == 3) and
+                    ($l.packages | type) == "object" and ($l.packages[""] | type) == "object" and
+                    declarations($m) == declarations($l.packages[""])
+                then . else error("Unsupported npm manifest or lockfile scope") end |
+                declarations($m) as $decl |
+                [$decl | to_entries[] | select(.value | has($name)) | {key:.key,value:.value[$name]}] | from_entries as $requirements |
+                if ($requirements | length) == 0 or any($requirements[]; type != "string" or startswith("npm:"))
+                then error("Target is not an unambiguous declared package") else . end |
+                ([$decl[] | keys[]] | unique) as $names |
+                (reduce $names[] as $key ({};
+                    $l.packages["node_modules/" + $key] as $p |
+                    if ($p | type) != "object" or ($p.version | type) != "string" or $p.link == true or
+                        ($p.name != null and $p.name != $key) or
+                        any($decl[] | to_entries[] | select(.key == $key); (.value | type) != "string" or (.value | startswith("npm:")))
+                    then error("Ambiguous direct lock entry") else .[$key] = $p end)) as $versions |
+                if $n.dependencies[$name].version != $versions[$name].version or $n.dependencies[$name].invalid != null
+                then error("Native target differs from lock") else . end |
+                {actual_version:$versions[$name].version,dependency_key:$name,target_requirements:$requirements,
+                 stable_manifest:{manifest:(reduce scopes[] as $s ($m; del(.[$s][$name]))),
+                                  root:(reduce scopes[] as $s ($l.packages[""]; del(.[$s][$name])))},
+                 direct_versions:$versions,lock_metadata:($l | del(.packages,.dependencies)),
+                 target_source:{name:($versions[$name].name // $name)},resolution:$l.packages}'); then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Cannot verify a single root npm dependency against this manifest and lockfile"
+                return 3
+            fi
+            ;;
+        composer)
+            manifest=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("Invalid Composer manifest") end' "$repo/composer.json") || return 3
+            lock=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("Invalid Composer lock") end' "$repo/composer.lock") || return 3
+            if ! (cd "$repo" && COMPOSER=composer.json COMPOSER_DISABLE_NETWORK=1 composer --no-interaction --no-plugins --no-scripts \
+                    validate --no-check-publish --check-lock) >/dev/null; then
+                _dep_update_evidence_error "$manager" "$name" manager_validation_failed "Composer rejected the manifest and lockfile"
+                return 3
+            fi
+            if ! state=$(jq -cne --arg name "$name" --argjson m "$manifest" --argjson l "$lock" '
+                def scopes: ["require","require-dev"];
+                if ($name | test("^[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*$")) and
+                    ($m.config["vendor-dir"] // "vendor") == "vendor" and
+                    ($m.config["bin-dir"] // "vendor/bin") == "vendor/bin" and
+                    ($l.packages | type) == "array" and (($l["packages-dev"] // []) | type) == "array"
+                then . else error("Unsupported Composer scope") end |
+                [scopes[] as $s | select(($m[$s] // {}) | has($name)) | {key:$s,value:$m[$s][$name]}] | from_entries as $requirements |
+                if ($requirements | length) == 0 or any($requirements[]; type != "string") then error("Not a direct package") else . end |
+                ($l.packages + ($l["packages-dev"] // [])) as $packages |
+                ([scopes[] as $s | ($m[$s] // {}) | keys[] | select(contains("/"))] | unique) as $names |
+                (reduce $names[] as $key ({};
+                    [$packages[] | select(.name == $key)] as $p |
+                    if ($p | length) != 1 or ($p[0].version | type) != "string" then error("Ambiguous locked package")
+                    else .[$key] = $p[0] end)) as $versions |
+                {actual_version:$versions[$name].version,dependency_key:$name,target_requirements:$requirements,
+                 stable_manifest:(reduce scopes[] as $s ($m; del(.[$s][$name]))),direct_versions:$versions,
+                 lock_metadata:($l | del(.packages,.["packages-dev"],.["content-hash"])),
+                 target_source:($versions[$name] | {name,type,source_type:.source.type,source_url:.source.url,dist_type:.dist.type}),resolution:$packages}'); then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Cannot verify a direct Composer package in the standard vendor layout"
+                return 3
+            fi
+            ;;
+        cargo)
+            # Hash every tracked workspace manifest before invoking the reader.
+            while IFS= read -r -d '' relative; do
+                _dep_update_evidence_file "$repo" "$relative" || return 3
+                hash=$(git -C "$repo" hash-object -- "$relative") || return 3
+                manifests=$(jq -cn --argjson hashes "$manifests" --arg path "$relative" --arg hash "$hash" '$hashes + {($path):$hash}') || return 3
+            done < <(git -C "$repo" ls-files -z -- Cargo.toml '*/Cargo.toml')
+            native=$(cd "$repo" && cargo metadata --format-version=1 --locked --offline) || rc=$?
+            if [[ "$rc" -ne 0 ]] || ! native=$(printf '%s\n' "$native" | jq -cse '
+                if length == 1 and (.[0] | .version == 1 and (.packages | type == "array") and (.workspace_members | type == "array") and
+                    (.resolve.nodes | type == "array")) then .[0] else error("Invalid Cargo metadata") end'); then
+                _dep_update_evidence_error "$manager" "$name" manager_validation_failed "Cargo could not read the locked offline resolution"
+                return 3
+            fi
+            physical_repo=$(printf '%s\n' "$native" | jq -er '.workspace_root') || return 3
+            physical_repo=$(cd "$physical_repo" && pwd -P) || return 3
+            if [[ "$physical_repo" != "$repo" ]]; then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Cargo workspace root must be the owned repository root"
+                return 3
+            fi
+            if ! state=$(jq -cne --argjson n "$native" --argjson request "$request" '
+                def kind($k): if $k == null or $k == "Normal" then null elif $k == "Development" then "dev" elif $k == "Build" then "build" else error("Unsupported dependency kind") end;
+                [$n.packages[] | select(.id as $id | $n.workspace_members | index($id) != null)] as $members |
+                [$members[] as $member | $member.dependencies[] as $dep |
+                    [$n.resolve.nodes[] | select(.id == $member.id) | .deps[] |
+                        select(.name == (($dep.rename // $dep.name) | gsub("-";"_"))) |
+                        select(any(.dep_kinds[]; .kind == $dep.kind and .target == $dep.target)) | .pkg] as $ids |
+                    [$n.packages[] | select(.id as $id | $ids | index($id) != null)] as $resolved |
+                    {key:([$member.name,$dep.name,($dep.kind // "normal"),($dep.target // "")] | tojson),
+                     member:$member.name,dependency:$dep,resolved:$resolved}] as $edges |
+                [$edges[] | select(.member == $request.crate_name and .dependency.name == $request.name and
+                    .dependency.kind == kind($request.kind) and .dependency.target == $request.platform)] as $target |
+                if ($target | length) != 1 or ($target[0].resolved | length) != 1 or
+                    ($target[0].dependency.source | type) != "string" or ($target[0].dependency.source | startswith("registry+") | not) or
+                    $target[0].resolved[0].name != $request.name or ($target[0].resolved[0].version | type) != "string"
+                then error("Target must identify one direct registry edge") else . end |
+                {actual_version:$target[0].resolved[0].version,dependency_key:$target[0].key,
+                 target_requirements:{cargo:$target[0].dependency.req},
+                 direct_versions:(reduce $edges[] as $edge ({}; .[$edge.key] = {requirement:$edge.dependency,resolved:[$edge.resolved[] | {name,version,source}]})),
+                 lock_metadata:{workspace_members:[$members[].name]},target_source:$target[0].dependency.source,
+                 resolution:{packages:[$n.packages[] | {name,version,source}],resolve:$n.resolve}}'); then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Cargo request must identify one member, kind and platform dependency"
+                return 3
+            fi
+            while IFS= read -r member_path; do
+                [[ "$member_path" == "$repo/"* ]] || { _dep_update_evidence_error "$manager" "$name" unsupported_update "Cargo member manifest is outside this repository"; return 3; }
+                relative="${member_path#"$repo/"}"
+                _dep_update_evidence_file "$repo" "$relative" || return 3
+                hash=$(git -C "$repo" hash-object -- "$relative") || return 3
+                if ! printf '%s\n' "$manifests" | jq -e --arg path "$relative" --arg hash "$hash" '.[$path] == $hash' >/dev/null; then
+                    _dep_update_evidence_error "$manager" "$name" validation_mutated_files "Cargo validation changed or selected an untracked member manifest"
+                    return 3
+                fi
+            done < <(printf '%s\n' "$native" | jq -r '. as $n | .packages[] | select(.id as $id | $n.workspace_members | index($id) != null) | .manifest_path')
+            state=$(jq -cn --argjson state "$state" --argjson manifests "$manifests" '$state + {stable_manifest:$manifests}') || return 3
+            # Native metadata is not a lossless TOML rewrite validator.
+            files='["Cargo.lock"]'
+            ;;
+        go)
+            local modules sums
+            if ! dep_update_go_workspace_safe "$repo"; then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Go workspace updates require a workspace-aware evidence adapter"
+                return 3
+            fi
+            manifest=$(cd "$repo" && GOWORK=off GOTOOLCHAIN=local GOFLAGS='' go mod edit -json) || rc=$?
+            native=$(cd "$repo" && GOWORK=off GOTOOLCHAIN=local GOPROXY=off GOFLAGS='' go list -mod=readonly -m -json all) || rc=$?
+            if [[ "$rc" -ne 0 ]] ||
+               ! manifest=$(printf '%s\n' "$manifest" | jq -cse 'if length == 1 and (.[0] | type == "object" and (.Require | type == "array")) then .[0] else error("Invalid go.mod") end') ||
+               ! modules=$(printf '%s\n' "$native" | jq -cse 'if length > 0 and all(.[]; type == "object" and .Error == null and (.Path | type == "string")) then . else error("Invalid Go graph") end') ||
+               ! sums=$(jq -Rse 'split("\n") | map(select(length > 0) |
+                    if test("^[^[:space:]]+ v[^[:space:]]+ h1:[A-Za-z0-9+/]{43}=$")
+                    then capture("^(?<path>[^[:space:]]+) (?<version>v[^[:space:]]+) (?<sum>h1:[A-Za-z0-9+/]{43}=)$")
+                    else error("Invalid go.sum entry") end)' "$repo/go.sum"); then
+                _dep_update_evidence_error "$manager" "$name" manager_validation_failed "Go could not read the readonly module graph and checksums"
+                return 3
+            fi
+            if ! state=$(jq -cne --arg name "$name" --argjson m "$manifest" --argjson modules "$modules" --argjson sums "$sums" '
+                [$m.Require[] | select(.Path == $name and .Indirect != true)] as $requirements |
+                [$modules[] | select(.Path == $name and .Main != true and .Replace == null)] as $target |
+                if ($requirements | length) != 1 or ($target | length) != 1 or
+                    any(($m.Replace // [])[]; .Old.Path == $name) or ($target[0].Version | type) != "string"
+                then error("Only direct modules without replacements are verified") else . end |
+                $target[0].Version as $version |
+                [$sums[] | select(.path == $name and .version == $version)] as $archive |
+                [$sums[] | select(.path == $name and .version == ($version + "/go.mod"))] as $modsum |
+                if ($archive | length) != 1 or ($modsum | length) != 1 then error("Missing target checksums") else . end |
+                (reduce ($m.Require[] | select(.Indirect != true) | .Path) as $key ({};
+                    [$modules[] | select(.Path == $key and .Main != true)] as $r |
+                    if ($r | length) != 1 or ($r[0].Version | type) != "string" then error("Missing direct resolution")
+                    else .[$key] = {version:$r[0].Version,replace:$r[0].Replace} end)) as $versions |
+                {actual_version:$version,dependency_key:$name,target_requirements:{go:$requirements[0].Version},
+                 stable_manifest:($m | .Require = [.Require[] | select(.Indirect != true) | if .Path == $name then del(.Version) else . end]),
+                 direct_versions:$versions,lock_metadata:null,target_source:{path:$name},resolution:{modules:$modules,sums:$sums}}'); then
+                _dep_update_evidence_error "$manager" "$name" unsupported_update "Go target must be a direct unreplaced module with locked checksums"
+                return 3
+            fi
+            ;;
+    esac
+    for relative in "$manifest_path" "$lock_path"; do
+        _dep_update_evidence_file "$repo" "$relative" || return 3
+        hash=$(git -C "$repo" hash-object -- "$relative") || return 3
+        if ! printf '%s\n' "$initial_hashes" | jq -e --arg path "$relative" --arg hash "$hash" '.[$path] == $hash' >/dev/null; then
+            _dep_update_evidence_error "$manager" "$name" validation_mutated_files "Native dependency inspection changed the manifest or lockfile"
+            return 3
+        fi
+        hashes=$(jq -cn --argjson hashes "$hashes" --arg path "$relative" --arg hash "$hash" '$hashes + {($path):$hash}') || return 3
+    done
+    jq -cn --argjson state "$state" --arg manager "$manager" --arg name "$name" --arg manifest "$manifest_path" --arg lock "$lock_path" \
+        --argjson files "$files" --argjson hashes "$hashes" \
+        '$state + {status:"success",manager:$manager,name:$name,manifest_path:$manifest,lockfile_path:$lock,files:$files,file_hashes:$hashes}'
+}
+
+dep_update_verify() {
+    local before="$1" after="$2" request="$3" result
+    result=$(jq -cne --argjson before "$before" --argjson after "$after" --argjson dep "$request" '
+        def normalized($x): if $dep.manager == "composer" then ($x | ltrimstr("v")) else $x end;
+        def valid($x): $x.status == "success" and ($x.file_hashes | type) == "object" and
+            ($x.manifest_path | type) == "string" and ($x.lockfile_path | type) == "string" and
+            ($x.file_hashes[$x.manifest_path] | type) == "string" and ($x.file_hashes[$x.lockfile_path] | type) == "string" and
+            ($x.files | type) == "array" and ($x.direct_versions | type) == "object" and
+            ($x.target_requirements | type) == "object" and ($x.dependency_key | type) == "string";
+        def result($status;$code;$error): {status:$status,error_code:$code,error:$error,manager:$dep.manager,name:$dep.name,
+            before_version:$before.actual_version,actual_version:$after.actual_version,requested_version:$dep.latest};
+        if (valid($before) | not) or (valid($after) | not) or $before.manager != $dep.manager or $after.manager != $dep.manager or
+            $before.name != $dep.name or $after.name != $dep.name or ($before.actual_version | type) != "string" or
+            ($after.actual_version | type) != "string" or ($dep.latest | type) != "string" or
+            $before.dependency_key != $after.dependency_key or $before.files != $after.files
+        then result("unverified";"invalid_snapshot";"Snapshots must describe the same dependency and supported scope")
+        elif $before.stable_manifest != $after.stable_manifest or ($before.target_requirements | keys) != ($after.target_requirements | keys) or
+            $before.lock_metadata != $after.lock_metadata or $before.target_source != $after.target_source or
+            ($before.direct_versions | del(.[$before.dependency_key])) != ($after.direct_versions | del(.[$after.dependency_key]))
+        then result("failed";"unexpected_dependency_change";"Another direct dependency, manifest setting or identity changed")
+        elif normalized($after.actual_version) != normalized($dep.latest)
+        then result("failed";"requested_version_not_reached";"The lockfile did not resolve the target to its requested version")
+        elif normalized($before.actual_version) == normalized($after.actual_version)
+        then if $before.file_hashes == $after.file_hashes then result("skipped";"already_current";"The baseline already contains the requested version")
+             else result("failed";"no_version_change";"File changes did not advance the requested dependency") end
+        elif $before.file_hashes[$before.lockfile_path] == $after.file_hashes[$after.lockfile_path]
+        then result("failed";"lockfile_unchanged";"The requested version changed without a changed lockfile")
+        else result("success";null;null) + {manifest_changed:($before.file_hashes[$before.manifest_path] != $after.file_hashes[$after.manifest_path]),
+            lockfile_changed:true,before_files:$before.file_hashes,after_files:$after.file_hashes,
+            requirements_before:$before.target_requirements,requirements_after:$after.target_requirements,
+            resolution_before:$before.resolution,resolution_after:$after.resolution} end
+    ') || { _dep_update_evidence_error "" "" invalid_snapshot "Dependency snapshots must be single well-formed JSON objects"; return 3; }
+    printf '%s\n' "$result"
+    printf '%s\n' "$result" | jq -e '.status == "success"' >/dev/null
+}
+
+# npm ls can trust a forged lock version even after installing an older tarball.
+# Verify the package metadata physically materialized before and after tests.
+dep_update_verify_installed() {
+    local repo="$1" request="$2" snapshot="$3" manager name expected native='' rc=0
+    manager=$(printf '%s\n' "$request" | jq -er '.manager') || return 3
+    name=$(printf '%s\n' "$request" | jq -er '.name') || return 3
+    if ! expected=$(printf '%s\n' "$snapshot" | jq -ers --arg manager "$manager" --arg name "$name" '
+        if length == 1 and (.[0] | .status == "success" and .manager == $manager and .name == $name and
+            (.actual_version | type == "string" and length > 0)) then .[0].actual_version else error("Invalid snapshot") end'); then
+        _dep_update_evidence_error "$manager" "$name" invalid_snapshot "An authoritative snapshot is required before installation verification"
+        return 3
+    fi
+    case "$manager" in
+        npm)
+            if ! _dep_update_evidence_file "$repo" "node_modules/$name/package.json" false ||
+               ! jq -se --arg name "$name" --arg expected "$expected" 'length == 1 and (.[0] | .name == $name and .version == $expected)' \
+                    "$repo/node_modules/$name/package.json" >/dev/null; then
+                _dep_update_evidence_error "$manager" "$name" installed_version_mismatch "The installed npm package does not contain the locked name and version"
+                return 3
+            fi
+            native=$(cd "$repo" && npm ls --depth=0 --json --ignore-scripts --include=dev --include=optional --include=peer --workspaces=false --global=false) || rc=$?
+            if [[ "$rc" -ne 0 ]] || ! printf '%s\n' "$native" | jq -se --arg name "$name" --arg expected "$expected" '
+                length == 1 and (.[0] | .error == null and ((.problems // []) | length == 0) and
+                    .dependencies[$name].version == $expected and .dependencies[$name].invalid == null)' >/dev/null; then
+                _dep_update_evidence_error "$manager" "$name" installed_validation_failed "npm rejected the installed direct dependency tree"
+                return 3
+            fi
+            ;;
+        composer)
+            if ! _dep_update_evidence_file "$repo" vendor/composer/installed.json false ||
+               ! _dep_update_evidence_file "$repo" "vendor/$name/composer.json" false ||
+               ! jq -se --arg name "$name" --arg expected "$expected" 'length == 1 and (.[0] | .name == $name and
+                    (.version == null or (.version | ltrimstr("v")) == ($expected | ltrimstr("v"))))' "$repo/vendor/$name/composer.json" >/dev/null ||
+               ! jq -se --arg name "$name" --arg expected "$expected" 'length == 1 and (.[0] | (if type == "array" then . else .packages end) |
+                    map(select(.name == $name)) | length == 1 and (.[0].version | ltrimstr("v")) == ($expected | ltrimstr("v")))' "$repo/vendor/composer/installed.json" >/dev/null; then
+                _dep_update_evidence_error "$manager" "$name" installed_version_mismatch "The installed Composer package does not match its locked name and version"
+                return 3
+            fi
+            ;;
+        cargo|go)
+            local after
+            after=$(dep_update_snapshot "$repo" "$request") || return "$?"
+            if ! printf '%s\n' "$after" | jq -e --argjson snapshot "$snapshot" \
+                '.status == "success" and .actual_version == $snapshot.actual_version and .file_hashes == $snapshot.file_hashes' >/dev/null; then
+                _dep_update_evidence_error "$manager" "$name" installed_validation_failed "The native installed resolution differs from the candidate"
+                return 3
+            fi
+            ;;
+        *) _dep_update_evidence_error "$manager" "$name" unsupported_update "No installed dependency evidence adapter for this manager"; return 3 ;;
+    esac
+    jq -cn --arg manager "$manager" --arg name "$name" --arg version "$expected" \
+        '{status:"success",manager:$manager,name:$name,actual_version:$version,installed:true}'
+}
+
+#------------------------------------------------------------------------------
 # DEPENDENCY VERSION CHECKING
 # Check for outdated dependencies per package manager
 #------------------------------------------------------------------------------
@@ -1632,7 +1975,7 @@ capture_ai_session_work() {
                 error='Session left requested repository work incomplete'
             else
                 local difference_exit=0
-                git -C "$repo_path" diff --quiet "$before_head" "$after_head" || difference_exit=$?
+                git -C "$repo_path" diff --quiet "$before_head" "$after_head" >/dev/null || difference_exit=$?
                 case "$difference_exit" in
                     0) error='New commits contain no requested file changes' ;;
                     1)
@@ -1757,10 +2100,11 @@ verify_ai_session_tests() {
 validate_ai_session_result() {
     local result="$1" actual_exit="$2" expected_repo="$3"
     local expected_test_command="${4:-}" tests_required=false
+    local expected_dependency="${5:-null}"
     [[ $# -lt 4 ]] || tests_required=true
     expected_repo=$(cd "$expected_repo" && pwd -P) || return 1
     printf '%s\n' "$result" | jq -es --argjson actual_exit "$actual_exit" --arg repo "$expected_repo" \
-        --arg command "$expected_test_command" --argjson tests_required "$tests_required" '
+        --arg command "$expected_test_command" --argjson tests_required "$tests_required" --argjson dependency "$expected_dependency" '
         length == 1 and (.[0] as $r |
             $r.schema_version == 1 and $r.repo == $repo and $r.exit_code == $actual_exit and
             ($r.transport.status == "idle" or $r.transport.status == "failed" or $r.transport.status == "timeout") and
@@ -1784,9 +2128,75 @@ validate_ai_session_result() {
                     ($r.tests.command | type == "string" and test("\\S")) and
                     (if $tests_required then $r.tests.command == $command else true end)
                  else $r.tests == null or ($r.tests.required == false and $r.tests.status == "not_requested") end) and
+                (if $dependency != null then
+                    $r.dependency.status == "success" and $r.dependency.manager == $dependency.manager and
+                    $r.dependency.name == $dependency.name and $r.dependency.requested_version == $dependency.latest and
+                    ($r.dependency.actual_version | ltrimstr("v")) == ($dependency.latest | ltrimstr("v")) and
+                    $r.dependency.verified_head == $r.work.after_head and
+                    $r.dependency.install.ran == true and $r.dependency.install.ok == true and
+                    $r.dependency.install.exit_code == 0 and $r.dependency.installed.status == "success" and
+                    $r.cleanup.status == "confirmed" and $r.publication.no_push == true
+                 else true end) and
                 (if $r.publication.no_push then $r.publication.status == "not_requested" else $r.publication.status == "success" end)
              else $actual_exit != 0 and ($r.status == "failed" or $r.status == "timeout") end))
     ' >/dev/null
+}
+
+# Only the verified final tree of one dependency may enter retained history.
+# The owned agent has stopped; its intermediate commits stay in this clone.
+prepare_dep_update_candidate() {
+    local repo_path="$1" request="$2" before_snapshot="$3" work="$4" evidence="$5"
+    local after_snapshot verification before_head after_head after_ref after_tree allowed_files changed path entry mode before_mode
+    local candidate message name old_version new_version
+    before_head=$(run_with_input "$work" jq -er '.before_head') || return 2
+    after_head=$(run_with_input "$work" jq -er '.after_head') || return 2
+    after_ref=$(run_with_input "$work" jq -er '.after_ref') || return 2
+    after_tree=$(run_with_input "$work" jq -er '.after_tree') || return 2
+    after_snapshot=$(dep_update_snapshot "$repo_path" "$request") || {
+        printf '%s\n' "$after_snapshot"
+        return 1
+    }
+    printf '%s\n' "$after_snapshot" > "$evidence/dependency-after.json" || return 2
+    verification=$(dep_update_verify "$before_snapshot" "$after_snapshot" "$request") || {
+        printf '%s\n' "$verification"
+        return 1
+    }
+    allowed_files=$(run_with_input "$before_snapshot" jq -ce '.files | select(type == "array" and length > 0 and all(.[]; type == "string" and length > 0))') || return 2
+    git -C "$repo_path" diff --name-only -z "$before_head" "$after_head" > "$evidence/dependency-paths" || return 2
+    changed=$(jq -Rsc 'split("\u0000") | map(select(length > 0))' "$evidence/dependency-paths") || return 2
+    if ! run_with_input "$changed" jq -e --argjson files "$allowed_files" 'length > 0 and all(.[]; . as $p | $files | index($p) != null)' >/dev/null; then
+        jq -cn --argjson changed "$changed" '{status:"unverified",error_code:"unexpected_changes",error:"Dependency attempt changed files outside its manifest and lockfile",changed_paths:$changed}'
+        return 1
+    fi
+    while IFS= read -r -d '' path; do
+        git --literal-pathspecs -C "$repo_path" ls-tree -z "$after_head" -- "$path" > "$evidence/dependency-entry" || return 2
+        IFS= read -r -d '' entry < "$evidence/dependency-entry" || return 2
+        mode=${entry%% *}
+        if [[ "$mode" != 100644 && "$mode" != 100755 ]]; then
+            jq -cn '{status:"unverified",error_code:"unsafe_file_type",error:"Dependency files must remain regular tracked files"}'
+            return 1
+        fi
+        git --literal-pathspecs -C "$repo_path" ls-tree -z "$before_head" -- "$path" > "$evidence/dependency-before-entry" || return 2
+        IFS= read -r -d '' entry < "$evidence/dependency-before-entry" || return 2
+        before_mode=${entry%% *}
+        if [[ "$mode" != "$before_mode" ]]; then
+            jq -cn '{status:"unverified",error_code:"unexpected_file_mode",error:"Dependency updates must preserve manifest and lockfile modes"}'
+            return 1
+        fi
+    done < "$evidence/dependency-paths"
+    if ! dep_update_repo_matches "$repo_path" "$after_head" "$after_ref"; then
+        jq -cn '{status:"unverified",error_code:"candidate_changed",error:"Native dependency inspection changed the candidate"}'
+        return 1
+    fi
+    name=$(run_with_input "$request" jq -er '.name') || return 2
+    old_version=$(run_with_input "$verification" jq -er '.before_version') || return 2
+    new_version=$(run_with_input "$verification" jq -er '.actual_version') || return 2
+    message="chore(deps): update $name from $old_version to $new_version"
+    candidate=$(printf '%s\n' "$message" | git -C "$repo_path" commit-tree "$after_tree" -p "$before_head") || return 2
+    # Tree/index/worktree stay identical. Compare-and-swap only the private ref.
+    git -C "$repo_path" update-ref "$after_ref" "$candidate" "$after_head" || return 2
+    run_with_input "$verification" jq -c --arg head "$candidate" --argjson paths "$changed" \
+        '. + {verified_head:$head,changed_paths:$paths}'
 }
 
 # Run an inherited Bash worker in its own process group under one absolute
@@ -1846,7 +2256,10 @@ stop_owned_ai_session() {
 incomplete_ai_session_result() {
     local operation_exit="$1" cleanup_status="$2" cleanup_exit="$3"
     local status=failed transport=failed publication=blocked phase=preflight before="" before_ref="" after="" after_ref="" work='{}' commits='[]' remaining='[]'
-    local error='AI workflow ended without a valid completed result' tests_json
+    local error='AI workflow ended without a valid completed result' tests_json dependency_json=null
+    if [[ -f "$artifact_dir/dependency.json" ]] && jq -es 'length == 1 and (.[0] | type == "object")' "$artifact_dir/dependency.json" >/dev/null; then
+        dependency_json=$(jq -c 'if .status == "success" then . + {status:"unverified",error_code:"incomplete_validation",error:"Dependency validation did not complete"} else . end' "$artifact_dir/dependency.json") || return 2
+    fi
     tests_json=$(jq -cn --argjson required "$session_tests_requested" --arg command "$session_test_command" \
         '{required:$required,command:$command,status:(if $required then "not_started" else "not_requested" end)}') || return 2
     if [[ -f "$artifact_dir/tests.json" ]] && jq -es 'length == 1 and (.[0] | type == "object")' "$artifact_dir/tests.json" >/dev/null; then
@@ -1874,19 +2287,56 @@ incomplete_ai_session_result() {
     [[ "$cleanup_status" == confirmed || "$cleanup_status" == not_started ]] || error+='; owned-session cleanup remains uncertain'
     jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg transport "$transport" \
         --arg error "$error" --arg evidence "$artifact_dir" --arg phase "$phase" --arg cleanup "$cleanup_status" --arg publication "$publication" \
-        --argjson work "$work" --argjson tests "$tests_json" --argjson operation_exit "$operation_exit" --argjson cleanup_exit "$cleanup_exit" --argjson no_push "$no_push" \
+        --argjson work "$work" --argjson tests "$tests_json" --argjson dependency "$dependency_json" --argjson operation_exit "$operation_exit" --argjson cleanup_exit "$cleanup_exit" --argjson no_push "$no_push" \
         --argjson seconds "$timeout_seconds" --argjson duration "$((SECONDS - ai_operation_entry))" \
-        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:1,duration_seconds:$duration,transport:{status:$transport,exit_code:$operation_exit},work:$work,tests:$tests,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit,budget_seconds:2},deadline:{seconds:$seconds,expired:($operation_exit==124),phase:$phase},evidence_dir:$evidence}'
+        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:1,duration_seconds:$duration,transport:{status:$transport,exit_code:$operation_exit},work:$work,tests:$tests,dependency:$dependency,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit,budget_seconds:2},deadline:{seconds:$seconds,expired:($operation_exit==124),phase:$phase},evidence_dir:$evidence}'
 }
 
 run_ai_session_workflow() {
     local ai_session_worker_active=true before_head before_ref publication_target=null requested_content requested_tree
     local transport=failed transport_exit=2 status=failed result_exit=2 error='spawn failed' cleanup_status=not_started cleanup_exit=0
+    local dependency_request="${session_dependency_request:-null}" dependency_before=null dependency_json=null dependency_exit=0
     printf 'preflight\n' > "$artifact_dir/phase"
+    if [[ "$dependency_request" != null ]] && ! dep_update_git_environment_safe; then
+        run_with_input "$dependency_request" jq -c \
+            '. + {status:"unverified",error_code:"unsafe_git_environment",error:"Inherited Git routing overrides prevent repository ownership verification"}' > "$artifact_dir/dependency.json" || return 2
+        return 1
+    fi
     before_head=$(git -C "$repo_path" rev-parse --verify HEAD) || return 2
     printf '%s\n' "$before_head" > "$artifact_dir/before.head"
     before_ref=$(git -C "$repo_path" symbolic-ref --quiet HEAD) || return 2
     printf '%s\n' "$before_ref" > "$artifact_dir/before.ref"
+    if [[ "$dependency_request" != null ]]; then
+        if run_with_input "$dependency_request" jq -e '(.validation_managers // [.manager]) | index("go") != null' >/dev/null &&
+           ! dep_update_go_workspace_safe "$repo_path"; then
+            run_with_input "$dependency_request" jq -c \
+                '. + {status:"unverified",error_code:"unsupported_update",error:"Go workspaces cannot be replaced with a single-module validation environment"}' > "$artifact_dir/dependency.json" || return 2
+            return 1
+        fi
+        local GOWORK=off GOTOOLCHAIN=local COMPOSER=composer.json COMPOSER_VENDOR_DIR=vendor COMPOSER_BIN_DIR=vendor/bin
+        local NPM_CONFIG_PREFIX="$repo_path"
+        export GOWORK GOTOOLCHAIN COMPOSER COMPOSER_VENDOR_DIR COMPOSER_BIN_DIR NPM_CONFIG_PREFIX
+        dep_update_repo_matches "$repo_path" "$before_head" "$before_ref" || return 2
+        dependency_before=$(dep_update_snapshot "$repo_path" "$dependency_request") || dependency_exit=$?
+        printf '%s\n' "$dependency_before" > "$artifact_dir/dependency-before.json" || return 2
+        if [[ "$dependency_exit" -ne 0 ]]; then
+            printf '%s\n' "$dependency_before" > "$artifact_dir/dependency.json" || return 2
+            return 1
+        fi
+        if run_with_input "$dependency_before" jq -e --argjson request "$dependency_request" \
+            '(.actual_version | ltrimstr("v")) == ($request.latest | ltrimstr("v"))' >/dev/null; then
+            run_with_input "$dependency_before" jq -c --argjson request "$dependency_request" \
+                '. + {status:"skipped",error_code:"already_current",before_version:.actual_version,requested_version:$request.latest}' > "$artifact_dir/dependency.json" || return 2
+            return 1
+        fi
+        if ! run_with_input "$dependency_before" jq -e --argjson request "$dependency_request" \
+            '(.actual_version | ltrimstr("v")) == ($request.current | ltrimstr("v"))' >/dev/null; then
+            run_with_input "$dependency_before" jq -c --argjson request "$dependency_request" \
+                '. + {status:"unverified",error_code:"stale_dependency_plan",before_version:.actual_version,requested_version:$request.latest,error:"The authoritative dependency baseline changed since discovery"}' > "$artifact_dir/dependency.json" || return 2
+            return 1
+        fi
+        dep_update_repo_matches "$repo_path" "$before_head" "$before_ref" || return 2
+    fi
     if [[ "$no_push" == false ]] && ! publication_target=$(get_commit_publication_target "$repo_path"); then
         log_error "Requested AI publication has no valid destination"
         return 4
@@ -1950,15 +2400,73 @@ run_ai_session_workflow() {
     else work_json=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir" "$requested_content" "$requested_content_policy" "$requested_tree") || work_exit=$?; fi
     printf '%s\n' "$work_json" > "$artifact_dir/work.json"
     if [[ "$transport" == idle && "$work_exit" -eq 0 && "$cleanup_status" == confirmed ]]; then
-        if [[ "$session_tests_requested" == true ]]; then
+        if [[ "$dependency_request" != null ]]; then
+            printf 'dependency-validation\n' > "$artifact_dir/phase"
+            dependency_json=$(prepare_dep_update_candidate "$repo_path" "$dependency_request" "$dependency_before" "$work_json" "$artifact_dir") || dependency_exit=$?
+            if [[ "$dependency_exit" -eq 0 ]]; then
+                # Bind tests to the single normalized host commit.
+                work_json=$(capture_ai_session_work "$repo_path" "$before_head" "$before_ref" "$artifact_dir" "$requested_content" "$requested_content_policy" "$requested_tree") || dependency_exit=$?
+                printf '%s\n' "$work_json" > "$artifact_dir/work.json" || return 2
+            fi
+            if [[ "$dependency_exit" -eq 0 ]]; then
+                local install_command install_result install_exit=0 installed_result installed_exit=0
+                install_command=$(dep_update_install_command "$dependency_request") || return 2
+                mkdir "$artifact_dir/dependency-install" || return 2
+                printf 'dependency-install\n' > "$artifact_dir/phase"
+                install_result=$(run_test_gate "$repo_path" "$install_command" "$timeout_seconds" "$artifact_dir/dependency-install") || install_exit=$?
+                printf '%s\n' "$install_result" > "$artifact_dir/dependency-install/result.json" || return 2
+                if [[ "$install_exit" -ne 0 ]] || ! run_with_input "$install_result" jq -e \
+                    '.ran == true and .ok == true and .exit_code == 0' >/dev/null ||
+                    ! dep_update_repo_matches "$repo_path" "$(run_with_input "$work_json" jq -r '.after_head')" "$before_ref"; then
+                    dependency_exit=1
+                    dependency_json=$(run_with_input "$dependency_json" jq -c --argjson install "$install_result" \
+                        '. + {status:"failed",error_code:"dependency_install_failed",error:"Locked dependency installation failed or changed the candidate",install:$install}') || return 2
+                else
+                    dependency_json=$(run_with_input "$dependency_json" jq -c --argjson install "$install_result" '. + {install:$install}') || return 2
+                    installed_result=$(dep_update_verify_installed "$repo_path" "$dependency_request" "$(cat "$artifact_dir/dependency-after.json")") || installed_exit=$?
+                    printf '%s\n' "$installed_result" > "$artifact_dir/dependency-installed.json" || return 2
+                    if [[ "$installed_exit" -ne 0 ]] || ! run_with_input "$installed_result" jq -e '.status == "success"' >/dev/null; then
+                        dependency_exit=1
+                        dependency_json=$(run_with_input "$dependency_json" jq -c --argjson installed "$installed_result" \
+                            '. + {status:"unverified",error_code:"installed_version_unverified",error:"Installed package does not prove the requested version",installed:$installed}') || return 2
+                    else
+                        dependency_json=$(run_with_input "$dependency_json" jq -c --argjson installed "$installed_result" '. + {installed:$installed}') || return 2
+                    fi
+                fi
+            fi
+            printf '%s\n' "$dependency_json" > "$artifact_dir/dependency.json" || return 2
+        fi
+        if [[ "$dependency_exit" -eq 0 && "$session_tests_requested" == true ]]; then
             printf 'tests\n' > "$artifact_dir/phase"
             tests_json=$(verify_ai_session_tests "$repo_path" "$session_test_command" "$timeout_seconds" "$artifact_dir" "$work_json") || tests_exit=$?
             ( set -C; printf '%s\n' "$tests_json" > "$artifact_dir/tests.json" ) || return 2
         fi
-        if [[ "$tests_exit" -ne 0 ]]; then
+        if [[ "$dependency_request" != null && "$dependency_exit" -eq 0 && "$tests_exit" -eq 0 ]]; then
+            installed_exit=0
+            installed_result=$(dep_update_verify_installed "$repo_path" "$dependency_request" "$(cat "$artifact_dir/dependency-after.json")") || installed_exit=$?
+            if [[ "$installed_exit" -ne 0 ]] || ! run_with_input "$installed_result" jq -e '.status == "success"' >/dev/null ||
+               ! dep_update_repo_matches "$repo_path" "$(run_with_input "$work_json" jq -r '.after_head')" "$before_ref"; then
+                dependency_exit=1
+                dependency_json=$(run_with_input "$dependency_json" jq -c \
+                    '. + {status:"unverified",error_code:"post_test_dependency_changed",error:"Installed dependency or candidate changed during tests"}') || return 2
+            fi
+            dependency_json=$(run_with_input "$dependency_json" jq -c --argjson installed "$installed_result" '. + {installed_after_tests:$installed}') || return 2
+        fi
+        if [[ "$dependency_exit" -ne 0 ]]; then
+            status=failed; result_exit=1
+            error=$(run_with_input "$dependency_json" jq -r '.error // "Dependency change could not be verified"') || error='Dependency change could not be verified'
+        elif [[ "$tests_exit" -ne 0 ]]; then
             status=failed; result_exit=1
             error=$(run_with_input "$tests_json" jq -r '.error // "Project test validation failed"') || error='Project test validation failed'
+            if [[ "$dependency_request" != null ]]; then
+                dependency_json=$(run_with_input "$dependency_json" jq -c --argjson tests "$tests_json" \
+                    '. + {status:"failed",error_code:"tests_failed",tests:$tests}') || return 2
+            fi
         else status=success; result_exit=0; fi
+        if [[ "$dependency_request" != null ]]; then
+            dependency_json=$(run_with_input "$dependency_json" jq -c --argjson tests "$tests_json" '. + {tests:$tests}') || return 2
+            printf '%s\n' "$dependency_json" > "$artifact_dir/dependency.json" || return 2
+        fi
         if [[ "$status" == success && "$no_push" == false ]]; then
             printf 'publication\n' > "$artifact_dir/phase"
             printf 'started\n' > "$artifact_dir/publication.started"
@@ -1972,8 +2480,8 @@ run_ai_session_workflow() {
     jq -cen --arg session "$session_name" --arg repo "$repo_path" --arg agent "$agent_type" --arg status "$status" --arg error "$error" \
         --arg transport "$transport" --arg evidence "$artifact_dir" --arg cleanup "$cleanup_status" --arg publication "$publication_status" \
         --argjson duration "$((SECONDS - ai_operation_entry))" --argjson exit_code "$result_exit" --argjson transport_exit "$transport_exit" \
-        --argjson work "$work_json" --argjson tests "$tests_json" --argjson no_push "$no_push" --argjson seconds "$timeout_seconds" --argjson cleanup_exit "$cleanup_exit" \
-        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:$exit_code,duration_seconds:$duration,transport:{status:$transport,exit_code:$transport_exit},work:$work,tests:$tests,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit},deadline:{seconds:$seconds,expired:false},evidence_dir:$evidence}'
+        --argjson work "$work_json" --argjson tests "$tests_json" --argjson dependency "$dependency_json" --argjson no_push "$no_push" --argjson seconds "$timeout_seconds" --argjson cleanup_exit "$cleanup_exit" \
+        '{schema_version:1,session:$session,repo:$repo,agent:$agent,status:$status,error:$error,exit_code:$exit_code,duration_seconds:$duration,transport:{status:$transport,exit_code:$transport_exit},work:$work,tests:$tests,dependency:$dependency,publication:{no_push:$no_push,status:$publication},cleanup:{status:$cleanup,exit_code:$cleanup_exit},deadline:{seconds:$seconds,expired:false},evidence_dir:$evidence}'
     return "$result_exit"
 }
 
@@ -2011,6 +2519,7 @@ spawn_ai_session() {
     local no_push=true
     local requested_content_policy=edit
     local session_test_command="" session_tests_requested=false
+    local session_dependency_request=null
     local repo_name="" repo_parent="" artifact_dir="" session_label="" session_name="" resolved_repo=""
 
     # Parse arguments
@@ -2043,6 +2552,10 @@ spawn_ai_session() {
             --test-command=*)
                 session_test_command="${1#*=}"
                 session_tests_requested=true
+                shift
+                ;;
+            --dependency-request=*)
+                session_dependency_request="${1#*=}"
                 shift
                 ;;
             -*)
@@ -2107,6 +2620,14 @@ spawn_ai_session() {
         log_error "spawn_ai_session: jq is required"
         ai_session_preflight_failure 3 'missing dependency: jq'
         return 3
+    fi
+    if [[ "$session_dependency_request" != null ]] &&
+       { [[ "$session_tests_requested" != true || "$no_push" != true ]] ||
+         ! run_with_input "$session_dependency_request" jq -es 'length == 1 and (.[0] | type == "object" and
+            (.name | type == "string" and length > 0) and (.manager | type == "string" and length > 0) and
+            (.latest | type == "string" and length > 0) and (.current | type == "string" and length > 0))' >/dev/null; }; then
+        ai_session_preflight_failure 4 'dependency sessions require one valid request, host tests and no direct publication'
+        return 4
     fi
     if ! command -v tmux >/dev/null; then
         log_error "spawn_ai_session: tmux is required"
@@ -2427,10 +2948,10 @@ Now implement the migration plan. For each dependency:
    - Edit the manifest file (package.json, Cargo.toml, etc.)
    - Run the package manager's install/update command
 
-2. **Make code changes** (if needed from your analysis)
-   - Update import statements
-   - Fix deprecated API usage
-   - Add any new required configuration
+2. **Keep the update within its verified scope**
+   - Change only the requested manifest requirement and lockfile resolution
+   - Preserve other direct dependencies, source files, test commands and configuration
+   - Leave migrations requiring source changes for manual review
 
 3. **Run tests**
    \`\`\`bash
@@ -2439,14 +2960,14 @@ Now implement the migration plan. For each dependency:
 
 4. **If tests fail** (max $max_attempts attempts per dependency):
    - Read the error messages carefully
-   - Fix the issues in the code
+   - Fix only issues within the requested dependency manifest/lockfile update
    - Re-run tests
    - If still failing after $max_attempts attempts, revert this dependency and note it as blocked
 
 5. **Commit the change**
-   - One commit per dependency (or logical group)
+   - One commit for the single requested dependency
    - Format: \"chore(deps): update <package> from <old> to <new>\"
-   - Include any code changes in the same commit
+   - ru independently validates, installs and tests the final tree before retaining it
 
 ### Important Guidelines
 
@@ -2769,6 +3290,309 @@ Exit Codes:
 # Update dependencies across repos using AI-powered analysis and testing
 #------------------------------------------------------------------------------
 
+# Git routing overrides can select another repository even with an explicit
+# -C path, or publish to a namespace that ordinary receiver refs never observe.
+# Refuse their presence instead of silently changing the caller's selection.
+dep_update_git_environment_safe() {
+    local variable
+    for variable in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+        GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE; do
+        [[ "${!variable+x}" != x ]] || return 1
+    done
+}
+
+# Check the original checkout too: a clone omits ignored or ancestor workspaces.
+dep_update_go_workspace_safe() {
+    local repo="$1" workspace
+    [[ ! -e "$repo/go.work" && ! -L "$repo/go.work" ]] || return 1
+    [[ -z "${GOWORK:-}" || "$GOWORK" == off ]] || return 1
+    command -v go >/dev/null 2>&1 || return 1
+    workspace=$(cd "$repo" && GOTOOLCHAIN=local go env GOWORK) || return 1
+    [[ -z "$workspace" || "$workspace" == off ]]
+}
+
+dep_update_repo_matches() {
+    local path="$1" head="$2" ref="$3" root untracked state state_path
+    dep_update_git_environment_safe || return 1
+    root=$(git -C "$path" rev-parse --show-toplevel) || return 1
+    root=$(cd "$root" && pwd -P) || return 1
+    [[ "$root" == "$path" ]] || return 1
+    [[ "$(git -C "$path" rev-parse --verify HEAD)" == "$head" ]] || return 1
+    [[ "$(git -C "$path" symbolic-ref --quiet HEAD)" == "$ref" ]] || return 1
+    git -C "$path" diff --quiet --exit-code -- >/dev/null || return 1
+    git -C "$path" diff --cached --quiet --exit-code HEAD -- >/dev/null || return 1
+    untracked=$(git -C "$path" ls-files --others --exclude-standard) || return 1
+    [[ -z "$untracked" ]] || return 1
+    for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+        state_path=$(git -C "$path" rev-parse --git-path "$state") || return 1
+        [[ "$state_path" == /* ]] || state_path="$path/$state_path"
+        [[ ! -e "$state_path" ]] || return 1
+    done
+}
+
+# Materialize every selected manager's lock before running the required suites.
+dep_update_install_command() {
+    local manager managers install_command="" command
+    managers=$(run_with_input "$1" jq -er '(.validation_managers // [.manager]) | unique | .[]') || return 1
+    while IFS= read -r manager; do
+        case "$manager" in
+            npm) command='npm ci --ignore-scripts --no-audit --no-fund --include=dev --include=optional --include=peer --global=false --workspaces=false' ;;
+            cargo) command='cargo fetch --locked' ;;
+            go) command='go mod download' ;;
+            composer) command='composer install --no-interaction --no-scripts --no-plugins --no-progress' ;;
+            *) return 1 ;;
+        esac
+        [[ -z "$install_command" ]] || install_command+=' && '
+        install_command+="$command"
+    done < <(printf '%s\n' "$managers")
+    [[ -n "$install_command" ]] || return 1
+    printf '%s\n' "$install_command"
+}
+
+dep_update_clone_attempt() {
+    local source="$1" head="$2" ref="$3" destination="$4" identity value
+    dep_update_git_environment_safe || return 1
+    # Independent objects, index, refs and configuration. Do not share a worktree.
+    git -c protocol.file.allow=always clone --quiet --no-hardlinks --no-local --single-branch \
+        --branch "${ref#refs/heads/}" -- "$source" "$destination" || return 1
+    git -C "$destination" remote set-url origin 'ru-publication-disabled://attempt' || return 1
+    git -C "$destination" remote set-url --push origin 'ru-publication-disabled://attempt' || return 1
+    for identity in user.name user.email; do
+        if value=$(git -C "$source" config --get "$identity"); then
+            git -C "$destination" config "$identity" "$value" || return 1
+        fi
+    done
+    dep_update_repo_matches "$destination" "$head" "$ref"
+}
+
+# Only the single host-created, tested candidate may advance the original branch.
+# Fast-forward merge preserves unrelated work; never reset or clean the source.
+dep_update_promote_candidate() {
+    local repo="$1" before="$2" ref="$3" candidate_repo="$4" candidate="$5"
+    dep_update_repo_matches "$repo" "$before" "$ref" || return 1
+    [[ "$(git -C "$candidate_repo" rev-parse "$candidate^@")" == "$before" ]] || return 1
+    git -c protocol.file.allow=always -C "$repo" fetch --quiet --no-tags --no-write-fetch-head \
+        "$candidate_repo" "$candidate" || return 1
+    dep_update_repo_matches "$repo" "$before" "$ref" || return 1
+    git -c merge.autoStash=false -C "$repo" merge --ff-only --no-edit "$candidate" || return 1
+    dep_update_repo_matches "$repo" "$candidate" "$ref"
+}
+
+# One isolated attempt and authoritative receipt per request. All expensive
+# operations consume the remaining original repository deadline. Failed attempts
+# remain available for inspection and cannot enter the original branch/history.
+run_dep_update_transactions() {
+    (
+    local repo="$1" plan="$2" test_command="$3" timeout_seconds="$4" agent="$5" no_push="$6" max_attempts="$7"
+    local started=$SECONDS deadline count requests evidence head ref initial_head common lock target=null
+    local status=success result_exit=0 publication=not_requested error="" error_code=repository_preflight_failed records='[]' updated_count=0
+    local request ordinal=0 attempt candidate_repo prompt single_plan session session_exit remaining candidate record dep_status operation_exit
+    if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ || ${#timeout_seconds} -gt 5 || "$timeout_seconds" -gt 86400 ||
+          ! "$max_attempts" =~ ^[1-9][0-9]*$ || ${#max_attempts} -gt 3 || "$max_attempts" -gt 100 ||
+          ! "$test_command" =~ [^[:space:]] || ( "$no_push" != true && "$no_push" != false ) ]]; then
+        jq -cn --arg repo "$repo" '{repo:$repo,status:"failed",exit_code:4,error:"Invalid dependency transaction options",deps_updated:0,dependencies:[]}'
+        return 4
+    fi
+    deadline=$((started + timeout_seconds))
+    if ! requests=$(run_with_input "$plan" jq -cse '
+        if length != 1 then error("Expected one plan") else .[0] end |
+        . as $plan | [.results[] | .manager as $manager | .outdated[] | . + {manager:$manager}] |
+        if length == $plan.total_outdated and length > 0 and all(.[];
+            (.manager | type == "string" and length > 0) and
+            (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+            (.latest | type == "string" and length > 0) and (.current | type == "string" and length > 0))
+        then . else error("Invalid dependency requests") end |
+        (map(.manager) | unique) as $managers | map(. + {requested_version:.latest,validation_managers:$managers})'); then
+        jq -cn --arg repo "$repo" '{repo:$repo,status:"failed",exit_code:4,error:"Invalid dependency transaction plan",deps_updated:0,dependencies:[]}'
+        return 4
+    fi
+    count=$(run_with_input "$requests" jq 'length') || return 2
+    repo=$(cd "$repo" && pwd -P) || return 2
+    evidence=$(mktemp -d "${TMPDIR:-/tmp}/ru-dep-update.XXXXXX") || return 2
+    printf '%s\n' "$requests" > "$evidence/requests.json" || return 2
+    head=""; ref=""
+    if ! dep_update_git_environment_safe; then
+        error='Inherited Git routing overrides prevent repository ownership verification'
+        error_code=unsafe_git_environment
+    else
+        head=$(git -C "$repo" rev-parse --verify HEAD) || head=""
+        ref=$(git -C "$repo" symbolic-ref --quiet HEAD) || ref=""
+    fi
+    initial_head="$head"
+    if [[ -n "$error" ]]; then
+        : # Never inspect or mutate Git through an inherited routing override.
+    elif [[ -z "$head" || -z "$ref" ]] || ! dep_update_repo_matches "$repo" "$head" "$ref"; then
+        error='Dependency updates require the clean root of a repository on a branch, with no Git operation in progress'
+    elif ! common=$(git -C "$repo" rev-parse --git-common-dir); then
+        error='Cannot inspect repository ownership'
+    else
+        [[ "$common" == /* ]] || common="$repo/$common"
+        lock="$common/ru-dep-update.lock"
+        if ! mkdir "$lock"; then
+            error='Another dependency update owns this repository, or its ownership lock needs inspection'
+        else
+            # Remove only the empty lock acquired by this process; never steal.
+            trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+        fi
+    fi
+    if [[ -z "$error" ]] && run_with_input "$requests" jq -e 'any(.[]; .manager == "go")' >/dev/null; then
+        operation_exit=0
+        run_inherited_ai_deadline "$deadline" "$evidence/go-workspace.stdout" "$evidence/go-workspace.stderr" \
+            dep_update_go_workspace_safe "$repo" || operation_exit=$?
+        if [[ "$operation_exit" -ne 0 ]]; then
+            error='Go validation requires an available manager and a single owned module without an active workspace'
+            error_code=unsupported_update
+            if [[ "$operation_exit" -eq 124 ]]; then status=timeout; error_code=deadline_expired; fi
+        fi
+    fi
+    if [[ -z "$error" && "$no_push" == false ]] && ! target=$(get_commit_publication_target "$repo"); then
+        error='Requested publication has no valid destination'
+    fi
+    [[ "$no_push" == true ]] || publication=blocked
+    if [[ -n "$error" ]]; then
+        [[ "$status" == timeout ]] || status=failed
+        result_exit=1
+        records=$(run_with_input "$requests" jq -c --arg error "$error" --arg code "$error_code" \
+            'map(. + {status:"unverified",error_code:$code,error:$error,actual_version:null})') || return 2
+    else
+        while IFS= read -r request; do
+            ordinal=$((ordinal + 1))
+            attempt="$evidence/$ordinal"
+            mkdir "$attempt" || return 2
+            candidate_repo="$attempt/repository"
+            remaining=$((deadline - SECONDS))
+            if [[ "$remaining" -le 0 || "$status" == timeout ]]; then
+                status=timeout; result_exit=1
+                record=$(run_with_input "$request" jq -c '. + {status:"unverified",error_code:"deadline_expired",error:"Repository deadline expired before this update",actual_version:null}') || return 2
+                records=$(run_with_input "$records" jq -c --argjson record "$record" '. + [$record]') || return 2
+                continue
+            fi
+            if ! dep_update_repo_matches "$repo" "$head" "$ref" ||
+               { [[ "$no_push" == false ]] && [[ "$(get_commit_publication_target "$repo")" != "$target" ]]; }; then
+                status=failed; result_exit=1; error='Original repository or publication destination changed during dependency updates'
+                record=$(run_with_input "$request" jq -c --arg error "$error" '. + {status:"unverified",error_code:"repository_changed",error:$error,actual_version:null}') || return 2
+                records=$(run_with_input "$records" jq -c --argjson record "$record" '. + [$record]') || return 2
+                continue
+            fi
+            operation_exit=0
+            run_inherited_ai_deadline "$deadline" "$attempt/clone.stdout" "$attempt/clone.stderr" \
+                dep_update_clone_attempt "$repo" "$head" "$ref" "$candidate_repo" || operation_exit=$?
+            if [[ "$operation_exit" -ne 0 ]]; then
+                status=failed; result_exit=1
+                [[ "$operation_exit" -ne 124 ]] || status=timeout
+                record=$(run_with_input "$request" jq -c --argjson exit "$operation_exit" \
+                    '. + {status:"unverified",error_code:"clone_failed",error:"Isolated dependency repository could not be prepared",actual_version:null,exit_code:$exit}') || return 2
+                records=$(run_with_input "$records" jq -c --argjson record "$record" '. + [$record]') || return 2
+                continue
+            fi
+            single_plan=$(jq -cn --argjson request "$request" \
+                '{status:"ok",failed_managers:0,total_outdated:1,results:[{manager:$request.manager,status:"ok",outdated:[$request]}]}') || return 2
+            prompt=$(generate_depupdate_prompt_combined "$candidate_repo" "$single_plan" "$test_command" "--max-attempts=$max_attempts") || return 2
+            printf '%s\n\n%s\n' "$prompt" \
+                'This session owns exactly the single dependency listed above. Change only its manifest/lockfile requirements and necessary transitive lock entries. Do not change test commands, source files, other direct dependencies, Git configuration, branches, or publish anything. ru installs the locked packages, independently tests the candidate and retains one verified commit. Leave unsupported migrations for manual review.' > "$attempt/prompt.txt" || return 2
+            remaining=$((deadline - SECONDS))
+            session_exit=0
+            if [[ "$remaining" -le 0 ]]; then
+                status=timeout; result_exit=1
+                record=$(run_with_input "$request" jq -c '. + {status:"unverified",error_code:"deadline_expired",error:"Repository deadline expired before agent startup",actual_version:null}') || return 2
+                records=$(run_with_input "$records" jq -c --argjson record "$record" '. + [$record]') || return 2
+                continue
+            fi
+            session=$(spawn_ai_session "$candidate_repo" "$attempt/prompt.txt" "--timeout=$remaining" "--agent=$agent" \
+                --prefix=dep-update --no-push "--test-command=$test_command" "--dependency-request=$request") || session_exit=$?
+            printf '%s\n' "$session" > "$attempt/session.stdout" || return 2
+            if ! validate_ai_session_result "$session" "$session_exit" "$candidate_repo" "$test_command" "$request"; then
+                session=$(jq -cn --arg repo "$candidate_repo" \
+                    '{repo:$repo,status:"failed",error:"Invalid or incomplete dependency session result",dependency:{status:"unverified",error_code:"invalid_session_result"}}') || return 2
+                session_exit=1
+            fi
+            candidate=$(run_with_input "$session" jq -r '.dependency.verified_head // empty') || return 2
+            if [[ "$session_exit" -eq 0 ]] && run_with_input "$session" jq -e '.status == "success"' >/dev/null; then
+                operation_exit=0
+                if [[ "$no_push" == false && "$(get_commit_publication_target "$repo")" != "$target" ]]; then
+                    operation_exit=1
+                elif ! dep_update_repo_matches "$candidate_repo" "$candidate" "$ref"; then
+                    operation_exit=1
+                else
+                    run_inherited_ai_deadline "$deadline" "$attempt/promotion.stdout" "$attempt/promotion.stderr" \
+                        dep_update_promote_candidate "$repo" "$head" "$ref" "$candidate_repo" "$candidate" || operation_exit=$?
+                fi
+                if [[ "$operation_exit" -eq 0 ]]; then
+                    head="$candidate"
+                    updated_count=$((updated_count + 1))
+                    record=$(jq -cn --argjson request "$request" --argjson session "$session" --arg evidence "$attempt" \
+                        '$request + $session.dependency + {status:"updated",tests:$session.tests,commit:$session.work.after_head,evidence_dir:$evidence,publication:"pending"}') || return 2
+                else
+                    status=failed; result_exit=1; error='Validated dependency could not be promoted without changing repository ownership'
+                    [[ "$operation_exit" -ne 124 ]] || status=timeout
+                    record=$(jq -cn --argjson request "$request" --argjson session "$session" --arg evidence "$attempt" --arg error "$error" \
+                        '$request + $session.dependency + {status:"unverified",tests:$session.tests,error_code:"promotion_failed",error:$error,evidence_dir:$evidence}') || return 2
+                fi
+            else
+                dep_status=$(run_with_input "$session" jq -r '.dependency.status // "failed"') || return 2
+                if [[ "$dep_status" != skipped ]]; then
+                    result_exit=1
+                    [[ "$status" == timeout ]] || status=failed
+                fi
+                if run_with_input "$session" jq -e '.status == "timeout"' >/dev/null; then status=timeout; fi
+                if [[ "$dep_status" != skipped && "$dep_status" != unverified ]] &&
+                   run_with_input "$session" jq -e '.work.before_head != null and .work.after_head != null and .work.before_head != .work.after_head' >/dev/null; then
+                    dep_status=reverted
+                fi
+                case "$dep_status" in skipped|unverified|reverted) ;; *) dep_status=failed ;; esac
+                record=$(jq -cn --argjson request "$request" --argjson session "$session" --arg dep_status "$dep_status" --arg evidence "$attempt" --arg retained "$head" \
+                    '$request + ($session.dependency // {}) + {status:$dep_status,tests:($session.tests // null),error:($session.error // "Dependency update not completed"),error_code:($session.dependency.error_code // "update_failed"),actual_version:($session.dependency.actual_version // null),evidence_dir:$evidence,rollback:{status:"isolated",preserved_head:$retained}}') || return 2
+            fi
+            records=$(run_with_input "$records" jq -c --argjson record "$record" '. + [$record]') || return 2
+            printf '%s\n' "$records" > "$evidence/dependencies.json" || return 2
+        done < <(run_with_input "$requests" jq -c '.[]')
+    fi
+    if [[ "$updated_count" -gt 0 && "$no_push" == false && "$status" != timeout ]]; then
+        operation_exit=0
+        if ! dep_update_repo_matches "$repo" "$head" "$ref"; then
+            operation_exit=1
+        else
+            run_inherited_ai_deadline "$deadline" "$evidence/publication.stdout" "$evidence/publication.stderr" \
+                publish_ai_session_work "$repo" "$head" "$target" || operation_exit=$?
+        fi
+        if [[ "$operation_exit" -eq 0 ]]; then publication=success;
+        else
+            publication=failed; result_exit=1; error='Requested publication failed or is uncertain; verified local updates are retained'
+            [[ "$operation_exit" -ne 124 ]] || status=timeout
+        fi
+    fi
+    if [[ "$result_exit" -ne 0 && "$status" != timeout ]]; then
+        if [[ "$updated_count" -gt 0 ]]; then status=partial; else status=failed; fi
+    fi
+    [[ "$updated_count" -gt 0 ]] || publication=not_requested
+    if [[ "$result_exit" -ne 0 && -z "$error" ]]; then
+        error='One or more requested dependencies could not be updated and verified; inspect individual receipts'
+    fi
+    local observed_head="" observed_ref="" final_state_verified=false
+    if dep_update_git_environment_safe; then
+        observed_head=$(git -C "$repo" rev-parse --verify HEAD) || observed_head=""
+        observed_ref=$(git -C "$repo" symbolic-ref --quiet HEAD) || observed_ref=""
+    fi
+    if dep_update_repo_matches "$repo" "$head" "$ref"; then final_state_verified=true;
+    elif [[ "$result_exit" -eq 0 ]]; then
+        status=failed; result_exit=1; error='Original repository changed after its last verified update'
+    fi
+    records=$(run_with_input "$records" jq -c --arg publication "$publication" \
+        'map(. + {before_version:(.before_version // null),actual_version:(.actual_version // null)} |
+            if .status == "updated" then .publication=$publication else . end)') || return 2
+    jq -cn --arg repo "$repo" --arg status "$status" --arg error "$error" --arg evidence "$evidence" \
+        --arg before "$initial_head" --arg after "$observed_head" --arg ref "$observed_ref" --arg retained "$head" --arg publication "$publication" \
+        --argjson final_state_verified "$final_state_verified" \
+        --argjson exit_code "$result_exit" --argjson count "$count" --argjson updated "$updated_count" --argjson records "$records" \
+        --argjson no_push "$no_push" --argjson duration "$((SECONDS - started))" \
+        '{repo:$repo,status:$status,error:$error,exit_code:$exit_code,deps_outdated_before:$count,deps_updated:$updated,dependencies:$records,
+          before_head:$before,after_head:$after,ref:$ref,last_verified_head:$retained,final_state_verified:$final_state_verified,
+          publication:{no_push:$no_push,status:$publication},duration_seconds:$duration,evidence_dir:$evidence}' > "$evidence/result.json" || return 2
+    cat "$evidence/result.json"
+    return "$result_exit"
+    )
+}
+
 # cmd_dep_update - Main entry point for dep-update subcommand
 # Usage: ru dep-update [OPTIONS]
 #   --dry-run           Show what would be updated (no changes)
@@ -3072,50 +3896,33 @@ cmd_dep_update() {
             continue
         fi
 
-        # Avoid changelog requests or session setup when tests are unavailable.
-        log_info "Fetching changelogs for $repo_name..."
-        local changelog_text=""
-        changelog_text=$(_fetch_changelogs_for_outdated "$outdated_json")
-
-        # Generate the combined prompt
-        local prompt
-        prompt=$(generate_depupdate_prompt_combined \
-            "$repo_path" \
-            "$outdated_json" \
-            "$test_cmd" \
-            "--changelog=$changelog_text" \
-            "--max-attempts=$max_fix_attempts")
-
-        # Write prompt to temp file
-        local prompt_file
-        prompt_file=$(write_prompt_to_file "$prompt")
-        if [[ -z "$prompt_file" || ! -f "$prompt_file" ]]; then
-            log_error "Failed to create prompt file for $repo_name"
-            ((failed++))
-            continue
-        fi
-
-        # Spawn AI session
-        log_info "Spawning AI session for $repo_name..."
+        # Verify each dependency and its intermediate tests before promotion.
+        log_info "Updating dependencies individually in $repo_name..."
         local session_result session_exit=0 status=failed
-        local -a session_args=("--timeout=$timeout_seconds" "--agent=$agent_type" --prefix=dep-update "--test-command=$test_cmd")
-        if [[ "$no_push" == true ]]; then session_args+=(--no-push); else session_args+=(--push); fi
-        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" "${session_args[@]}") || session_exit=$?
-        if validate_ai_session_result "$session_result" "$session_exit" "$repo_path" "$test_cmd"; then
+        session_result=$(run_dep_update_transactions "$repo_path" "$outdated_json" "$test_cmd" \
+            "$timeout_seconds" "$agent_type" "$no_push" "$max_fix_attempts") || session_exit=$?
+        if run_with_input "$session_result" jq -es --argjson exit_code "$session_exit" \
+            'length == 1 and (.[0] | .exit_code == $exit_code and
+                (.dependencies | type == "array") and (.deps_updated | type == "number" and . >= 0) and
+                .deps_updated == ([.dependencies[] | select(.status == "updated")] | length) and
+                (if .status == "success" then $exit_code == 0 else $exit_code != 0 end))' >/dev/null; then
             status=$(printf '%s\n' "$session_result" | jq -r '.status') || status=failed
         else
             [[ "$session_exit" -ne 0 ]] || session_exit=2
-            session_result=$(jq -cen --arg repo "$repo_path" --argjson exit_code "$session_exit" '{repo:$repo,status:"failed",exit_code:$exit_code,error:"Invalid or incomplete AI session result"}') || return 3
+            session_result=$(jq -cen --arg repo "$repo_path" --argjson exit_code "$session_exit" \
+                '{repo:$repo,status:"failed",exit_code:$exit_code,error:"Invalid or incomplete dependency transaction result",deps_updated:0,dependencies:[]}') || return 3
         fi
 
         case "$status" in
             success)
-                log_success "Successfully updated dependencies in $repo_name"
-                ((updated++))
-                # Discovery counts do not establish which dependencies changed.
-                # Do not forward an unverified count supplied by the session.
-                results+=("$(jq -cen --argjson session "$session_result" --argjson deps "$total_outdated" \
-                    '$session | del(.deps_updated) | . + {deps_outdated_before:$deps}')")
+                if run_with_input "$session_result" jq -e '.deps_updated > 0' >/dev/null; then
+                    log_success "Successfully updated dependencies in $repo_name"
+                    ((updated++))
+                else
+                    log_info "No dependency version changes were needed in $repo_name"
+                    ((skipped++))
+                fi
+                results+=("$session_result")
                 ;;
             timeout)
                 log_warn "Timeout while updating $repo_name"
@@ -26336,7 +27143,7 @@ _robot_docs_schemas() {
       "description":"Actual update outcomes, pending dependency previews, and skipped counts",
       "data_schema":{
         "type":"object","required":["processed","updated","failed","skipped","results"],
-        "properties":{"processed":{"type":"integer","minimum":0},"updated":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"results":{"type":"array","items":{"type":"object","required":["repo","status"],"properties":{"repo":{"type":"string"},"status":{"type":"string"},"outdated":{"type":"object","required":["total_outdated","results"]},"deps_outdated_before":{"type":"integer","minimum":0,"description":"Dependencies discovered before the session; not a verified completed-update count"},"error":{"type":"string"}}}}}
+        "properties":{"processed":{"type":"integer","minimum":0},"updated":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},"results":{"type":"array","items":{"type":"object","required":["repo","status"],"properties":{"repo":{"type":"string"},"status":{"type":"string"},"outdated":{"type":"object","required":["total_outdated","results"]},"deps_outdated_before":{"type":"integer","minimum":0,"description":"Requested dependency records after discovery and filtering"},"deps_updated":{"type":"integer","minimum":0,"description":"Updates independently verified, tested and promoted into the original repository"},"dependencies":{"type":"array","items":{"type":"object","required":["manager","name","status"],"properties":{"manager":{"type":"string"},"name":{"type":"string"},"status":{"enum":["updated","skipped","failed","reverted","unverified"]},"before_version":{"type":["string","null"]},"actual_version":{"type":["string","null"]},"requested_version":{"type":"string"},"verified_head":{"type":"string"},"tests":{"type":["object","null"]},"evidence_dir":{"type":"string"}}}},"publication":{"type":"object"},"error":{"type":"string"}}}}}
       }
     },
     "robot-docs": {
