@@ -15,6 +15,8 @@
 #
 # shellcheck disable=SC2034  # Variables used by sourced functions
 set -uo pipefail
+# ru sets this too; functions extracted from ru run under these options.
+shopt -s globasciiranges
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"

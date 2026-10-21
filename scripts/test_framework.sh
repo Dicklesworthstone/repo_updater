@@ -22,6 +22,8 @@
 # shellcheck disable=SC2034  # Variables are used by sourcing scripts
 
 set -uo pipefail
+# ru sets this too; functions extracted from ru run under these options.
+shopt -s globasciiranges
 
 # Work in the physical temporary directory. On macOS $TMPDIR (/var/folders)
 # and /tmp are symlinks, while ru records the physical paths it resolves with

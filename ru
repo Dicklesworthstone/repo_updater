@@ -119,6 +119,11 @@ if [[ -z "${BASH_VERSINFO[*]:-}" ]] ||
     exit 3
 fi
 
+# Ranges such as [a-zA-Z0-9] in patterns mean ASCII, as in Bash 5 by default.
+# Bash 4.4 otherwise matches them by locale collation, so in a UTF-8 locale
+# sanitize_session_name kept "é" instead of replacing it.
+shopt -s globasciiranges
+
 #==============================================================================
 # SECTION 1: VERSION AND CONSTANTS
 #==============================================================================
