@@ -282,6 +282,26 @@ test_json_output() {
     assert_contains "$output" '"command": "fork-status"' "JSON has correct command field"
     assert_contains "$output" '"repo":"test_owner/jsonrepo"' "JSON has repo field"
     assert_contains "$output" '"behind"' "JSON has behind field"
+    assert_equals "0" "$(printf '%s\n' "$output" | jq -r '._meta.exit_code' 2>/dev/null)" "JSON reports the exit code"
+
+    e2e_cleanup
+}
+
+test_json_without_config_or_repos() {
+    e2e_setup
+
+    local output exit_code=0
+    output=$("$E2E_RU_SCRIPT" fork-status --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "fork-status --json without config exits 0"
+    assert_equals "1 0 0" "$(printf '%s\n' "$output" | jq -s -r '"\(length) \(.[0].data.total) \(.[0]._meta.exit_code)"' 2>/dev/null)" \
+        "without config it prints one empty JSON result"
+
+    init_fork_config ""
+    exit_code=0
+    output=$("$E2E_RU_SCRIPT" fork-status --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "fork-status --json with no repos exits 0"
+    assert_equals "1 0 0" "$(printf '%s\n' "$output" | jq -s -r '"\(length) \(.[0].data.total) \(.[0]._meta.exit_code)"' 2>/dev/null)" \
+        "with no repos it prints one empty JSON result"
 
     e2e_cleanup
 }
@@ -326,6 +346,7 @@ run_test test_pollution_detection
 run_test test_dry_run
 run_test test_repos_filter
 run_test test_json_output
+run_test test_json_without_config_or_repos
 run_test test_verbose_no_upstream
 
 print_results

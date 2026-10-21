@@ -24100,9 +24100,11 @@ _fork_matches_pattern() {
 # cmd_fork_status: Show fork sync status relative to upstream
 #------------------------------------------------------------------------------
 cmd_fork_status() {
+    local empty_json='{"total":0,"checked":0,"skipped":0,"synced":0,"behind":0,"diverged":0,"polluted":0,"repos":[]}'
     # Ensure config exists
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_info "No configuration found. Run: ru init"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-status "$empty_json" '{"exit_code":0}')"
         exit 0
     fi
 
@@ -24125,6 +24127,7 @@ cmd_fork_status() {
     local total=${#repos[@]}
     if [[ "$total" -eq 0 ]]; then
         log_info "No repositories configured."
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-status "$empty_json" '{"exit_code":0}')"
         exit 0
     fi
 
@@ -24203,7 +24206,7 @@ cmd_fork_status() {
         local data_json
         data_json="$(printf '{"total":%d,"checked":%d,"skipped":%d,"synced":%d,"behind":%d,"diverged":%d,"polluted":%d,"repos":%s}' \
             "$total" "$checked" "$skipped" "$synced" "$behind_count" "$diverged_count" "$polluted_count" "$repos_json")"
-        emit_structured "$(build_json_envelope "fork-status" "$data_json")"
+        emit_structured "$(build_json_envelope "fork-status" "$data_json" '{"exit_code":0}')"
     else
         # Human-readable output
         log_info "Fork Status ($total repos, upstream remote: $upstream_remote)"
@@ -24294,9 +24297,31 @@ cmd_fork_status() {
 #------------------------------------------------------------------------------
 # cmd_fork_sync: Sync fork default branch with upstream
 #------------------------------------------------------------------------------
+# Print fork-sync's JSON result: its counts and every repository it recorded.
+# Args: exit_code total checked synced skipped failed [strategy] [upstream_remote]
+emit_fork_sync_json() {
+    [[ "$JSON_OUTPUT" == true ]] || return 0
+    local exit_code="$1" total="$2" checked="$3" synced="$4" skipped="$5" failed="$6"
+    local strategy="${7:-}" upstream="${8:-}" repos_json="[" line first=true dry_run=false
+    [[ "$DRY_RUN" == true ]] && dry_run=true
+    if [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == *'"action":"fork-sync"'* ]] || continue
+            [[ "$first" == true ]] || repos_json+=","
+            repos_json+="$line"
+            first=false
+        done < "$RESULTS_FILE"
+    fi
+    repos_json+="]"
+    emit_structured "$(build_json_envelope fork-sync "$(printf '{"total":%d,"checked":%d,"synced":%d,"skipped":%d,"failed":%d,"dry_run":%s,"strategy":"%s","upstream_remote":"%s","repos":%s}' \
+        "$total" "$checked" "$synced" "$skipped" "$failed" "$dry_run" "$(json_escape "$strategy")" "$(json_escape "$upstream")" "$repos_json")" \
+        "$(printf '{"exit_code":%d}' "$exit_code")")"
+}
+
 cmd_fork_sync() {
     if [[ ! -d "$RU_CONFIG_DIR" ]]; then
         log_info "No configuration found. Run: ru init"
+        emit_fork_sync_json 0 0 0 0 0 0
         exit 0
     fi
 
@@ -24317,6 +24342,7 @@ cmd_fork_sync() {
     local total=${#repos[@]}
     if [[ "$total" -eq 0 ]]; then
         log_info "No repositories configured."
+        emit_fork_sync_json 0 0 0 0 0 0 "$strategy" "$upstream_remote"
         exit 0
     fi
 
@@ -24439,18 +24465,19 @@ cmd_fork_sync() {
         fi
 
         if [[ "$sync_ok" == "true" ]]; then
+            # A requested push that fails leaves the fork unsynced on origin.
+            if [[ "$do_push" == "true" ]]; then
+                if ! git -C "$local_path" push origin "$up_branch" --quiet 2>/dev/null; then
+                    log_error "$repo_id synced via $strategy locally, but the push to origin failed"
+                    failed=$((failed + 1))
+                    write_result "$repo_id" "fork-sync" "failed" "0" "synced via $strategy; push to origin failed" "$local_path"
+                    continue
+                fi
+                log_verbose "Pushed $repo_id to origin/$up_branch"
+            fi
             log_success "$repo_id synced via $strategy"
             synced=$((synced + 1))
             write_result "$repo_id" "fork-sync" "synced" "0" "synced via $strategy" "$local_path"
-
-            # Push to origin if requested
-            if [[ "$do_push" == "true" ]]; then
-                if git -C "$local_path" push origin "$up_branch" --quiet 2>/dev/null; then
-                    log_verbose "Pushed $repo_id to origin/$up_branch"
-                else
-                    log_warn "Failed to push $repo_id to origin"
-                fi
-            fi
         else
             log_error "Failed to sync $repo_id via $strategy"
             failed=$((failed + 1))
@@ -24461,8 +24488,10 @@ cmd_fork_sync() {
     echo "" >&2
     log_info "Summary: $synced synced, $failed failed, $skipped skipped"
 
-    [[ "$failed" -gt 0 ]] && return 1
-    return 0
+    local exit_code=0
+    [[ "$failed" -gt 0 ]] && exit_code=1
+    emit_fork_sync_json "$exit_code" "$total" "$checked" "$synced" "$skipped" "$failed" "$strategy" "$upstream_remote"
+    return "$exit_code"
 }
 
 #------------------------------------------------------------------------------

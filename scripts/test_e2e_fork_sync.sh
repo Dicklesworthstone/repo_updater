@@ -272,6 +272,65 @@ test_merge_sync() {
     e2e_cleanup
 }
 
+test_json_reports_each_repo() {
+    e2e_setup
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+
+    local UPSTREAM_DIR ORIGIN_DIR LOCAL_DIR
+    setup_fork_env "jsonrepo"
+    add_upstream_commit "$UPSTREAM_DIR" "upstream for json"
+    init_fork_config "test_owner/jsonrepo"
+
+    local out exit_code=0
+    out=$("$E2E_RU_SCRIPT" fork-sync --dry-run --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "fork-sync --dry-run --json exits 0"
+    assert_equals "1" "$(printf '%s\n' "$out" | jq -s 'length' 2>/dev/null)" "dry run prints exactly one JSON document"
+    assert_equals "dry-run true 0" "$(printf '%s\n' "$out" | jq -r '"\(.data.repos[0].status) \(.data.dry_run) \(._meta.exit_code)"' 2>/dev/null)" "dry run reports the repo it would sync"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" fork-sync --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "fork-sync --json exits 0"
+    assert_equals "fork-sync 1 0 synced 0" \
+        "$(printf '%s\n' "$out" | jq -r '"\(.command) \(.data.synced) \(.data.failed) \(.data.repos[0].status) \(._meta.exit_code)"' 2>/dev/null)" \
+        "the sync result names the synced repo and the exit code"
+
+    e2e_cleanup
+}
+
+test_json_without_repos() {
+    e2e_setup
+    init_fork_config ""
+
+    local out exit_code=0
+    out=$("$E2E_RU_SCRIPT" fork-sync --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "fork-sync --json with no repos exits 0"
+    assert_equals "0 0" "$(printf '%s\n' "$out" | jq -r '"\(.data.total) \(._meta.exit_code)"' 2>/dev/null)" "an empty run is still one JSON result"
+
+    e2e_cleanup
+}
+
+test_push_failure_is_a_failure() {
+    e2e_setup
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+
+    local UPSTREAM_DIR ORIGIN_DIR LOCAL_DIR
+    setup_fork_env "pushrepo"
+    add_upstream_commit "$UPSTREAM_DIR" "upstream to publish"
+    init_fork_config "test_owner/pushrepo"
+    # The fork's origin cannot accept the push.
+    git -C "$LOCAL_DIR" remote set-url --push origin "$E2E_TEMP_DIR/remotes/missing_origin.git"
+
+    local out exit_code=0 origin_before
+    origin_before=$(git -C "$ORIGIN_DIR" rev-parse main)
+    out=$("$E2E_RU_SCRIPT" fork-sync --push --json 2>/dev/null) || exit_code=$?
+    assert_equals "1" "$exit_code" "a failed push fails fork-sync"
+    assert_equals "0 1 failed" "$(printf '%s\n' "$out" | jq -r '"\(.data.synced) \(.data.failed) \(.data.repos[0].status)"' 2>/dev/null)" \
+        "the repo is reported failed, not synced"
+    assert_equals "$origin_before" "$(git -C "$ORIGIN_DIR" rev-parse main)" "origin did not move"
+
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -286,6 +345,9 @@ run_test test_repos_filter
 run_test test_already_synced_skipped
 run_test test_dirty_working_tree_skipped
 run_test test_merge_sync
+run_test test_json_reports_each_repo
+run_test test_json_without_repos
+run_test test_push_failure_is_a_failure
 
 print_results
 exit "$(get_exit_code)"
