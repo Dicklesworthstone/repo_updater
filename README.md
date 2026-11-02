@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.0-blue?style=for-the-badge" alt="Version" />
+  <img src="https://img.shields.io/badge/version-1.7.0-blue?style=for-the-badge" alt="Version" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blueviolet?style=for-the-badge" alt="Platform" />
   <img src="https://img.shields.io/badge/shell-Bash%204.4+-purple?style=for-the-badge" alt="Shell" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License" />

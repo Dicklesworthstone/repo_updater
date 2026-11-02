@@ -129,7 +129,7 @@ shopt -s globasciiranges
 #==============================================================================
 
 # Version: read from VERSION file, fallback to embedded
-VERSION="1.6.0"
+VERSION="1.7.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
     VERSION="$(cat "$SCRIPT_DIR/VERSION")"
