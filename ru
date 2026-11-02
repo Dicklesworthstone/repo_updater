@@ -8755,12 +8755,17 @@ set_config_value() {
         escaped_value="${escaped_value//&/\\&}"    # Escape ampersands
         escaped_value="${escaped_value//|/\\|}"    # Escape our delimiter
 
-        # Update existing key (use sed with different delimiter for paths with /)
-        # macOS sed requires -i '' while GNU sed uses -i
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            sed -i '' "s|^${key}=.*|${key}=${escaped_value}|" "$config_file"
-        else
-            sed -i "s|^${key}=.*|${key}=${escaped_value}|" "$config_file"
+        # Update existing key (use sed with different delimiter for paths with /).
+        # No `sed -i`: BSD and GNU sed take its argument differently, and the
+        # sed first on PATH need not match the OS (GNU sed from Homebrew on
+        # macOS). Write the edited copy beside the file, then rename it over
+        # the file; cp -p first so the copy keeps the file's mode.
+        local tmp_file="${config_file}.tmp.$$"
+        if ! cp -p "$config_file" "$tmp_file" 2>/dev/null ||
+           ! sed "s|^${key}=.*|${key}=${escaped_value}|" "$config_file" > "$tmp_file" ||
+           ! mv "$tmp_file" "$config_file"; then
+            rm -f "$tmp_file" 2>/dev/null || true
+            return 1
         fi
     else
         # Append new key
