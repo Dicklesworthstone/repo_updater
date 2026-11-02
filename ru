@@ -5109,24 +5109,54 @@ run_commit_publication_transport() {
     local repo_path="$1" remote="$2" destination="$3" operation="$4"
     shift 4
     local transport_alias="ru-publication-${BASHPID:-$$}-${RANDOM}-${RANDOM}://" resolved
-    [[ "$remote" != . ]] || remote="ru-publication-local-${BASHPID:-$$}"
-    local -a transport_config=(
-        -c "url.$destination.insteadOf=$transport_alias"
-        -c "remote.$remote.url=" -c "remote.$remote.url=$transport_alias"
-        -c "remote.$remote.pushurl=" -c "remote.$remote.pushurl=$transport_alias"
-        -c "remote.$remote.mirror=false"
+    # Bind a fresh remote name that no config file holds, so its only URL is
+    # the alias. Replacing the named remote's own URLs would need an empty
+    # `-c remote.X.url=` to clear its list first, and Git 2.34 and 2.43 (the
+    # stock git on Ubuntu 22.04 and 24.04) take that as one more URL, so
+    # every publication there failed the bind check. The
+    # named remote's other settings (fetch refspecs, so its tracking refs
+    # update as before; proxy, push options, receive/upload-pack) are copied
+    # onto the fresh name, and hooks still see the named remote.
+    local transport_remote="ru-publication-${BASHPID:-$$}-${RANDOM}-${RANDOM}" hook_remote="$remote"
+    local -a transport_config=(-c "url.$destination.insteadOf=$transport_alias")
+    if [[ "$remote" == . ]]; then
+        hook_remote="ru-publication-local-${BASHPID:-$$}"
+    else
+        local entry key prefix="remote.$remote."
+        while IFS= read -r -d '' entry; do
+            key="${entry%%$'\n'*}"
+            [[ "$key" == "$prefix"* ]] || continue
+            key="${key#"$prefix"}"
+            [[ "$key" != *.* ]] || continue
+            case "$key" in url|pushurl|mirror) continue ;; esac
+            if [[ "$entry" == *$'\n'* ]]; then
+                transport_config+=(-c "remote.$transport_remote.$key=${entry#*$'\n'}")
+            else
+                transport_config+=(-c "remote.$transport_remote.$key")
+            fi
+        done < <(git -C "$repo_path" config --null --list)
+    fi
+    transport_config+=(
+        -c "remote.$transport_remote.url=$transport_alias"
+        -c "remote.$transport_remote.pushurl=$transport_alias"
+        -c "remote.$transport_remote.mirror=false"
         # Push only the one ref requested; followTags would add local tags.
         -c "push.followTags=false"
     )
-    resolved=$(git -C "$repo_path" "${transport_config[@]}" remote get-url --push --all "$remote") || return 1
-    if [[ "$resolved" != "$destination" ]]; then
+    # `git remote get-url` does not see a remote defined only by -c, so check
+    # that the fresh remote's push URLs are exactly the alias and that the
+    # alias expands (insteadOf applied) to exactly the scanned destination.
+    local push_urls
+    push_urls=$(git -C "$repo_path" "${transport_config[@]}" config --get-all "remote.$transport_remote.pushurl") || return 1
+    resolved=$(git -C "$repo_path" "${transport_config[@]}" ls-remote --get-url "$transport_remote") || return 1
+    if [[ "$push_urls" != "$transport_alias" || "$resolved" != "$destination" ]]; then
         log_error "Cannot bind transport to the scanned publication destination"
         return 1
     fi
     case "$operation" in
-        inspect) run_network_command git -C "$repo_path" "${transport_config[@]}" ls-remote --heads "$remote" "$@" ;;
-        inspect-tag) run_network_command git -C "$repo_path" "${transport_config[@]}" ls-remote --tags --refs "$remote" "$@" ;;
-        fetch) run_network_command git -C "$repo_path" "${transport_config[@]}" fetch --no-tags "$remote" "$@" ;;
+        inspect) run_network_command git -C "$repo_path" "${transport_config[@]}" ls-remote --heads "$transport_remote" "$@" ;;
+        inspect-tag) run_network_command git -C "$repo_path" "${transport_config[@]}" ls-remote --tags --refs "$transport_remote" "$@" ;;
+        fetch) run_network_command git -C "$repo_path" "${transport_config[@]}" fetch --no-tags "$transport_remote" "$@" ;;
         push)
             # A release pushes its annotated tag object (source) while HEAD
             # stays the tagged commit (candidate); a commit push uses neither.
@@ -5150,7 +5180,7 @@ if [[ "${2:-}" != "$RU_PUBLICATION_EXPECTED_DESTINATION" ]]; then
 fi
 cat > "$RU_PUBLICATION_INPUT" || exit 1
 if [[ -x "$RU_PUBLICATION_ORIGINAL_HOOK" ]]; then
-    "$RU_PUBLICATION_ORIGINAL_HOOK" "$@" < "$RU_PUBLICATION_INPUT" || exit $?
+    "$RU_PUBLICATION_ORIGINAL_HOOK" "$RU_PUBLICATION_HOOK_REMOTE" "${@:2}" < "$RU_PUBLICATION_INPUT" || exit $?
 fi
 update_count=0
 while IFS='\'' '\'' read -r local_ref local_oid remote_ref remote_oid extra; do
@@ -5172,9 +5202,9 @@ fi' > "$guard_dir/hooks/pre-push"
             RU_PUBLICATION_ORIGINAL_HOOK="$original_hooks/pre-push" \
             RU_PUBLICATION_EXPECTED_HEAD="$expected_head" RU_PUBLICATION_EXPECTED_REF="$target_ref" \
             RU_PUBLICATION_EXPECTED_OLD="$expected_old" RU_PUBLICATION_EXPECTED_DESTINATION="$destination" \
-            RU_PUBLICATION_EXPECTED_CANDIDATE="$candidate" \
+            RU_PUBLICATION_EXPECTED_CANDIDATE="$candidate" RU_PUBLICATION_HOOK_REMOTE="$hook_remote" \
                 run_network_command git -C "$repo_path" "${transport_config[@]}" \
-                -c core.hooksPath="$guard_dir/hooks" push "$remote" "$source:$target_ref"
+                -c core.hooksPath="$guard_dir/hooks" push "$transport_remote" "$source:$target_ref"
             ;;
         *) return 1 ;;
     esac
