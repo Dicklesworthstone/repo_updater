@@ -318,10 +318,25 @@ maybe_self_refresh_installer() {
     fi
 
     local src="${BASH_SOURCE[0]-}"
+    local is_stdin=0
     if [[ -z "$src" ]]; then
-        # When bash executes a script from stdin (e.g. `curl ... | bash`), BASH_SOURCE[0]
-        # can be empty. In that case, only attempt self-refresh when stdin isn't a TTY
-        # (i.e. this looks piped/redirected).
+        # Bash 3.2/4.x leaves BASH_SOURCE[0] empty when reading from stdin.
+        is_stdin=1
+    elif [[ "$src" == "main" && "$0" != "main" ]]; then
+        # Bash 5.0-5.2 sets BASH_SOURCE[0] to "main" when reading from stdin,
+        # while $0 remains the shell name (e.g. "bash" or "/bin/bash").
+        is_stdin=1
+    elif [[ "$src" == "$0" ]] && {
+        [[ "$src" == "${BASH:-}" ]] ||
+        [[ "$src" == "$(basename -- "${BASH:-bash}")" ]] ||
+        [[ ! -r "$src" ]]
+    }; then
+        # Bash 5.3+ sets BASH_SOURCE[0] to $0 (e.g. "bash" or "/opt/homebrew/bin/bash")
+        # inside a function when executed via `curl ... | bash`.
+        is_stdin=1
+    fi
+    if [[ "$is_stdin" -eq 1 ]]; then
+        # Only attempt self-refresh when stdin isn't a TTY (i.e. piped/redirected).
         if [[ -t 0 ]]; then
             return 0
         fi
@@ -668,16 +683,27 @@ install_from_main() {
     install_script "$temp_dir/$SCRIPT_NAME" "$install_dir"
 }
 
+# Return 0 if installing into install_dir requires sudo for the given uid
+installer_needs_sudo() {
+    local install_dir="$1"
+    local uid="${2:-${EUID:-$(id -u)}}"
+    [[ "$install_dir" == "/usr/local/bin" && "$uid" -ne 0 ]]
+}
+
 # Install the script to destination
 install_script() {
     local source="$1"
     local install_dir="$2"
     local dest="$install_dir/$SCRIPT_NAME"
+    local use_sudo=0
+    if installer_needs_sudo "$install_dir"; then
+        use_sudo=1
+    fi
 
     # Create directory if needed
     if [[ ! -d "$install_dir" ]]; then
         log_step "Creating directory: $install_dir"
-        if [[ "$install_dir" == "/usr/local/bin" ]]; then
+        if [[ "$use_sudo" -eq 1 ]]; then
             if ! command_exists sudo; then
                 log_error "sudo is required to create $install_dir"
                 return 1
@@ -696,7 +722,7 @@ install_script() {
 
     # Install with proper permissions
     log_step "Installing to $dest"
-    if [[ "$install_dir" == "/usr/local/bin" ]]; then
+    if [[ "$use_sudo" -eq 1 ]]; then
         if ! command_exists sudo; then
             log_error "sudo is required to install to $install_dir"
             return 1

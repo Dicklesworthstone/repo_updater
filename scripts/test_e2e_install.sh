@@ -156,6 +156,7 @@ test_installer_requires_explicit_main_when_no_releases() {
 
 create_mock_curl_installer_release() {
     export INSTALL_TEST_RU="$E2E_PROJECT_DIR/ru"
+    export INSTALL_TEST_INSTALL_SCRIPT="$INSTALL_SCRIPT"
     export INSTALL_TEST_SHA
     INSTALL_TEST_SHA=$(sha256sum "$INSTALL_TEST_RU" | cut -d' ' -f1)
     cat > "$E2E_MOCK_BIN/curl" <<'EOF'
@@ -171,6 +172,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "$url" in
+    */main/install.sh)
+        if [[ -n "${INSTALL_TEST_REFRESH_LOG:-}" ]]; then
+            printf 'refresh\n' >> "$INSTALL_TEST_REFRESH_LOG"
+        fi
+        cp "$INSTALL_TEST_INSTALL_SCRIPT" "$dest"
+        ;;
     */releases/latest)
         printf 'https://github.com/Dicklesworthstone/repo_updater/releases/tag/v1.5.0'
         ;;
@@ -246,8 +253,95 @@ test_pipeline_env_reaches_installer() {
     output=$(cat "$INSTALL_SCRIPT" | DEST="$destination" RU_VERSION=1.5.0 RU_UNSAFE_MAIN=0 RU_INSTALLER_NO_SELF_REFRESH=1 INSTALL_TEST_MODE=valid bash 2>&1) || rc=$?
     assert_equals 0 "$rc" "Documented environment placement works through a pipe"
     assert_contains "$output" 'Installing version: 1.5.0' "Requested version reaches bash"
+    assert_not_contains "$output" 'Refreshing installer (cache-bust)' "Opt-out suppresses piped self-refresh"
     assert_file_exists "$destination/ru" "Requested destination reaches bash"
-    unset INSTALL_TEST_RU INSTALL_TEST_SHA
+    unset INSTALL_TEST_RU INSTALL_TEST_INSTALL_SCRIPT INSTALL_TEST_SHA
+    e2e_cleanup
+}
+
+test_piped_installer_self_refresh() {
+    e2e_setup
+    create_mock_curl_installer_release
+    local destination="$E2E_TEMP_DIR/refresh-bin"
+    local file_dest="$E2E_TEMP_DIR/file-bin"
+    local refresh_log="$E2E_TEMP_DIR/refresh.log"
+    local output rc=0
+    mkdir -p "$destination" "$file_dest"
+
+    # Piped install (including Bash 5 where BASH_SOURCE[0] equals $0) must self-refresh once
+    output=$(cat "$INSTALL_SCRIPT" | DEST="$destination" RU_VERSION=1.5.0 RU_UNSAFE_MAIN=0 INSTALL_TEST_MODE=valid INSTALL_TEST_REFRESH_LOG="$refresh_log" bash 2>&1) || rc=$?
+    assert_equals 0 "$rc" "Piped install succeeds after self-refresh"
+    assert_contains "$output" 'Refreshing installer (cache-bust)...' "Piped install triggers self-refresh"
+    assert_file_exists "$refresh_log" "Self-refresh fetched install.sh"
+    assert_equals "1" "$(wc -l < "$refresh_log" | tr -d ' ')" "Self-refresh runs exactly once without looping"
+    assert_success "Refreshed piped install writes verified ru bytes" cmp -s "$INSTALL_TEST_RU" "$destination/ru"
+
+    # Direct file invocation must NOT self-refresh even when stdin is redirected
+    local file_log="$E2E_TEMP_DIR/file-refresh.log"
+    rc=0
+    output=$(DEST="$file_dest" RU_VERSION=1.5.0 RU_UNSAFE_MAIN=0 INSTALL_TEST_MODE=valid INSTALL_TEST_REFRESH_LOG="$file_log" bash "$INSTALL_SCRIPT" </dev/null 2>&1) || rc=$?
+    assert_equals 0 "$rc" "Direct file install succeeds"
+    assert_not_contains "$output" 'Refreshing installer (cache-bust)' "Direct file invocation skips self-refresh"
+    assert_file_not_exists "$file_log" "Direct file invocation does not fetch install.sh"
+
+    unset INSTALL_TEST_RU INSTALL_TEST_INSTALL_SCRIPT INSTALL_TEST_SHA
+    e2e_cleanup
+}
+
+test_installer_system_dir_sudo_policy() {
+    e2e_setup
+    local output rc=0
+
+    # Verify installer_needs_sudo requires sudo for /usr/local/bin only when non-root
+    output=$(
+        # shellcheck source=../install.sh
+        source <(sed -n '/^installer_needs_sudo()/,/^}/p' "$INSTALL_SCRIPT")
+        installer_needs_sudo "/usr/local/bin" 0 && echo "root-needs-sudo" || echo "root-direct"
+        installer_needs_sudo "/usr/local/bin" 1000 && echo "nonroot-needs-sudo" || echo "nonroot-direct"
+        installer_needs_sudo "/tmp/custom-bin" 1000 && echo "custom-needs-sudo" || echo "custom-direct"
+    ) || rc=$?
+    assert_equals 0 "$rc" "installer_needs_sudo policy helper runs cleanly"
+    assert_contains "$output" "root-direct" "Root does not require sudo for /usr/local/bin"
+    assert_contains "$output" "nonroot-needs-sudo" "Non-root requires sudo for /usr/local/bin"
+    assert_contains "$output" "custom-direct" "Non-root custom install dir does not require sudo"
+
+    # When non-root without sudo, install_script refuses /usr/local/bin cleanly
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        rc=0
+        output=$(
+            SCRIPT_NAME="ru"
+            # shellcheck source=../install.sh
+            source <(sed -n '/^installer_needs_sudo()/,/^}/p' "$INSTALL_SCRIPT")
+            # shellcheck source=../install.sh
+            source <(sed -n '/^install_script()/,/^}/p' "$INSTALL_SCRIPT")
+            command_exists() { return 1; }
+            log_step() { :; }
+            log_error() { printf '%s\n' "$*" >&2; }
+            log_success() { :; }
+            install_script "$E2E_PROJECT_DIR/ru" "/usr/local/bin" 2>&1
+        ) || rc=$?
+        assert_equals 1 "$rc" "Non-root without sudo fails closed on /usr/local/bin"
+        assert_contains "$output" 'sudo is required' "Non-root refusal explains missing sudo"
+    fi
+
+    # Custom install dir succeeds even without sudo on PATH
+    local custom_dir="$E2E_TEMP_DIR/no-sudo-bin"
+    rc=0
+    output=$(
+        SCRIPT_NAME="ru"
+        # shellcheck source=../install.sh
+        source <(sed -n '/^installer_needs_sudo()/,/^}/p' "$INSTALL_SCRIPT")
+        # shellcheck source=../install.sh
+        source <(sed -n '/^install_script()/,/^}/p' "$INSTALL_SCRIPT")
+        command_exists() { return 1; }
+        log_step() { :; }
+        log_error() { printf '%s\n' "$*" >&2; }
+        log_success() { :; }
+        install_script "$E2E_PROJECT_DIR/ru" "$custom_dir" 2>&1
+    ) || rc=$?
+    assert_equals 0 "$rc" "Custom directory installs directly without sudo"
+    assert_file_exists "$custom_dir/ru" "Custom directory receives installed script"
+
     e2e_cleanup
 }
 
@@ -334,6 +428,8 @@ run_test test_installer_requires_explicit_main_when_no_releases
 run_test test_installer_release_integrity_matrix
 run_test test_installer_checksum_tool_absence
 run_test test_pipeline_env_reaches_installer
+run_test test_piped_installer_self_refresh
+run_test test_installer_system_dir_sudo_policy
 run_test test_version_output
 run_test test_help_output
 run_test test_init_command
