@@ -8,6 +8,26 @@ Links point to individual commits on GitHub. Version headers link to comparison 
 
 ---
 
+## [v1.7.1](https://github.com/Dicklesworthstone/repo_updater/compare/v1.7.0...v1.7.1) -- 2026-11-21
+
+Fixes `ru commit-sweep` on Ubuntu 22.04 (`jq 1.6`), restores structured output and `ru robot-docs` on minimal Linux hosts without `jq` or `python3`, fixes piped `install.sh` self-refresh under Bash 5 and root system installs without `sudo`, and hardens non-interactive Git prompts and test suite isolation.
+
+### Fixed
+
+- **`ru commit-sweep` no longer drops files on Ubuntu 22.04 (`jq 1.6`).** In `jq 1.6`, `split("\u0000")` on NUL-terminated input omits the trailing empty string, so `split("\u0000")[:-1]` sliced off the last real path and refused single-file plans with `"Commit 1 has no files"`. `commit-sweep` now uses `jq -Rsc 'split("\u0000") | map(select(length > 0))'`, matching the rest of `ru` across both `jq 1.6` and `jq 1.7+` ([1e11490](https://github.com/Dicklesworthstone/repo_updater/commit/1e114900fdb01c9fe66699e8cac00555f5a01728)).
+- **Structured workflows and `ru robot-docs` work on minimal Linux hosts without `jq` or `python3`.** When neither `jq` nor `python3` was installed (for example bare Ubuntu/Debian containers), `run_structured_workflow` rejected valid JSON with exit 3 (`invalid_structured_output`), and nested `"generated_at"` keys inside `robot-docs schemas`/`all` could confuse the text fallback. `ru` now includes a zero-dependency `perl-base` RFC 8259 JSON object validator, top-level field reader, and `_meta.exit_code` injector alongside the `jq` and `python3` paths ([1e11490](https://github.com/Dicklesworthstone/repo_updater/commit/1e114900fdb01c9fe66699e8cac00555f5a01728)).
+- **`--non-interactive` prevents Git from prompting on `/dev/tty`.** Passing `--non-interactive` now exports `GIT_TERMINAL_PROMPT=0` so non-interactive `status --fetch` and `sync` invocations fail cleanly instead of blocking on terminal credential prompts ([1e11490](https://github.com/Dicklesworthstone/repo_updater/commit/1e114900fdb01c9fe66699e8cac00555f5a01728)).
+- **Piped `install.sh` self-refresh works on Bash 5.** Bash 5.0–5.2 sets `BASH_SOURCE[0]` to `"main"` and Bash 5.3+ sets it to `$0` when running `curl ... | bash`, which bypassed the empty-`BASH_SOURCE` check. `maybe_self_refresh_installer` now detects piped stdin across Bash 3.2, 4.x, 5.0–5.2, and 5.3+ while still skipping direct file invocations ([6c10a40](https://github.com/Dicklesworthstone/repo_updater/commit/6c10a4052c318cc60d3f41a2b9b6cd3aabf29f8d)).
+- **`RU_SYSTEM=1` / `/usr/local/bin` installs directly as root without requiring `sudo`.** `install_script` now checks `installer_needs_sudo` so `sudo` is required for `/usr/local/bin` only when `EUID != 0`; non-root installs without `sudo` still fail closed ([6c10a40](https://github.com/Dicklesworthstone/repo_updater/commit/6c10a4052c318cc60d3f41a2b9b6cd3aabf29f8d)).
+- **Test suite isolation and reliability.** Added `reset_subshell_counters` in `scripts/test_framework.sh` so isolated subshells cannot inherit earlier failure counts, drained `--body-file -` stdin in the lifecycle `gh` mock to avoid SIGPIPE exit 141 under load, raised non-timeout session-driver fixture timeouts from 10s to 30s, made `scripts/test_e2e_status.sh` fetch strictly from its offline local remote, and surfaced a clear cached diagnostic when `python3` `jsonschema` / `rfc3339-validator` test prerequisites are absent ([e15d02f](https://github.com/Dicklesworthstone/repo_updater/commit/e15d02f0150af7a8783eca91a46b3cd37c64c39f)).
+
+### Known limitations
+
+- `ru dep-update` discovers updates only for npm, Cargo, Go and Composer; repositories using Yarn, pnpm, pip, pipenv, Bundler, Maven or Gradle fail with `unsupported_scan`. Automatic verification covers narrow layouts (for example one root npm project with a v2/v3 `package-lock.json`, or Cargo lockfile updates within the existing requirements), installs run with npm lifecycle scripts and Composer scripts and plugins disabled, and Go and Composer updates are tested only against fixtures. GH #19 stays open for this.
+- `agent-sweep --with-release`'s GitHub release, `ci` and `checksums` steps were tested against a mocked `gh`, not a live GitHub release.
+
+---
+
 ## [v1.7.0](https://github.com/Dicklesworthstone/repo_updater/compare/v1.6.0...v1.7.0) -- 2026-11-02
 
 ru now needs Bash 4.4 or later and stops at startup on older Bash. Commit publication now works with the stock Git on Ubuntu 22.04 and 24.04; in v1.6.0 every publication failed there. Commands that read the repository list, discover GitHub issues and PRs, or scan dependencies now fail when they cannot read everything, instead of acting on a partial result. `ru dep-update` keeps only the updates ru has checked and tested itself, and `agent-sweep --with-release` applies the release plan instead of only tagging HEAD. See the upgrade notes.
