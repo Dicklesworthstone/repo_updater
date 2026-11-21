@@ -482,6 +482,8 @@ run_ai_cli_fixture() {
         command_args=(--manager=npm --major "--test-cmd=bash $test_script")
         [[ "${AI_CLI_USE_CONFIGURED:-false}" == true ]] || command_args+=("--repo=$repo_path")
     fi
+    local cli_timeout=30
+    [[ "$scenario" != timeout ]] || cli_timeout=10
     env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
         XDG_CONFIG_HOME="$env_root/config" XDG_STATE_HOME="$env_root/state" XDG_CACHE_HOME="$env_root/cache" \
         RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_CACHE_DIR="$env_root/cache/ru" \
@@ -491,7 +493,7 @@ run_ai_cli_fixture() {
         NTM_MOCK_ARGS_LOG="$env_root/ntm.args" NTM_MOCK_WORK_FILE="$work_file" \
         NTM_MOCK_PACKAGE_NAME="$package_name" NTM_MOCK_PACKAGE_VERSION=1.0.1 NTM_MOCK_REJECT_PUSH="$reject" \
         GIT_TRACE="$env_root/git.trace" \
-        bash "$E2E_RU_SCRIPT" "$command" --agent=codex --timeout=10 --json --non-interactive \
+        bash "$E2E_RU_SCRIPT" "$command" --agent=codex --timeout="$cli_timeout" --json --non-interactive \
         "${command_args[@]}" "$@" > "$env_root/cli.stdout" 2> "$env_root/cli.stderr"
 }
 

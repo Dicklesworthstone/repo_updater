@@ -653,6 +653,7 @@ test_commit_blocks_untracked_secret_candidate() {
     index_before=$(git hash-object "$index_path")
     plan='{"commits":[{"message":"Secret candidate","files":["planned.txt"]}],"push":false}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block
         assert_fails "Block mode detects an untracked candidate secret before commit" execute_commit_plan "$plan" "$repo_path"
         assert_equals "$before" "$(git -C "$repo_path" rev-parse HEAD)" "Secret refusal creates no commit"
@@ -671,6 +672,7 @@ test_commit_blocks_unknown_scanner_outcomes() {
     before=$(git -C "$repo_path" rev-parse HEAD)
     plan='{"commits":[{"message":"Scanner checked","files":["planned.txt"]}],"push":false}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block
         gitleaks() { return "$scanner_code"; }
         for scanner_code in 1 2 42 124 127; do
@@ -694,6 +696,7 @@ test_candidate_change_revokes_validation() {
     index_before=$(git hash-object "$index_path")
     plan='{"commits":[{"message":"Immutable candidate","files":["planned.txt"]}],"push":false}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block
         gitleaks() { printf 'changed during scan\n' > "$repo_path/planned.txt"; return 0; }
         assert_fails "Scanner-time candidate change revokes validation" execute_commit_plan "$plan" "$repo_path"
@@ -722,6 +725,7 @@ test_commit_scans_removed_historical_secret_before_publication() {
     printf 'clean current content\n' > "$repo_path/config.txt"
     plan='{"commits":[{"message":"Remove current secret","files":["config.txt"]}],"push":true}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block
         assert_fails "Secret absent from HEAD still blocks its unpublished historical commit" execute_commit_plan "$plan" "$repo_path"
         assert_equals "$base_sha" "$(git -C "$remote_path" rev-parse main)" "Historical secret is never published"
@@ -753,6 +757,7 @@ test_commit_publication_targets_only_approved_branch() {
     printf 'first approved candidate\n' > "$repo_path/planned.txt"
     plan='{"commits":[{"message":"Keep local","files":["planned.txt"]}],"push":false}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block
         assert_success "No-push plan commits locally" execute_commit_plan "$plan" "$repo_path"
         assert_equals "$base_sha" "$(git -C "$remote_path" rev-parse main)" "No-push leaves the actual remote unchanged"
@@ -810,6 +815,7 @@ test_publication_respects_push_remote_and_branch_selection() {
         before_head=$(git -C "$repo_path" rev-parse HEAD)
         plan='{"commits":[{"message":"Configured publication","files":["planned.txt"]}],"push":true}'
         (
+            reset_subshell_counters
             export AGENT_SWEEP_SECRET_SCAN=block
             rc=0
             execute_commit_plan "$plan" "$repo_path" > "$fixture_root/publication.stdout" 2> "$fixture_root/publication.stderr" || rc=$?
@@ -857,6 +863,7 @@ HOOK
     chmod +x "$repo_path/.git/hooks/pre-push"
     plan='{"commits":[{"message":"One actual receiver","files":["planned.txt"]}],"push":true}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block RU_TEST_PUSH_CALLS="$hook_calls"
         execute_commit_plan "$plan" "$repo_path" || rc=$?
         candidate=$(git -C "$repo_path" rev-parse HEAD)
@@ -924,6 +931,7 @@ test_publication_scans_each_actual_push_receiver() {
         printf 'new clean planned content\n' > "$repo_path/planned.txt"
         plan='{"commits":[{"message":"Actual receiver range","files":["planned.txt"]}],"push":true}'
         (
+            reset_subshell_counters
             export PATH="$env_root/cli-bin" AGENT_SWEEP_SECRET_SCAN=block
             hash -r
             rc=0
@@ -998,6 +1006,7 @@ HOOK
         printf 'approved new candidate\n' > "$repo_path/planned.txt"
         plan='{"commits":[{"message":"Bind actual advertised tip","files":["planned.txt"]}],"push":true}'
         (
+            reset_subshell_counters
             export PATH="$env_root/cli-bin" AGENT_SWEEP_SECRET_SCAN=block
             export RU_TEST_PUSH_ARGS="$env_root/hook.args" RU_TEST_PUSH_INPUT="$env_root/hook.stdin"
             hash -r
@@ -1043,6 +1052,7 @@ test_python_parser_preserves_literal_candidate_paths() {
     index_before=$(git hash-object "$index_path")
     head_before=$(git -C "$repo_path" rev-parse HEAD)
     (
+        reset_subshell_counters
         export PATH="$no_jq_path" AGENT_SWEEP_SECRET_SCAN=none
         hash -r
         assert_fails "Python fallback actually runs without jq on PATH" command -v jq
@@ -1086,6 +1096,7 @@ test_malformed_commit_plan_refusals_have_valid_controls() {
         assert_success "Near-identical valid schema remains accepted" validate_commit_plan "$plan" "$repo_path"
     done
     (
+        reset_subshell_counters
         export PATH="$no_jq_path" AGENT_SWEEP_SECRET_SCAN=none
         hash -r
         assert_fails "Python schema probe has no jq" command -v jq
@@ -1108,6 +1119,7 @@ test_size_binary_and_deny_policies_have_permitted_controls() {
     index_path=$(git -C "$repo_path" rev-parse --git-path index)
     [[ "$index_path" == /* ]] || index_path="$repo_path/$index_path"
     (
+        reset_subshell_counters
         export AGENT_SWEEP_MAX_FILE_MB=0 AGENT_SWEEP_MAX_FILE_SIZE=32 AGENT_SWEEP_SECRET_SCAN=none
         before=$(git -C "$repo_path" rev-parse HEAD)
         index_before=$(git hash-object "$index_path")
@@ -1158,6 +1170,7 @@ test_configured_byte_limit_is_exact_after_mb_rounding() {
     index_path=$(git -C "$repo_path" rev-parse --git-path index)
     [[ "$index_path" == /* ]] || index_path="$repo_path/$index_path"
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=none
         printf '%s\n' '{"agent_sweep":{"max_file_size":64}}' > "$repo_path/.ru-agent.json"
         assert_success "Real repository configuration loads the byte limit" load_repo_agent_config "$repo_path"
@@ -1278,6 +1291,7 @@ HOOK
     printf 'first approved candidate\n' > "$repo_path/planned.txt"
     plan='{"commits":[{"message":"Requested rejected push","files":["planned.txt"]}],"push":true}'
     (
+        reset_subshell_counters
         export AGENT_SWEEP_SECRET_SCAN=block
         assert_fails "Actual remote receive rejection reports requested push failure" execute_commit_plan "$plan" "$repo_path"
         assert_file_exists "$remote_path/rejection-observed" "Real Git invoked the remote receive hook"

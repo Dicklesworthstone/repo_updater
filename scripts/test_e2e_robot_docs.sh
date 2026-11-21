@@ -33,6 +33,45 @@ source "$SCRIPT_DIR/test_e2e_framework.sh"
 STRUCTURED_TOON_SH="${TOON_SH_PATH:-${HOME}/.local/lib/toon.sh}"
 # The toon_rust CLI decodes TOON in these checks: "toon" since v0.2, "tru" before.
 STRUCTURED_TOON_CLI=$(type -P tru || type -P toon || echo tru)
+SCHEMA_CONFORMANCE_PREREQS_STATUS=""
+SCHEMA_CONFORMANCE_PREREQS_ERROR=""
+
+check_schema_conformance_prereqs() {
+    if [[ -n "$SCHEMA_CONFORMANCE_PREREQS_STATUS" ]]; then
+        return "$SCHEMA_CONFORMANCE_PREREQS_STATUS"
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        SCHEMA_CONFORMANCE_PREREQS_ERROR="Missing test dependency: python3 (install python3 plus jsonschema and rfc3339-validator)"
+        SCHEMA_CONFORMANCE_PREREQS_STATUS=1
+        printf '%s\n' "$SCHEMA_CONFORMANCE_PREREQS_ERROR" >&2
+        return 1
+    fi
+    local check_output="" rc=0
+    check_output=$(python3 - <<'PY' 2>&1
+import importlib.util, sys
+missing = []
+if importlib.util.find_spec("jsonschema") is None:
+    missing.append("jsonschema")
+if importlib.util.find_spec("rfc3339_validator") is None:
+    missing.append("rfc3339-validator")
+if missing:
+    print("Missing Python test dependencies for JSON Schema conformance: " + ", ".join(missing) + ". Install with: python3 -m pip install " + " ".join(missing))
+    sys.exit(1)
+from jsonschema import Draft202012Validator, FormatChecker
+if "date-time" not in FormatChecker.checkers:
+    print("jsonschema FormatChecker is missing the date-time checker (install rfc3339-validator)")
+    sys.exit(1)
+PY
+    ) || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        SCHEMA_CONFORMANCE_PREREQS_ERROR="${check_output:-Missing python3 jsonschema/rfc3339-validator test dependencies}"
+        SCHEMA_CONFORMANCE_PREREQS_STATUS=1
+        printf '%s\n' "$SCHEMA_CONFORMANCE_PREREQS_ERROR" >&2
+        return 1
+    fi
+    SCHEMA_CONFORMANCE_PREREQS_STATUS=0
+    return 0
+}
 
 # PATH without any directory that holds a TOON encoder.
 path_without_toon_encoder() {
@@ -51,6 +90,10 @@ assert_cli_schema() {
     local actual_code=0
     "$E2E_RU_SCRIPT" "$@" > "$E2E_LOG_DIR/$label.stdout" 2> "$E2E_LOG_DIR/$label.stderr" || actual_code=$?
     assert_equals "$expected_code" "$actual_code" "$label preserves the actual exit code"
+    if ! check_schema_conformance_prereqs; then
+        fail "$label cannot validate schema: $SCHEMA_CONFORMANCE_PREREQS_ERROR"
+        return 1
+    fi
     if python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/$label.stdout" "$command_name" "$actual_code" <<'PY'
 import json, sys
 from jsonschema import Draft202012Validator, FormatChecker
@@ -322,7 +365,11 @@ test_version_matches() {
 
 test_actual_empty_and_failure_schemas() {
     setup_structured_conformance
-    assert_success "The schema proof has its declared validator dependency" python3 -c 'import jsonschema, rfc3339_validator; assert "date-time" in jsonschema.FormatChecker.checkers'
+    if check_schema_conformance_prereqs; then
+        pass "The schema proof has its declared validator dependency"
+    else
+        fail "The schema proof is missing its declared validator dependency: $SCHEMA_CONFORMANCE_PREREQS_ERROR"
+    fi
     assert_cli_schema empty-list 0 list list --json
     assert_cli_schema empty-status 0 status status --no-fetch --json
     assert_cli_schema empty-sync 0 sync sync --dry-run --json
@@ -419,7 +466,9 @@ test_actual_config_command_schemas() {
         jq -e '.data.imported.public == 1 and .data.duplicates == 1 and .data.invalid == ["not a repo"]' "$E2E_LOG_DIR/dry-import.stdout"
     assert_cli_schema refused-import 4 import import --stars --limit=0 --json
     jq 'del(.data.invalid)' "$E2E_LOG_DIR/partial-add.stdout" > "$E2E_LOG_DIR/add-without-invalid.json"
-    if python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/add-without-invalid.json" <<'PY'
+    if ! check_schema_conformance_prereqs; then
+        fail "The add schema negative check requires jsonschema + rfc3339-validator: $SCHEMA_CONFORMANCE_PREREQS_ERROR"
+    elif python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/add-without-invalid.json" <<'PY'
 import json, sys
 from jsonschema import Draft202012Validator, FormatChecker
 with open(sys.argv[1]) as stream:
@@ -465,7 +514,9 @@ test_actual_fork_schemas() {
     assert_cli_schema actual-fork-sync 0 fork-sync fork-sync --no-fetch --json
     assert_success "fork-sync reports the actual synced repository" jq -e '.data.synced == 1 and .data.repos[0].status == "synced"' "$E2E_LOG_DIR/actual-fork-sync.stdout"
     jq 'del(.data.repos)' "$E2E_LOG_DIR/actual-fork-sync.stdout" > "$E2E_LOG_DIR/fork-sync-without-repos.json"
-    if python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/fork-sync-without-repos.json" <<'PY'
+    if ! check_schema_conformance_prereqs; then
+        fail "The fork-sync schema negative check requires jsonschema + rfc3339-validator: $SCHEMA_CONFORMANCE_PREREQS_ERROR"
+    elif python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/fork-sync-without-repos.json" <<'PY'
 import json, sys
 from jsonschema import Draft202012Validator, FormatChecker
 with open(sys.argv[1]) as stream:
@@ -571,7 +622,9 @@ MOCK
     git -C "$repo" ls-files --stage -z > "$E2E_LOG_DIR/index.after"
     assert_success "Structured dry/error flows preserve every byte of retained NUL staged entries" cmp "$E2E_LOG_DIR/index.before" "$E2E_LOG_DIR/index.after"
 
-    if python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/populated-list.stdout" "$E2E_LOG_DIR/dry-ai-sync.stdout" <<'PY'
+    if ! check_schema_conformance_prereqs; then
+        fail "Advertised schema mutation checks require jsonschema + rfc3339-validator: $SCHEMA_CONFORMANCE_PREREQS_ERROR"
+    elif python3 - "$E2E_LOG_DIR/schema.stdout" "$E2E_LOG_DIR/populated-list.stdout" "$E2E_LOG_DIR/dry-ai-sync.stdout" <<'PY'
 import copy, json, sys
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 schema = json.load(open(sys.argv[1]))["data"]["content"]
@@ -657,6 +710,58 @@ test_structured_workflow_source_api() {
         cat "$E2E_LOG_DIR/no-jq.stderr" >&2
     fi
     assert_success "Python branch retains the same already-enveloped metadata" jq -se 'length == 1 and .[0]._meta.exit_code == 7 and .[0]._meta.duration_seconds == 13 and .[0]._meta.summary.n == 2 and .[0].data.useful == "Python control"' "$E2E_LOG_DIR/no-jq.stdout"
+
+    # Bare Linux fallback: neither jq nor python3 is installed, only coreutils + perl-base
+    if command -v perl >/dev/null 2>&1; then
+        local minimal_bin="$E2E_TEMP_DIR/no-jq-no-python-bin"
+        mkdir -p "$minimal_bin"
+        for tool in bash date mktemp cat rm dirname perl tr sed grep mkdir basename uname head tail; do
+            local tool_path
+            tool_path=$(type -P "$tool" 2>/dev/null || true)
+            [[ -n "$tool_path" ]] && ln -s "$tool_path" "$minimal_bin/$tool"
+        done
+        if PATH="$minimal_bin" "$minimal_bin/bash" -c '
+            source "$1"
+            command -v jq && exit 93
+            command -v python3 && exit 94
+            JSON_OUTPUT=true OUTPUT_FORMAT=json
+            already_wrapped() {
+                emit_structured "$(build_json_envelope review '\''{"mode":"status","useful":"Perl control","nested":{"generated_at":"2020-01-01T00:00:00Z"}}'\'' '\''{"duration_seconds":13,"summary":{"n":2},"exit_code":0}'\'')"
+                return 7
+            }
+            rc=0
+            run_structured_workflow review already_wrapped || rc=$?
+            [[ "$rc" == 7 && "$OUTPUT_FORMAT" == json ]]
+        ' _ "$E2E_RU_SCRIPT" > "$E2E_LOG_DIR/no-jq-no-py.stdout" 2> "$E2E_LOG_DIR/no-jq-no-py.stderr"; then
+            pass "Minimal PATH without jq or python3 retains workflow result and exit"
+        else
+            fail "Minimal PATH without jq or python3 broke run_structured_workflow"
+            cat "$E2E_LOG_DIR/no-jq-no-py.stderr" >&2
+        fi
+        assert_success "Perl fallback retains already-enveloped metadata and injects exit_code" jq -se 'length == 1 and .[0]._meta.exit_code == 7 and .[0]._meta.duration_seconds == 13 and .[0]._meta.summary.n == 2 and .[0].data.useful == "Perl control"' "$E2E_LOG_DIR/no-jq-no-py.stdout"
+
+        if PATH="$minimal_bin" "$minimal_bin/bash" -c '
+            source "$1"
+            command -v jq && exit 93
+            command -v python3 && exit 94
+            JSON_OUTPUT=true OUTPUT_FORMAT=json
+            bad_stream() { printf "{}\n{}\n"; }
+            rc=0
+            run_structured_workflow review bad_stream || rc=$?
+            [[ "$rc" == 3 ]]
+        ' _ "$E2E_RU_SCRIPT" > "$E2E_LOG_DIR/no-jq-no-py-bad.stdout" 2> "$E2E_LOG_DIR/no-jq-no-py-bad.stderr"; then
+            pass "Perl fallback rejects multi-object stream with exit 3"
+        else
+            fail "Perl fallback accepted multi-object stream"
+            cat "$E2E_LOG_DIR/no-jq-no-py-bad.stderr" >&2
+        fi
+        assert_success "Perl fallback emits typed invalid_structured_output error" jq -se 'length == 1 and .[0]._meta.exit_code == 3 and .[0].data.error.reason == "invalid_structured_output"' "$E2E_LOG_DIR/no-jq-no-py-bad.stdout"
+
+        local docs_rc=0
+        PATH="$minimal_bin" "$minimal_bin/bash" "$E2E_RU_SCRIPT" robot-docs all > "$E2E_LOG_DIR/no-jq-no-py-docs-all.stdout" 2> "$E2E_LOG_DIR/no-jq-no-py-docs-all.stderr" || docs_rc=$?
+        assert_equals 0 "$docs_rc" "robot-docs all succeeds without jq or python3"
+        assert_success "robot-docs all without jq or python3 produces one valid envelope without double-wrapping" jq -se 'length == 1 and .[0].command == "robot-docs" and .[0]._meta.exit_code == 0 and .[0].data.topic == "all" and (.[0].data | has("schemas"))' "$E2E_LOG_DIR/no-jq-no-py-docs-all.stdout"
+    fi
     cleanup_structured_conformance
 }
 

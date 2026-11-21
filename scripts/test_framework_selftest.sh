@@ -212,6 +212,36 @@ EOF
     done
 }
 
+test_reset_subshell_counters() {
+    log_test_start "reset_subshell_counters isolates subshell exit codes"
+
+    local rc=0
+    (
+        TF_TESTS_FAILED=2
+        TF_ASSERTIONS_FAILED=3
+
+        (
+            reset_subshell_counters
+            assert_equals "ok" "ok" "Passing assertion inside reset subshell"
+            exit "$(get_exit_code)"
+        ) || exit 11
+
+        local fail_rc=0
+        (
+            reset_subshell_counters
+            assert_equals "expected" "actual" "Failing assertion inside reset subshell" >/dev/null 2>&1
+            exit "$(get_exit_code)"
+        ) || fail_rc=$?
+        [[ "$fail_rc" -eq 1 ]] || exit 12
+
+        [[ "$TF_TESTS_FAILED" -eq 2 && "$TF_ASSERTIONS_FAILED" -eq 3 ]] || exit 13
+        exit 0
+    ) || rc=$?
+
+    assert_equals "0" "$rc" "reset_subshell_counters prevents parent failure bleed while keeping real subshell failures"
+    log_test_pass "reset_subshell_counters isolates subshell exit codes"
+}
+
 echo "============================================"
 echo "Test Framework Self-Test"
 echo "============================================"
@@ -239,6 +269,7 @@ run_test test_create_test_env
 run_test test_structured_logging
 run_test test_log_test_lifecycle
 run_test test_master_runner_retains_multiline_failures
+run_test test_reset_subshell_counters
 
 print_results
 exit "$(get_exit_code)"

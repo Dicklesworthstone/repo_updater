@@ -23,6 +23,17 @@ for f in scripts/test_e2e_*.sh; do "$f"; done
 for f in scripts/test_unit_*.sh; do "$f"; done
 ```
 
+### Test Prerequisites
+
+Most unit and E2E suites require only `bash` (>= 4.4), `git`, `jq`, and standard POSIX utilities.
+
+- **JSON Schema conformance (`scripts/test_e2e_robot_docs.sh`)**: requires `python3` with `jsonschema` (Draft 2020-12) and `rfc3339-validator` installed so `date-time` format assertions are enforced:
+  ```bash
+  python3 -m pip install jsonschema rfc3339-validator
+  ```
+  Missing packages fail the schema conformance assertions explicitly rather than skipping them.
+- **TOON round-trip check (`scripts/test_e2e_robot_docs.sh`)**: uses `toon` (or legacy `tru`) if installed to verify TOON encode/decode round-trip parity.
+
 ### Test Environment Variables
 
 | Variable | Default | Description |

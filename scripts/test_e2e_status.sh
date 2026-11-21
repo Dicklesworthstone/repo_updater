@@ -175,8 +175,9 @@ test_status_shows_behind() {
     # Add commit to remote (via work dir)
     add_remote_commit "$E2E_TEMP_DIR/work/behind-test" "New remote commit"
 
-    # Fetch to update refs (status needs to see remote changes)
-    git -C "$TEST_PROJECTS_DIR/behind-test" fetch >/dev/null 2>&1
+    # Fetch from local test-fetch remote to update origin tracking refs offline
+    git -C "$TEST_PROJECTS_DIR/behind-test" fetch test-fetch >/dev/null 2>&1
+    git -C "$TEST_PROJECTS_DIR/behind-test" update-ref refs/remotes/origin/main refs/remotes/test-fetch/main 2>/dev/null || true
 
     init_test_config
     add_repo_to_config "behind-test"
@@ -223,8 +224,9 @@ test_status_shows_diverged() {
     # Add remote commit
     add_remote_commit "$E2E_TEMP_DIR/work/diverged-test" "Remote diverge"
 
-    # Fetch to see remote changes
-    git -C "$TEST_PROJECTS_DIR/diverged-test" fetch >/dev/null 2>&1
+    # Fetch from local test-fetch remote to update origin tracking refs offline
+    git -C "$TEST_PROJECTS_DIR/diverged-test" fetch test-fetch >/dev/null 2>&1
+    git -C "$TEST_PROJECTS_DIR/diverged-test" update-ref refs/remotes/origin/main refs/remotes/test-fetch/main 2>/dev/null || true
 
     init_test_config
     add_repo_to_config "diverged-test"
@@ -278,7 +280,8 @@ test_status_multiple_repos() {
 
     # Make multi2 behind
     add_remote_commit "$E2E_TEMP_DIR/work/multi2" "Remote commit"
-    git -C "$TEST_PROJECTS_DIR/multi2" fetch >/dev/null 2>&1
+    git -C "$TEST_PROJECTS_DIR/multi2" fetch test-fetch >/dev/null 2>&1
+    git -C "$TEST_PROJECTS_DIR/multi2" update-ref refs/remotes/origin/main refs/remotes/test-fetch/main 2>/dev/null || true
 
     # Make multi3 ahead
     add_local_commit "$TEST_PROJECTS_DIR/multi3" "Local commit"

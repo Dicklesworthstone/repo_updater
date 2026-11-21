@@ -1272,6 +1272,13 @@ get_exit_code() {
     fi
 }
 
+# Reset failure counters at the entry of an isolated subshell so earlier test
+# failures in the parent shell cannot poison exit "$(get_exit_code)".
+reset_subshell_counters() {
+    TF_TESTS_FAILED=0
+    TF_ASSERTIONS_FAILED=0
+}
+
 #==============================================================================
 # Parallel Test Execution
 #==============================================================================
@@ -1827,7 +1834,7 @@ export -f log_debug log_info log_warn log_error
 export -f log_test_start log_test_pass log_test_fail log_test_skip log_suite_start
 export -f init_log_file set_log_level
 export -f create_temp_dir cleanup_temp_dirs reset_test_env create_test_env get_test_env_root setup_cleanup_trap
-export -f run_test skip_test require_gh_auth print_results get_exit_code run_parallel_tests
+export -f run_test skip_test require_gh_auth print_results get_exit_code reset_subshell_counters run_parallel_tests
 export -f enable_tap_output disable_tap_output is_tap_mode tap_plan tap_version tap_diag
 export -f _tap_ok _tap_not_ok _tap_skip _tap_todo _tap_summary
 export -f get_project_dir source_ru_function

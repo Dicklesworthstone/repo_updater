@@ -52,6 +52,14 @@ declare -g MOCK_GH_OUTPUT=""
 
 # Mock gh command - logs to file so it works inside subshells
 gh() {
+    local prev="" arg=""
+    for arg in "$@"; do
+        if [[ "$arg" == "--body-file=-" || ( "$prev" == "--body-file" && "$arg" == "-" ) ]]; then
+            cat >/dev/null
+            break
+        fi
+        prev="$arg"
+    done
     if [[ -n "$MOCK_GH_LOG_FILE" ]]; then
         echo "$*" >> "$MOCK_GH_LOG_FILE"
     fi

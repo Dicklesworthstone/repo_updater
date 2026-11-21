@@ -95,6 +95,7 @@ test_dir_lock_rejects_false_mkdir_success() {
     # Reproduce mkdir implementations that turn a racing EEXIST into success.
     # The actual directory and owner file still use real filesystem operations.
     (
+        reset_subshell_counters
         mkdir() { command mkdir "$@" 2>/dev/null || [[ -d "$1" ]]; }
         assert_success "First holder acquires the lock" dir_lock_try_acquire "$lock_dir"
         owner_before=$(cat "$lock_dir/owner")

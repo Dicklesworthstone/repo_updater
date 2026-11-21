@@ -840,6 +840,7 @@ test_ai_work_diff_inspection_error_preserves_real_state() {
     assert_equals "$index_before" "$(git hash-object "$repo_path/.git/index")" "Positive inspection preserves exact index"
     assert_equals "$content_before" "$(git hash-object "$repo_path/base.txt")" "Positive inspection preserves actual content"
     (
+        reset_subshell_counters
         git() {
             if [[ "$#" == 6 && "$1" == -C && "$2" == "$repo_path" && "$3" == diff && "$4" == --quiet && "$5" == "$before" && "$6" == "$after" ]]; then
                 printf 'Controlled diff --quiet inspection error: exit 128\n' >&2
@@ -964,6 +965,7 @@ test_controlled_ai_transport_and_real_git_work_results() {
         before=$(git -C "$repo_path" rev-parse HEAD)
         before_index=$(git hash-object "$repo_path/.git/index")
         (
+            reset_subshell_counters
             export PATH="$mock_bin:$PATH" NTM_MOCK_SCENARIO="$scenario" NTM_MOCK_REPO="$repo_path"
             export NTM_MOCK_STATE_FILE="$env_root/ntm.state" NTM_MOCK_LAST_PROMPT="$env_root/ntm.prompt"
             export NTM_MOCK_ARGS_LOG="$env_root/ntm.args" NTM_MOCK_ENV_LOG="$env_root/ntm.env"
@@ -1035,6 +1037,7 @@ HOOK
     printf 'Commit the actual requested fixture work locally\n' > "$env_root/prompt.txt"
     before=$(git -C "$repo_path" rev-parse HEAD) || return 1
     (
+        reset_subshell_counters
         export PATH="$mock_bin:$PATH" NTM_MOCK_SCENARIO=session_work NTM_MOCK_REPO="$repo_path"
         export NTM_MOCK_STATE_FILE="$env_root/ntm.state" NTM_MOCK_LAST_PROMPT="$env_root/ntm.prompt"
         export NTM_MOCK_ARGS_LOG="$env_root/ntm.args" GIT_TRACE="$env_root/git.trace"
@@ -1098,6 +1101,7 @@ test_ai_project_tests_before_publication() {
     for publication in push no-push; do
         for mode in success failed dirty changed-head changed-branch timeout; do
             (
+                reset_subshell_counters
                 local repo_path env_root before result rc=0 evidence candidate command test_pid
                 local timeout_seconds=12
                 repo_path=$(create_ai_work_fixture "$retained_root") || exit 1
@@ -1339,6 +1343,7 @@ FSMONITOR
         chmod +x "$env_root/fsmonitor" || return 1
     fi
     (
+        reset_subshell_counters
         export PATH="$env_root/mock-bin:$PATH" NTM_MOCK_SCENARIO=session_work NTM_MOCK_REPO="$repo_path"
         export NTM_MOCK_STATE_FILE="$env_root/ntm.state" NTM_MOCK_LAST_PROMPT="$env_root/ntm.prompt"
         export NTM_MOCK_ARGS_LOG="$env_root/ntm.args" NTM_MOCK_DELAY_LOG="$env_root/delay.log"
@@ -1475,6 +1480,7 @@ test_ai_deadline_polling_group_scope() {
     for monitor_mode in off on; do
         for outcome in success exit7 timeout; do
             (
+                reset_subshell_counters
                 local env_root real_sleep real_ps caller_pid=$BASHPID caller_group
                 local unrelated_pid deadline rc=0 worker_pid worker_parent worker_group child_pid child_parent child_group
                 local watch_pid watch_parent watch_group poll_pid poll_parent poll_group poll_count=0 wrong_poll_groups=0
@@ -1677,6 +1683,7 @@ assert_ai_preflight_common_failure() {
     before=$(git -C "$repo_path" rev-parse HEAD) || return 1
     index_before=$(git hash-object "$repo_path/.git/index") || return 1
     (
+        reset_subshell_counters
         export PATH="$ordinary_path" NTM_MOCK_SCENARIO=session_work NTM_MOCK_REPO="$repo_path"
         export NTM_MOCK_STATE_FILE="$env_root/ntm.state" NTM_MOCK_LAST_PROMPT="$env_root/ntm.prompt" NTM_MOCK_ARGS_LOG="$env_root/ntm.args"
         case "$mode" in missing_jq|missing_tmux|missing_ntm|missing_provider|no_jq_escaped) export PATH="$restricted_path" ;; esac
