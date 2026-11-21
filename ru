@@ -7457,6 +7457,79 @@ except:
         return 0
     fi
 
+    # Fallback: pure perl-base top-level RFC 8259 JSON object extractor (no modules)
+    if command -v perl &>/dev/null; then
+        run_with_input "$json" perl -e '
+            my $target = shift;
+            local $/; my $s = <STDIN>; exit 0 unless defined $s;
+            my $ws = qr/[ \t\r\n]*/;
+            my ($val, $obj, $arr, $str, $unesc);
+            $unesc = sub {
+                my ($raw) = @_;
+                $raw =~ s/\A"|"\z//g;
+                $raw =~ s/\\(["\\\/bfnrt]|u[0-9a-fA-F]{4})/
+                    $1 eq "n" ? "\n" : $1 eq "r" ? "\r" : $1 eq "t" ? "\t" :
+                    $1 eq "b" ? "\b" : $1 eq "f" ? "\f" :
+                    substr($1, 0, 1) eq "u" ? chr(hex(substr($1, 1))) : $1
+                /ge;
+                return $raw;
+            };
+            $str = sub { $s =~ /\G"(?:[^"\\\x00-\x1f]|\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"/gc };
+            $arr = sub {
+                $s =~ /\G\[$ws/gc or return 0;
+                return 1 if $s =~ /\G\]/gc;
+                while (1) {
+                    $val->() or return 0;
+                    $s =~ /\G$ws/gc;
+                    return 1 if $s =~ /\G\]/gc;
+                    $s =~ /\G,$ws/gc or return 0;
+                }
+            };
+            $obj = sub {
+                $s =~ /\G\{$ws/gc or return 0;
+                return 1 if $s =~ /\G\}/gc;
+                while (1) {
+                    $str->() or return 0;
+                    $s =~ /\G$ws:$ws/gc or return 0;
+                    $val->() or return 0;
+                    $s =~ /\G$ws/gc;
+                    return 1 if $s =~ /\G\}/gc;
+                    $s =~ /\G,$ws/gc or return 0;
+                }
+            };
+            $val = sub {
+                $s =~ /\G$ws/gc;
+                my $c = substr($s, pos($s) // 0, 1);
+                return $str->() if $c eq "\"";
+                return $obj->() if $c eq "{";
+                return $arr->() if $c eq "[";
+                return 1 if $s =~ /\G(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/gc;
+                return 0;
+            };
+            $s =~ /\G$ws\{$ws/gc or exit 0;
+            exit 0 if $s =~ /\G\}/gc;
+            while (1) {
+                my $ks = pos($s) // 0;
+                $str->() or exit 0;
+                my $key = $unesc->(substr($s, $ks, pos($s) - $ks));
+                $s =~ /\G$ws:$ws/gc or exit 0;
+                my $vs = pos($s) // 0;
+                $val->() or exit 0;
+                my $raw = substr($s, $vs, pos($s) - $vs);
+                if ($key eq $target) {
+                    if ($raw eq "null") { exit 0; }
+                    elsif (substr($raw, 0, 1) eq "\"") { print $unesc->($raw); }
+                    else { print $raw; }
+                    exit 0;
+                }
+                $s =~ /\G$ws/gc;
+                exit 0 if $s =~ /\G\}/gc;
+                $s =~ /\G,$ws/gc or exit 0;
+            }
+        ' "$field" 2>/dev/null
+        return 0
+    fi
+
     # Last resort: minimal sed (ONLY works for simple flat string values!)
     # WARNING: This is fragile and won't handle nested objects, arrays,
     # escaped quotes, or boolean/numeric types correctly. Use with caution.
@@ -7875,6 +7948,54 @@ run_structured_workflow() {
             meta_json=$(run_with_input "$meta_json" jq -c --argjson code "$code" '. + {exit_code:$code}')
         elif [[ -n "$meta_json" ]] && command -v python3 >/dev/null 2>&1; then
             meta_json=$(run_with_input "$meta_json" python3 -c 'import json,sys; meta=json.load(sys.stdin); meta["exit_code"]=int(sys.argv[1]); print(json.dumps(meta))' "$code")
+        elif [[ -n "$meta_json" ]] && command -v perl >/dev/null 2>&1; then
+            meta_json=$(run_with_input "$meta_json" perl -e '
+                my $code = int(shift);
+                local $/; my $s = <STDIN>;
+                defined $s or do { print "{\"exit_code\":$code}"; exit 0; };
+                my $ws = qr/[ \t\r\n]*/;
+                my ($val, $obj, $arr, $str);
+                $str = sub { $s =~ /\G"(?:[^"\\\x00-\x1f]|\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"/gc };
+                $arr = sub {
+                    $s =~ /\G\[$ws/gc or return 0;
+                    return 1 if $s =~ /\G\]/gc;
+                    while (1) { $val->() or return 0; $s =~ /\G$ws/gc; return 1 if $s =~ /\G\]/gc; $s =~ /\G,$ws/gc or return 0; }
+                };
+                $obj = sub {
+                    $s =~ /\G\{$ws/gc or return 0;
+                    return 1 if $s =~ /\G\}/gc;
+                    while (1) { $str->() or return 0; $s =~ /\G$ws:$ws/gc or return 0; $val->() or return 0; $s =~ /\G$ws/gc; return 1 if $s =~ /\G\}/gc; $s =~ /\G,$ws/gc or return 0; }
+                };
+                $val = sub {
+                    $s =~ /\G$ws/gc;
+                    my $c = substr($s, pos($s) // 0, 1);
+                    return $str->() if $c eq "\"";
+                    return $obj->() if $c eq "{";
+                    return $arr->() if $c eq "[";
+                    return 1 if $s =~ /\G(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/gc;
+                    return 0;
+                };
+                my @pairs;
+                if ($s =~ /\G$ws\{$ws/gc) {
+                    if ($s !~ /\G\}/gc) {
+                        while (1) {
+                            my $ks = pos($s) // 0;
+                            $str->() or do { @pairs = (); last; };
+                            my $kraw = substr($s, $ks, pos($s) - $ks);
+                            $s =~ /\G$ws:$ws/gc or do { @pairs = (); last; };
+                            my $vs = pos($s) // 0;
+                            $val->() or do { @pairs = (); last; };
+                            my $vraw = substr($s, $vs, pos($s) - $vs);
+                            push @pairs, [$kraw, $vraw] if $kraw ne "\"exit_code\"";
+                            $s =~ /\G$ws/gc;
+                            last if $s =~ /\G\}/gc;
+                            $s =~ /\G,$ws/gc or do { @pairs = (); last; };
+                        }
+                    }
+                }
+                push @pairs, ["\"exit_code\"", "$code"];
+                print "{", join(",", map { "$_->[0]:$_->[1]" } @pairs), "}";
+            ' "$code")
         else
             meta_json="{\"exit_code\":$code}"
         fi
@@ -7894,8 +8015,48 @@ structured_payload_is_object() {
         run_with_input "$payload" jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null
     elif command -v python3 >/dev/null 2>&1; then
         run_with_input "$payload" python3 -c 'import json,sys; sys.exit(0 if isinstance(json.load(sys.stdin), dict) else 1)'
+    elif command -v perl >/dev/null 2>&1; then
+        run_with_input "$payload" perl -e '
+            local $/; my $s = <STDIN>; defined $s or exit 1;
+            my $ws = qr/[ \t\r\n]*/;
+            my ($val, $obj, $arr, $str);
+            $str = sub { $s =~ /\G"(?:[^"\\\x00-\x1f]|\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"/gc };
+            $arr = sub {
+                $s =~ /\G\[$ws/gc or return 0;
+                return 1 if $s =~ /\G\]/gc;
+                while (1) {
+                    $val->() or return 0;
+                    $s =~ /\G$ws/gc;
+                    return 1 if $s =~ /\G\]/gc;
+                    $s =~ /\G,$ws/gc or return 0;
+                }
+            };
+            $obj = sub {
+                $s =~ /\G\{$ws/gc or return 0;
+                return 1 if $s =~ /\G\}/gc;
+                while (1) {
+                    $str->() or return 0;
+                    $s =~ /\G$ws:$ws/gc or return 0;
+                    $val->() or return 0;
+                    $s =~ /\G$ws/gc;
+                    return 1 if $s =~ /\G\}/gc;
+                    $s =~ /\G,$ws/gc or return 0;
+                }
+            };
+            $val = sub {
+                $s =~ /\G$ws/gc;
+                my $c = substr($s, pos($s) // 0, 1);
+                return $str->() if $c eq "\"";
+                return $obj->() if $c eq "{";
+                return $arr->() if $c eq "[";
+                return 1 if $s =~ /\G(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/gc;
+                return 0;
+            };
+            $s =~ /\G$ws/gc;
+            exit(($obj->() && $s =~ /\G$ws\z/gc) ? 0 : 1);
+        ' >/dev/null 2>&1
     else
-        log_error "Structured workflow output requires jq or python3"
+        log_error "Structured workflow output requires jq, python3, or perl"
         return 1
     fi
 }
@@ -10690,6 +10851,7 @@ parse_args() {
                 ;;
             --non-interactive)
                 NON_INTERACTIVE="true"
+                export GIT_TERMINAL_PROMPT=0
                 shift
                 ;;
             --dry-run)
@@ -25132,7 +25294,7 @@ cs_process_repo() {
             msg="${prefix}(${scope}): update ${scope} ${bucket}"
             [[ -z "$task_id" ]] || msg+=" ($task_id)"
         fi
-        files_json=$(printf '%s\0' "${group_paths[@]}" | jq -Rs 'split("\u0000")[:-1]') || return 1
+        files_json=$(printf '%s\0' "${group_paths[@]}" | jq -Rsc 'split("\u0000") | map(select(length > 0))') || return 1
         commit_json=$(jq -cn --arg message "$msg" --arg source "$commit_source" --argjson files "$files_json" \
             '{message:$message,source:$source,files:$files}') || return 1
         commits_json=$(run_with_input "$commits_json" jq -c --argjson commit "$commit_json" '. + [$commit]') || return 1
