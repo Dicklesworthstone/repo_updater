@@ -401,7 +401,14 @@ import json
 import pathlib
 import sys
 root = pathlib.Path(sys.argv[1])
-packs = {v: json.loads((root / ("pack-" + v + ".json")).read_text())[0] for v in ("1.0.0", "1.1.0")}
+def load_pack(p):
+    d = json.loads(p.read_text())
+    if isinstance(d, list):
+        return d[0]
+    if isinstance(d, dict) and len(d) == 1:
+        return next(iter(d.values()))
+    raise ValueError(f"Unexpected npm pack --json shape in {p}: {type(d)}")
+packs = {v: load_pack(root / ("pack-" + v + ".json")) for v in ("1.0.0", "1.1.0")}
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass

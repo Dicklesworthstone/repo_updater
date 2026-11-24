@@ -937,6 +937,166 @@ MOCK
     cleanup_structured_conformance
 }
 
+test_help_robot_docs_readme_parity_and_denylist_schema() {
+    setup_structured_conformance
+
+    local help_out commands_out
+    help_out=$("$E2E_RU_SCRIPT" --help 2>&1)
+    commands_out=$("$E2E_RU_SCRIPT" robot-docs commands 2>/dev/null)
+
+    # Every command advertised by robot-docs commands appears in ru --help
+    local cmd missing_help=""
+    while IFS= read -r cmd; do
+        [[ -n "$cmd" ]] || continue
+        if ! printf '%s\n' "$help_out" | grep -qE "^[[:space:]]+${cmd}([[:space:]]|$)"; then
+            missing_help+=" $cmd"
+        fi
+    done < <(printf '%s\n' "$commands_out" | jq -r '.data.content.commands[].name')
+    assert_equals "" "$missing_help" "Every robot-docs command appears in ru --help"
+
+    # Command flags in robot-docs agree with runtime capabilities
+    assert_equals "true" "$(printf '%s\n' "$commands_out" | jq -r '
+        (.data.content.commands | map({(.name): ([.flags[]?.flag])}) | add) as $m |
+        (($m["ai-sync"] | length) >= 7) and
+        (($m["dep-update"] | length) >= 10) and
+        (($m["self-update"] | index("--check")) != null) and
+        (($m["config"] | index("--check")) == null) and
+        (($m["add"] | index("--public")) != null) and
+        (($m["remove"] | index("--private")) != null) and
+        (($m["remove"] | index("--public")) != null) and
+        (($m["agent-sweep"] | index("--max-file-mb=N")) != null)
+    ')" "robot-docs command flag tables match actual CLI capabilities"
+
+    # README privacy disclosure accurately names external AI providers
+    local repo_root
+    repo_root=$(cd "$SCRIPT_DIR/.." && pwd)
+    assert_true "grep -q 'AI-assisted workflows' '$repo_root/README.md'" "README discloses external AI-assisted workflows"
+    assert_false "grep -q 'No data sent anywhere except to GitHub' '$repo_root/README.md'" "README no longer claims no data leaves machine outside GitHub"
+
+    # agent-sweep --show-denylist --json conforms to advertised Draft 2020-12 schema
+    assert_cli_schema denylist-sweep 0 agent-sweep agent-sweep --show-denylist --json
+
+    cleanup_structured_conformance
+}
+
+test_readme_examples_full_cli_acceptance() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip_test "Full-CLI README example acceptance requires python3"
+        return 0
+    fi
+
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+
+    # Isolated controlled stubs so no README example talks to live GitHub, npm, ntm, or AI providers
+    mkdir -p "$E2E_TEMP_DIR/readme-bin"
+    local tool
+    for tool in gh ntm claude codex gemini tmux npm; do
+        cat > "$E2E_TEMP_DIR/readme-bin/$tool" <<'STUB'
+#!/usr/bin/env bash
+case "$(basename "$0"):$*" in
+    gh:auth\ status*) exit 0 ;;
+    gh:api\ graphql*)
+        printf '%s\n' '{"data":{"rateLimit":{"remaining":5000,"resetAt":"2099-01-01T00:00:00Z"},"repo_0":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'
+        exit 0 ;;
+    gh:*) exit 1 ;;
+    npm:outdated*) printf '{}\n'; exit 0 ;;
+    *) exit 1 ;;
+esac
+STUB
+        chmod +x "$E2E_TEMP_DIR/readme-bin/$tool"
+    done
+
+    # Create a local repo fixture for --repo=./my-project and configured commands
+    local demo_repo="$E2E_TEMP_DIR/my-project"
+    mkdir -p "$demo_repo"
+    git -C "$demo_repo" init -b main >/dev/null 2>&1
+    git -C "$demo_repo" config user.name "Test"
+    git -C "$demo_repo" config user.email "test@example.com"
+    printf '{"name":"demo","version":"1.0.0"}\n' > "$demo_repo/package.json"
+    git -C "$demo_repo" add package.json && git -C "$demo_repo" commit -m "init" >/dev/null 2>&1
+
+    local repo_root
+    repo_root=$(cd "$SCRIPT_DIR/.." && pwd)
+    local extractor='
+import re, shlex, sys
+fence = shell = False
+for n, raw in enumerate(open(sys.argv[1], encoding="utf-8").read().split("\n"), 1):
+    s = raw.strip()
+    if s.startswith("```"):
+        if fence:
+            fence = shell = False
+        else:
+            fence, shell = True, s[3:].strip() in ("", "bash", "sh", "shell", "console")
+        continue
+    if not (fence and shell):
+        continue
+    line = s[2:] if s.startswith("$ ") else s
+    if not line.startswith("ru "):
+        continue
+    line = re.split(r"\s+\|\s+", line, maxsplit=1)[0]
+    line = re.sub(r"\s+2>/dev/null\b", "", line).strip()
+    if any(t in line for t in ("$(", "`", "&&", ";", " > ", " < ", ">>")) or re.search(r"<[A-Za-z_-]+>|\.\.\.|\[[A-Z]", line):
+        continue
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        args = list(lexer)[1:]
+    except ValueError:
+        continue
+    if not args:
+        continue
+    sys.stdout.write(str(n) + "\x1f" + "\x1f".join(args) + "\x00")
+'
+    local record lineno rc examples=0 rejected=""
+    local -a fields args
+    while IFS= read -r -d '' record; do
+        IFS=$'\x1f' read -r -a fields <<< "$record"
+        lineno="${fields[0]}"
+        args=("${fields[@]:1}")
+        [[ "${args[0]}" == "(bash,"* ]] && continue
+        examples=$((examples + 1))
+        rc=0
+        local err_file="$E2E_TEMP_DIR/err-$lineno.log"
+        (
+            cd "$E2E_TEMP_DIR" || exit 99
+            PATH="$E2E_TEMP_DIR/readme-bin:$PATH" \
+            RU_CONFIG_DIR="$E2E_TEMP_DIR/cfg-$lineno" \
+            RU_STATE_DIR="$E2E_TEMP_DIR/state-$lineno" \
+            RU_PROJECTS_DIR="$E2E_TEMP_DIR/proj-$lineno" \
+            RU_NON_INTERACTIVE=true \
+            timeout 10 "$E2E_RU_SCRIPT" "${args[@]}" >/dev/null 2>"$err_file"
+        ) || rc=$?
+        if [[ "$rc" -eq 124 ]]; then
+            rejected+=" README:$lineno(rc=124: ru ${args[*]})"
+        elif [[ "$rc" -eq 4 ]]; then
+            # `ru review --apply` exits 4 specifically when no prior --plan worktrees exist
+            if ! { [[ "${args[0]}" == "review" ]] && grep -q "No review worktrees directory found" "$err_file" 2>/dev/null; }; then
+                rejected+=" README:$lineno(rc=4: ru ${args[*]})"
+            fi
+        fi
+    done < <(python3 -c "$extractor" "$repo_root/README.md")
+
+    assert_true "[[ $examples -ge 80 ]]" "Full-CLI README examples executed ($examples)"
+    assert_equals "" "$rejected" "No README example is rejected as invalid args (rc=4) or hangs (rc=124) by full CLI"
+
+    # Planted negative: an actual unknown flag MUST exit 4 under the same CLI harness
+    local neg_rc=0
+    (
+        cd "$E2E_TEMP_DIR" || exit 99
+        PATH="$E2E_TEMP_DIR/readme-bin:$PATH" \
+        RU_CONFIG_DIR="$E2E_TEMP_DIR/cfg-neg" \
+        RU_STATE_DIR="$E2E_TEMP_DIR/state-neg" \
+        RU_PROJECTS_DIR="$E2E_TEMP_DIR/proj-neg" \
+        RU_NON_INTERACTIVE=true \
+        "$E2E_RU_SCRIPT" agent-sweep --definitely-not-a-flag >/dev/null 2>&1
+    ) || neg_rc=$?
+    assert_equals "4" "$neg_rc" "Planted negative: unknown option exits 4 in full-CLI harness"
+
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -961,6 +1121,8 @@ run_test test_structured_workflow_source_api
 run_test test_structured_dispatcher_preserves_actual_tty_approval
 run_test test_actual_workflow_toon_and_fallback
 run_test test_actual_review_interrupt_envelope
+run_test test_help_robot_docs_readme_parity_and_denylist_schema
+run_test test_readme_examples_full_cli_acceptance
 
 print_results
 exit "$(get_exit_code)"

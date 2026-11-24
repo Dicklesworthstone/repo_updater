@@ -3137,6 +3137,24 @@ cmd_ai_sync() {
         esac
     done
 
+    # Validate option values before checking external dependencies
+    if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ || ${#timeout_seconds} -gt 5 || "$timeout_seconds" -gt 86400 ]]; then
+        log_error "ai-sync: Invalid --timeout value: $timeout_seconds (expected integer 1..86400)"
+        return 4
+    fi
+
+    local agent_provider
+    case "$agent_type" in
+        claude|cc)       agent_provider="claude" ;;
+        codex|cod)       agent_provider="codex" ;;
+        gemini|gmi)      agent_provider="gemini" ;;
+        antigravity|agy) agent_provider="agy" ;;
+        *)
+            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
+            return 4
+            ;;
+    esac
+
     # Check dependencies
     if ! command -v ntm &>/dev/null; then
         log_error "ai-sync requires ntm (Named Tmux Manager) to be installed"
@@ -3144,9 +3162,8 @@ cmd_ai_sync() {
         return 3
     fi
 
-    if ! command -v claude &>/dev/null && [[ "$agent_type" == "claude" ]]; then
-        log_error "ai-sync with Claude requires claude-code to be installed"
-        log_error "Install from: https://github.com/anthropics/claude-code"
+    if ! command -v "$agent_provider" &>/dev/null; then
+        log_error "ai-sync requires $agent_provider CLI for agent type '$agent_type'"
         return 3
     fi
 
@@ -3719,6 +3736,26 @@ cmd_dep_update() {
         esac
     done
 
+    # Validate option values before checking external dependencies
+    if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ || ${#timeout_seconds} -gt 5 || "$timeout_seconds" -gt 86400 ]]; then
+        log_error "dep-update: Invalid --timeout value: $timeout_seconds (expected integer 1..86400)"
+        return 4
+    fi
+    if [[ ! "$max_fix_attempts" =~ ^[1-9][0-9]*$ || ${#max_fix_attempts} -gt 3 || "$max_fix_attempts" -gt 100 ]]; then
+        log_error "dep-update: Invalid --max-fix-attempts value: $max_fix_attempts (expected integer 1..100)"
+        return 4
+    fi
+    local agent_provider
+    case "$agent_type" in
+        claude) agent_provider="claude" ;;
+        codex)  agent_provider="codex" ;;
+        gemini) agent_provider="gemini" ;;
+        *)
+            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
+            return 4
+            ;;
+    esac
+
     # Check dependencies
     if ! command -v jq &>/dev/null; then
         log_error "dep-update requires jq for dependency scanning"
@@ -3731,31 +3768,10 @@ cmd_dep_update() {
         return 3
     fi
 
-    case "$agent_type" in
-        claude)
-            if ! command -v claude &>/dev/null; then
-                log_error "dep-update requires claude-code for agent type 'claude'"
-                log_error "Install from: https://github.com/anthropics/claude-code"
-                return 3
-            fi
-            ;;
-        codex)
-            if ! command -v codex &>/dev/null; then
-                log_error "dep-update requires codex for agent type 'codex'"
-                return 3
-            fi
-            ;;
-        gemini)
-            if ! command -v gemini &>/dev/null; then
-                log_error "dep-update requires gemini CLI for agent type 'gemini'"
-                return 3
-            fi
-            ;;
-        *)
-            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
-            return 4
-            ;;
-    esac
+    if ! command -v "$agent_provider" &>/dev/null; then
+        log_error "dep-update requires $agent_provider CLI for agent type '$agent_type'"
+        return 3
+    fi
 
     # Process each repo
     local processed=0
@@ -8547,6 +8563,9 @@ COMMANDS:
     prune           Find and manage orphan repositories
     import          Import repos from files or GitHub (stars, org, user)
     review          Review GitHub issues and PRs using Claude Code
+    agent-sweep     Orchestrate AI agents across dirty repositories
+    ai-sync         Auto-commit dirty repos using AI agents (via ntm)
+    dep-update      Update dependencies across repos using AI agents
     fork-status     Show fork sync status against upstream
     fork-sync       Sync fork with upstream remote
     fork-clean      Clean main branch pollution (creates rescue branch)
@@ -8584,10 +8603,15 @@ INIT OPTIONS:
     --example            Include example repositories in initial config
 
 ADD OPTIONS:
+    --public             Add to public.txt (default)
     --private            Add to private.txt instead of public.txt
     --from-cwd           Detect repo from current working directory
     --group NAME         Clone into a NAME/ subfolder of the layout path
                          (writes '\''owner/repo in NAME'\''; NAME may be nested: a/b)
+
+REMOVE OPTIONS:
+    --public             Remove from public.txt only
+    --private            Remove from private.txt only
 
 LIST OPTIONS:
     --paths              Show local paths instead of URLs
@@ -8596,6 +8620,13 @@ LIST OPTIONS:
 
 DOCTOR OPTIONS:
     --review             Include review command prerequisites
+
+SELF-UPDATE OPTIONS:
+    --check              Check for updates without installing
+
+CONFIG OPTIONS:
+    --print              Print current config file contents
+    --set KEY=VALUE      Set a configuration value (also --set=KEY=VALUE)
 
 PRUNE OPTIONS:
     (no options)         List orphan repositories (dry run)
@@ -8626,6 +8657,10 @@ COMMIT-SWEEP OPTIONS:
     --dry-run            Explicit dry-run (default behavior)
 
 IMPORT OPTIONS:
+    --stars              Import the repos you starred on GitHub
+    --org=NAME           Import an organization'\''s repos (repeatable)
+    --user=NAME          Import a user'\''s repos (repeatable)
+    --limit=N            Read at most N repos from each GitHub source
     --public             Force all repos to be added as public
     --private            Force all repos to be added as private
     --dry-run            Preview import without modifying config
@@ -8649,6 +8684,48 @@ REVIEW OPTIONS:
     --max-repos=N        Limit number of repos to review
     --max-runtime=MIN    Time budget in minutes
     --max-questions=N    Question budget before pausing
+
+AGENT-SWEEP OPTIONS:
+    --dry-run            Preview which repos would be processed
+    --parallel N, -jN    Process N repos concurrently (default: 1)
+    --repos=PATTERN      Filter repos by glob (or plain-text substring)
+    --show-denylist      List active denylist patterns and exit
+    --with-release       Include release step after commit
+    --resume             Resume an interrupted sweep
+    --restart            Clear previous state and start fresh
+    --keep-sessions      Keep tmux sessions after completion
+    --keep-sessions-on-fail Keep sessions only on failure
+    --attach-on-fail     Attach to session on failure
+    --execution-mode=M   Mode: plan, apply, or agent (default: agent)
+    --secret-scan=MODE   Secret scanning: none, warn, or block (default: warn)
+    --max-file-mb=N      Max staged file size in MB
+    --phase1-timeout=N   Phase 1 timeout in seconds (default: 300)
+    --phase2-timeout=N   Phase 2 timeout in seconds (default: 600)
+    --phase3-timeout=N   Phase 3 timeout in seconds (default: 300)
+    --verbose, -v        Verbose output
+    --debug, -d          Debug output (implies verbose)
+
+AI-SYNC OPTIONS (see `ru ai-sync --help`):
+    --dry-run            Show dirty repos without starting AI sessions
+    --include=PATTERN    Only process matching repos (glob or substring)
+    --exclude=PATTERN    Skip matching repos (glob or substring)
+    --timeout=SEC        Per-repo timeout in seconds (default: 600)
+    --no-push            Commit changes without pushing
+    --agent=TYPE         Agent type: claude (default), codex, gemini
+    --no-untracked       Ignore untracked files when scanning dirty repos
+
+DEP-UPDATE OPTIONS (see `ru dep-update --help`):
+    --dry-run            Show outdated dependencies without updating
+    --manager=NAME       Filter by package manager (npm, cargo, go, composer, ...)
+    --include=PATTERN    Only update deps matching regex pattern
+    --exclude=PATTERN    Skip deps matching regex pattern
+    --major              Include major version updates (default: skip)
+    --test-cmd=CMD       Custom test command (overrides auto-detection)
+    --max-fix-attempts=N Max fix iterations per dependency (default: 5)
+    --no-push            Commit verified updates without pushing
+    --repo=PATH          Process a single repository path
+    --agent=TYPE         Agent type: claude (default), codex, gemini
+    --timeout=SEC        Per-repo timeout in seconds (default: 900)
 
 ROBOT-DOCS OPTIONS:
     <topic>              Topic: quickstart, commands, examples, exit-codes, formats, schemas, all
@@ -10779,7 +10856,7 @@ parse_args() {
     local scan_i command_seen=false
     for ((scan_i = 0; scan_i < ${#scan_args[@]}; scan_i++)); do
         case "${scan_args[scan_i]}" in
-            --format|--dir|--timeout|--parallel|-j|--group|--set|--mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions|--invalidate-cache|--auto-answer)
+            --format|--dir|--timeout|--parallel|-j|--group|--set|--mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions|--invalidate-cache|--auto-answer|--org|--user|--limit)
                 ((scan_i++))
                 ;;
             sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep|ai-sync|dep-update|robot-docs|fork-status|fork-sync|fork-clean|commit-sweep)
@@ -10966,6 +11043,16 @@ parse_args() {
                 fi
                 shift
                 ;;
+            --sequential)
+                if [[ "$COMMAND" == "ai-sync" ]]; then
+                    ARGS+=("$1")
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                shift
+                ;;
             --parallel)
                 if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     if [[ $# -lt 2 ]]; then
@@ -11081,6 +11168,19 @@ parse_args() {
                 ARGS+=("$1")
                 shift
                 ;;
+            --org|--user|--limit)
+                if [[ "$COMMAND" != "import" ]]; then
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    log_error "$1 requires a value"
+                    exit 4
+                fi
+                ARGS+=("$1=$2")
+                shift 2
+                ;;
             --group|--group=*)
                 if [[ "$COMMAND" != "add" ]]; then
                     log_error "Unknown option: $1 (only valid for 'ru add')"
@@ -11176,7 +11276,7 @@ parse_args() {
                 fi
                 ;;
             --mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions|--invalidate-cache|--auto-answer)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" ]] || { [[ "$1" == "--repos" ]] && [[ "$COMMAND" == "agent-sweep" || "$COMMAND" == "fork-status" || "$COMMAND" == "fork-sync" || "$COMMAND" == "fork-clean" || "$COMMAND" == "commit-sweep" ]]; }; then
                     if [[ $# -lt 2 ]]; then
                         log_error "$1 requires a value"
                         exit 4
@@ -12154,6 +12254,7 @@ cmd_init() {
 
 cmd_add() {
     # Parse command-specific options
+    local use_public="false"
     local use_private="false"
     local from_cwd="false"
     local add_group=""
@@ -12168,6 +12269,7 @@ cmd_add() {
             continue
         fi
         case "$arg" in
+            --public) use_public="true" ;;
             --private) use_private="true" ;;
             --from-cwd) from_cwd="true" ;;
             --group) expect_group="true" ;;
@@ -12176,6 +12278,12 @@ cmd_add() {
             *) repo_args+=("$arg") ;;
         esac
     done
+
+    if [[ "$use_public" == "true" && "$use_private" == "true" ]]; then
+        log_error "--public and --private are mutually exclusive"
+        emit_command_refusal add conflicting_visibility_flags 4
+        exit 4
+    fi
 
     if [[ "$expect_group" == "true" ]]; then
         log_error "--group requires a value"
@@ -12753,10 +12861,29 @@ cmd_import() {
 }
 
 cmd_remove() {
-    if [[ ${#ARGS[@]} -eq 0 ]]; then
-        log_error "Usage: ru remove <repo> [repo2] ..."
+    local filter_public="false"
+    local filter_private="false"
+    local -a repo_args=()
+    local arg
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --public)  filter_public="true" ;;
+            --private) filter_private="true" ;;
+            *)         repo_args+=("$arg") ;;
+        esac
+    done
+
+    if [[ "$filter_public" == "true" && "$filter_private" == "true" ]]; then
+        log_error "--public and --private are mutually exclusive"
+        emit_command_refusal remove conflicting_visibility_flags 4
+        exit 4
+    fi
+
+    if [[ ${#repo_args[@]} -eq 0 ]]; then
+        log_error "Usage: ru remove [--public|--private] <repo> [repo2] ..."
         log_info "Examples:"
         log_info "  ru remove owner/repo"
+        log_info "  ru remove --private owner/repo"
         log_info "  ru remove https://github.com/owner/repo"
         emit_command_refusal remove missing_repository 4
         exit 4
@@ -12776,10 +12903,22 @@ cmd_remove() {
         exit 3
     fi
 
+    local -a target_files=()
+    if [[ "$filter_private" == "true" ]]; then
+        [[ -f "$repos_dir/private.txt" ]] && target_files+=("$repos_dir/private.txt")
+    elif [[ "$filter_public" == "true" ]]; then
+        [[ -f "$repos_dir/public.txt" ]] && target_files+=("$repos_dir/public.txt")
+    else
+        local f
+        for f in "$repos_dir"/*.txt; do
+            [[ -f "$f" ]] && target_files+=("$f")
+        done
+    fi
+
     local removed=0 not_found=0
     local -a removed_json=() not_found_json=() invalid_json=()
 
-    for repo in "${ARGS[@]}"; do
+    for repo in "${repo_args[@]}"; do
         # Normalize the repo URL for matching (accept @branch / "as name")
         # shellcheck disable=SC2034  # spec_branch/spec_name set by parse_repo_spec, intentionally unused
         local spec_url spec_branch spec_name
@@ -12794,12 +12933,13 @@ cmd_remove() {
 
         local found_in_any="false"
 
-        # Search all .txt files in repos.d/
-        for repos_file in "$repos_dir"/*.txt; do
+        # Search selected .txt file(s) in repos.d/
+        for repos_file in ${target_files[@]+"${target_files[@]}"}; do
             [[ -f "$repos_file" ]] || continue
 
             # Parse each line and compare owner/repo to avoid substring matching issues
             local tmp_file="${repos_file}.tmp.$$"
+            : > "$tmp_file"
             local found="false"
 
             while IFS= read -r line || [[ -n "$line" ]]; do
@@ -13424,6 +13564,11 @@ cmd_config() {
                 ;;
             --set=*)
                 set_value="${arg#--set=}"
+                ;;
+            *)
+                log_error "config: Unknown option: $arg"
+                [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope config '{"error":{"reason":"unknown_option"}}' '{"exit_code":4}')"
+                return 4
                 ;;
         esac
     done
@@ -26723,9 +26868,20 @@ cmd_agent_sweep() {
         esac
     done
 
-    # List the active denylist patterns, one per line, and stop
+    # List the active denylist patterns, one per line (or JSON), and stop
     if [[ "$show_denylist" == true ]]; then
-        get_denylist_patterns
+        if [[ "$json_output" == true ]]; then
+            local -a patterns_json=()
+            local pattern
+            while IFS= read -r pattern; do
+                [[ -n "$pattern" ]] || continue
+                patterns_json+=("$(printf '"%s"' "$(json_escape "$pattern")")")
+            done < <(get_denylist_patterns)
+            local IFS=,
+            printf '{"mode":"denylist","patterns":[%s]}\n' "${patterns_json[*]-}"
+        else
+            get_denylist_patterns
+        fi
         return 0
     fi
 
@@ -27724,6 +27880,7 @@ _robot_docs_commands() {
       "description": "Add a repository to your sync list",
       "args": ["<owner/repo>"],
       "flags": [
+        {"flag": "--public", "description": "Add to public.txt (default)"},
         {"flag": "--private", "description": "Add to private.txt instead of public.txt"},
         {"flag": "--from-cwd", "description": "Detect repo from current working directory"},
         {"flag": "--group NAME", "description": "Clone into a NAME/ subfolder of the layout path (writes '\''owner/repo in NAME'\'')"}
@@ -27732,7 +27889,11 @@ _robot_docs_commands() {
     {
       "name": "remove",
       "description": "Remove a repository from your sync list",
-      "args": ["<owner/repo>"]
+      "args": ["<owner/repo>"],
+      "flags": [
+        {"flag": "--public", "description": "Remove from public.txt only"},
+        {"flag": "--private", "description": "Remove from private.txt only"}
+      ]
     },
     {
       "name": "list",
@@ -27752,15 +27913,17 @@ _robot_docs_commands() {
     },
     {
       "name": "self-update",
-      "description": "Update ru to the latest version from GitHub"
+      "description": "Update ru to the latest version from GitHub",
+      "flags": [
+        {"flag": "--check", "description": "Check for updates without installing"}
+      ]
     },
     {
       "name": "config",
       "description": "Show or set configuration values",
       "flags": [
         {"flag": "--print", "description": "Print current config"},
-        {"flag": "--set=KEY=VALUE", "description": "Set a config value"},
-        {"flag": "--check", "description": "Validate configuration"}
+        {"flag": "--set KEY=VALUE, --set=KEY=VALUE", "description": "Set a config value"}
       ]
     },
     {
@@ -27795,22 +27958,51 @@ _robot_docs_commands() {
         {"flag": "--analytics", "description": "Show review metrics dashboard"},
         {"flag": "--basic", "description": "Use basic question TUI"},
         {"flag": "--mode=MODE", "description": "Driver: auto, ntm, or local"},
-        {"flag": "--repos=PATTERN", "description": "Filter repos by pattern"},
+        {"flag": "--parallel=N, -jN", "description": "Concurrent review sessions (default: 4)"},
+        {"flag": "--repos=PATTERN", "description": "Filter repos by glob (or plain-text substring)"},
         {"flag": "--priority=LEVEL", "description": "Min priority: all, critical, high, normal, low"},
         {"flag": "--skip-days=N", "description": "Skip recently reviewed repos (default: 7)"},
         {"flag": "--dry-run", "description": "Discovery only"},
         {"flag": "--status", "description": "Show review lock/checkpoint status"},
         {"flag": "--resume", "description": "Resume interrupted review"},
-        {"flag": "--push", "description": "Allow pushing changes (with --apply)"}
+        {"flag": "--push", "description": "Allow pushing changes (with --apply)"},
+        {"flag": "--auto-answer=POLICY", "description": "Auto-answer policy in non-interactive mode (auto|skip|fail)"},
+        {"flag": "--invalidate-cache=R", "description": "Invalidate digest cache for repo(s) or all"},
+        {"flag": "--max-repos=N", "description": "Limit number of repos to review"},
+        {"flag": "--max-runtime=MIN", "description": "Time budget in minutes"},
+        {"flag": "--max-questions=N", "description": "Question budget before pausing"}
       ]
     },
     {
       "name": "ai-sync",
-      "description": "AI-assisted sync with intelligent conflict resolution"
+      "description": "Auto-commit dirty repositories using AI agents (via ntm)",
+      "flags": [
+        {"flag": "--dry-run", "description": "Preview dirty repos without starting AI sessions"},
+        {"flag": "--include=PATTERN", "description": "Only process matching repos (glob or substring)"},
+        {"flag": "--exclude=PATTERN", "description": "Skip matching repos (glob or substring)"},
+        {"flag": "--timeout=SEC", "description": "Per-repo timeout in seconds (default: 600)"},
+        {"flag": "--no-push", "description": "Commit changes without pushing"},
+        {"flag": "--agent=TYPE", "description": "Agent type: claude (default), codex, gemini"},
+        {"flag": "--no-untracked", "description": "Ignore untracked files when scanning dirty repos"},
+        {"flag": "--sequential", "description": "Process repositories sequentially (default)"}
+      ]
     },
     {
       "name": "dep-update",
-      "description": "Update dependencies across managed repositories"
+      "description": "Update dependencies across managed repositories using AI agents",
+      "flags": [
+        {"flag": "--dry-run", "description": "Show outdated dependencies without updating"},
+        {"flag": "--manager=NAME", "description": "Filter by package manager (npm, cargo, go, composer, etc.)"},
+        {"flag": "--include=PATTERN", "description": "Only update deps matching regex pattern"},
+        {"flag": "--exclude=PATTERN", "description": "Skip deps matching regex pattern"},
+        {"flag": "--major", "description": "Include major version updates (default: skip major)"},
+        {"flag": "--test-cmd=CMD", "description": "Custom test command (overrides auto-detection)"},
+        {"flag": "--max-fix-attempts=N", "description": "Max fix iterations per dependency (default: 5)"},
+        {"flag": "--no-push", "description": "Commit verified updates without pushing"},
+        {"flag": "--repo=PATH", "description": "Process single repo only (default: all configured repos)"},
+        {"flag": "--agent=TYPE", "description": "Agent type: claude (default), codex, gemini"},
+        {"flag": "--timeout=SEC", "description": "Per-repo timeout in seconds (default: 900)"}
+      ]
     },
     {
       "name": "agent-sweep",
@@ -27827,6 +28019,7 @@ _robot_docs_commands() {
         {"flag": "--attach-on-fail", "description": "Attach to session on failure"},
         {"flag": "--execution-mode=MODE", "description": "plan, apply or agent (default: agent)"},
         {"flag": "--secret-scan=MODE", "description": "none, warn or block (default: warn)"},
+        {"flag": "--max-file-mb=N", "description": "Max staged file size in MB"},
         {"flag": "--phase1-timeout=N", "description": "Phase 1 timeout in seconds (default: 300)"},
         {"flag": "--phase2-timeout=N", "description": "Phase 2 timeout in seconds (default: 600)"},
         {"flag": "--phase3-timeout=N", "description": "Phase 3 timeout in seconds (default: 300)"},
@@ -27897,7 +28090,8 @@ _robot_docs_commands() {
     {"flag": "--stats", "description": "Show JSON vs TOON token stats on stderr"},
     {"flag": "-q, --quiet", "description": "Minimal output (errors only)"},
     {"flag": "--verbose", "description": "Detailed output"},
-    {"flag": "--non-interactive", "description": "Never prompt (for CI/automation)"}
+    {"flag": "--non-interactive", "description": "Never prompt (for CI/automation)"},
+    {"flag": "--schema", "description": "Output JSON schemas (shortcut for robot-docs schemas)"}
   ]
 }'
 }
@@ -28229,6 +28423,7 @@ _robot_docs_schemas() {
         "type":"object",
         "oneOf":[
           {"required":["mode","repos"],"properties":{"mode":{"const":"dry-run"},"repos":{"type":"array","items":{"type":"string"}}}},
+          {"required":["mode","patterns"],"properties":{"mode":{"const":"denylist"},"patterns":{"type":"array","items":{"type":"string"}}}},
           {"required":["status","message","repos_processed"],"properties":{"status":{"const":"success"},"message":{"type":"string"},"repos_processed":{"const":0}}},
           {"required":["timestamp","run_id","duration_seconds","summary","artifacts_dir","repos"],"properties":{
             "timestamp":{"type":"string"},"run_id":{"type":"string"},"duration_seconds":{"type":"integer","minimum":0},

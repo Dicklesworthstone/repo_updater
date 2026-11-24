@@ -426,6 +426,23 @@ test_state_dir_creation() {
     log_test_pass "$test_name"
 }
 
+test_config_rejects_unknown_options() {
+    local test_name="config rejects unsupported flags such as --check"
+    log_test_start "$test_name"
+
+    config_test_setup
+    run_ru_command init
+
+    local exit_code=0 out
+    out=$("$E2E_RU_SCRIPT" --json config --check 2>/dev/null) || exit_code=$?
+    assert_equals "4" "$exit_code" "ru config --check exits 4"
+    assert_equals "unknown_option 4" "$(printf '%s\n' "$out" | jq -r '"\(.data.error.reason) \(._meta.exit_code)"' 2>/dev/null)" \
+        "ru --json config --check emits unknown_option envelope"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -443,6 +460,7 @@ run_test test_invalid_config
 run_test test_repos_d_multiple_files
 run_test test_config_affects_sync
 run_test test_state_dir_creation
+run_test test_config_rejects_unknown_options
 
 print_results
 exit "$(get_exit_code)"

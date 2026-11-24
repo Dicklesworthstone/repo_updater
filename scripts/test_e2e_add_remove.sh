@@ -535,6 +535,78 @@ test_import_github_argument_validation() {
     e2e_cleanup
 }
 
+test_add_and_remove_visibility_flags() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+
+    local exit_code=0 out
+    "$E2E_RU_SCRIPT" add --public octocat/pub-one >/dev/null 2>&1 || exit_code=$?
+    assert_equals "0" "$exit_code" "ru add --public exits 0"
+    assert_file_contains "$RU_CONFIG_DIR/repos.d/public.txt" "octocat/pub-one" "ru add --public writes to public.txt"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json add --public --private octocat/both 2>/dev/null) || exit_code=$?
+    assert_equals "4" "$exit_code" "ru add --public --private exits 4"
+    assert_equals "conflicting_visibility_flags 4" "$(printf '%s\n' "$out" | jq -r '"\(.data.error.reason) \(._meta.exit_code)"' 2>/dev/null)"         "ru add --public --private reports conflicting_visibility_flags in JSON"
+
+    # Negative: --private must not remove a repo that lives only in public.txt
+    exit_code=0
+    "$E2E_RU_SCRIPT" remove --private octocat/pub-one >/dev/null 2>&1 || exit_code=$?
+    assert_equals "1" "$exit_code" "ru remove --private refuses to touch public-only repo"
+    assert_file_contains "$RU_CONFIG_DIR/repos.d/public.txt" "octocat/pub-one" "public.txt entry remains intact after remove --private"
+
+    # Put the same repo in both public.txt and private.txt to prove targeted removal
+    "$E2E_RU_SCRIPT" add --public octocat/dual >/dev/null 2>&1
+    printf '%s\n' "octocat/dual" >> "$RU_CONFIG_DIR/repos.d/private.txt"
+    assert_file_contains "$RU_CONFIG_DIR/repos.d/public.txt" "octocat/dual" "octocat/dual in public.txt"
+    assert_file_contains "$RU_CONFIG_DIR/repos.d/private.txt" "octocat/dual" "octocat/dual in private.txt"
+
+    exit_code=0
+    "$E2E_RU_SCRIPT" remove --private octocat/dual >/dev/null 2>&1 || exit_code=$?
+    assert_equals "0" "$exit_code" "ru remove --private exits 0"
+    assert_file_contains "$RU_CONFIG_DIR/repos.d/public.txt" "octocat/dual" "ru remove --private keeps public.txt entry"
+    assert_false "grep -q 'octocat/dual' '$RU_CONFIG_DIR/repos.d/private.txt'" "ru remove --private deletes private.txt entry"
+
+    exit_code=0
+    "$E2E_RU_SCRIPT" remove --public octocat/dual >/dev/null 2>&1 || exit_code=$?
+    assert_equals "0" "$exit_code" "ru remove --public exits 0"
+    assert_false "grep -q 'octocat/dual' '$RU_CONFIG_DIR/repos.d/public.txt'" "ru remove --public deletes public.txt entry"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" --json remove --public --private octocat/pub-one 2>/dev/null) || exit_code=$?
+    assert_equals "4" "$exit_code" "ru remove --public --private exits 4"
+    assert_equals "conflicting_visibility_flags 4" "$(printf '%s\n' "$out" | jq -r '"\(.data.error.reason) \(._meta.exit_code)"' 2>/dev/null)"         "ru remove --public --private reports conflicting_visibility_flags in JSON"
+
+    exit_code=0
+    "$E2E_RU_SCRIPT" remove --private >/dev/null 2>&1 || exit_code=$?
+    assert_equals "4" "$exit_code" "ru remove --private without repo exits 4"
+
+    e2e_cleanup
+}
+
+test_import_github_space_separated_flags() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    create_import_gh_stub
+
+    local exit_code=0 out_eq out_space out_lead
+    out_eq=$("$E2E_RU_SCRIPT" --json import --org=acme --limit=1 --dry-run 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "ru import --org=acme --limit=1 --dry-run exits 0"
+
+    exit_code=0
+    out_space=$("$E2E_RU_SCRIPT" --json import --org acme --limit 1 --dry-run 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "ru import --org acme --limit 1 --dry-run exits 0"
+
+    exit_code=0
+    out_lead=$("$E2E_RU_SCRIPT" --json --org acme --limit 1 --dry-run import 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "ru --org acme --limit 1 --dry-run import exits 0"
+
+    assert_equals "$(printf '%s\n' "$out_eq" | jq -c '.data')" "$(printf '%s\n' "$out_space" | jq -c '.data')"         "space-separated import flags match equals form"
+    assert_equals "$(printf '%s\n' "$out_eq" | jq -c '.data')" "$(printf '%s\n' "$out_lead" | jq -c '.data')"         "leading import flags match trailing form"
+
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -564,5 +636,7 @@ run_test test_import_org_limit_and_private
 run_test test_import_dry_run_writes_nothing
 run_test test_import_failed_listing_imports_nothing
 run_test test_import_github_argument_validation
+run_test test_add_and_remove_visibility_flags
+run_test test_import_github_space_separated_flags
 
 print_results

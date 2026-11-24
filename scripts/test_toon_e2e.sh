@@ -220,19 +220,43 @@ else
 fi
 log ""
 
-# Phase 6: Multiple Commands
-log "--- Phase 6: Multiple Commands ---"
+# Phase 6: Multiple Commands & Semantic Round-Trip Equivalence
+log "--- Phase 6: Multiple Commands & Round-Trip ---"
 
-# Note: 'status' omitted because it scans all repos and is too slow for CI
 COMMANDS=(
     "list"
+    "status --no-fetch"
+    "config"
+    "prune"
+    "agent-sweep --dry-run"
+    "agent-sweep --show-denylist"
+    "commit-sweep --dry-run"
+    "fork-status --no-fetch"
+    "robot-docs exit-codes"
+    "review --status"
 )
 
 for cmd in "${COMMANDS[@]}"; do
-    if ru --format toon $cmd &>/dev/null; then
-        record_pass "ru --format toon $cmd"
+    # shellcheck disable=SC2086  # intentional word-splitting of static command+flags tuples
+    cmd_json=$(ru --format json $cmd 2>/dev/null)
+    json_rc=$?
+    # shellcheck disable=SC2086
+    cmd_toon=$(ru --format toon $cmd 2>/dev/null)
+    toon_rc=$?
+    if [[ "$json_rc" -ne "$toon_rc" ]]; then
+        record_fail "ru --format toon $cmd exit mismatch (json=$json_rc toon=$toon_rc)"
+        continue
+    fi
+    if [[ -n "$TOON_CLI" ]]; then
+        if decoded=$(printf '%s\n' "$cmd_toon" | "$TOON_CLI" --decode 2>/dev/null) &&
+           jq -ne --argjson j "$cmd_json" --argjson t "$decoded" \
+               '$j.command == $t.command and $j.version == $t.version and $j._meta.exit_code == $t._meta.exit_code and $j.data == $t.data' >/dev/null 2>&1; then
+            record_pass "ru --format toon $cmd round-trips identically to JSON"
+        else
+            record_fail "ru --format toon $cmd failed semantic TOON round-trip"
+        fi
     else
-        record_skip "ru --format toon $cmd"
+        record_skip "ru --format toon $cmd round-trip (no TOON CLI)"
     fi
 done
 log ""

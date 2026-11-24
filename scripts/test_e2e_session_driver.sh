@@ -776,6 +776,121 @@ test_dep_update_cli_configured_repo_uses_verified_transactions() {
     assert_not_contains "$(cat "$env_root/git.trace")" ' push ' "Configured no-push invokes no host push"
 }
 
+test_ai_sync_cli_validates_agent_timeout_and_blocks_pane_push() {
+    local env_root repo_path before rc=0 result
+    env_root=$(create_ai_cli_fixture ai-sync) || return 1
+    repo_path="$env_root/projects/repo"
+    before=$(git -C "$repo_path" rev-parse HEAD) || return 1
+
+    # Invalid agent and timeout must fail closed with exit 4 even under --dry-run
+    rc=0
+    env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" ai-sync --dry-run --agent=bogus --json > "$env_root/bad-agent.stdout" 2> "$env_root/bad-agent.stderr" || rc=$?
+    assert_equals 4 "$rc" "ai-sync rejects unknown --agent with exit 4"
+
+    rc=0
+    env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" ai-sync --dry-run --timeout=0 --json > "$env_root/bad-timeout.stdout" 2> "$env_root/bad-timeout.stderr" || rc=$?
+    assert_equals 4 "$rc" "ai-sync rejects --timeout=0 with exit 4"
+
+    rc=0
+    env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" ai-sync --dry-run --timeout=abc --json > "$env_root/bad-timeout2.stdout" 2> "$env_root/bad-timeout2.stderr" || rc=$?
+    assert_equals 4 "$rc" "ai-sync rejects non-numeric --timeout with exit 4"
+
+    # Missing selected provider binary (gemini absent in minimal PATH) exits 3
+    mkdir -p "$env_root/no-gemini-bin"
+    local tool
+    for tool in bash git jq ntm tmux; do
+        local found
+        found=$(PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" type -P "$tool" 2>/dev/null || true)
+        [[ -n "$found" ]] && ln -sf "$found" "$env_root/no-gemini-bin/$tool"
+    done
+    rc=0
+    env PATH="$env_root/no-gemini-bin" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" ai-sync --dry-run --agent=gemini --json > "$env_root/no-gemini.stdout" 2> "$env_root/no-gemini.stderr" || rc=$?
+    assert_equals 3 "$rc" "ai-sync exits 3 when selected provider CLI is missing"
+
+    # Verify --no-push passes --pane-env GIT_ALLOW_PROTOCOL= and that Git refuses any push under that env
+    rc=0
+    run_ai_cli_fixture "$env_root" ai-sync session_work false --no-push || rc=$?
+    assert_equals 0 "$rc" "ai-sync --no-push succeeds on verified local commit"
+    assert_success "ai-sync passes empty GIT_ALLOW_PROTOCOL into spawned pane" grep -qF -- "--pane-env GIT_ALLOW_PROTOCOL=" "$env_root/ntm.args"
+    local push_rc=0
+    GIT_ALLOW_PROTOCOL='' git -C "$repo_path" push origin main > "$env_root/pane-push.stdout" 2> "$env_root/pane-push.stderr" || push_rc=$?
+    assert_not_equals 0 "$push_rc" "Real git push under pane GIT_ALLOW_PROTOCOL= is refused"
+    assert_equals "$before" "$(git -C "$env_root/receiver.git" rev-parse refs/heads/main)" "Blocked pane push leaves bare receiver untouched"
+}
+
+test_dep_update_cli_validates_options_unsupported_managers_and_missing_jq() {
+    local env_root repo_path rc=0 out_cfg out_single
+    env_root=$(create_ai_cli_fixture dep-update) || return 1
+    repo_path="$env_root/projects/repo"
+
+    # Option validation fails closed with exit 4 even under --dry-run
+    rc=0
+    env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" dep-update --dry-run --timeout=0 --json > "$env_root/dep-bad-t.stdout" 2> "$env_root/dep-bad-t.stderr" || rc=$?
+    assert_equals 4 "$rc" "dep-update rejects --timeout=0 with exit 4"
+
+    rc=0
+    env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" dep-update --dry-run --max-fix-attempts=0 --json > "$env_root/dep-bad-a.stdout" 2> "$env_root/dep-bad-a.stderr" || rc=$?
+    assert_equals 4 "$rc" "dep-update rejects --max-fix-attempts=0 with exit 4"
+
+    # Default configured mode and --repo mode reach the same repo and produce identical dry-run outdated plans
+    rc=0
+    AI_CLI_USE_CONFIGURED=true run_ai_cli_fixture "$env_root" dep-update ok false --dry-run || rc=$?
+    assert_equals 0 "$rc" "Configured dep-update --dry-run exits 0 for valid npm scan"
+    out_cfg=$(cat "$env_root/cli.stdout")
+    rc=0
+    AI_CLI_USE_CONFIGURED=false run_ai_cli_fixture "$env_root" dep-update ok false --dry-run || rc=$?
+    assert_equals 0 "$rc" "--repo dep-update --dry-run exits 0 for valid npm scan"
+    out_single=$(cat "$env_root/cli.stdout")
+    assert_equals "$(jq -c '.data' <<< "$out_cfg")" "$(jq -c '.data' <<< "$out_single")" \
+        "Configured mode and --repo mode select identical repo and dry-run plan"
+
+    # Unsupported managers (Maven, Gradle, pip) fail closed with typed unsupported_scan errors (never empty current set)
+    local unsup_repo="$env_root/projects/polyglot-unsupported"
+    mkdir -p "$unsup_repo"
+    git -C "$unsup_repo" init -b main >/dev/null 2>&1
+    git -C "$unsup_repo" config user.name "Test"
+    git -C "$unsup_repo" config user.email "test@example.com"
+    printf '<project/>\n' > "$unsup_repo/pom.xml"
+    printf 'plugins {}\n' > "$unsup_repo/build.gradle"
+    printf 'requests==2.31.0\n' > "$unsup_repo/requirements.txt"
+    git -C "$unsup_repo" add pom.xml build.gradle requirements.txt && git -C "$unsup_repo" commit -m "init" >/dev/null 2>&1
+    rc=0
+    env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" dep-update --dry-run --agent=codex "--repo=$unsup_repo" --json > "$env_root/unsup.stdout" 2> "$env_root/unsup.stderr" || rc=$?
+    assert_equals 1 "$rc" "Maven/Gradle/pip repo fails closed with exit 1 instead of pretending current"
+    assert_success "Unsupported managers emit typed unsupported_scan errors" \
+        jq -e '.data.failed == 1 and .data.processed == 0 and (.data.results[0].scan.results | map(select(.error_code == "unsupported_scan") | .manager) | sort) == ["gradle","maven","pip"]' \
+        "$env_root/unsup.stdout"
+
+    # Missing jq fails closed with exit 3 and typed JSON error envelope
+    mkdir -p "$env_root/no-jq-bin"
+    local tool found
+    for tool in bash cat date dirname git mktemp ntm codex perl python3 rm tr; do
+        found=$(PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" type -P "$tool" 2>/dev/null || true)
+        [[ -n "$found" ]] && ln -sf "$found" "$env_root/no-jq-bin/$tool"
+    done
+    rc=0
+    env PATH="$env_root/no-jq-bin" CI=true RU_CHECK_UPDATES=false \
+        RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
+        bash "$E2E_RU_SCRIPT" dep-update --dry-run --agent=codex "--repo=$repo_path" --json > "$env_root/no-jq.stdout" 2> "$env_root/no-jq.stderr" || rc=$?
+    assert_equals 3 "$rc" "dep-update without jq exits 3"
+    assert_success "dep-update without jq emits valid JSON error envelope" \
+        jq -e '._meta.exit_code == 3 and .command == "dep-update" and (.data.error.reason | length > 0)' "$env_root/no-jq.stdout"
+}
+
 # Run tests
 #------------------------------------------------------------------------------
 
@@ -791,6 +906,8 @@ run_test test_ai_cli_host_publication_success_and_refusal
 run_test test_ai_cli_dry_run_is_read_only
 run_test test_dep_update_cli_relative_repo_preserves_physical_identity
 run_test test_dep_update_cli_configured_repo_uses_verified_transactions
+run_test test_ai_sync_cli_validates_agent_timeout_and_blocks_pane_push
+run_test test_dep_update_cli_validates_options_unsupported_managers_and_missing_jq
 
 print_results
 exit "$(get_exit_code)"

@@ -889,6 +889,42 @@ test_documented_timeout_settings_bound_actual_clone() {
     done
 }
 
+test_sync_detached_pin_dirty_autostash() {
+    sync_test_setup
+    create_test_remote pins autostash-tag 2
+    local remote="${REMOTE_REGISTRY[pins/autostash-tag]}" old_sha new_sha clone config
+    old_sha=$(git -C "$remote" rev-parse HEAD^)
+    new_sha=$(git -C "$remote" rev-parse HEAD)
+    git -C "$remote" tag tag-v1 "$old_sha"
+    git -C "$remote" tag tag-v2 "$new_sha"
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add pins/autostash-tag@tag-v1 >/dev/null 2>&1
+    sync_test_finalize_mock
+    clone="$E2E_TEMP_DIR/projects/autostash-tag"
+    config="$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+
+    run_ru_sync --json
+    assert_equals 0 "$RU_EXIT_CODE" "Initial detached tag clone succeeds"
+    assert_equals "$old_sha" "$(git -C "$clone" rev-parse HEAD)" "Initial detached tag selects tag-v1"
+
+    # Modify a tracked file (file1.txt is untouched by commit 2, which adds file2.txt)
+    printf 'dirty user bytes\n' >> "$clone/file1.txt"
+    printf '%s\n' pins/autostash-tag@tag-v2 > "$config"
+
+    run_ru_sync --json
+    assert_equals 2 "$RU_EXIT_CODE" "Detached dirty repo refuses pin transition without --autostash"
+    assert_equals "$old_sha" "$(git -C "$clone" rev-parse HEAD)" "Refused transition keeps old detached HEAD"
+    assert_file_contains "$clone/file1.txt" "dirty user bytes" "Refused transition preserves dirty tracked bytes"
+
+    run_ru_sync --autostash --json
+    assert_equals 0 "$RU_EXIT_CODE" "Detached dirty repo transitions pin cleanly with --autostash"
+    assert_equals "$new_sha" "$(git -C "$clone" rev-parse HEAD)" "Autostash transition reaches tag-v2"
+    assert_file_contains "$clone/file1.txt" "dirty user bytes" "Autostash transition restores dirty tracked bytes"
+
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -908,6 +944,7 @@ run_test test_sync_missing_ref_preserves_clone_and_checkpoint
 run_test test_sync_missing_pin_named_like_tracked_file
 run_test test_sync_pinned_tag_is_stable
 run_test test_sync_can_change_a_detached_pin
+run_test test_sync_detached_pin_dirty_autostash
 run_test test_sync_clone_failure
 run_test test_sync_clone_timeout_handling
 run_test test_sync_clone_dry_run_paths

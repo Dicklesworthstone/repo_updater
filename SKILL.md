@@ -1,6 +1,6 @@
 ---
 name: ru
-description: "Repo Updater - Multi-repo synchronization with AI-assisted review orchestration. Parallel sync, agent-sweep for dirty repos, ntm integration, git plumbing. 17K LOC Bash CLI."
+description: "Repo Updater - Multi-repo synchronization with AI-assisted review orchestration. Parallel sync, agent-sweep for dirty repos, ntm integration, git plumbing. 28.5K LOC Bash CLI."
 ---
 
 # RU - Repo Updater
@@ -39,7 +39,7 @@ git rev-parse HEAD
 Human-readable output goes to stderr; data to stdout:
 
 ```bash
-ru sync --json 2>/dev/null | jq '.summary'
+ru sync --json 2>/dev/null | jq '.data.summary'
 # Progress shows in terminal, JSON pipes to jq
 ```
 
@@ -65,7 +65,7 @@ ru sync --dry-run
 ru sync --resume
 
 # JSON output for scripting
-ru sync --json 2>/dev/null | jq '.summary'
+ru sync --json 2>/dev/null | jq '.data.summary'
 ```
 
 ### Status (Read-Only Check)
@@ -455,16 +455,21 @@ ru sync --json 2>/dev/null
 
 ```json
 {
-  "version": "1.2.0",
-  "timestamp": "2025-01-03T14:30:00Z",
-  "summary": {
-    "total": 47,
-    "cloned": 8,
-    "updated": 34,
-    "current": 3,
-    "conflicts": 2
+  "generated_at": "2025-01-03T14:30:00Z",
+  "version": "1.7.1",
+  "output_format": "json",
+  "command": "sync",
+  "data": {
+    "summary": {
+      "total": 47,
+      "cloned": 8,
+      "updated": 34,
+      "current": 3,
+      "conflicts": 2
+    },
+    "repos": [...]
   },
-  "repos": [...]
+  "_meta": {"exit_code": 0}
 }
 ```
 
@@ -479,7 +484,7 @@ ru sync --json 2>/dev/null
 
 ```bash
 # Get paths of all cloned repos
-ru sync --json 2>/dev/null | jq -r '.repos[] | select(.action=="clone") | .path'
+ru sync --json 2>/dev/null | jq -r '.data.repos[] | select(.action=="clone") | .path'
 
 # Count by status
 cat ~/.local/state/ru/logs/latest/results.ndjson | jq -s 'group_by(.status) | map({status: .[0].status, count: length})'
@@ -491,7 +496,6 @@ cat ~/.local/state/ru/logs/latest/results.ndjson | jq -s 'group_by(.status) | ma
 ru sync                        # Default: ff-only (safest)
 ru sync --rebase               # Rebase local commits
 ru sync --autostash            # Auto-stash before pull
-ru sync --force                # Force update (use with caution)
 ```
 
 | Strategy | Behavior |
@@ -509,7 +513,7 @@ Before applying changes, RU runs automated quality gates:
 | Project Type | Test Command | Lint Command |
 |--------------|--------------|--------------|
 | npm/yarn | `npm test` | `npm run lint` |
-| Cargo (Rust) | `cargo test` | `cargo clippy` |
+| Cargo (Rust) | `cargo test --workspace` | `cargo clippy` |
 | Go | `go test ./...` | `golangci-lint run` |
 | Python | `pytest` | `ruff check` |
 | Makefile | `make test` | `make lint` |
@@ -543,7 +547,7 @@ RU includes an adaptive parallelism governor:
 |----------|-------------|---------|
 | `RU_PROJECTS_DIR` | Base directory for repos | `/data/projects` |
 | `RU_LAYOUT` | Path layout | `flat` |
-| `RU_PARALLEL` | Parallel workers | `1` |
+| `RU_PARALLEL` | Parallel workers | `4` |
 | `RU_TIMEOUT` | Network timeout (seconds) | `30` |
 | `RU_UPDATE_STRATEGY` | Pull strategy | `ff-only` |
 | `GH_TOKEN` | GitHub token | (from gh CLI) |
@@ -577,7 +581,7 @@ ru agent-sweep --verbose --debug
 
 ```bash
 # View why repos were skipped
-ru agent-sweep --json 2>/dev/null | jq '.repos[] | select(.status == "skipped")'
+ru agent-sweep --json 2>/dev/null | jq '.data.repos[] | select(.status == "skipped")'
 ```
 
 ## Installation
@@ -592,7 +596,7 @@ ru doctor
 
 ## Architecture Notes
 
-- **~17,700 LOC** pure Bash, no external dependencies beyond git, curl, gh
+- **~28,500 LOC** pure Bash; core sync needs only git, curl, and gh, while AI workflows (`review`, `agent-sweep`, `ai-sync`, `dep-update`) invoke external AI provider CLIs (`claude`, `codex`, `gemini`) and transmit repository context to those providers
 - **Work-stealing queue** for parallel sync with atomic dequeue
 - **Portable locking** via `mkdir` (works on all POSIX systems)
 - **Path security validation** prevents traversal attacks

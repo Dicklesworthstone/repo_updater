@@ -539,7 +539,7 @@ ru [command] [options]
 | `--rebase` | Use `git pull --rebase` instead of merge |
 | `--dry-run` | Show what would happen without making changes |
 | `--dir PATH` | Override projects directory |
-| `--parallel N`, `-j N` | Sync N repos concurrently (default: 1) |
+| `--parallel N`, `-j N` | Sync N repos concurrently (default: 4) |
 | `--timeout SECONDS` | Network timeout for slow operations (default: 30) |
 | `--resume` | Resume an interrupted sync from where it left off |
 | `--restart` | Discard interrupted sync state and start fresh |
@@ -558,9 +558,10 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 **`ru add`**
 | Flag | Description |
 |------|-------------|
-| `--private` | Add to private repos list |
 | `--public` | Add to public repos list (default) |
+| `--private` | Add to private repos list |
 | `--from-cwd` | Detect repo from current directory's git remote |
+| `--group NAME` | Clone into a `NAME/` subfolder of the layout path |
 
 **`ru remove`**
 | Flag | Description |
@@ -623,10 +624,12 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | Flag | Description |
 |------|-------------|
 | `--stars` | Import from your GitHub stars |
-| `--org=NAME` | Import from an organization |
-| `--user=NAME` | Import from a user's repos |
+| `--org=NAME` | Import from an organization (repeatable) |
+| `--user=NAME` | Import from a user's repos (repeatable) |
 | `--limit=N` | Read at most N repos from each GitHub source |
-| `--private` | Add to private repos list |
+| `--public` | Force all imported repos into the public list |
+| `--private` | Force all imported repos into the private list |
+| `--dry-run` | Preview import without modifying config |
 
 **`ru agent-sweep`**
 | Flag | Description |
@@ -647,8 +650,21 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | `--phase2-timeout=N` | Phase 2 timeout in seconds (default: 600) |
 | `--phase3-timeout=N` | Phase 3 timeout in seconds (default: 300) |
 | `--json` | Output results as JSON |
+| `--max-file-mb=N` | Max staged file size in MB |
 | `--verbose`, `-v` | Verbose output |
 | `--debug`, `-d` | Debug output (implies verbose) |
+
+**`ru ai-sync`**
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview dirty repos without starting AI sessions |
+| `--include=PATTERN` | Only process matching repos (glob or plain-text substring) |
+| `--exclude=PATTERN` | Skip matching repos (glob or plain-text substring) |
+| `--timeout=SEC` | Per-repo timeout in seconds (default: 600) |
+| `--no-push` | Commit changes but don't push to remote |
+| `--agent=TYPE` | Agent type: `claude` (default), `codex`, `gemini` |
+| `--no-untracked` | Ignore untracked files when scanning for dirty repos |
+| `--sequential` | Process repositories sequentially (default) |
 
 **`ru dep-update`**
 | Flag | Description |
@@ -2894,10 +2910,10 @@ esac
 
 ### Component Overview
 
-ru is organized into logical layers, with each layer building on the ones below. The full implementation is approximately 17,700 lines of pure Bash, with no external dependencies beyond git, curl, and optionally `gh` CLI and `gum` for enhanced UX.
+ru is organized into logical layers, with each layer building on the ones below. The full implementation is approximately 28,500 lines of pure Bash, with no external dependencies beyond git, curl, and optionally `gh` CLI and `gum` for enhanced UX.
 
 ```
-ru (bash, ~17,700 LOC)
+ru (bash, ~28,500 LOC)
 │
 ├── Core Foundation Layer
 │   ├── Utilities & Guards
@@ -4054,12 +4070,12 @@ All checks passed!
 - **No credential storage:** Uses gh CLI's secure credential storage
 - **Prompted installation:** Never auto-installs without user confirmation
 
-### Privacy
+### Privacy & External Services
 
-- **Local execution:** All processing happens on your machine
-- **No telemetry:** No data sent anywhere except to GitHub (via gh)
-- **No logging to remote:** All logs are local only
-- **Config is local:** No cloud sync of configuration
+- **No telemetry:** `ru` itself collects no analytics or telemetry, and keeps all config, state, and logs local on your machine.
+- **Core Git/GitHub commands (`sync`, `status`, `list`, `prune`, `import`, `fork-*`, `commit-sweep`):** Execute locally and communicate only with your configured Git remotes and GitHub (via `git` / `gh`).
+- **AI-assisted workflows (`review`, `agent-sweep`, `ai-sync`, `dep-update`):** Invoke external AI agent CLIs you select (`claude`, `codex`, or `gemini`, optionally via `ntm`). When you run those commands (outside `--dry-run`), repository prompts, diffs, issue/PR context, and dependency plans are sent to the configured AI provider under that CLI's credentials and privacy terms.
+- **Dependency discovery & changelogs (`dep-update`):** Package managers (`npm`, `cargo-outdated`, `go`, `composer`) and changelog lookups query their configured package registries and GitHub Releases.
 
 ### Audit
 

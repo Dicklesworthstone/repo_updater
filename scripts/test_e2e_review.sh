@@ -791,6 +791,88 @@ EOF
     e2e_cleanup
 }
 
+test_review_paginates_55_issues_25_prs_12_labels_and_reaches_critical() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip_test "Paginated GraphQL review fixture requires python3"
+        return 0
+    fi
+    e2e_setup
+    local call_log="$E2E_TEMP_DIR/gh_calls.log"
+    cat > "$E2E_MOCK_BIN/gh" <<EOF
+#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open("$call_log", "a") as f:
+    f.write(json.dumps(args) + "\\n")
+if args[:2] == ["auth", "status"]:
+    sys.exit(0)
+if args[:2] == ["api", "--paginate"] and len(args) >= 3 and "/issues/55/labels" in args[2]:
+    labels = [{"name": f"tag-{i}"} for i in range(1, 12)] + [{"name": "security"}]
+    print(json.dumps(labels))
+    sys.exit(0)
+if args[:2] == ["api", "graphql"]:
+    query = ""
+    for i, a in enumerate(args):
+        if a == "-f" and i + 1 < len(args) and args[i + 1].startswith("query="):
+            query = args[i + 1][6:]
+    if os.environ.get("MOCK_GQL_PARTIAL_ERROR") == "1":
+        print(json.dumps({
+            "data": {"repo0": {
+                "nameWithOwner": "owner/bigrepo", "isArchived": False, "isFork": False, "updatedAt": "2026-01-01T00:00:00Z",
+                "issues": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+                "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+            }},
+            "errors": [{"type": "FORBIDDEN", "message": "Partial API failure"}]
+        }))
+        sys.exit(0)
+    if "issues(" in query and "pullRequests(" not in query:
+        p2 = [{"number": i, "title": f"Issue {i}", "createdAt": "2025-01-01T00:00:00Z", "updatedAt": "2025-01-02T00:00:00Z", "labels": {"totalCount": 0, "nodes": []}} for i in range(51, 55)]
+        p2.append({"number": 55, "title": "Old Security Issue 55", "createdAt": "2024-01-01T00:00:00Z", "updatedAt": "2024-01-02T00:00:00Z",
+                   "labels": {"totalCount": 12, "nodes": [{"name": f"tag-{k}"} for k in range(1, 11)]}})
+        print(json.dumps({"data": {"repository": {"issues": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": p2}}}}))
+        sys.exit(0)
+    if "pullRequests(" in query and "issues(" not in query:
+        pr2 = [{"number": 100 + i, "title": f"PR {i}", "createdAt": "2025-01-01T00:00:00Z", "updatedAt": "2025-01-02T00:00:00Z", "isDraft": False, "labels": {"totalCount": 0, "nodes": []}} for i in range(21, 26)]
+        print(json.dumps({"data": {"repository": {"pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": pr2}}}}))
+        sys.exit(0)
+    p1 = [{"number": i, "title": f"Issue {i}", "createdAt": "2025-11-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "labels": {"totalCount": 0, "nodes": []}} for i in range(1, 51)]
+    pr1 = [{"number": 100 + i, "title": f"PR {i}", "createdAt": "2025-11-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "isDraft": False, "labels": {"totalCount": 0, "nodes": []}} for i in range(1, 21)]
+    print(json.dumps({"data": {"repo0": {
+        "nameWithOwner": "owner/bigrepo", "isArchived": False, "isFork": False, "updatedAt": "2026-01-01T00:00:00Z",
+        "issues": {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": p1},
+        "pullRequests": {"pageInfo": {"hasNextPage": True, "endCursor": "p1"}, "nodes": pr1}
+    }}}))
+    sys.exit(0)
+sys.exit(2)
+EOF
+    chmod +x "$E2E_MOCK_BIN/gh"
+
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+    "$E2E_RU_SCRIPT" add owner/bigrepo >/dev/null 2>&1
+
+    local out_all="$E2E_TEMP_DIR/all.json" out_crit="$E2E_TEMP_DIR/crit.json" out_err="$E2E_TEMP_DIR/err.json" rc=0
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --priority=all >"$out_all" 2>/dev/null || rc=$?
+    assert_equals "0" "$rc" "Paginated review --priority=all exits 0"
+    assert_jq_number "$out_all" '.data.summary.by_type.issues' "55" "All 55 issues across pages are discovered"
+    assert_jq_number "$out_all" '.data.summary.by_type.prs' "25" "All 25 PRs across pages are discovered"
+    assert_jq_number "$out_all" '.data.summary.items_found' "80" "Total discovered items is 80"
+    assert_equals "3" "$(grep -c '"graphql"' "$call_log")" "Measured GraphQL call count is 3 (1 batch + 1 issue page + 1 PR page)"
+    assert_equals "1" "$(grep -c '/issues/55/labels' "$call_log")" "Label pagination fetched labels beyond first 10 for issue #55"
+
+    rc=0
+    "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --priority=critical >"$out_crit" 2>/dev/null || rc=$?
+    assert_equals "0" "$rc" "review --priority=critical exits 0"
+    assert_jq_number "$out_crit" '.data.summary.items_found' "1" "Old issue #55 with security label #12 survives --priority=critical"
+    assert_equals "55 CRITICAL" "$(jq -r '"\(.data.items[0].number) \(.data.items[0].priority)"' "$out_crit")" "Issue #55 is classified CRITICAL"
+
+    rc=0
+    MOCK_GQL_PARTIAL_ERROR=1 "$E2E_RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_err" 2>/dev/null || rc=$?
+    assert_equals "3" "$rc" "Partial GraphQL error fails closed with exit 3 instead of empty backlog"
+    assert_equals "3" "$(jq -r '._meta.exit_code' "$out_err")" "Partial GraphQL error JSON envelope carries exit_code=3"
+
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -821,6 +903,7 @@ run_test test_review_cleanup_releases_lock
 run_test test_review_state_file_operations
 run_test test_review_discovery_respects_priority_filter
 run_test test_review_respects_max_repos_limit
+run_test test_review_paginates_55_issues_25_prs_12_labels_and_reaches_critical
 
 print_results
 exit "$(get_exit_code)"

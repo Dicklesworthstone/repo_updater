@@ -356,6 +356,46 @@ test_ai_sync_include_exclude_globs() {
     log_test_pass "$test_name"
 }
 
+test_agent_sweep_show_denylist_json_and_space_repos() {
+    local test_name="agent-sweep: --show-denylist --json emits schema envelope and --repos space form works"
+    log_test_start "$test_name"
+
+    e2e_setup
+    e2e_init_ru
+    create_dirty_repo "demo-one" >/dev/null
+    create_dirty_repo "other-two" >/dev/null
+    e2e_add_repo "example/demo-one"
+    e2e_add_repo "example/other-two"
+
+    local out exit_code=0
+    out=$("$E2E_RU_SCRIPT" agent-sweep --show-denylist --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "ru agent-sweep --show-denylist --json exits 0"
+    assert_equals "1" "$(printf '%s\n' "$out" | jq -s 'length' 2>/dev/null)" "show-denylist --json emits one JSON document"
+    assert_equals "denylist 0" "$(printf '%s\n' "$out" | jq -r '"\(.data.mode) \(._meta.exit_code)"' 2>/dev/null)" \
+        "show-denylist --json carries mode=denylist and exit_code=0"
+    assert_equals "true" "$(printf '%s\n' "$out" | jq -r '(.data.patterns | index("*.pem")) != null' 2>/dev/null)" \
+        "show-denylist --json includes default *.pem pattern"
+
+    local lead_out=""
+    exit_code=0
+    lead_out=$("$E2E_RU_SCRIPT" --show-denylist agent-sweep 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "ru --show-denylist agent-sweep exits 0"
+    assert_contains "$lead_out" "*.pem" "leading --show-denylist lists *.pem"
+
+    local eq_out space_out
+    exit_code=0
+    eq_out=$("$E2E_RU_SCRIPT" agent-sweep --dry-run --json '--repos=demo*' 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "agent-sweep --repos=demo* exits 0"
+    exit_code=0
+    space_out=$("$E2E_RU_SCRIPT" agent-sweep --dry-run --json --repos 'demo*' 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "agent-sweep --repos demo* space form exits 0"
+    assert_equals "$(printf '%s\n' "$eq_out" | jq -c '.data')" "$(printf '%s\n' "$space_out" | jq -c '.data')" \
+        "agent-sweep --repos space form selects identical repos as equals form"
+
+    e2e_cleanup
+    log_test_pass "$test_name"
+}
+
 # Run tests
 setup_cleanup_trap
 run_test test_agent_sweep_dry_run_lists_repo
@@ -370,5 +410,6 @@ run_test test_agent_sweep_show_denylist
 run_test test_agent_sweep_debug_flag
 run_test test_ai_sync_leading_dry_run_is_a_dry_run
 run_test test_ai_sync_include_exclude_globs
+run_test test_agent_sweep_show_denylist_json_and_space_repos
 print_results
 exit "$(get_exit_code)"
