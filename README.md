@@ -606,6 +606,7 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 |------|-------------|
 | `--plan` | Discovery mode: find work items and plan review (default) |
 | `--apply` | Apply mode: process approved changes from a previous plan |
+| `--dashboard` | Launch interactive review dashboard TUI (TTY required) |
 | `--dry-run` | Show what would be discovered without starting sessions |
 | `--status` | Show current review state without running discovery |
 | `--analytics` | Display analytics dashboard for past reviews |
@@ -662,7 +663,7 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | `--exclude=PATTERN` | Skip matching repos (glob or plain-text substring) |
 | `--timeout=SEC` | Per-repo timeout in seconds (default: 600) |
 | `--no-push` | Commit changes but don't push to remote |
-| `--agent=TYPE` | Agent type: `claude` (default), `codex`, `gemini` |
+| `--agent=TYPE` | Agent type: `claude` (default), `codex`, `gemini`, `antigravity` |
 | `--no-untracked` | Ignore untracked files when scanning for dirty repos |
 | `--sequential` | Process repositories sequentially (default) |
 
@@ -678,7 +679,7 @@ ru sync owner/repo1 owner/repo2 https://github.com/owner/repo3
 | `--max-fix-attempts=N` | Max fix iterations per dependency (default: 5) |
 | `--no-push` | Commit changes but don't push to remote |
 | `--repo=PATH` | Process single repo only (default: all repos) |
-| `--agent=TYPE` | Agent type: `claude` (default), `codex`, `gemini` |
+| `--agent=TYPE` | Agent type: `claude` (default), `codex`, `gemini`, `antigravity` |
 | `--timeout=SEC` | Per-repo timeout in seconds (default: 900) |
 
 ---
@@ -4074,7 +4075,7 @@ All checks passed!
 
 - **No telemetry:** `ru` itself collects no analytics or telemetry, and keeps all config, state, and logs local on your machine.
 - **Core Git/GitHub commands (`sync`, `status`, `list`, `prune`, `import`, `fork-*`, `commit-sweep`):** Execute locally and communicate only with your configured Git remotes and GitHub (via `git` / `gh`).
-- **AI-assisted workflows (`review`, `agent-sweep`, `ai-sync`, `dep-update`):** Invoke external AI agent CLIs you select (`claude`, `codex`, or `gemini`, optionally via `ntm`). When you run those commands (outside `--dry-run`), repository prompts, diffs, issue/PR context, and dependency plans are sent to the configured AI provider under that CLI's credentials and privacy terms.
+- **AI-assisted workflows (`review`, `agent-sweep`, `ai-sync`, `dep-update`):** Invoke external AI agent CLIs you select (`claude`, `codex`, `gemini`, or `antigravity`, optionally via `ntm`). When you run those commands (outside `--dry-run`), repository prompts, diffs, issue/PR context, and dependency plans are sent to the configured AI provider under that CLI's credentials and privacy terms.
 - **Dependency discovery & changelogs (`dep-update`):** Package managers (`npm`, `cargo-outdated`, `go`, `composer`) and changelog lookups query their configured package registries and GitHub Releases.
 
 ### Audit

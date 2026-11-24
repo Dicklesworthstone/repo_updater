@@ -1122,7 +1122,67 @@ run_test test_structured_dispatcher_preserves_actual_tty_approval
 run_test test_actual_workflow_toon_and_fallback
 run_test test_actual_review_interrupt_envelope
 run_test test_help_robot_docs_readme_parity_and_denylist_schema
+test_dashboard_and_antigravity_cli_parity() {
+    e2e_setup
+    local docs_json="" help_text=""
+    docs_json=$("$E2E_RU_SCRIPT" robot-docs commands 2>/dev/null)
+    help_text=$("$E2E_RU_SCRIPT" --help 2>&1)
+
+    if printf "%s\n" "$docs_json" | jq -e '.data.content.commands[]? | select(.name == "review") | .flags[]? | select(.flag == "--dashboard")' >/dev/null; then
+        pass "robot-docs documents review --dashboard"
+    else
+        fail "robot-docs missing review --dashboard"
+    fi
+    assert_contains "$help_text" "--dashboard" "ru --help documents --dashboard"
+
+    if printf "%s\n" "$docs_json" | jq -e '.data.content.commands[]? | select(.name == "ai-sync") | .flags[]? | select(.flag == "--agent=TYPE" and (.description | contains("antigravity")))' >/dev/null; then
+        pass "robot-docs ai-sync --agent=TYPE lists antigravity"
+    else
+        fail "robot-docs ai-sync --agent=TYPE missing antigravity"
+    fi
+
+    if printf "%s\n" "$docs_json" | jq -e '.data.content.commands[]? | select(.name == "dep-update") | .flags[]? | select(.flag == "--agent=TYPE" and (.description | contains("antigravity")))' >/dev/null; then
+        pass "robot-docs dep-update --agent=TYPE lists antigravity"
+    else
+        fail "robot-docs dep-update --agent=TYPE missing antigravity"
+    fi
+
+    # Planted negatives: unknown agent errors for ai-sync and dep-update must list antigravity
+    local rc=0 err=""
+    err=$("$E2E_RU_SCRIPT" ai-sync --agent=bogus 2>&1) || rc=$?
+    assert_equals "4" "$rc" "ai-sync rejects unknown agent with exit 4"
+    assert_contains "$err" "antigravity" "ai-sync unknown agent error lists antigravity"
+
+    rc=0
+    err=$("$E2E_RU_SCRIPT" dep-update --agent=bogus 2>&1) || rc=$?
+    assert_equals "4" "$rc" "dep-update rejects unknown agent with exit 4"
+    assert_contains "$err" "antigravity" "dep-update unknown agent error lists antigravity"
+
+    # Positive controls: ai-sync and dep-update accept antigravity/agy without exit 4
+    rc=0
+    "$E2E_RU_SCRIPT" ai-sync --agent=antigravity --help >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "ai-sync --agent=antigravity --help exits 0"
+
+    rc=0
+    "$E2E_RU_SCRIPT" dep-update --agent=agy --help >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "dep-update --agent=agy --help exits 0"
+
+    # agent-sweep --show-denylist --json with empty custom denylist under set -u
+    rc=0
+    local dl_out=""
+    dl_out=$("$E2E_RU_SCRIPT" agent-sweep --show-denylist --json 2>/dev/null) || rc=$?
+    assert_equals "0" "$rc" "agent-sweep --show-denylist --json exits 0"
+    if printf "%s\n" "$dl_out" | jq -e '.data.mode == "denylist" and (.data.patterns | type == "array")' >/dev/null; then
+        pass "agent-sweep --show-denylist --json returns valid denylist schema"
+    else
+        fail "agent-sweep --show-denylist --json schema invalid"
+    fi
+
+    e2e_cleanup
+}
+
 run_test test_readme_examples_full_cli_acceptance
+run_test test_dashboard_and_antigravity_cli_parity
 
 print_results
 exit "$(get_exit_code)"

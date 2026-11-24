@@ -439,6 +439,12 @@ test_config_rejects_unknown_options() {
     assert_equals "unknown_option 4" "$(printf '%s\n' "$out" | jq -r '"\(.data.error.reason) \(._meta.exit_code)"' 2>/dev/null)" \
         "ru --json config --check emits unknown_option envelope"
 
+    local toon_rc=0 toon_out=""
+    toon_out=$("$E2E_RU_SCRIPT" --format toon config --check 2>/dev/null) || toon_rc=$?
+    assert_equals "4" "$toon_rc" "ru --format toon config --check exits 4"
+    assert_contains "$toon_out" "unknown_option" "TOON config refusal contains unknown_option reason"
+    assert_contains "$toon_out" "exit_code: 4" "TOON config refusal preserves exit_code 4"
+
     e2e_cleanup
     log_test_pass "$test_name"
 }

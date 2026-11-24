@@ -637,6 +637,44 @@ run_test test_import_dry_run_writes_nothing
 run_test test_import_failed_listing_imports_nothing
 run_test test_import_github_argument_validation
 run_test test_add_and_remove_visibility_flags
+test_add_remove_reject_unknown_options_and_empty_group() {
+    e2e_setup
+    "$E2E_RU_SCRIPT" init >/dev/null 2>&1
+
+    local rc=0 out="" summary=""
+    local jq_reason_exit='"\(.data.error.reason) \(._meta.exit_code)"'
+    out=$("$E2E_RU_SCRIPT" --json add --check 2>/dev/null) || rc=$?
+    assert_equals "4" "$rc" "ru add --check exits 4"
+    summary=$(printf "%s\n" "$out" | jq -r "$jq_reason_exit" 2>/dev/null)
+    assert_equals "unknown_option 4" "$summary" "ru --json add --check emits unknown_option refusal"
+
+    rc=0
+    out=$("$E2E_RU_SCRIPT" --json remove --check 2>/dev/null) || rc=$?
+    assert_equals "4" "$rc" "ru remove --check exits 4"
+    summary=$(printf "%s\n" "$out" | jq -r "$jq_reason_exit" 2>/dev/null)
+    assert_equals "unknown_option 4" "$summary" "ru --json remove --check emits unknown_option refusal"
+
+    rc=0
+    out=$("$E2E_RU_SCRIPT" --json add --group "" owner/repo 2>/dev/null) || rc=$?
+    assert_equals "4" "$rc" "ru add --group empty exits 4"
+    local empty_group_meta=""
+    empty_group_meta=$(printf "%s\n" "$out" | jq -r "._meta.exit_code" 2>/dev/null)
+    assert_equals "4" "$empty_group_meta" "ru --json add --group empty preserves exit_code 4"
+
+    # Positive control: valid --group writes 'owner/repo in custom' to public.txt and remove cleans it safely
+    rc=0
+    "$E2E_RU_SCRIPT" --json add --group custom owner/sample-repo >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "ru add --group custom exits 0"
+    assert_file_contains "$RU_CONFIG_DIR/repos.d/public.txt" "owner/sample-repo in custom" "grouped repo entry written to public.txt"
+
+    rc=0
+    "$E2E_RU_SCRIPT" --json remove owner/sample-repo >/dev/null 2>&1 || rc=$?
+    assert_equals "0" "$rc" "ru remove cleans repo safely"
+
+    e2e_cleanup
+}
+
 run_test test_import_github_space_separated_flags
+run_test test_add_remove_reject_unknown_options_and_empty_group
 
 print_results

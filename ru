@@ -517,6 +517,60 @@ strip_ansi() {
     sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'
 }
 
+# Capability-based file size in bytes (GNU, uutils, and BSD stat)
+# Usage: get_file_size_bytes /path/to/file
+get_file_size_bytes() {
+    local file="${1:-}"
+    [[ -n "$file" && -e "$file" ]] || return 1
+    local out=""
+    if out=$(stat -c %s -- "$file" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    if out=$(stat -f %z -- "$file" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    if [[ -f "$file" ]]; then
+        out=$(wc -c < "$file" 2>/dev/null | tr -d '[:space:]') || out=""
+        if [[ "$out" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Capability-based file mtime in Unix epoch seconds (GNU, uutils, and BSD stat)
+# Tests actual stat flags and numeric output rather than --version brand strings.
+# Usage: get_file_mtime_epoch /path/to/path
+get_file_mtime_epoch() {
+    local path="${1:-}"
+    [[ -n "$path" && -e "$path" ]] || return 1
+    local out=""
+    if out=$(stat -c %Y -- "$path" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    if out=$(stat -f %m -- "$path" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        if out=$(python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$path" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+    if command -v perl >/dev/null 2>&1; then
+        if out=$(perl -e 'my @s = stat($ARGV[0]); print $s[9] if @s' "$path" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Get file size in MB (for display/validation)
 # Usage: get_file_size_mb /path/to/file
 # Outputs: size in MB (one decimal place)
@@ -525,8 +579,12 @@ get_file_size_mb() {
     [[ -z "$file" || ! -f "$file" ]] && { echo "0"; return; }
 
     local size_bytes
-    # Try GNU stat first, fall back to BSD stat
-    size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    if declare -f get_file_size_bytes &>/dev/null; then
+        size_bytes=$(get_file_size_bytes "$file" 2>/dev/null || echo 0)
+    else
+        size_bytes=$(stat -c %s -- "$file" 2>/dev/null || stat -f %z -- "$file" 2>/dev/null || wc -c < "$file" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    fi
+    [[ "$size_bytes" =~ ^[0-9]+$ ]] || size_bytes=0
 
     # Use awk for portability (bc may not be available)
     awk "BEGIN { printf \"%.1f\", $size_bytes / 1048576 }"
@@ -600,7 +658,12 @@ is_file_too_large() {
         return 1
     fi
     local size_bytes
-    size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    if declare -f get_file_size_bytes &>/dev/null; then
+        size_bytes=$(get_file_size_bytes "$file" 2>/dev/null || echo 0)
+    else
+        size_bytes=$(stat -c %s -- "$file" 2>/dev/null || stat -f %z -- "$file" 2>/dev/null || wc -c < "$file" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    fi
+    [[ "$size_bytes" =~ ^[0-9]+$ ]] || size_bytes=0
     [[ "$size_bytes" -gt "$max_bytes" ]]
 }
 
@@ -3150,7 +3213,7 @@ cmd_ai_sync() {
         gemini|gmi)      agent_provider="gemini" ;;
         antigravity|agy) agent_provider="agy" ;;
         *)
-            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
+            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini, antigravity)"
             return 4
             ;;
     esac
@@ -3327,7 +3390,7 @@ Options:
   --exclude=PAT   Skip repos with paths matching pattern
   --timeout=SEC   Per-repo timeout in seconds (default: 600)
   --no-push       Commit changes but don'\''t push to remote
-  --agent=TYPE    Agent type: claude (default), codex, gemini
+  --agent=TYPE    Agent type: claude (default), codex, gemini, antigravity
   --no-untracked  Ignore untracked files when detecting dirty repos
 
 The AI agent will:
@@ -3747,11 +3810,12 @@ cmd_dep_update() {
     fi
     local agent_provider
     case "$agent_type" in
-        claude) agent_provider="claude" ;;
-        codex)  agent_provider="codex" ;;
-        gemini) agent_provider="gemini" ;;
+        claude|cc)       agent_provider="claude" ;;
+        codex|cod)       agent_provider="codex" ;;
+        gemini|gmi)      agent_provider="gemini" ;;
+        antigravity|agy) agent_provider="agy" ;;
         *)
-            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
+            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini, antigravity)"
             return 4
             ;;
     esac
@@ -4149,7 +4213,7 @@ Options:
   --max-fix-attempts=N  Max fix iterations per dependency (default: 5)
   --no-push             Commit changes but don'\''t push to remote
   --repo=PATH           Process single repo only (default: all repos)
-  --agent=TYPE          Agent type: claude (default), codex, gemini
+  --agent=TYPE          Agent type: claude (default), codex, gemini, antigravity
   --timeout=SEC         Per-repo timeout in seconds (default: 900)
 
 The AI agent will:
@@ -8668,6 +8732,7 @@ IMPORT OPTIONS:
 REVIEW OPTIONS:
     --plan               Generate review plans only, no mutations (default)
     --apply              Execute approved plans from previous --plan run
+    --dashboard          Launch interactive review dashboard TUI
     --analytics          Show review metrics dashboard and exit
     --basic              Use basic question TUI (gum/ANSI) and exit
     --mode=MODE          Driver: auto, ntm, or local (default: auto)
@@ -8711,7 +8776,7 @@ AI-SYNC OPTIONS (see `ru ai-sync --help`):
     --exclude=PATTERN    Skip matching repos (glob or substring)
     --timeout=SEC        Per-repo timeout in seconds (default: 600)
     --no-push            Commit changes without pushing
-    --agent=TYPE         Agent type: claude (default), codex, gemini
+    --agent=TYPE         Agent type: claude (default), codex, gemini, antigravity
     --no-untracked       Ignore untracked files when scanning dirty repos
 
 DEP-UPDATE OPTIONS (see `ru dep-update --help`):
@@ -8724,7 +8789,7 @@ DEP-UPDATE OPTIONS (see `ru dep-update --help`):
     --max-fix-attempts=N Max fix iterations per dependency (default: 5)
     --no-push            Commit verified updates without pushing
     --repo=PATH          Process a single repository path
-    --agent=TYPE         Agent type: claude (default), codex, gemini
+    --agent=TYPE         Agent type: claude (default), codex, gemini, antigravity
     --timeout=SEC        Per-repo timeout in seconds (default: 900)
 
 ROBOT-DOCS OPTIONS:
@@ -10928,6 +10993,7 @@ parse_args() {
                 ;;
             --non-interactive)
                 NON_INTERACTIVE="true"
+                CLI_NON_INTERACTIVE_EXPLICIT="true"
                 export GIT_TERMINAL_PROMPT=0
                 shift
                 ;;
@@ -11214,7 +11280,7 @@ parse_args() {
                     exit 4
                 fi
                 ;;
-            --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
+            --plan|--apply|--push|--dashboard|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
                 if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                     shift
@@ -12264,6 +12330,11 @@ cmd_add() {
 
     for arg in "${ARGS[@]}"; do
         if [[ "$expect_group" == "true" ]]; then
+            if [[ -z "$arg" ]]; then
+                log_error "--group requires a value"
+                emit_command_refusal add missing_group_value 4
+                exit 4
+            fi
             add_group="$arg"
             expect_group="false"
             continue
@@ -12275,6 +12346,11 @@ cmd_add() {
             --group) expect_group="true" ;;
             --group=*) add_group="${arg#--group=}"
                 [[ -n "$add_group" ]] || { log_error "--group requires a value"; emit_command_refusal add missing_group_value 4; exit 4; } ;;
+            -*)
+                log_error "add: Unknown option: $arg"
+                emit_command_refusal add unknown_option 4
+                exit 4
+                ;;
             *) repo_args+=("$arg") ;;
         esac
     done
@@ -12869,6 +12945,11 @@ cmd_remove() {
         case "$arg" in
             --public)  filter_public="true" ;;
             --private) filter_private="true" ;;
+            -*)
+                log_error "remove: Unknown option: $arg"
+                emit_command_refusal remove unknown_option 4
+                exit 4
+                ;;
             *)         repo_args+=("$arg") ;;
         esac
     done
@@ -12938,8 +13019,12 @@ cmd_remove() {
             [[ -f "$repos_file" ]] || continue
 
             # Parse each line and compare owner/repo to avoid substring matching issues
-            local tmp_file="${repos_file}.tmp.$$"
-            : > "$tmp_file"
+            local tmp_file
+            if ! tmp_file=$(mktemp "${repos_file}.tmp.XXXXXX" 2>/dev/null); then
+                log_error "Failed to create temporary file for: $repos_file"
+                emit_command_refusal remove write_failed 3
+                exit 3
+            fi
             local found="false"
 
             while IFS= read -r line || [[ -n "$line" ]]; do
@@ -13567,7 +13652,7 @@ cmd_config() {
                 ;;
             *)
                 log_error "config: Unknown option: $arg"
-                [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope config '{"error":{"reason":"unknown_option"}}' '{"exit_code":4}')"
+                emit_command_refusal config unknown_option 4
                 return 4
                 ;;
         esac
@@ -15171,48 +15256,72 @@ local_driver_start_session() {
     ensure_dir "$ru_dir"
 
     local log_file="$ru_dir/session.log"
-    local event_pipe="$ru_dir/events.pipe"
+    local exit_file="$ru_dir/session.exit"
+    local runner_script="$ru_dir/run-session.sh"
     local state_file="$ru_dir/session.state"
 
-    # Create named pipe for event streaming
-    rm -f "$event_pipe"
-    if ! mkfifo "$event_pipe" 2>/dev/null; then
-        log_error "Failed to create event pipe: $event_pipe"
-        return 1
-    fi
+    rm -f "$exit_file" "$ru_dir/events.pipe"
+    touch "$log_file"
+
+    local started_at
+    started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     # Initialize state file
-    printf '{
-  "session_id": "%s",
-  "state": "starting",
-  "started_at": "%s"
-}
-' "$session_name" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state_file"
+    if command -v jq &>/dev/null; then
+        jq -n --arg sid "$session_name" --arg started_at "$started_at" \
+            '{session_id:$sid,state:"starting",started_at:$started_at}' > "$state_file"
+    else
+        local esc_sid
+        esc_sid=$(json_escape "$session_name")
+        printf '{\n  "session_id": "%s",\n  "state": "starting",\n  "started_at": "%s"\n}\n' \
+            "$esc_sid" "$started_at" > "$state_file"
+    fi
 
     # Build claude command with stream-json output (shell-escaped args)
     local -a claude_args=(claude -p "$prompt" --output-format stream-json)
-    local claude_cmd=""
+    local claude_cmd="" q_log="" q_exit="" q_runner="" q_path=""
     printf -v claude_cmd '%q ' "${claude_args[@]}"
     claude_cmd="${claude_cmd% }"
+    printf -v q_log '%q' "$log_file"
+    printf -v q_exit '%q' "$exit_file"
+    printf -v q_runner '%q' "$runner_script"
+    printf -v q_path '%q' "$PATH"
 
-    # Create tmux session running claude
-    if ! tmux new-session -d -s "$session_name" -c "$wt_path" \
-        "exec bash -c \"$claude_cmd 2>&1 | tee \\\"$log_file\\\" > \\\"$event_pipe\\\"\""; then
+    # Write direct log runner so stdout/stderr stream to session.log without FIFO deadlock
+    # and provider exit status is durably captured in session.exit.
+    local script_header
+    script_header="#""!/usr/bin/env bash"
+    printf '%s\n' \
+        "$script_header" \
+        'set -o pipefail' \
+        "export PATH=${q_path}" \
+        'rc=0' \
+        "${claude_cmd} >> ${q_log} 2>&1 || rc=\$?" \
+        "printf '%d\n' \"\$rc\" > ${q_exit}" \
+        'exit "$rc"' > "$runner_script"
+    chmod 700 "$runner_script" 2>/dev/null || true
+
+    # Create tmux session running the direct log runner
+    if ! tmux new-session -d -s "$session_name" -c "$wt_path" "bash ${q_runner}"; then
         log_error "Failed to create tmux session: $session_name"
-        rm -f "$event_pipe"
         return 1
     fi
 
     # Update state to running
-    printf '{
-  "session_id": "%s",
-  "state": "generating",
-  "worktree": "%s",
-  "log_file": "%s",
-  "event_pipe": "%s",
-  "started_at": "%s"
-}
-' "$session_name" "$wt_path" "$log_file" "$event_pipe" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state_file"
+    started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if command -v jq &>/dev/null; then
+        jq -n --arg sid "$session_name" --arg wt "$wt_path" --arg log_file "$log_file" \
+            --arg exit_file "$exit_file" --arg started_at "$started_at" \
+            '{session_id:$sid,state:"generating",worktree:$wt,log_file:$log_file,exit_file:$exit_file,started_at:$started_at}' > "$state_file"
+    else
+        local esc_sid esc_wt esc_log esc_exit
+        esc_sid=$(json_escape "$session_name")
+        esc_wt=$(json_escape "$wt_path")
+        esc_log=$(json_escape "$log_file")
+        esc_exit=$(json_escape "$exit_file")
+        printf '{\n  "session_id": "%s",\n  "state": "generating",\n  "worktree": "%s",\n  "log_file": "%s",\n  "exit_file": "%s",\n  "started_at": "%s"\n}\n' \
+            "$esc_sid" "$esc_wt" "$esc_log" "$esc_exit" "$started_at" > "$state_file"
+    fi
 
     # Return session info on stdout
     cat "$state_file"
@@ -15239,6 +15348,25 @@ local_driver_send_to_session() {
 # Local driver: Get current session state
 local_driver_get_session_state() {
     local session_id="$1"
+
+    # Check durable exit marker first so non-zero provider exits are never misreported as complete
+    if declare -f get_worktree_for_session &>/dev/null; then
+        local wt_path=""
+        wt_path=$(get_worktree_for_session "$session_id" 2>/dev/null || echo "")
+        if [[ -n "$wt_path" && -f "$wt_path/.ru/session.exit" ]]; then
+            local recorded_rc=""
+            recorded_rc=$(tr -d '[:space:]' < "$wt_path/.ru/session.exit" 2>/dev/null || echo "")
+            if [[ "$recorded_rc" =~ ^[0-9]+$ ]]; then
+                if [[ "$recorded_rc" -ne 0 ]]; then
+                    printf '{\n  "session_id": "%s",\n  "state": "error",\n  "exit_code": %s,\n  "reason": "session command exited with code %s"\n}\n' \
+                        "$session_id" "$recorded_rc" "$recorded_rc"
+                    return 0
+                fi
+                printf '{\n  "session_id": "%s",\n  "state": "complete",\n  "exit_code": 0\n}\n' "$session_id"
+                return 0
+            fi
+        fi
+    fi
 
     # Check if tmux session exists
     if ! tmux has-session -t "$session_id" 2>/dev/null; then
@@ -15267,7 +15395,8 @@ local_driver_get_session_state() {
 
     # Check if child process (claude) is running
     local children
-    children=$(pgrep -P "$pane_pid" 2>/dev/null | wc -l)
+    children=$(pgrep -P "$pane_pid" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$children" =~ ^[0-9]+$ ]] || children=0
 
     local state="generating"
     if [[ "$children" -eq 0 ]]; then
@@ -15375,11 +15504,19 @@ parse_stream_json_event() {
 #   0 if AskUserQuestion found, 1 otherwise
 detect_ask_user_question() {
     local event_data="$1"
+    [[ -n "$event_data" ]] || return 1
 
-    # Check if any content block is AskUserQuestion
-    echo "$event_data" | jq -e \
-        '.[] | select(.type == "tool_use" and .name == "AskUserQuestion")' \
-        >/dev/null 2>&1
+    local jq_ask_find="
+        def blocks:
+            if type == \"array\" then .[]
+            elif type == \"object\" then
+                ., (.message.content[]? // empty), (.content[]? // empty)
+            else empty end;
+        (fromjson? // ([split(\"\\n\")[] | fromjson?]))
+        | blocks
+        | select(type == \"object\" and .type == \"tool_use\" and .name == \"AskUserQuestion\")
+    "
+    echo "$event_data" | jq -R -s -e "[$jq_ask_find] | length > 0" >/dev/null 2>&1
 }
 
 # Extract question information from AskUserQuestion tool use
@@ -15390,22 +15527,24 @@ detect_ask_user_question() {
 extract_question_info() {
     local event_data="$1"
 
-    # Extract the AskUserQuestion input
-    local question_input
-    question_input=$(echo "$event_data" | jq -c \
-        '[.[] | select(.name == "AskUserQuestion")] | .[0].input // {}')
-
-    # Parse first question (usually only one)
-    local tool_use_id
-    tool_use_id=$(echo "$event_data" | jq -r \
-        '[.[] | select(.name == "AskUserQuestion")] | .[0].id // ""')
-
-    # Format for queue
-    echo "$question_input" | jq --arg tool_id "$tool_use_id" '{
-        questions: .questions,
-        tool_use_id: $tool_id,
-        detected_at: (now | todate)
-    }'
+    local jq_extract="
+        def blocks:
+            if type == \"array\" then .[]
+            elif type == \"object\" then
+                ., (.message.content[]? // empty), (.content[]? // empty)
+            else empty end;
+        [
+            (fromjson? // ([split(\"\\n\")[] | fromjson?]))
+            | blocks
+            | select(type == \"object\" and .type == \"tool_use\" and .name == \"AskUserQuestion\")
+        ] | (.[0] // {})
+        | {
+            questions: (.input.questions // []),
+            tool_use_id: (.id // \"\"),
+            detected_at: (now | todate)
+        }
+    "
+    echo "$event_data" | jq -R -s "$jq_extract" 2>/dev/null
 }
 
 # Detect questions in plain text output (fallback detection)
@@ -15855,7 +15994,12 @@ calculate_output_velocity() {
         prev_size=0
     fi
 
-    file_size=$(stat -c%s "$pipe_log" 2>/dev/null || stat -f%z "$pipe_log" 2>/dev/null || echo "0")
+    if declare -f get_file_size_bytes &>/dev/null; then
+        file_size=$(get_file_size_bytes "$pipe_log")
+    else
+        file_size=$(stat -c %s "$pipe_log" 2>/dev/null || stat -f %z "$pipe_log" 2>/dev/null || echo "0")
+    fi
+    [[ "$file_size" =~ ^[0-9]+$ ]] || file_size=0
 
     # Save current size for next call
     echo "$file_size" > "$prev_size_file"
@@ -15892,7 +16036,12 @@ get_last_output_time() {
 
     # Get file modification time
     local mtime
-    mtime=$(stat -c%Y "$pipe_log" 2>/dev/null || stat -f%m "$pipe_log" 2>/dev/null || echo "0")
+    if declare -f get_file_mtime_epoch &>/dev/null; then
+        mtime=$(get_file_mtime_epoch "$pipe_log")
+    else
+        mtime=$(stat -c %Y "$pipe_log" 2>/dev/null || stat -f %m "$pipe_log" 2>/dev/null || echo "0")
+    fi
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     echo "$mtime"
 }
 
@@ -15971,8 +16120,25 @@ session_has_result() {
         return 1
     fi
 
-    # Check for result event in stream-json output
-    if grep -q '"type":"result"' "$pipe_log" 2>/dev/null; then
+    if command -v jq &>/dev/null; then
+        if jq -R -s -e '
+            [split("\n")[] | fromjson? | select(type == "object" and .type == "result")]
+            | length > 0 and (
+                .[-1] as $last
+                | ($last.is_error != true)
+                and (($last.status // "") != "error")
+                and ($last.success != false)
+                and ((($last.subtype // "") | tostring | startswith("error")) | not)
+            )
+        ' "$pipe_log" >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+
+    # Fallback when jq is unavailable: require a result line without explicit error flags
+    if grep -E '"type"[[:space:]]*:[[:space:]]*"result"' "$pipe_log" 2>/dev/null \
+        | grep -vqE '"is_error"[[:space:]]*:[[:space:]]*true|"status"[[:space:]]*:[[:space:]]*"error"|"success"[[:space:]]*:[[:space:]]*false'; then
         return 0
     fi
 
@@ -15993,6 +16159,27 @@ session_has_error() {
 
     if [[ -z "$pipe_log" || ! -f "$pipe_log" ]]; then
         return 1
+    fi
+
+    # Detect structured stream-json error result events before generic regexes
+    if command -v jq &>/dev/null; then
+        if jq -R -s -e '
+            [split("\n")[] | fromjson? | select(type == "object" and .type == "result")]
+            | length > 0 and (
+                .[-1] as $last
+                | ($last.is_error == true)
+                or (($last.status // "") == "error")
+                or ($last.success == false)
+                or ((($last.subtype // "") | tostring | startswith("error")))
+            )
+        ' "$pipe_log" >/dev/null 2>&1; then
+            echo "result_error" >&2
+            return 0
+        fi
+    elif grep -E '"type"[[:space:]]*:[[:space:]]*"result"' "$pipe_log" 2>/dev/null \
+        | grep -qE '"is_error"[[:space:]]*:[[:space:]]*true|"status"[[:space:]]*:[[:space:]]*"error"|"success"[[:space:]]*:[[:space:]]*false'; then
+        echo "result_error" >&2
+        return 0
     fi
 
     local pattern
@@ -16164,6 +16351,11 @@ apply_state_hysteresis() {
 #   0 on success
 handle_waiting_session() {
     local session_id="$1"
+    local repo_id="${2:-}"
+
+    if [[ -z "$repo_id" ]]; then
+        repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "")
+    fi
 
     # Get wait reason
     local pipe_log
@@ -16173,21 +16365,31 @@ handle_waiting_session() {
         recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
     fi
 
-    local wait_info
-    wait_info=$(detect_wait_reason "$session_id" "" "$recent_output")
+    local wait_info reason jq_reason
+    jq_reason=".reason // \"unknown\""
+    wait_info=$(detect_wait_reason "$session_id" "$recent_output" "$recent_output")
+    reason=$(echo "$wait_info" | jq -r "$jq_reason" 2>/dev/null || echo "unknown")
+    [[ -z "$reason" ]] && reason="unknown"
 
-    # Log the waiting state
-    log_verbose "Session $session_id waiting: $(echo "$wait_info" | jq -r '.reason // "unknown"')"
+    log_verbose "Session $session_id waiting: $reason"
 
-    # Queue question if it's an ask_user_question
-    local reason
-    reason=$(echo "$wait_info" | jq -r '.reason // "unknown"')
+    if [[ "${REVIEW_NON_INTERACTIVE:-false}" == "true" ]]; then
+        case "$reason" in
+            ask_user_question|agent_question_text|external_prompt)
+                if declare -f handle_question_non_interactive &>/dev/null; then
+                    local ni_rc=0
+                    handle_question_non_interactive "$wait_info" "$session_id" || ni_rc=$?
+                    return "$ni_rc"
+                fi
+                return 3
+                ;;
+        esac
+    fi
 
-    if [[ "$reason" == "ask_user_question" ]]; then
-        # Extract and queue the question
-        local question_data
-        question_data=$(echo "$wait_info" | jq -c '.context // {}')
-        queue_question "$session_id" "$question_data" 2>/dev/null || true
+    if [[ "$reason" == "ask_user_question" || "$reason" == "agent_question_text" ]]; then
+        if declare -f queue_question &>/dev/null; then
+            queue_question "$session_id" "$wait_info" "$repo_id" 2>/dev/null || true
+        fi
     fi
 
     return 0
@@ -16264,24 +16466,61 @@ handle_session_error() {
 #   0 on success
 handle_session_complete() {
     local session_id="$1"
+    local repo_id="${2:-}"
+
+    HANDLE_SESSION_LAST_OUTCOME="unknown"
+    if [[ -z "$repo_id" ]]; then
+        repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "")
+    fi
 
     # Get worktree path for this session
-    local wt_path
+    local wt_path=""
     wt_path=$(get_worktree_for_session "$session_id" 2>/dev/null || echo "")
+    if [[ -z "$wt_path" && -n "$repo_id" ]] && declare -f get_worktree_path &>/dev/null; then
+        get_worktree_path "$repo_id" wt_path 2>/dev/null || wt_path=""
+    fi
 
     local outcome="unknown"
-    local items_count=0
+    local items_count=0 issues_count=0 prs_count=0
 
-    if [[ -n "$wt_path" ]] && [[ -d "$wt_path" ]]; then
+    if [[ -n "$wt_path" && -d "$wt_path" ]]; then
         local plan_file="$wt_path/.ru/review-plan.json"
 
         if [[ -f "$plan_file" ]]; then
-            if validate_review_plan "$plan_file" 2>/dev/null; then
-                items_count=$(jq '.items | length' "$plan_file" 2>/dev/null || echo "0")
-                log_info "Session $session_id completed: $items_count items reviewed"
-                outcome="success"
+            local validation=""
+            validation=$(validate_review_plan "$plan_file" 2>/dev/null || true)
+            if [[ "$validation" == "Valid" ]]; then
+                local identity_ok="true"
+                if [[ -n "$repo_id" ]] && declare -f validate_review_identity &>/dev/null; then
+                    local run_dir=""
+                    if declare -f get_worktrees_dir &>/dev/null; then
+                        run_dir=$(get_worktrees_dir 2>/dev/null || echo "")
+                    fi
+                    if [[ -n "$run_dir" && -f "$run_dir/mapping.json" ]]; then
+                        if ! validate_review_identity "$repo_id" "$wt_path" "$plan_file"; then
+                            identity_ok="false"
+                        fi
+                    fi
+                fi
+
+                if [[ "$identity_ok" == "true" ]]; then
+                    local jq_items=".items | length"
+                    local jq_issues="[.items[]? | select(.type == \"issue\")] | length"
+                    local jq_prs="[.items[]? | select(.type == \"pr\")] | length"
+                    items_count=$(jq -r "$jq_items" "$plan_file" 2>/dev/null || echo "0")
+                    issues_count=$(jq -r "$jq_issues" "$plan_file" 2>/dev/null || echo "0")
+                    prs_count=$(jq -r "$jq_prs" "$plan_file" 2>/dev/null || echo "0")
+                    [[ "$items_count" =~ ^[0-9]+$ ]] || items_count=0
+                    [[ "$issues_count" =~ ^[0-9]+$ ]] || issues_count=0
+                    [[ "$prs_count" =~ ^[0-9]+$ ]] || prs_count=0
+                    log_info "Session $session_id completed: $items_count items reviewed"
+                    outcome="success"
+                else
+                    log_warn "Session $session_id produced plan failing identity binding"
+                    outcome="invalid_identity"
+                fi
             else
-                log_warn "Session $session_id produced invalid plan"
+                log_warn "Session $session_id produced invalid plan: ${validation:-unknown error}"
                 outcome="invalid_plan"
             fi
         else
@@ -16293,14 +16532,16 @@ handle_session_complete() {
         outcome="no_worktree"
     fi
 
-    # Record outcome
-    record_session_outcome "$session_id" "$outcome" "$items_count" 2>/dev/null || true
+    HANDLE_SESSION_LAST_OUTCOME="$outcome"
 
-    # Clear stall counter
+    # Record outcome
+    record_session_outcome "$session_id" "$outcome" "$issues_count" "$prs_count" "$repo_id" 2>/dev/null || true
+
+    # Clear stall counter and state history
     unset "SESSION_STALL_COUNTS[$session_id]"
     unset "SESSION_STATE_HISTORY[$session_id]"
 
-    return 0
+    [[ "$outcome" == "success" ]]
 }
 
 # Record session outcome (stub - integrates with checkpoint system)
@@ -16311,17 +16552,22 @@ handle_session_complete() {
 record_session_outcome() {
     local session_id="$1"
     local outcome="$2"
-    local details="${3:-}"
+    local issues_count="${3:-0}"
+    local prs_count="${4:-0}"
+    local repo_id="${5:-}"
 
-    # Get repo ID from session mapping if available
-    local repo_id
-    repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "$session_id")
+    if [[ -z "$repo_id" ]]; then
+        repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "$session_id")
+    fi
 
-    log_debug "Session $session_id ($repo_id) outcome: $outcome ($details)"
+    [[ "$issues_count" =~ ^[0-9]+$ ]] || issues_count=0
+    [[ "$prs_count" =~ ^[0-9]+$ ]] || prs_count=0
+
+    log_debug "Session $session_id ($repo_id) outcome: $outcome (issues=$issues_count prs=$prs_count)"
 
     # If checkpoint system is available, record via that
     if type -t record_repo_outcome &>/dev/null; then
-        record_repo_outcome "$repo_id" "$outcome" "0" "${details:-0}" "0" 2>/dev/null || true
+        record_repo_outcome "$repo_id" "$outcome" "0" "$issues_count" "$prs_count" 2>/dev/null || true
     fi
 
     return 0
@@ -16419,9 +16665,9 @@ monitor_sessions() {
             local raw_state
             raw_state=$(detect_session_state_raw "$session_id")
 
-            # Apply hysteresis
-            local confirmed_state
-            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "${sessions[$session_id]}")
+            # Apply hysteresis in-process so SESSION_STATE_HISTORY persists across polls
+            local confirmed_state=""
+            apply_state_hysteresis "$session_id" "$raw_state" "${sessions[$session_id]}" confirmed_state
 
             log_debug "Session $session_id: raw=$raw_state confirmed=$confirmed_state"
 
@@ -16549,7 +16795,7 @@ start_next_queued_session() {
         local -n _repo_items_ref="_empty_items"
     fi
 
-    # Try to start the next viable repo; skip failures without stalling the queue.
+    # Try to start the next viable repo; record failures durably without stalling the queue.
     while [[ ${#_pending_ref[@]} -gt 0 ]]; do
         # Get next repo from pending list
         local repo_id="${_pending_ref[0]}"
@@ -16560,6 +16806,12 @@ start_next_queued_session() {
         if ! get_worktree_path "$repo_id" wt_path 2>/dev/null || [[ -z "$wt_path" ]]; then
             log_warn "No worktree found for $repo_id, marking error"
             update_review_state ".repos[\"$repo_id\"].status = \"error\""
+            if declare -f record_repo_outcome &>/dev/null; then
+                record_repo_outcome "$repo_id" "no_worktree" "0" "0" "0" 2>/dev/null || true
+            fi
+            if declare -f review_orchestration_record_failure &>/dev/null; then
+                review_orchestration_record_failure "$repo_id" "no_worktree" 1
+            fi
             continue
         fi
 
@@ -16574,7 +16826,7 @@ start_next_queued_session() {
             while IFS= read -r line; do
                 # shellcheck disable=SC2190  # False positive: repo_items is indexed array, not associative
                 [[ -n "$line" ]] && repo_items+=("$line")
-            done < <(printf '%s\n' "$items_blob")
+            done < <(printf "%s\n" "$items_blob")
         fi
 
         local items_json="[]"
@@ -16590,21 +16842,35 @@ start_next_queued_session() {
             if ! load_review_driver "${REVIEW_DRIVER:-local}"; then
                 log_error "Failed to load review driver for $repo_id"
                 update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                if declare -f record_repo_outcome &>/dev/null; then
+                    record_repo_outcome "$repo_id" "driver_failed" "0" "0" "0" 2>/dev/null || true
+                fi
+                if declare -f review_orchestration_record_failure &>/dev/null; then
+                    review_orchestration_record_failure "$repo_id" "driver_failed" 3
+                fi
                 return 1
             fi
             REVIEW_DRIVER_LOADED=1
         fi
 
-        # Start session via driver
-        if ! driver_start_session "$wt_path" "$session_id" "$prompt"; then
+        # Start session via driver (suppress stdout JSON so structured review output stays valid)
+        if ! driver_start_session "$wt_path" "$session_id" "$prompt" >/dev/null; then
             log_error "Failed to start session for $repo_id"
             update_review_state ".repos[\"$repo_id\"].status = \"error\""
+            if declare -f record_repo_outcome &>/dev/null; then
+                record_repo_outcome "$repo_id" "spawn_failed" "0" "0" "0" 2>/dev/null || true
+            fi
+            if declare -f review_orchestration_record_failure &>/dev/null; then
+                review_orchestration_record_failure "$repo_id" "spawn_failed" 1
+            fi
             continue
         fi
 
         # Track session
+        local started_at
+        started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         _sessions_ref["$repo_id"]="$session_id"
-        update_review_state ".repos[\"$repo_id\"].status = \"in_progress\" | .repos[\"$repo_id\"].session_id = \"$session_id\""
+        update_review_state ".repos[\"$repo_id\"].status = \"in_progress\" | .repos[\"$repo_id\"].session_id = \"$session_id\" | .repos[\"$repo_id\"].started_at = \"$started_at\""
 
         log_info "Started session for $repo_id (${#_sessions_ref[@]} active)"
         return 0
@@ -16721,35 +16987,174 @@ prefetch_next_repos() {
 #   $1+ - Work items array (repo_id|type|number|...)
 # Returns:
 #   0 on success
-run_review_orchestration() {
+declare -gA ORCH_ACTIVE_SESSIONS=()
+declare -gA ORCH_SESSION_STATES=()
+declare -gA ORCH_QUESTION_COUNTED=()
+declare -gA ORCH_REPO_ITEMS=()
+declare -ga ORCH_PENDING_REPOS=()
+declare -ga ORCH_COMPLETED_REPOS=()
+declare -ga ORCH_FAILED_REPOS=()
+declare -ga ORCH_DEFERRED_REPOS=()
+declare -ga ORCH_EXIT_CODES=()
+declare -g ORCH_LOCK_FILE=""
+declare -g ORCH_INITIALIZED="false"
+declare -g ORCH_BUDGET_STOPPED="false"
+declare -g ORCH_TOTAL_REPOS=0
+declare -g ORCH_ITEMS_COMPLETED=0
+declare -g HANDLE_SESSION_LAST_OUTCOME="unknown"
+declare -g REVIEW_RESUME_COMPLETED_REPOS=""
+
+review_orchestration_record_failure() {
+    local repo_id="$1"
+    local reason="${2:-error}"
+    local exit_code="${3:-1}"
+
+    [[ "$ORCH_INITIALIZED" == "true" ]] || return 0
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+
+    local already="false" idx=0 n_failed=${#ORCH_FAILED_REPOS[@]}
+    while (( idx < n_failed )); do
+        if [[ "${ORCH_FAILED_REPOS[$idx]}" == "$repo_id" ]]; then
+            already="true"
+            break
+        fi
+        idx=$((idx + 1))
+    done
+    if [[ "$already" != "true" && -n "$repo_id" ]]; then
+        ORCH_FAILED_REPOS+=("$repo_id")
+    fi
+
+    ORCH_EXIT_CODES+=("$exit_code")
+    log_debug "Recorded orchestration failure for $repo_id: reason=$reason exit=$exit_code"
+    review_save_orchestration_checkpoint || true
+}
+
+review_save_orchestration_checkpoint() {
+    declare -f checkpoint_review_state &>/dev/null || return 0
+
+    local -A seen_done=()
+    local -A seen_pend=()
+    local completed_list="" pending_list="" repo="" idx=0 count=0
+
+    # Preserve already-completed repos from prior resumed run
+    if [[ -n "${REVIEW_RESUME_COMPLETED_REPOS:-}" ]]; then
+        local -a prev_done=()
+        IFS=" " run_with_input "$REVIEW_RESUME_COMPLETED_REPOS" read -ra prev_done
+        idx=0
+        count=${#prev_done[@]}
+        while (( idx < count )); do
+            repo="${prev_done[$idx]}"
+            if [[ -n "$repo" && -z "${seen_done[$repo]:-}" ]]; then
+                seen_done["$repo"]=1
+                completed_list+="${repo} "
+            fi
+            idx=$((idx + 1))
+        done
+    fi
+
+    idx=0
+    count=${#ORCH_COMPLETED_REPOS[@]}
+    while (( idx < count )); do
+        repo="${ORCH_COMPLETED_REPOS[$idx]}"
+        if [[ -n "$repo" && -z "${seen_done[$repo]:-}" ]]; then
+            seen_done["$repo"]=1
+            completed_list+="${repo} "
+        fi
+        idx=$((idx + 1))
+    done
+
+    # Failed, active, deferred, and unstarted repos stay pending for --resume
+    idx=0
+    count=${#ORCH_FAILED_REPOS[@]}
+    while (( idx < count )); do
+        repo="${ORCH_FAILED_REPOS[$idx]}"
+        if [[ -n "$repo" && -z "${seen_done[$repo]:-}" && -z "${seen_pend[$repo]:-}" ]]; then
+            seen_pend["$repo"]=1
+            pending_list+="${repo} "
+        fi
+        idx=$((idx + 1))
+    done
+
+    local active_keys=""
+    if [[ ${#ORCH_ACTIVE_SESSIONS[@]} -gt 0 ]]; then
+        active_keys=$(printf "%s\n" "${!ORCH_ACTIVE_SESSIONS[@]}")
+        while IFS= read -r repo; do
+            if [[ -n "$repo" && -z "${seen_done[$repo]:-}" && -z "${seen_pend[$repo]:-}" ]]; then
+                seen_pend["$repo"]=1
+                pending_list+="${repo} "
+            fi
+        done < <(printf "%s\n" "$active_keys")
+    fi
+
+    idx=0
+    count=${#ORCH_PENDING_REPOS[@]}
+    while (( idx < count )); do
+        repo="${ORCH_PENDING_REPOS[$idx]}"
+        if [[ -n "$repo" && -z "${seen_done[$repo]:-}" && -z "${seen_pend[$repo]:-}" ]]; then
+            seen_pend["$repo"]=1
+            pending_list+="${repo} "
+        fi
+        idx=$((idx + 1))
+    done
+
+    idx=0
+    count=${#ORCH_DEFERRED_REPOS[@]}
+    while (( idx < count )); do
+        repo="${ORCH_DEFERRED_REPOS[$idx]}"
+        if [[ -n "$repo" && -z "${seen_done[$repo]:-}" && -z "${seen_pend[$repo]:-}" ]]; then
+            seen_pend["$repo"]=1
+            pending_list+="${repo} "
+        fi
+        idx=$((idx + 1))
+    done
+
+    completed_list="${completed_list%" "}"
+    pending_list="${pending_list%" "}"
+    checkpoint_review_state "$completed_list" "$pending_list"
+}
+
+review_orchestration_init() {
     local -a work_items=("$@")
 
-    # Initialize tracking
-    declare -A active_sessions=()  # repo_id -> session_id
-    declare -A session_states=()   # session_id -> confirmed_state
-    declare -A question_counted=()  # session_id -> 1 if question already counted
-    local -a pending_repos=()
-    local -a completed_repos=()
-    local poll_interval=2
+    ORCH_ACTIVE_SESSIONS=()
+    ORCH_SESSION_STATES=()
+    ORCH_QUESTION_COUNTED=()
+    ORCH_REPO_ITEMS=()
+    ORCH_PENDING_REPOS=()
+    ORCH_COMPLETED_REPOS=()
+    ORCH_FAILED_REPOS=()
+    ORCH_DEFERRED_REPOS=()
+    ORCH_EXIT_CODES=()
+    ORCH_BUDGET_STOPPED="false"
+    ORCH_ITEMS_COMPLETED=0
+    ORCH_INITIALIZED="false"
+    ORCH_LOCK_FILE=""
+
+    local nl=""
+    printf -v nl "%b" "\\n"
 
     # Extract unique repos from work items and group items per repo
-    declare -A seen_repos=()
-    declare -A repo_items=()
-    local item repo_id
-    for item in "${work_items[@]}"; do
-        IFS='|' run_with_input "$item" read -r repo_id _
+    local -A seen_repos=()
+    local item="" repo_id="" idx=0 n_items=${#work_items[@]}
+    while (( idx < n_items )); do
+        item="${work_items[$idx]}"
+        repo_id=""
+        IFS="|" run_with_input "$item" read -r repo_id _
         if [[ -n "$repo_id" && -z "${seen_repos[$repo_id]:-}" ]]; then
             seen_repos["$repo_id"]=1
-            pending_repos+=("$repo_id")
+            ORCH_PENDING_REPOS+=("$repo_id")
         fi
         if [[ -n "$repo_id" ]]; then
-            if [[ -n "${repo_items[$repo_id]:-}" ]]; then
-                repo_items["$repo_id"]+=$'\n'"$item"
+            if [[ -n "${ORCH_REPO_ITEMS[$repo_id]:-}" ]]; then
+                ORCH_REPO_ITEMS["$repo_id"]+="${nl}${item}"
             else
-                repo_items["$repo_id"]="$item"
+                ORCH_REPO_ITEMS["$repo_id"]="$item"
             fi
         fi
+        idx=$((idx + 1))
     done
+
+    ORCH_TOTAL_REPOS="${#ORCH_PENDING_REPOS[@]}"
 
     # Initialize cost budget
     COST_BUDGET_START_TIME=$(date +%s)
@@ -16758,11 +17163,15 @@ run_review_orchestration() {
 
     # Initialize review state
     init_review_state
-    for repo_id in "${pending_repos[@]}"; do
+    idx=0
+    local n_pending=${#ORCH_PENDING_REPOS[@]}
+    while (( idx < n_pending )); do
+        repo_id="${ORCH_PENDING_REPOS[$idx]}"
         update_review_state ".repos[\"$repo_id\"] = {\"status\": \"pending\", \"started_at\": null}"
+        idx=$((idx + 1))
     done
 
-    log_info "Starting orchestration for ${#pending_repos[@]} repos (driver: ${REVIEW_DRIVER:-local}, parallel: ${REVIEW_PARALLEL:-1})"
+    log_info "Starting orchestration for ${#ORCH_PENDING_REPOS[@]} repos (driver: ${REVIEW_DRIVER:-local}, parallel: ${REVIEW_PARALLEL:-1})"
 
     # Load driver
     load_review_driver "${REVIEW_DRIVER:-local}" || return 3
@@ -16775,102 +17184,151 @@ run_review_orchestration() {
         return 1
     fi
 
-    # Main orchestration loop
-    local lock_file="${RU_STATE_DIR:-/tmp}/review-${REVIEW_RUN_ID:-$$}.lock"
-    touch "$lock_file"
+    ORCH_LOCK_FILE="${RU_STATE_DIR:-/tmp}/review-${REVIEW_RUN_ID:-$$}.lock"
+    touch "$ORCH_LOCK_FILE"
+    ORCH_INITIALIZED="true"
+    review_save_orchestration_checkpoint || true
+    return 0
+}
 
-    while [[ ${#pending_repos[@]} -gt 0 || ${#active_sessions[@]} -gt 0 ]]; do
-        # Refresh governor state to honor rate limits before starting sessions.
-        if declare -f governor_update &>/dev/null; then
-            governor_update
+review_orchestration_is_done() {
+    [[ ${#ORCH_PENDING_REPOS[@]} -eq 0 && ${#ORCH_ACTIVE_SESSIONS[@]} -eq 0 ]]
+}
+
+review_orchestration_tick() {
+    [[ "$ORCH_INITIALIZED" == "true" ]] || return 0
+
+    # Refresh governor state to honor rate limits before starting sessions.
+    if declare -f governor_update &>/dev/null; then
+        governor_update
+    fi
+
+    # Check cost budget only when unstarted repos remain
+    if [[ ${#ORCH_PENDING_REPOS[@]} -gt 0 ]] && ! check_cost_budget; then
+        log_warn "Cost budget exceeded, deferring ${#ORCH_PENDING_REPOS[@]} remaining repo(s)"
+        ORCH_DEFERRED_REPOS+=("${ORCH_PENDING_REPOS[@]}")
+        ORCH_PENDING_REPOS=()
+        if [[ "$ORCH_BUDGET_STOPPED" != "true" ]]; then
+            ORCH_BUDGET_STOPPED="true"
+            ORCH_EXIT_CODES+=(5)
+        fi
+        review_save_orchestration_checkpoint || true
+    fi
+
+    # Pre-fetch next repos while we have active sessions
+    if [[ ${#ORCH_ACTIVE_SESSIONS[@]} -gt 0 && ${#ORCH_PENDING_REPOS[@]} -gt 0 ]]; then
+        prefetch_next_repos 0 "${ORCH_PENDING_REPOS[@]}"
+    fi
+
+    # Start new sessions if capacity and pause state allow
+    while can_start_new_session "${#ORCH_ACTIVE_SESSIONS[@]}" && [[ ${#ORCH_PENDING_REPOS[@]} -gt 0 ]]; do
+        if start_next_queued_session ORCH_ACTIVE_SESSIONS ORCH_PENDING_REPOS ORCH_REPO_ITEMS; then
+            increment_repos_processed
+        else
+            break
+        fi
+    done
+
+    # Monitor active sessions (snapshot keys so unsets never mutate iteration)
+    local active_keys="" repo_id=""
+    if [[ ${#ORCH_ACTIVE_SESSIONS[@]} -gt 0 ]]; then
+        active_keys=$(printf "%s\n" "${!ORCH_ACTIVE_SESSIONS[@]}")
+    fi
+
+    while IFS= read -r repo_id; do
+        [[ -z "$repo_id" ]] && continue
+        local session_id="${ORCH_ACTIVE_SESSIONS[$repo_id]:-}"
+        [[ -z "$session_id" ]] && continue
+
+        local raw_state confirmed_state="" prev_state
+        raw_state=$(detect_session_state_raw "$session_id" 2>/dev/null || echo "generating")
+        prev_state="${ORCH_SESSION_STATES[$session_id]:-generating}"
+        apply_state_hysteresis "$session_id" "$raw_state" "$prev_state" confirmed_state
+        ORCH_SESSION_STATES["$session_id"]="$confirmed_state"
+
+        # Clear question counter when leaving waiting state (allows counting new questions)
+        if [[ "$prev_state" == "waiting" && "$confirmed_state" != "waiting" ]]; then
+            unset "ORCH_QUESTION_COUNTED[$session_id]"
         fi
 
-        # Check cost budget before starting new sessions
-        if ! check_cost_budget; then
-            log_warn "Cost budget exceeded, stopping new sessions"
-            pending_repos=()  # Don't start any more
-        fi
+        log_debug "Session $session_id: state=$confirmed_state"
 
-        # Pre-fetch next repos while we have active sessions
-        # Note: Always pass 0 as index since pending_repos shrinks (first element removed)
-        # as repos are started, so we always want to prefetch from the front of the queue
-        if [[ ${#active_sessions[@]} -gt 0 && ${#pending_repos[@]} -gt 0 ]]; then
-            prefetch_next_repos 0 "${pending_repos[@]}"
-        fi
+        case "$confirmed_state" in
+            waiting)
+                local pipe_log wait_info reason recent_output="" wait_rc=0
+                pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
+                if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
+                    recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
+                fi
+                wait_info=$(detect_wait_reason "$session_id" "$recent_output" "$recent_output")
+                reason=$(echo "$wait_info" | jq -r ".reason // \"unknown\"" 2>/dev/null || echo "unknown")
+                [[ -z "$reason" ]] && reason="unknown"
 
-        # Start new sessions if capacity allows
-        while can_start_new_session "${#active_sessions[@]}" && [[ ${#pending_repos[@]} -gt 0 ]]; do
-            if start_next_queued_session active_sessions pending_repos repo_items; then
-                increment_repos_processed
-            else
-                break
-            fi
-        done
-
-        # Monitor active sessions
-        for repo_id in "${!active_sessions[@]}"; do
-            local session_id="${active_sessions[$repo_id]}"
-            local raw_state confirmed_state prev_state
-
-            raw_state=$(detect_session_state_raw "$session_id" 2>/dev/null || echo "generating")
-            prev_state="${session_states[$session_id]:-generating}"
-            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "$prev_state")
-            session_states["$session_id"]="$confirmed_state"
-
-            # Clear question counter when leaving waiting state (allows counting new questions)
-            if [[ "$prev_state" == "waiting" && "$confirmed_state" != "waiting" ]]; then
-                unset "question_counted[$session_id]"
-            fi
-
-            log_debug "Session $session_id: state=$confirmed_state"
-
-            case "$confirmed_state" in
-                waiting)
-                    # Get session output for wait reason detection
-                    local pipe_log wait_info reason recent_output=""
-                    pipe_log=$(get_session_log_path "$session_id" 2>/dev/null || true)
-                    if [[ -n "$pipe_log" && -f "$pipe_log" ]]; then
-                        recent_output=$(tail -c 2000 "$pipe_log" 2>/dev/null || true)
+                if [[ "$reason" == "ask_user_question" || "$reason" == "agent_question_text" ]]; then
+                    if [[ -z "${ORCH_QUESTION_COUNTED[$session_id]:-}" ]]; then
+                        increment_questions_asked
+                        ORCH_QUESTION_COUNTED["$session_id"]=1
                     fi
-                    wait_info=$(detect_wait_reason "$session_id" "" "$recent_output")
-                    reason=$(echo "$wait_info" | jq -r '.reason // "unknown"' 2>/dev/null)
-                    [[ -z "$reason" ]] && reason="unknown"
-                    if [[ "$reason" == "ask_user_question" || "$reason" == "agent_question_text" ]]; then
-                        # Only count question once (not every poll cycle)
-                        if [[ -z "${question_counted[$session_id]:-}" ]]; then
-                            increment_questions_asked
-                            question_counted["$session_id"]=1
-                        fi
-                        if ! check_cost_budget; then
-                            log_warn "Question budget reached, auto-skipping"
-                            driver_send_to_session "$session_id" "Skip this question and continue" 2>/dev/null || true
-                        else
-                            handle_waiting_session "$session_id"
-                        fi
+                    if ! check_cost_budget; then
+                        log_warn "Question budget reached, auto-skipping"
+                        driver_send_to_session "$session_id" "Skip this question and continue" 2>/dev/null || true
                     else
-                        handle_waiting_session "$session_id"
+                        handle_waiting_session "$session_id" "$repo_id" || wait_rc=$?
                     fi
-                    ;;
-                complete)
-                    completed_repos+=("$repo_id")
-                    unset "active_sessions[$repo_id]"
-                    update_review_state ".repos[\"$repo_id\"].status = \"completed\""
-                    handle_session_complete "$session_id"
-                    log_info "Session completed for $repo_id"
-                    ;;
-                error)
-                    governor_record_error "session_error" "$session_id" 2>/dev/null || true
-                    handle_session_error "$session_id"
-                    unset "active_sessions[$repo_id]"
-                    update_review_state ".repos[\"$repo_id\"].status = \"error\""
-                    ;;
-                stalled)
-                    handle_stalled_session "$session_id"
-                    ;;
-            esac
-        done
+                else
+                    handle_waiting_session "$session_id" "$repo_id" || wait_rc=$?
+                fi
 
-        # Process question queue (TUI) if we have pending questions
+                if [[ "$wait_rc" -ne 0 ]]; then
+                    log_error "Session $session_id cannot proceed in non-interactive mode (exit $wait_rc)"
+                    driver_stop_session "$session_id" 2>/dev/null || true
+                    unset "ORCH_ACTIVE_SESSIONS[$repo_id]"
+                    update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                    record_session_outcome "$session_id" "non_interactive_blocked" "0" "0" "$repo_id" 2>/dev/null || true
+                    review_orchestration_record_failure "$repo_id" "non_interactive_blocked" "$wait_rc"
+                fi
+                ;;
+            complete)
+                unset "ORCH_ACTIVE_SESSIONS[$repo_id]"
+                if handle_session_complete "$session_id" "$repo_id"; then
+                    ORCH_COMPLETED_REPOS+=("$repo_id")
+                    update_review_state ".repos[\"$repo_id\"].status = \"completed\""
+                    local repo_item_lines=0
+                    if [[ -n "${ORCH_REPO_ITEMS[$repo_id]:-}" ]]; then
+                        repo_item_lines=$(printf "%s\n" "${ORCH_REPO_ITEMS[$repo_id]}" | wc -l | tr -d " ")
+                        [[ "$repo_item_lines" =~ ^[0-9]+$ ]] || repo_item_lines=0
+                        ORCH_ITEMS_COMPLETED=$((ORCH_ITEMS_COMPLETED + repo_item_lines))
+                    fi
+                    review_save_orchestration_checkpoint || true
+                    log_info "Session completed for $repo_id"
+                else
+                    local fail_outcome="${HANDLE_SESSION_LAST_OUTCOME:-invalid_plan}"
+                    log_error "Session for $repo_id finished without valid review artifact ($fail_outcome)"
+                    update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                    review_orchestration_record_failure "$repo_id" "$fail_outcome" 1
+                fi
+                ;;
+            error)
+                governor_record_error "session_error" "$session_id" 2>/dev/null || true
+                handle_session_error "$session_id"
+                unset "ORCH_ACTIVE_SESSIONS[$repo_id]"
+                update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                review_orchestration_record_failure "$repo_id" "session_error" 1
+                ;;
+            stalled)
+                if ! handle_stalled_session "$session_id"; then
+                    log_error "Session for $repo_id stopped after persistent stall"
+                    unset "ORCH_ACTIVE_SESSIONS[$repo_id]"
+                    update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                    record_session_outcome "$session_id" "stalled" "0" "0" "$repo_id" 2>/dev/null || true
+                    review_orchestration_record_failure "$repo_id" "stalled" 1
+                fi
+                ;;
+        esac
+    done < <(printf "%s\n" "$active_keys")
+
+    # Process question queue in non-dashboard interactive mode if pending questions exist
+    if [[ "${REVIEW_DASHBOARD:-false}" != "true" && "${REVIEW_NON_INTERACTIVE:-false}" != "true" ]]; then
         if declare -f has_pending_questions &>/dev/null && has_pending_questions 2>/dev/null; then
             if declare -f render_question_tui &>/dev/null; then
                 render_question_tui
@@ -16879,17 +17337,93 @@ run_review_orchestration() {
                 fi
             fi
         fi
-
-        sleep "$poll_interval"
-    done
-
-    rm -f "$lock_file"
-    log_success "Orchestration complete: ${#completed_repos[@]} repos processed"
-
-    # Update digest caches from completed worktrees
-    update_repo_digests_from_worktrees || true
+    fi
 
     return 0
+}
+
+review_orchestration_finalize() {
+    local forced_exit="${1:-0}"
+
+    if [[ -n "$ORCH_LOCK_FILE" ]]; then
+        rm -f "$ORCH_LOCK_FILE"
+        ORCH_LOCK_FILE=""
+    fi
+
+    # Stop any still-running sessions if exiting early (e.g., dashboard quit / interrupt)
+    if [[ ${#ORCH_ACTIVE_SESSIONS[@]} -gt 0 ]]; then
+        local active_keys="" repo_id=""
+        active_keys=$(printf "%s\n" "${!ORCH_ACTIVE_SESSIONS[@]}")
+        while IFS= read -r repo_id; do
+            [[ -z "$repo_id" ]] && continue
+            local sid="${ORCH_ACTIVE_SESSIONS[$repo_id]:-}"
+            [[ -n "$sid" ]] && driver_stop_session "$sid" 2>/dev/null || true
+        done < <(printf "%s\n" "$active_keys")
+    fi
+
+    # Update digest caches ONLY for legitimately completed repos
+    if [[ ${#ORCH_COMPLETED_REPOS[@]} -gt 0 ]]; then
+        update_repo_digests_from_worktrees "${ORCH_COMPLETED_REPOS[@]}" || true
+    fi
+
+    # Record review run telemetry
+    if declare -f record_review_run &>/dev/null; then
+        record_review_run "${#ORCH_COMPLETED_REPOS[@]}" "$ORCH_ITEMS_COMPLETED" "${COST_BUDGET_QUESTIONS_ASKED:-0}" || true
+    fi
+
+    if [[ "$forced_exit" =~ ^[0-9]+$ && "$forced_exit" -ne 0 ]]; then
+        ORCH_EXIT_CODES+=("$forced_exit")
+    elif [[ ${#ORCH_FAILED_REPOS[@]} -gt 0 && ${#ORCH_EXIT_CODES[@]} -eq 0 ]]; then
+        ORCH_EXIT_CODES+=(1)
+    elif [[ ${#ORCH_PENDING_REPOS[@]} -gt 0 || ${#ORCH_ACTIVE_SESSIONS[@]} -gt 0 || ${#ORCH_DEFERRED_REPOS[@]} -gt 0 ]]; then
+        ORCH_EXIT_CODES+=(5)
+    fi
+
+    local final_code=0
+    if [[ ${#ORCH_EXIT_CODES[@]} -gt 0 ]]; then
+        if declare -f aggregate_review_exit_codes &>/dev/null; then
+            final_code=$(aggregate_review_exit_codes "${ORCH_EXIT_CODES[@]}")
+        else
+            final_code="${ORCH_EXIT_CODES[0]}"
+        fi
+    fi
+
+    local n_done=${#ORCH_COMPLETED_REPOS[@]}
+    local n_fail=${#ORCH_FAILED_REPOS[@]}
+    local n_pend=${#ORCH_PENDING_REPOS[@]}
+    local n_def=${#ORCH_DEFERRED_REPOS[@]}
+    local n_act=${#ORCH_ACTIVE_SESSIONS[@]}
+    local n_rem=$((n_pend + n_def + n_act))
+
+    if [[ "$final_code" -ne 0 ]]; then
+        review_save_orchestration_checkpoint || true
+        log_warn "Orchestration finished with exit code $final_code ($n_done completed, $n_fail failed, $n_rem pending)"
+    else
+        log_success "Orchestration complete: $n_done repos processed"
+    fi
+
+    ORCH_INITIALIZED="false"
+    return "$final_code"
+}
+
+run_review_orchestration() {
+    local -a work_items=("$@")
+    local poll_interval="${RU_REVIEW_POLL_INTERVAL:-2}"
+
+    local init_rc=0
+    review_orchestration_init "${work_items[@]}" || init_rc=$?
+    if [[ "$init_rc" -ne 0 ]]; then
+        return "$init_rc"
+    fi
+
+    while ! review_orchestration_is_done; do
+        review_orchestration_tick
+        if ! review_orchestration_is_done; then
+            sleep "$poll_interval"
+        fi
+    done
+
+    review_orchestration_finalize 0
 }
 
 #------------------------------------------------------------------------------
@@ -17976,7 +18510,12 @@ check_model_rate_limit() {
     for log_file in "${log_files[@]}"; do
         if [[ -f "$log_file" ]]; then
             local mtime
-            mtime=$(stat -c %Y "$log_file" 2>/dev/null || stat -f %m "$log_file" 2>/dev/null || echo 0)
+            if declare -f get_file_mtime_epoch &>/dev/null; then
+                mtime=$(get_file_mtime_epoch "$log_file")
+            else
+                mtime=$(stat -c %Y "$log_file" 2>/dev/null || stat -f %m "$log_file" 2>/dev/null || echo 0)
+            fi
+            [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
             if [[ "$mtime" -gt "$five_min_ago" ]]; then
                 if grep -qiE 'rate[ .]limit|429|overloaded' "$log_file" 2>/dev/null; then
                     ((recent_429s++))
@@ -18068,8 +18607,61 @@ adjust_parallelism() {
 # Check if we can start a new session based on governor state
 # Args: current_active_count (number of currently active sessions)
 # Returns: 0 if allowed, 1 if not
+declare -g REVIEW_SCHEDULER_PAUSED="false"
+
+get_review_pause_file() {
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/review/review.paused"
+}
+
+review_scheduler_is_paused() {
+    if [[ "${REVIEW_SCHEDULER_PAUSED:-false}" == "true" ]]; then
+        return 0
+    fi
+    if [[ "$(declare -p DASHBOARD_STATE 2>/dev/null || true)" == "declare -A"* ]] && \
+       [[ "${DASHBOARD_STATE[paused]:-false}" == "true" ]]; then
+        return 0
+    fi
+    local pause_file
+    pause_file=$(get_review_pause_file)
+    [[ -f "$pause_file" ]]
+}
+
+review_scheduler_pause() {
+    REVIEW_SCHEDULER_PAUSED="true"
+    DASHBOARD_STATE[paused]="true"
+    local pause_file
+    pause_file=$(get_review_pause_file)
+    ensure_dir "$(dirname "$pause_file")"
+    touch "$pause_file" 2>/dev/null || true
+    DASHBOARD_STATE[last_status_message]="Paused: new session admission suspended"
+    log_info "Review scheduler paused"
+}
+
+review_scheduler_resume() {
+    REVIEW_SCHEDULER_PAUSED="false"
+    DASHBOARD_STATE[paused]="false"
+    local pause_file
+    pause_file=$(get_review_pause_file)
+    rm -f "$pause_file"
+    DASHBOARD_STATE[last_status_message]="Resumed: session admission active"
+    log_info "Review scheduler resumed"
+}
+
 can_start_new_session() {
     local active_count="${1:-0}"
+
+    # Explicit pause state = no new sessions admitted until resumed
+    local pause_file="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/review/review.paused"
+    local dash_paused="false"
+    if [[ "$(declare -p DASHBOARD_STATE 2>/dev/null || true)" == "declare -A"* ]]; then
+        dash_paused="${DASHBOARD_STATE[paused]:-false}"
+    fi
+    if [[ "${REVIEW_SCHEDULER_PAUSED:-false}" == "true" ]] || \
+       [[ "$dash_paused" == "true" ]] || \
+       [[ -f "$pause_file" ]]; then
+        log_verbose "Cannot start session: review scheduler paused"
+        return 1
+    fi
 
     # Circuit breaker open = no new sessions
     if [[ "${GOVERNOR_STATE[circuit_breaker_open]}" == "true" ]]; then
@@ -18206,7 +18798,10 @@ declare -gA DASHBOARD_STATE=(
     [refresh_needed]="true"
     [last_refresh]=0
     [running]="true"
+    [last_status_message]=""
+    [last_exit_code]=0
 )
+declare -g DASHBOARD_TICK_CALLBACK=""
 
 # Dashboard color definitions
 # shellcheck disable=SC2034  # Some colors reserved for future use
@@ -18293,6 +18888,79 @@ write_questions_queue() {
         log_warn "Failed to write questions queue"
         return 1
     fi
+}
+
+queue_question() {
+    local session_id="$1"
+    local question_info="${2:-{}}"
+    local repo_id="${3:-}"
+
+    if ! command -v jq &>/dev/null; then
+        return 1
+    fi
+
+    if [[ -z "$repo_id" ]] && declare -f get_repo_for_session &>/dev/null; then
+        repo_id=$(get_repo_for_session "$session_id" 2>/dev/null || echo "")
+    fi
+
+    local info_json="{}"
+    if echo "$question_info" | jq empty >/dev/null 2>&1; then
+        info_json="$question_info"
+    else
+        info_json=$(jq -n --arg raw "$question_info" "{prompt:\$raw}")
+    fi
+
+    local now existing updated
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    existing=$(load_questions_queue)
+
+    local jq_build_entry="
+        (.context // .) as \$ctx
+        | (\$ctx.questions[0] // .questions[0] // {}) as \$first
+        | (\$first.prompt // \$first.question // .prompt // .message // \"Session waiting for input\") as \$prompt_text
+        | (.id // \$ctx.tool_use_id // .tool_use_id // (\"q-\" + \$sid + \"-\" + ((\$prompt_text | length | tostring)))) as \$qid
+        | {
+            id: \$qid,
+            session_id: \$sid,
+            repo: (if \$repo != \"\" then \$repo else (.repo // \"unknown\") end),
+            priority: (.priority // \"normal\"),
+            status: \"pending\",
+            prompt: \$prompt_text,
+            context: \$ctx,
+            options: (\$first.options // .options // []),
+            questions: (if (.questions | type) == \"array\" and (.questions | length) > 0 then .questions
+                        elif (\$ctx.questions | type) == \"array\" and (\$ctx.questions | length) > 0 then \$ctx.questions
+                        else [{prompt:\$prompt_text, options:(\$first.options // .options // [])}] end),
+            created_at: \$now
+        }
+    "
+    local new_entry=""
+    new_entry=$(echo "$info_json" | jq -c --arg sid "$session_id" --arg repo "$repo_id" --arg now "$now" "$jq_build_entry" 2>/dev/null || echo "")
+    [[ -n "$new_entry" ]] || return 1
+
+    local jq_dedup="
+        (if type == \"array\" then . else .questions // [] end) as \$arr
+        | if any(\$arr[]; .id == \$entry.id or ((.status // \"pending\") == \"pending\" and .session_id == \$entry.session_id and (.prompt // \"\") == (\$entry.prompt // \"\"))) then
+            \$arr
+          else
+            \$arr + [\$entry]
+          end
+    "
+    updated=$(echo "$existing" | jq -c --argjson entry "$new_entry" "$jq_dedup" 2>/dev/null || echo "")
+    [[ -n "$updated" ]] || return 1
+
+    write_questions_queue "$updated"
+}
+
+has_pending_questions() {
+    if ! command -v jq &>/dev/null; then
+        return 1
+    fi
+    local existing filtered count
+    existing=$(load_questions_queue)
+    filtered=$(filter_questions_json "$existing")
+    count=$(echo "$filtered" | jq -r "length" 2>/dev/null || echo "0")
+    [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]
 }
 
 update_question_in_queue() {
@@ -18415,11 +19083,36 @@ get_question_at_index() {
 
 date_add_days() {
     local days="$1"
-    if date --version 2>/dev/null | grep -q GNU; then
-        date -u -d "$days days" +%Y-%m-%dT%H:%M:%SZ
-    else
-        date -u -v+"${days}d" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ
+    [[ "$days" =~ ^-?[0-9]+$ ]] || days=0
+
+    local out=""
+    local iso_re="^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+
+    # GNU coreutils and uutils date accept -d "<N> days"
+    if out=$(date -u -d "${days} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) && [[ "$out" =~ $iso_re ]]; then
+        echo "$out"
+        return 0
     fi
+
+    # BSD / macOS date accepts -v+Nd / -v-Nd
+    local bsd_adj="+${days}d"
+    if [[ "$days" -lt 0 ]]; then
+        bsd_adj="${days}d"
+    fi
+    if out=$(date -u -v"${bsd_adj}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) && [[ "$out" =~ $iso_re ]]; then
+        echo "$out"
+        return 0
+    fi
+
+    # Portable fallback via python3
+    if command -v python3 &>/dev/null; then
+        if out=$(python3 -c "import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=int(sys.argv[1]))).strftime(\"%Y-%m-%dT%H:%M:%SZ\"))" "$days" 2>/dev/null) && [[ "$out" =~ $iso_re ]]; then
+            echo "$out"
+            return 0
+        fi
+    fi
+
+    date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
 dashboard_prompt_line() {
@@ -19021,6 +19714,9 @@ render_header() {
 
     # Title and stats
     local title="ru review"
+    if [[ "${DASHBOARD_STATE[paused]:-false}" == "true" ]] || { declare -f review_scheduler_is_paused &>/dev/null && review_scheduler_is_paused; }; then
+        title="ru review [PAUSED]"
+    fi
     local stats
     stats=$(printf 'Progress: %d/%d  Runtime: %s' "$current" "$total" "$(format_duration "$runtime")")
     local padding=$((cols - ${#title} - ${#stats} - 4))
@@ -19240,6 +19936,9 @@ render_summary_panel() {
     printf '  %sSUMMARY%s\n' "${DASH_BOLD}" "${DASH_RESET}"
     printf '  Completed: %s%d%s | Issues: %d | PRs: %d | Commits: %d\n' \
         "${DASH_GREEN}" "$completed_count" "${DASH_RESET}" "$issues" "$prs" "$commits"
+    if [[ -n "${DASHBOARD_STATE[last_status_message]:-}" ]]; then
+        printf '  Status: %s%s%s\n' "${DASH_CYAN}" "${DASHBOARD_STATE[last_status_message]}" "${DASH_RESET}"
+    fi
 }
 
 # Render footer with keyboard shortcuts
@@ -19251,7 +19950,7 @@ render_footer() {
     draw_hline "$cols"
     printf '\n'
 
-    local shortcuts="[1-9] Answer [Enter] Expand [d] Drill [s] Skip [S] Skip all [z] Snooze [t] Template [/] Search [h] Help [q] Quit"
+    local shortcuts="[1-9] Answer [a] Apply [b] Bulk [p] Pause [r] Resume [d] Drill [s] Skip [z] Snooze [h] Help [q] Quit"
     printf ' %s%s\n' "$shortcuts" "${DASH_RESET}"
 }
 
@@ -19364,34 +20063,369 @@ handle_dashboard_keypress() {
 # Read a keypress (handles escape sequences for arrow keys)
 read_keypress() {
     local timeout_seconds="${1:-}"
-    local key seq
+    local key="" seq="" read_rc=0
 
     if [[ -n "$timeout_seconds" ]]; then
-        IFS= read -rsn1 -t "$timeout_seconds" key 2>/dev/null || return 1
+        IFS= read -rsn1 -t "$timeout_seconds" key 2>/dev/null || read_rc=$?
     else
-        IFS= read -rsn1 key 2>/dev/null || return 1
+        IFS= read -rsn1 key 2>/dev/null || read_rc=$?
+    fi
+
+    if [[ "$read_rc" -ne 0 ]]; then
+        if [[ "$read_rc" -gt 128 ]]; then
+            return 1
+        fi
+        return 2
     fi
 
     # Check for escape sequence
-    if [[ "$key" == $'\x1b' ]]; then
+    local esc_char=""
+    printf -v esc_char "%b" "\\033"
+    if [[ "$key" == "$esc_char" ]]; then
         IFS= read -rsn2 -t 0.1 seq 2>/dev/null || true
         key+="$seq"
     fi
 
-    echo "$key"
+    printf "%s" "$key"
 }
 
 # Main dashboard event loop
 # Args: $1=run_id, $2=start_time
 # Global: Uses DASHBOARD_STATE, reads from question queue
+dashboard_resolve_run_id() {
+    local candidate="${1:-${REVIEW_RUN_ID:-}}"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+
+    if [[ -n "$candidate" && -f "$base/$candidate/mapping.json" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    if declare -f resolve_review_apply_run_id &>/dev/null; then
+        local resolved=""
+        if resolved=$(resolve_review_apply_run_id 2>/dev/null) && [[ -n "$resolved" && -f "$base/$resolved/mapping.json" ]]; then
+            echo "$resolved"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+dashboard_list_applicable_repos() {
+    local run_id="$1"
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local mapping_file="$base/$run_id/mapping.json"
+    [[ -f "$mapping_file" ]] || return 0
+    command -v jq &>/dev/null || return 0
+
+    local repo_id="" wt_path=""
+    while IFS= read -r repo_id; do
+        [[ -z "$repo_id" ]] && continue
+        wt_path=$(jq -r --arg repo "$repo_id" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+        if [[ -n "$wt_path" && -f "$wt_path/.ru/review-plan.json" ]]; then
+            printf "%s\n" "$repo_id"
+        fi
+    done < <(jq -r "keys[]" "$mapping_file" 2>/dev/null)
+}
+
+dashboard_is_safe_bulk_candidate() {
+    local repo_id="$1"
+    local wt_path="$2"
+    local plan_file="$3"
+
+    [[ -f "$plan_file" ]] || return 1
+    command -v jq &>/dev/null || return 1
+
+    local validation=""
+    validation=$(validate_review_plan "$plan_file" 2>/dev/null || true)
+    [[ "$validation" == "Valid" ]] || return 1
+
+    if declare -f validate_review_identity &>/dev/null; then
+        validate_review_identity "$repo_id" "$wt_path" "$plan_file" >/dev/null 2>&1 || return 1
+    fi
+
+    local jq_safe_filter="
+        all(.questions[]?; .answered == true)
+        and (any(.items[]?; (.risk_level // \"low\") == \"high\" or (.risk_level // \"low\") == \"critical\") | not)
+        and (any(.gh_actions[]?; .op == \"merge\" or .op == \"close\" or (.op == \"label\" and (.target | startswith(\"pr#\")))) | not)
+    "
+    jq -e "$jq_safe_filter" "$plan_file" >/dev/null 2>&1
+}
+
+dashboard_record_exit_code() {
+    local code="${1:-0}"
+    [[ "$code" =~ ^[0-9]+$ ]] || code=1
+    [[ "$code" -eq 0 ]] && return 0
+
+    local prev="${DASHBOARD_STATE[last_exit_code]:-0}"
+    if [[ "$prev" -eq 0 ]]; then
+        DASHBOARD_STATE[last_exit_code]="$code"
+    elif declare -f aggregate_review_exit_codes &>/dev/null; then
+        DASHBOARD_STATE[last_exit_code]=$(aggregate_review_exit_codes "$prev" "$code")
+    else
+        DASHBOARD_STATE[last_exit_code]="$code"
+    fi
+}
+
+dashboard_apply_selected() {
+    local run_id="$1"
+    local resolved_run_id=""
+    if ! resolved_run_id=$(dashboard_resolve_run_id "$run_id"); then
+        DASHBOARD_STATE[last_status_message]="Apply: no review run worktrees found"
+        DASHBOARD_STATE[refresh_needed]="true"
+        return 0
+    fi
+
+    local -a repos=()
+    local repo_line=""
+    while IFS= read -r repo_line; do
+        [[ -n "$repo_line" ]] && repos+=("$repo_line")
+    done < <(dashboard_list_applicable_repos "$resolved_run_id")
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        DASHBOARD_STATE[last_status_message]="Apply: no completed review plans ready"
+        DASHBOARD_STATE[refresh_needed]="true"
+        return 0
+    fi
+
+    local target_repo=""
+    if [[ ${#repos[@]} -eq 1 ]]; then
+        target_repo="${repos[0]}"
+    else
+        target_repo=$(dashboard_prompt_choice "Select repository plan to apply" "${repos[@]}" "Cancel")
+        if [[ -z "$target_repo" || "$target_repo" == "Cancel" ]]; then
+            DASHBOARD_STATE[last_status_message]="Apply cancelled"
+            DASHBOARD_STATE[refresh_needed]="true"
+            return 0
+        fi
+    fi
+
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local mapping_file="$base/$resolved_run_id/mapping.json"
+    local wt_path=""
+    wt_path=$(jq -r --arg repo "$target_repo" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+    if [[ -z "$wt_path" || ! -d "$wt_path" ]]; then
+        DASHBOARD_STATE[last_status_message]="Apply failed: worktree missing for $target_repo"
+        dashboard_record_exit_code 4
+        DASHBOARD_STATE[refresh_needed]="true"
+        return 4
+    fi
+
+    # Leave alternate screen so real approval prompt and quality gate diagnostics are visible
+    exit_alt_screen
+    local saved_run_id="${REVIEW_RUN_ID:-}"
+    REVIEW_RUN_ID="$resolved_run_id"
+    local apply_rc=0
+    apply_review_plan_for_repo "$target_repo" "$wt_path" || apply_rc=$?
+    REVIEW_RUN_ID="${saved_run_id:-$resolved_run_id}"
+    enter_alt_screen
+
+    if [[ "$apply_rc" -eq 0 ]]; then
+        DASHBOARD_STATE[last_status_message]="Applied plan for $target_repo"
+        if declare -f update_review_state &>/dev/null; then
+            update_review_state ".repos[\"$target_repo\"].applied = true | .repos[\"$target_repo\"].apply_exit_code = 0" 2>/dev/null || true
+        fi
+    else
+        DASHBOARD_STATE[last_status_message]="Apply failed for $target_repo (exit $apply_rc)"
+        dashboard_record_exit_code "$apply_rc"
+        if declare -f update_review_state &>/dev/null; then
+            update_review_state ".repos[\"$target_repo\"].applied = false | .repos[\"$target_repo\"].apply_exit_code = $apply_rc" 2>/dev/null || true
+        fi
+    fi
+
+    DASHBOARD_STATE[refresh_needed]="true"
+    return "$apply_rc"
+}
+
+dashboard_bulk_apply_safe() {
+    local run_id="$1"
+    local resolved_run_id=""
+    if ! resolved_run_id=$(dashboard_resolve_run_id "$run_id"); then
+        DASHBOARD_STATE[last_status_message]="Bulk apply: no review run worktrees found"
+        DASHBOARD_STATE[refresh_needed]="true"
+        return 0
+    fi
+
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local mapping_file="$base/$resolved_run_id/mapping.json"
+    local saved_run_id="${REVIEW_RUN_ID:-}"
+    REVIEW_RUN_ID="$resolved_run_id"
+
+    local -a safe_repos=()
+    local repo_id="" wt_path=""
+    while IFS= read -r repo_id; do
+        [[ -z "$repo_id" ]] && continue
+        wt_path=$(jq -r --arg repo "$repo_id" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+        if [[ -n "$wt_path" ]] && dashboard_is_safe_bulk_candidate "$repo_id" "$wt_path" "$wt_path/.ru/review-plan.json"; then
+            safe_repos+=("$repo_id")
+        fi
+    done < <(dashboard_list_applicable_repos "$resolved_run_id")
+
+    if [[ ${#safe_repos[@]} -eq 0 ]]; then
+        REVIEW_RUN_ID="${saved_run_id:-$resolved_run_id}"
+        DASHBOARD_STATE[last_status_message]="Bulk apply: no safe candidates eligible"
+        DASHBOARD_STATE[refresh_needed]="true"
+        return 0
+    fi
+
+    local applied=0 failed=0 idx=0 n_safe=${#safe_repos[@]} overall_rc=0
+    exit_alt_screen
+    while (( idx < n_safe )); do
+        repo_id="${safe_repos[$idx]}"
+        wt_path=$(jq -r --arg repo "$repo_id" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+        local rc=0
+        apply_review_plan_for_repo "$repo_id" "$wt_path" || rc=$?
+        if [[ "$rc" -eq 0 ]]; then
+            applied=$((applied + 1))
+            if declare -f update_review_state &>/dev/null; then
+                update_review_state ".repos[\"$repo_id\"].applied = true | .repos[\"$repo_id\"].apply_exit_code = 0" 2>/dev/null || true
+            fi
+        else
+            failed=$((failed + 1))
+            dashboard_record_exit_code "$rc"
+            if [[ "$overall_rc" -eq 0 ]]; then
+                overall_rc="$rc"
+            elif declare -f aggregate_review_exit_codes &>/dev/null; then
+                overall_rc=$(aggregate_review_exit_codes "$overall_rc" "$rc")
+            fi
+            if declare -f update_review_state &>/dev/null; then
+                update_review_state ".repos[\"$repo_id\"].applied = false | .repos[\"$repo_id\"].apply_exit_code = $rc" 2>/dev/null || true
+            fi
+        fi
+        idx=$((idx + 1))
+    done
+    enter_alt_screen
+    REVIEW_RUN_ID="${saved_run_id:-$resolved_run_id}"
+
+    DASHBOARD_STATE[last_status_message]="Bulk apply safe: $applied applied, $failed failed"
+    DASHBOARD_STATE[refresh_needed]="true"
+    return "$overall_rc"
+}
+
+dashboard_refresh_state() {
+    local run_id="$1"
+    command -v jq &>/dev/null || return 0
+
+    if declare -f review_scheduler_is_paused &>/dev/null && review_scheduler_is_paused; then
+        DASHBOARD_STATE[paused]="true"
+    else
+        DASHBOARD_STATE[paused]="false"
+    fi
+
+    if declare -f load_questions_queue &>/dev/null; then
+        DASHBOARD_QUESTIONS=$(load_questions_queue)
+    fi
+
+    # Build active sessions JSON from live orchestrator state or persisted review state
+    local sessions_json="[]"
+    if [[ "${ORCH_INITIALIZED:-false}" == "true" ]]; then
+        if [[ ${#ORCH_ACTIVE_SESSIONS[@]} -gt 0 ]]; then
+            local active_keys="" repo_id=""
+            active_keys=$(printf "%s\n" "${!ORCH_ACTIVE_SESSIONS[@]}")
+            while IFS= read -r repo_id; do
+                [[ -z "$repo_id" ]] && continue
+                local sid="${ORCH_ACTIVE_SESSIONS[$repo_id]:-}"
+                local raw_st="${ORCH_SESSION_STATES[$sid]:-generating}"
+                local upper_st="${raw_st^^}"
+                local health="Healthy"
+                [[ "$raw_st" == "stalled" ]] && health="Degraded"
+                [[ "$raw_st" == "error" ]] && health="Unhealthy"
+                sessions_json=$(echo "$sessions_json" | jq -c --arg repo "$repo_id" --arg st "$upper_st" --arg h "$health" ". + [{repo:\$repo,state:\$st,progress:\"active\",health:\$h}]" 2>/dev/null || echo "$sessions_json")
+            done < <(printf "%s\n" "$active_keys")
+        fi
+    else
+        local state_file=""
+        if declare -f get_review_state_file &>/dev/null; then
+            state_file=$(get_review_state_file 2>/dev/null || echo "")
+        fi
+        if [[ -n "$state_file" && -f "$state_file" ]]; then
+            local jq_sessions="[.repos // {} | to_entries[] | select(.value.status == \"in_progress\") | {repo:.key,state:\"GENERATING\",progress:\"active\",health:\"Healthy\"}]"
+            sessions_json=$(jq -c "$jq_sessions" "$state_file" 2>/dev/null || echo "[]")
+        fi
+    fi
+    DASHBOARD_SESSIONS="$sessions_json"
+
+    # Build summary stats from review-state and worktree plans
+    local completed=0 issues=0 prs=0 commits=0 current=0 total=0
+    local state_file=""
+    if declare -f get_review_state_file &>/dev/null; then
+        state_file=$(get_review_state_file 2>/dev/null || echo "")
+    fi
+    if [[ -n "$state_file" && -f "$state_file" ]]; then
+        local jq_comp="[.repos // {} | to_entries[] | select(.value.status == \"completed\")] | length"
+        local jq_tot="[.repos // {} | to_entries[]] | length"
+        local jq_iss="[.repos // {} | to_entries[] | (.value.issues_reviewed // 0)] | add // 0"
+        local jq_pr="[.repos // {} | to_entries[] | (.value.prs_reviewed // 0)] | add // 0"
+        completed=$(jq -r "$jq_comp" "$state_file" 2>/dev/null || echo "0")
+        total=$(jq -r "$jq_tot" "$state_file" 2>/dev/null || echo "0")
+        issues=$(jq -r "$jq_iss" "$state_file" 2>/dev/null || echo "0")
+        prs=$(jq -r "$jq_pr" "$state_file" 2>/dev/null || echo "0")
+    fi
+
+    if [[ "${ORCH_INITIALIZED:-false}" == "true" ]]; then
+        completed=${#ORCH_COMPLETED_REPOS[@]}
+        local n_fail=${#ORCH_FAILED_REPOS[@]}
+        current=$((completed + n_fail))
+        total="${ORCH_TOTAL_REPOS:-$total}"
+    else
+        current="$completed"
+    fi
+
+    local resolved_run_id=""
+    if resolved_run_id=$(dashboard_resolve_run_id "$run_id" 2>/dev/null); then
+        local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+        local mapping_file="$base/$resolved_run_id/mapping.json"
+        if [[ -f "$mapping_file" ]]; then
+            local repo_id="" wt_path="" c=0
+            while IFS= read -r repo_id; do
+                [[ -z "$repo_id" ]] && continue
+                wt_path=$(jq -r --arg repo "$repo_id" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+                if [[ -n "$wt_path" && -f "$wt_path/.ru/review-plan.json" ]]; then
+                    c=$(jq -r ".git.commits // [] | length" "$wt_path/.ru/review-plan.json" 2>/dev/null || echo "0")
+                    [[ "$c" =~ ^[0-9]+$ ]] && commits=$((commits + c))
+                fi
+            done < <(jq -r "keys[]" "$mapping_file" 2>/dev/null)
+        fi
+    fi
+
+    [[ "$completed" =~ ^[0-9]+$ ]] || completed=0
+    [[ "$issues" =~ ^[0-9]+$ ]] || issues=0
+    [[ "$prs" =~ ^[0-9]+$ ]] || prs=0
+    [[ "$commits" =~ ^[0-9]+$ ]] || commits=0
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+
+    DASHBOARD_STATS=$(jq -nc \
+        --argjson completed "$completed" \
+        --argjson issues "$issues" \
+        --argjson prs "$prs" \
+        --argjson commits "$commits" \
+        --argjson current "$current" \
+        --argjson total "$total" \
+        "{completed:\$completed,issues:\$issues,prs:\$prs,commits:\$commits,current:\$current,total:\$total}")
+}
+
 run_dashboard() {
     local run_id="$1"
     local start_time="$2"
     local interrupted="false"
 
+    # Explicit non-interactive conflict check
+    if [[ "${CLI_NON_INTERACTIVE_EXPLICIT:-false}" == "true" || "${REVIEW_NON_INTERACTIVE:-false}" == "true" ]]; then
+        log_error "Review dashboard cannot run in --non-interactive mode"
+        return 4
+    fi
+
+    # Require an interactive TTY on stdin and stdout so non-TTY invocations fail fast instead of hanging
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        log_error "Review dashboard requires an interactive terminal (TTY)"
+        return 3
+    fi
+
     # Dashboard requires jq for JSON parsing
     if ! command -v jq &>/dev/null; then
-        log_error "Dashboard requires 'jq' for JSON parsing. Please install jq."
+        log_error "Dashboard requires jq for JSON parsing. Please install jq."
         return 3
     fi
 
@@ -19405,23 +20439,30 @@ run_dashboard() {
     enter_alt_screen
 
     # Handle interrupts: restore terminal and bubble up after cleanup
-    trap 'interrupted="true"; DASHBOARD_STATE[running]="false"' INT TERM
+    trap "interrupted=true; DASHBOARD_STATE[running]=false" INT TERM
 
     # Handle resize
-    trap 'DASHBOARD_STATE[refresh_needed]="true"' SIGWINCH
+    trap "DASHBOARD_STATE[refresh_needed]=true" SIGWINCH
 
     DASHBOARD_STATE[running]="true"
     DASHBOARD_STATE[last_refresh]=0
+    DASHBOARD_STATE[last_exit_code]=0
+    DASHBOARD_STATE[refresh_needed]="true"
 
     while [[ "${DASHBOARD_STATE[running]}" == "true" ]]; do
+        # Advance live orchestration if callback is wired
+        if [[ -n "${DASHBOARD_TICK_CALLBACK:-}" ]] && declare -f "$DASHBOARD_TICK_CALLBACK" &>/dev/null; then
+            "$DASHBOARD_TICK_CALLBACK" || true
+        fi
+
         local now
         now=$(date +%s)
 
-        # Check if refresh needed (every 5 seconds or on demand)
+        # Refresh live state and re-render every second or on demand
         if [[ "${DASHBOARD_STATE[refresh_needed]}" == "true" ]] || \
-           [[ $((now - DASHBOARD_STATE[last_refresh])) -ge 5 ]]; then
+           [[ $((now - DASHBOARD_STATE[last_refresh])) -ge 1 ]]; then
+            dashboard_refresh_state "$run_id"
 
-            # Get current state (these would be populated by the orchestrator)
             local questions_json="${DASHBOARD_QUESTIONS:-[]}"
             local sessions_json="${DASHBOARD_SESSIONS:-[]}"
             local stats_json="${DASHBOARD_STATS:-{\"completed\":0,\"issues\":0,\"prs\":0,\"commits\":0,\"current\":0,\"total\":0}}"
@@ -19434,30 +20475,36 @@ run_dashboard() {
             DASHBOARD_STATE[last_refresh]="$now"
         fi
 
-        # Wait for keypress with timeout (for periodic refresh)
-        local key
-        if key=$(read_keypress 1); then
+        # Wait for keypress with timeout (for periodic tick + refresh)
+        local key="" key_rc=0
+        key=$(read_keypress 1) || key_rc=$?
+        if [[ "$key_rc" -eq 2 ]]; then
+            # EOF on stdin/PTY: exit cleanly instead of busy-looping
+            DASHBOARD_STATE[running]="false"
+            break
+        elif [[ "$key_rc" -eq 0 ]]; then
             local questions_count=0
             local filtered_questions=""
-            if command -v jq &>/dev/null; then
-                filtered_questions=$(filter_questions_json "${DASHBOARD_QUESTIONS:-[]}")
-                questions_count=$(echo "$filtered_questions" | jq 'length' 2>/dev/null || echo 0)
-            fi
+            filtered_questions=$(filter_questions_json "${DASHBOARD_QUESTIONS:-[]}")
+            questions_count=$(echo "$filtered_questions" | jq "length" 2>/dev/null || echo 0)
+            [[ "$questions_count" =~ ^[0-9]+$ ]] || questions_count=0
+
             if [[ "$questions_count" -le 0 ]]; then
                 DASHBOARD_STATE[selected_index]=0
             elif [[ "${DASHBOARD_STATE[selected_index]}" -ge "$questions_count" ]]; then
                 DASHBOARD_STATE[selected_index]=$((questions_count - 1))
             fi
 
-            local action
+            local action=""
             action=$(handle_dashboard_keypress "$key" "$questions_count")
 
             case "$action" in
                 answer:*)
                     local idx="${action#answer:}"
                     if [[ -n "$filtered_questions" ]]; then
-                        dashboard_answer_question "$filtered_questions" "$idx"
+                        dashboard_answer_question "$filtered_questions" "$idx" || true
                     fi
+                    DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 drill:*)
                     local idx="${action#drill:}"
@@ -19473,41 +20520,41 @@ run_dashboard() {
                 skip:*)
                     local idx="${action#skip:}"
                     if [[ -n "$filtered_questions" ]]; then
-                        dashboard_skip_question "$filtered_questions" "$idx"
+                        dashboard_skip_question "$filtered_questions" "$idx" || true
                     fi
                     DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 skip_all)
-                    dashboard_skip_all_questions
+                    dashboard_skip_all_questions || true
                     DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 snooze:*)
                     local idx="${action#snooze:}"
                     if [[ -n "$filtered_questions" ]]; then
-                        dashboard_snooze_question "$filtered_questions" "$idx"
+                        dashboard_snooze_question "$filtered_questions" "$idx" || true
                     fi
                     DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 template:*)
                     local idx="${action#template:}"
                     if [[ -n "$filtered_questions" ]]; then
-                        dashboard_apply_template "$filtered_questions" "$idx"
+                        dashboard_apply_template "$filtered_questions" "$idx" || true
                     fi
+                    DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 apply)
-                    # TODO: Apply approved changes
-                    log_verbose "Apply changes requested"
+                    dashboard_apply_selected "$run_id" || true
                     ;;
                 bulk_apply)
-                    log_verbose "Bulk apply safe requested"
+                    dashboard_bulk_apply_safe "$run_id" || true
                     ;;
                 pause)
-                    DASHBOARD_STATE[paused]="true"
-                    log_verbose "Dashboard paused"
+                    review_scheduler_pause
+                    DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 resume)
-                    DASHBOARD_STATE[paused]="false"
-                    log_verbose "Dashboard resumed"
+                    review_scheduler_resume
+                    DASHBOARD_STATE[refresh_needed]="true"
                     ;;
                 quit)
                     DASHBOARD_STATE[running]="false"
@@ -19534,6 +20581,11 @@ run_dashboard() {
 
     exit_alt_screen
 
+    # Clear transient dashboard pause so subsequent runs are not left paused
+    if declare -f review_scheduler_resume &>/dev/null && review_scheduler_is_paused; then
+        review_scheduler_resume
+    fi
+
     # Restore previous traps
     trap - INT TERM SIGWINCH
     [[ -n "$old_trap_int" ]] && eval "$old_trap_int"
@@ -19543,6 +20595,7 @@ run_dashboard() {
     if [[ "$interrupted" == "true" ]]; then
         return 130
     fi
+    return "${DASHBOARD_STATE[last_exit_code]:-0}"
 }
 
 # Initialize dashboard with data
@@ -19699,6 +20752,7 @@ parse_review_args() {
     REVIEW_STATUS="false"        # status only, no discovery/sessions
     REVIEW_ANALYTICS="false"     # show analytics dashboard
     REVIEW_BASIC_TUI="false"     # basic gum/ANSI TUI for questions
+    REVIEW_DASHBOARD="false"     # interactive review dashboard TUI
     # shellcheck disable=SC2034  # Used by later phases
     REVIEW_RESUME="${RESUME:-false}"  # use global --resume flag
     REVIEW_PUSH="false"          # allow pushing (with apply)
@@ -19725,6 +20779,9 @@ parse_review_args() {
                 ;;
             --basic)
                 REVIEW_BASIC_TUI="true"
+                ;;
+            --dashboard)
+                REVIEW_DASHBOARD="true"
                 ;;
             --mode=*)
                 REVIEW_DRIVER="${arg#--mode=}"
@@ -20371,11 +21428,18 @@ cleanup_old_review_state() {
         return 0
     fi
 
-    local cutoff
-    if date --version 2>/dev/null | grep -q GNU; then
-        cutoff=$(date -u -d "$max_age_days days ago" +%Y-%m-%dT%H:%M:%SZ)
+    local cutoff=""
+    if declare -f date_add_days &>/dev/null; then
+        cutoff=$(date_add_days "-${max_age_days}" 2>/dev/null || echo "")
     else
-        cutoff=$(date -u -v-${max_age_days}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+        local iso_re="^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        if cutoff=$(date -u -d "${max_age_days} days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) && [[ "$cutoff" =~ $iso_re ]]; then
+            :
+        elif cutoff=$(date -u -v-"${max_age_days}d" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) && [[ "$cutoff" =~ $iso_re ]]; then
+            :
+        else
+            cutoff=""
+        fi
     fi
 
     if [[ -z "$cutoff" ]]; then
@@ -20552,6 +21616,7 @@ archive_old_digests() {
 
 # Update digest caches for all worktrees in the current review run
 update_repo_digests_from_worktrees() {
+    local -a target_repos=("$@")
     local worktrees_dir mapping_file
     worktrees_dir=$(get_worktrees_dir)
     mapping_file="$worktrees_dir/mapping.json"
@@ -20565,12 +21630,36 @@ update_repo_digests_from_worktrees() {
         return 0
     fi
 
-    local repo_id wt_path
+    local repo_id="" wt_path=""
+    if [[ ${#target_repos[@]} -gt 0 ]]; then
+        local idx=0 n_targets=${#target_repos[@]}
+        while (( idx < n_targets )); do
+            repo_id="${target_repos[$idx]}"
+            idx=$((idx + 1))
+            [[ -z "$repo_id" ]] && continue
+            wt_path=$(jq -r --arg repo "$repo_id" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+            [[ -n "$wt_path" && -d "$wt_path" ]] && update_digest_cache "$wt_path" "$repo_id"
+        done
+        return 0
+    fi
+
+    # When called without explicit completed repos, only update repos recorded as completed/success
+    local state_file=""
+    if declare -f get_review_state_file &>/dev/null; then
+        state_file=$(get_review_state_file 2>/dev/null || echo "")
+    fi
+    local jq_ok_filter=".repos[\$repo].status == \"completed\" and (.repos[\$repo].outcome // \"success\") == \"success\""
+
     while IFS= read -r repo_id; do
         [[ -z "$repo_id" ]] && continue
-        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].worktree_path // ""' "$mapping_file")
-        [[ -n "$wt_path" ]] && update_digest_cache "$wt_path" "$repo_id"
-    done < <(jq -r 'keys[]' "$mapping_file" 2>/dev/null)
+        if [[ -n "$state_file" && -f "$state_file" ]]; then
+            if ! jq -e --arg repo "$repo_id" "$jq_ok_filter" "$state_file" >/dev/null 2>&1; then
+                continue
+            fi
+        fi
+        wt_path=$(jq -r --arg repo "$repo_id" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+        [[ -n "$wt_path" && -d "$wt_path" ]] && update_digest_cache "$wt_path" "$repo_id"
+    done < <(jq -r "keys[]" "$mapping_file" 2>/dev/null)
 }
 
 #------------------------------------------------------------------------------
@@ -22281,7 +23370,7 @@ build_review_completion_json() {
     local start_epoch="$3"
     local exit_code="$4"
     shift 4
-    local items=("$@")
+    local -a items=("$@")
 
     local end_epoch duration_seconds
     end_epoch=$(date +%s)
@@ -22291,35 +23380,110 @@ build_review_completion_json() {
     fi
 
     local -A unique_repos=()
-    local item
-    for item in "${items[@]}"; do
+    local item="" repo_id="" idx=0 n_items=${#items[@]}
+    while (( idx < n_items )); do
+        item="${items[$idx]}"
+        repo_id=""
         IFS="|" run_with_input "$item" read -r repo_id _ _ _ _ _ _ _
         [[ -n "$repo_id" ]] && unique_repos["$repo_id"]=1
+        idx=$((idx + 1))
     done
 
-    local repos_reviewed=${#unique_repos[@]}
+    local status="complete"
+    if [[ "$exit_code" -eq 5 ]]; then
+        status="interrupted"
+    elif [[ "$exit_code" -ne 0 ]]; then
+        status="failed"
+    fi
+
+    local repos_reviewed=0
     local items_processed=${#items[@]}
+    local items_fixed=0 items_skipped=0 items_needs_info=0 commits_created=0
+    local questions_asked="${COST_BUDGET_QUESTIONS_ASKED:-0}"
+    [[ "$questions_asked" =~ ^[0-9]+$ ]] || questions_asked=0
+    local repos_json="{}"
+
+    local state_file=""
+    if declare -f get_review_state_file &>/dev/null; then
+        state_file=$(get_review_state_file 2>/dev/null || echo "")
+    fi
+    local wt_base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/${run_id}"
+    local mapping_file="$wt_base/mapping.json"
+
+    if [[ -n "$state_file" && -f "$state_file" ]]; then
+        local state_has_repos=0
+        state_has_repos=$(jq -r "(.repos // {}) | length" "$state_file" 2>/dev/null || echo "0")
+        [[ "$state_has_repos" =~ ^[0-9]+$ ]] || state_has_repos=0
+
+        if [[ "$state_has_repos" -gt 0 ]]; then
+            local jq_build_repos="
+                .repos // {} | with_entries(
+                    .value = {
+                        status: (.value.status // \"unknown\"),
+                        outcome: (.value.outcome // null),
+                        issues_reviewed: (.value.issues_reviewed // 0),
+                        prs_reviewed: (.value.prs_reviewed // 0)
+                    }
+                )
+            "
+            repos_json=$(jq -c "$jq_build_repos" "$state_file" 2>/dev/null || echo "{}")
+            local jq_comp_count="[.repos // {} | to_entries[] | select(.value.status == \"completed\")] | length"
+            repos_reviewed=$(jq -r "$jq_comp_count" "$state_file" 2>/dev/null || echo "0")
+            [[ "$repos_reviewed" =~ ^[0-9]+$ ]] || repos_reviewed=0
+        fi
+    fi
+
+    # Fallback when called standalone without state file
+    if [[ "$repos_reviewed" -eq 0 && "$repos_json" == "{}" && "$exit_code" -eq 0 ]]; then
+        repos_reviewed=${#unique_repos[@]}
+    fi
+
+    # Accumulate plan counts from worktrees when mapping exists
+    if [[ -f "$mapping_file" ]]; then
+        local m_repo="" wt_path="" plan_file=""
+        local jq_fix="[.items[]? | select(.decision == \"fix\")] | length"
+        local jq_skip="[.items[]? | select(.decision == \"skip\")] | length"
+        local jq_ni="[.items[]? | select(.decision == \"needs-info\")] | length"
+        local jq_commits=".git.commits // [] | length"
+        while IFS= read -r m_repo; do
+            [[ -z "$m_repo" ]] && continue
+            wt_path=$(jq -r --arg repo "$m_repo" ".[\$repo].worktree_path // \"\"" "$mapping_file" 2>/dev/null || echo "")
+            plan_file="$wt_path/.ru/review-plan.json"
+            if [[ -n "$wt_path" && -f "$plan_file" ]]; then
+                local f_cnt=0 s_cnt=0 n_cnt=0 c_cnt=0
+                f_cnt=$(jq -r "$jq_fix" "$plan_file" 2>/dev/null || echo "0")
+                s_cnt=$(jq -r "$jq_skip" "$plan_file" 2>/dev/null || echo "0")
+                n_cnt=$(jq -r "$jq_ni" "$plan_file" 2>/dev/null || echo "0")
+                c_cnt=$(jq -r "$jq_commits" "$plan_file" 2>/dev/null || echo "0")
+                [[ "$f_cnt" =~ ^[0-9]+$ ]] && items_fixed=$((items_fixed + f_cnt))
+                [[ "$s_cnt" =~ ^[0-9]+$ ]] && items_skipped=$((items_skipped + s_cnt))
+                [[ "$n_cnt" =~ ^[0-9]+$ ]] && items_needs_info=$((items_needs_info + n_cnt))
+                [[ "$c_cnt" =~ ^[0-9]+$ ]] && commits_created=$((commits_created + c_cnt))
+            fi
+        done < <(jq -r "keys[]" "$mapping_file" 2>/dev/null)
+    fi
 
     local summary_json
     summary_json=$(jq -n \
         --argjson repos_reviewed "$repos_reviewed" \
         --argjson items_processed "$items_processed" \
-        --argjson items_fixed 0 \
-        --argjson items_skipped 0 \
-        --argjson items_needs_info 0 \
-        --argjson commits_created 0 \
-        --argjson questions_asked 0 \
+        --argjson items_fixed "$items_fixed" \
+        --argjson items_skipped "$items_skipped" \
+        --argjson items_needs_info "$items_needs_info" \
+        --argjson commits_created "$commits_created" \
+        --argjson questions_asked "$questions_asked" \
         --argjson duration_seconds "$duration_seconds" \
-        '{repos_reviewed:$repos_reviewed,items_processed:$items_processed,items_fixed:$items_fixed,items_skipped:$items_skipped,items_needs_info:$items_needs_info,commits_created:$commits_created,questions_asked:$questions_asked,duration_seconds:$duration_seconds}')
+        "{repos_reviewed:\$repos_reviewed,items_processed:\$items_processed,items_fixed:\$items_fixed,items_skipped:\$items_skipped,items_needs_info:\$items_needs_info,commits_created:\$commits_created,questions_asked:\$questions_asked,duration_seconds:\$duration_seconds}")
 
     jq -n \
         --arg command "review" \
         --arg mode "$mode" \
         --arg run_id "$run_id" \
-        --arg status "complete" \
+        --arg status "$status" \
         --argjson exit_code "$exit_code" \
         --argjson summary "$summary_json" \
-        '{command:$command,mode:$mode,run_id:$run_id,status:$status,exit_code:$exit_code,summary:$summary,repos:{}}'
+        --argjson repos "$repos_json" \
+        "{command:\$command,mode:\$mode,run_id:\$run_id,status:\$status,exit_code:\$exit_code,summary:\$summary,repos:\$repos}"
 }
 
 #------------------------------------------------------------------------------
@@ -22594,6 +23758,25 @@ cmd_review() {
         return $?
     fi
 
+    # Validate --dashboard compatibility before auto-enabling non-interactive mode
+    if [[ "$REVIEW_DASHBOARD" == "true" ]]; then
+        if [[ "$REVIEW_DRY_RUN" == "true" ]]; then
+            log_error "Review --dashboard cannot be combined with --dry-run"
+            emit_command_refusal review conflicting_options 4
+            return 4
+        fi
+        if [[ "${CLI_NON_INTERACTIVE_EXPLICIT:-false}" == "true" || "$REVIEW_NON_INTERACTIVE" == "true" ]]; then
+            log_error "Review --dashboard cannot be combined with --non-interactive"
+            emit_command_refusal review conflicting_options 4
+            return 4
+        fi
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            log_error "Review --dashboard requires an interactive terminal (TTY)"
+            emit_command_refusal review tty_required 3
+            return 3
+        fi
+    fi
+
     # Check prerequisites
     if ! check_review_prerequisites; then
         exit 3
@@ -22602,8 +23785,10 @@ cmd_review() {
     check_interactive_capability
 
     local resume_pending_repos=""
+    local resume_completed_repos=""
     local resume_run_id=""
     local repos_scanned=0
+    REVIEW_RESUME_COMPLETED_REPOS=""
 
     if [[ "$REVIEW_RESUME" == "true" ]]; then
         local checkpoint
@@ -22634,6 +23819,9 @@ cmd_review() {
                 fi
             fi
 
+            resume_completed_repos=$(echo "$checkpoint" | jq -r '.completed_repos[]?' 2>/dev/null | tr '\n' ' ')
+            resume_completed_repos="${resume_completed_repos%" "}"
+            REVIEW_RESUME_COMPLETED_REPOS="$resume_completed_repos"
             resume_pending_repos=$(echo "$checkpoint" | jq -r '.pending_repos[]?' 2>/dev/null | tr '\n' ' ')
             resume_pending_repos="${resume_pending_repos%" "}"
             if [[ -n "$resume_pending_repos" ]]; then
@@ -22715,6 +23903,12 @@ cmd_review() {
     # Apply mode does not require discovery or a driver.
     if [[ "$REVIEW_MODE" == "apply" ]]; then
         local apply_code=0
+        if [[ "$REVIEW_DASHBOARD" == "true" ]]; then
+            DASHBOARD_TICK_CALLBACK=""
+            run_dashboard "$run_id" "$review_start_epoch" || apply_code=$?
+            [[ "$apply_code" -eq 130 ]] && apply_code=5
+            finalize_review_exit "$apply_code"
+        fi
         cmd_review_apply
         apply_code=$?
         if [[ "$apply_code" -eq 0 ]]; then
@@ -22797,7 +23991,7 @@ cmd_review() {
         fi
     done
     pending_repos_list="${pending_repos_list%" "}"
-    if ! checkpoint_review_state "" "$pending_repos_list"; then
+    if ! checkpoint_review_state "$resume_completed_repos" "$pending_repos_list"; then
         log_error "Review was not started because its checkpoint could not be saved"
         return 3
     fi
@@ -22809,7 +24003,29 @@ cmd_review() {
     log_info "Parallel: $REVIEW_PARALLEL"
 
     local orchestration_code=0
-    if run_review_orchestration "${work_items[@]}"; then
+    if [[ "$REVIEW_DASHBOARD" == "true" ]]; then
+        local init_rc=0 dash_rc=0 forced_code=0
+        review_orchestration_init "${work_items[@]}" || init_rc=$?
+        if [[ "$init_rc" -ne 0 ]]; then
+            orchestration_code="$init_rc"
+            log_error "Orchestration initialization failed with code $orchestration_code"
+        else
+            DASHBOARD_TICK_CALLBACK="review_orchestration_tick"
+            run_dashboard "$run_id" "$review_start_epoch" || dash_rc=$?
+            DASHBOARD_TICK_CALLBACK=""
+            if [[ "$dash_rc" -eq 130 ]]; then
+                forced_code=5
+            elif [[ "$dash_rc" -ne 0 ]]; then
+                forced_code="$dash_rc"
+            fi
+            if review_orchestration_finalize "$forced_code"; then
+                orchestration_code=0
+            else
+                orchestration_code=$?
+                log_error "Orchestration finished with code $orchestration_code"
+            fi
+        fi
+    elif run_review_orchestration "${work_items[@]}"; then
         orchestration_code=0
     else
         orchestration_code=$?
@@ -22856,7 +24072,7 @@ resolve_review_apply_run_id() {
             return 1
         fi
 
-        run_id=$(echo "$checkpoint" | jq -r '.run_id // ""' 2>/dev/null || echo "")
+        run_id=$(echo "$checkpoint" | jq -r ".run_id // \"\"" 2>/dev/null || echo "")
         if [[ -z "$run_id" || "$run_id" == "null" ]]; then
             log_error "Checkpoint missing run_id (cannot --resume apply)"
             return 1
@@ -22872,20 +24088,41 @@ resolve_review_apply_run_id() {
         return 1
     fi
 
-    local best_run_id=""
-    local best_mtime=0
+    local best_run_id="" best_mtime=-1 best_has_mapping=0
+    local -a dirs=()
+    local d=""
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && dirs+=("$d")
+    done < <(find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort)
 
-    local dir
-    for dir in "$base"/*; do
+    local idx=0 n_dirs=${#dirs[@]}
+    while (( idx < n_dirs )); do
+        local dir="${dirs[$idx]}"
+        idx=$((idx + 1))
         [[ -d "$dir" ]] || continue
 
-        local mtime
-        if ! mtime=$(stat -c %Y "$dir" 2>/dev/null); then
-            mtime=$(stat -f %m "$dir" 2>/dev/null || echo 0)
+        local has_mapping=0
+        local target_path="$dir"
+        if [[ -f "$dir/mapping.json" ]]; then
+            has_mapping=1
+            target_path="$dir/mapping.json"
+        fi
+
+        local mtime=""
+        if declare -f get_file_mtime_epoch &>/dev/null; then
+            mtime=$(get_file_mtime_epoch "$target_path")
+        else
+            mtime=$(stat -c %Y "$target_path" 2>/dev/null || echo "")
+            if [[ ! "$mtime" =~ ^[0-9]+$ ]]; then
+                mtime=$(stat -f %m "$target_path" 2>/dev/null || echo "0")
+            fi
         fi
         [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
 
-        if (( mtime > best_mtime )); then
+        # Because dirs are sorted ascending by run_id, -ge breaks exact mtime ties deterministically
+        if [[ "$has_mapping" -gt "$best_has_mapping" ]] || \
+           { [[ "$has_mapping" -eq "$best_has_mapping" ]] && [[ "$mtime" -ge "$best_mtime" ]]; }; then
+            best_has_mapping="$has_mapping"
             best_mtime="$mtime"
             best_run_id="${dir##*/}"
         fi
@@ -26877,8 +28114,12 @@ cmd_agent_sweep() {
                 [[ -n "$pattern" ]] || continue
                 patterns_json+=("$(printf '"%s"' "$(json_escape "$pattern")")")
             done < <(get_denylist_patterns)
-            local IFS=,
-            printf '{"mode":"denylist","patterns":[%s]}\n' "${patterns_json[*]-}"
+            local patterns_csv=""
+            if [[ ${#patterns_json[@]} -gt 0 ]]; then
+                local IFS=,
+                patterns_csv="${patterns_json[*]}"
+            fi
+            printf '{"mode":"denylist","patterns":[%s]}\n' "$patterns_csv"
         else
             get_denylist_patterns
         fi
@@ -27955,6 +29196,7 @@ _robot_docs_commands() {
       "flags": [
         {"flag": "--plan", "description": "Generate review plans only (default)"},
         {"flag": "--apply", "description": "Execute approved plans"},
+        {"flag": "--dashboard", "description": "Launch interactive review dashboard TUI"},
         {"flag": "--analytics", "description": "Show review metrics dashboard"},
         {"flag": "--basic", "description": "Use basic question TUI"},
         {"flag": "--mode=MODE", "description": "Driver: auto, ntm, or local"},
@@ -27982,7 +29224,7 @@ _robot_docs_commands() {
         {"flag": "--exclude=PATTERN", "description": "Skip matching repos (glob or substring)"},
         {"flag": "--timeout=SEC", "description": "Per-repo timeout in seconds (default: 600)"},
         {"flag": "--no-push", "description": "Commit changes without pushing"},
-        {"flag": "--agent=TYPE", "description": "Agent type: claude (default), codex, gemini"},
+        {"flag": "--agent=TYPE", "description": "Agent type: claude (default), codex, gemini, antigravity"},
         {"flag": "--no-untracked", "description": "Ignore untracked files when scanning dirty repos"},
         {"flag": "--sequential", "description": "Process repositories sequentially (default)"}
       ]
@@ -28000,7 +29242,7 @@ _robot_docs_commands() {
         {"flag": "--max-fix-attempts=N", "description": "Max fix iterations per dependency (default: 5)"},
         {"flag": "--no-push", "description": "Commit verified updates without pushing"},
         {"flag": "--repo=PATH", "description": "Process single repo only (default: all configured repos)"},
-        {"flag": "--agent=TYPE", "description": "Agent type: claude (default), codex, gemini"},
+        {"flag": "--agent=TYPE", "description": "Agent type: claude (default), codex, gemini, antigravity"},
         {"flag": "--timeout=SEC", "description": "Per-repo timeout in seconds (default: 900)"}
       ]
     },
