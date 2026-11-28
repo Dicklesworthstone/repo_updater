@@ -20746,6 +20746,7 @@ basic_mode_loop() {
 parse_review_args() {
     # Reset review-specific variables
     REVIEW_MODE="plan"           # plan or apply
+    REVIEW_MODE_EXPLICIT=false   # --resume inherits the saved mode only when omitted
     REVIEW_DRIVER="auto"         # auto, ntm, or local
     REVIEW_PARALLEL=4            # concurrent sessions
     REVIEW_DRY_RUN="false"       # discovery only
@@ -20770,9 +20771,11 @@ parse_review_args() {
         case "$arg" in
             --plan)
                 REVIEW_MODE="plan"
+                REVIEW_MODE_EXPLICIT=true
                 ;;
             --apply)
                 REVIEW_MODE="apply"
+                REVIEW_MODE_EXPLICIT=true
                 ;;
             --analytics)
                 REVIEW_ANALYTICS="true"
@@ -20804,8 +20807,14 @@ parse_review_args() {
                     exit 4
                 fi
                 ;;
-            --repos=*)
-                REVIEW_REPOS_PATTERN="${arg#--repos=}"
+            --repos=*|[!-]*|'')
+                local selector="${arg#--repos=}"
+                if [[ "$selector" != *[![:space:]]* || "$selector" == *$'\n'* ]]; then
+                    log_error "--repos requires a nonempty repository pattern"
+                    emit_command_refusal review invalid_repo_pattern 4
+                    exit 4
+                fi
+                REVIEW_REPOS_PATTERN="${REVIEW_REPOS_PATTERN:+$REVIEW_REPOS_PATTERN }$selector"
                 ;;
             --skip-days=*)
                 REVIEW_SKIP_DAYS="${arg#--skip-days=}"
@@ -20876,14 +20885,6 @@ parse_review_args() {
             -*)
                 log_error "Unknown review option: $arg"
                 exit 4
-                ;;
-            *)
-                # Positional arguments could be repo patterns
-                if [[ -z "$REVIEW_REPOS_PATTERN" ]]; then
-                    REVIEW_REPOS_PATTERN="$arg"
-                else
-                    REVIEW_REPOS_PATTERN="$REVIEW_REPOS_PATTERN $arg"
-                fi
                 ;;
         esac
     done
@@ -22815,6 +22816,16 @@ repo_spec_to_github_id() {
     fi
 }
 
+# Use the same selector semantics for discovery and application.
+review_repo_matches_patterns() {
+    local id="$1" spec="$2" pattern
+    shift 2
+    for pattern in "$@"; do
+        repo_matches_filter "$pattern" "$id" "${id##*/}" "$spec" && return 0
+    done
+    return 1
+}
+
 # Discover work items from GitHub using GraphQL batching
 # Args: result_array_name, priority_filter, max_repos, allowed_repo_ids(optional)
 discover_work_items() {
@@ -22872,7 +22883,6 @@ discover_work_items() {
 
     # Convert to GitHub IDs (filter non-GitHub repos)
     local -a github_repos=()
-    local repo_pattern repo_selected
     for spec in "${all_repos[@]}"; do
         local github_id
         github_id=$(repo_spec_to_github_id "$spec")
@@ -22881,14 +22891,7 @@ discover_work_items() {
                 continue
             fi
             if [[ ${#repo_patterns[@]} -gt 0 ]]; then
-                repo_selected=false
-                for repo_pattern in "${repo_patterns[@]}"; do
-                    if repo_matches_filter "$repo_pattern" "$github_id" "${github_id##*/}" "$spec"; then
-                        repo_selected=true
-                        break
-                    fi
-                done
-                [[ "$repo_selected" == true ]] || continue
+                review_repo_matches_patterns "$github_id" "$spec" "${repo_patterns[@]}" || continue
             fi
             github_repos+=("$github_id")
         fi
@@ -23803,8 +23806,8 @@ cmd_review() {
             checkpoint_hash=$(echo "$checkpoint" | jq -r '.config_hash // empty' 2>/dev/null)
             pending_count=$(echo "$checkpoint" | jq -r '.repos_pending // 0' 2>/dev/null || echo 0)
 
-            if [[ -n "$checkpoint_mode" && "$REVIEW_MODE" != "$checkpoint_mode" ]]; then
-                log_warn "Checkpoint mode '$checkpoint_mode' overrides requested mode '$REVIEW_MODE'"
+            if [[ "$REVIEW_MODE_EXPLICIT" != true && -n "$checkpoint_mode" && "$REVIEW_MODE" != "$checkpoint_mode" ]]; then
+                log_info "Resuming checkpoint in '$checkpoint_mode' mode"
                 REVIEW_MODE="$checkpoint_mode"
             fi
 
@@ -23911,7 +23914,10 @@ cmd_review() {
         fi
         cmd_review_apply
         apply_code=$?
-        if [[ "$apply_code" -eq 0 ]]; then
+        # Planning and application share a checkpoint path. A preview or a
+        # scoped apply must not consume pending work from a planning run.
+        if [[ "$apply_code" -eq 0 && "$REVIEW_DRY_RUN" != true && -z "$REVIEW_REPOS_PATTERN" ]] &&
+           jq -e --arg run "$run_id" '.run_id == $run and .mode == "apply"' "$(get_checkpoint_file)" >/dev/null 2>&1; then
             clear_review_checkpoint
         fi
         finalize_review_exit "$apply_code"
@@ -24193,10 +24199,35 @@ cmd_review_apply() {
 
     local -a codes=()
     local -a mapped_repos=()
+    local -a repo_patterns=()
+    local -A repo_specs=()
+    if [[ -n "${REVIEW_REPOS_PATTERN:-}" ]]; then
+        run_with_input "$REVIEW_REPOS_PATTERN" read -ra repo_patterns
+        local configured_repos spec github_id
+        if ! configured_repos=$(get_all_repos); then
+            emit_review_apply_result 3 incomplete_configuration
+            return 3
+        fi
+        while IFS= read -r spec; do
+            [[ -n "$spec" ]] || continue
+            github_id=$(repo_spec_to_github_id "$spec")
+            [[ -n "$github_id" ]] && repo_specs["$github_id"]="$spec"
+        done < <(printf '%s\n' "$configured_repos")
+    fi
     local repo_id
     while IFS= read -r repo_id; do
-        [[ -n "$repo_id" ]] && mapped_repos+=("$repo_id")
+        [[ -n "$repo_id" ]] || continue
+        if [[ -n "${REVIEW_REPOS_PATTERN:-}" ]]; then
+            review_repo_matches_patterns "$repo_id" "${repo_specs[$repo_id]:-}" "${repo_patterns[@]}" || continue
+        fi
+        mapped_repos+=("$repo_id")
     done < <(run_with_input "$mapping_snapshot" jq -r 'keys[]')
+
+    if [[ ${#mapped_repos[@]} -eq 0 ]]; then
+        log_info "No repositories in run $run_id match: $REVIEW_REPOS_PATTERN"
+        emit_review_apply_result 0
+        return 0
+    fi
 
     # Apply outside the read loop so confirmations read the operator's TTY,
     # not the redirected stream of mapping keys.

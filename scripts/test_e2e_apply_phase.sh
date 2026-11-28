@@ -318,6 +318,50 @@ exit 0
     log_test_pass "e2e: dry-run mode prevents mutations"
 }
 
+test_cli_apply_limits_actions_to_selected_repos() {
+    log_test_start "e2e: scoped apply only processes selected mapped repositories"
+    e2e_setup
+    setup_real_review_candidate
+    git -C "$APPLY_WT" -c user.name=Apply -c user.email=apply@example.invalid commit -q --allow-empty -m 'Approved candidate'
+    write_real_review_plan '[{"op":"comment","target":"issue#42","body":"Published"}]'
+    approve_real_review_plan
+
+    # A second repo from the same run has an unavailable worktree.
+    local mapping="${APPLY_WT%/*}/mapping.json"
+    jq '.["other/missing"] = {worktree_path:""}' "$mapping" > "$mapping.tmp" && mv "$mapping.tmp" "$mapping"
+    local checkpoint="$RU_STATE_DIR/review/review-checkpoint.json"
+    mkdir -p "${checkpoint%/*}"
+    local saved_checkpoint='{"mode":"plan","run_id":"gate-test","pending_repos":["other/missing"]}'
+    printf '%s\n' "$saved_checkpoint" > "$checkpoint"
+    local gate="$E2E_TEMP_DIR/scoped-gate" result="$E2E_LOG_DIR/scoped.stdout" rc=0
+    printf 'REVIEW_ALLOW_PUSH=true\nTEST_COMMAND=touch %s\nLINT_COMMAND=exit 0\n' "$gate" > "$RU_CONFIG_DIR/review-policies.d/_default"
+    e2e_create_mock_gh_custom 'exit 0'
+
+    "$E2E_RU_SCRIPT" review --apply --push --repos 'absent*' --json > "$result" 2> "$E2E_LOG_DIR/scoped.stderr" || rc=$?
+    assert_equals 0 "$rc" "No match is an empty successful apply"
+    assert_equals '[]' "$(jq -c '.data.results' "$result")" "No results for unselected repositories"
+    assert_file_not_exists "$gate" "An excluded approved candidate runs no gates"
+    assert_equals "$APPLY_BASE" "$(git -C "$E2E_TEMP_DIR/remote.git" rev-parse main)" "An empty selection publishes nothing"
+    assert_not_contains "$(cat "$E2E_LOG_DIR/gh_calls.log")" "issue comment" "An excluded plan performs no GitHub action"
+    assert_equals "$saved_checkpoint" "$(cat "$checkpoint")" "No-match run preserves pending planning work"
+
+    rc=0
+    "$E2E_RU_SCRIPT" review --resume --apply --push '*/test-*' --repos=absent --json > "$result" 2> "$E2E_LOG_DIR/scoped.stderr" || rc=$?
+    assert_equals 0 "$rc" "Selected candidate applies despite an unrelated missing worktree"
+    assert_equals '["owner/test-repo"]' "$(jq -c '[.data.results[].repo]' "$result")" "Positional and flag selectors combine regardless of order"
+    assert_file_exists "$gate" "Selected repository runs its gates"
+    assert_equals "$(git -C "$APPLY_WT" rev-parse HEAD)" "$(git -C "$E2E_TEMP_DIR/remote.git" rev-parse main)" "Only the selected candidate is published"
+    assert_contains "$(cat "$E2E_LOG_DIR/gh_calls.log")" "issue comment" "Selected approved action executes"
+    assert_equals "$saved_checkpoint" "$(cat "$checkpoint")" "Scoped application preserves pending planning work"
+
+    rc=0
+    "$E2E_RU_SCRIPT" review --apply --repos=' ' --json > "$result" 2> "$E2E_LOG_DIR/scoped.stderr" || rc=$?
+    assert_equals 4 "$rc" "An empty explicit selector cannot broaden application"
+    assert_equals 4 "$(jq -r '._meta.exit_code' "$result")" "Empty selector refusal is machine readable"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 test_cli_identity_and_approval_refusals() {
     e2e_setup
     setup_real_review_candidate
@@ -909,6 +953,7 @@ run_test test_apply_with_quality_failure
 run_test test_cli_apply_failed_gates_prevent_mutations
 run_test test_fully_loaded_runtime_detects_ruby_and_shell
 run_test test_apply_dry_run
+run_test test_cli_apply_limits_actions_to_selected_repos
 run_test test_cli_identity_and_approval_refusals
 run_test test_cli_approved_publication_and_idempotence
 run_test test_cli_interactive_approval_receipt

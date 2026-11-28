@@ -1886,6 +1886,11 @@ already completed actions retain their idempotence records.
 `review --apply --dry-run` validates identity without running gates or mutations.
 `review --apply --json` emits the common envelope with per-repository exit codes,
 the run ID and a summary; refused applications include their actual nonzero result.
+Use `ru review --apply --repos='owner/service-*'` to apply only matching plans
+from the selected run. Positional patterns and repeated `--repos` options select
+their union. A filter with no matches produces an empty result. Only selected
+repositories run gates, receive pushes, or perform GitHub actions. A scoped apply
+preserves the planning checkpoint for unfinished reviews.
 
 | Policy | Default | Description |
 |--------|---------|-------------|
