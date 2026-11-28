@@ -25723,7 +25723,7 @@ has_upstream_remote() {
 #   $2 - Upstream remote name (default: upstream)
 #
 # Outputs:
-#   Default branch name (main/master) on stdout
+#   Default branch name, including any slash-separated prefix, on stdout
 #
 # Returns:
 #   0 on success, 1 if cannot determine
@@ -25733,11 +25733,12 @@ get_upstream_default_branch() {
     local upstream_remote="${2:-upstream}"
 
     # Try HEAD reference first (most reliable after fetch)
-    local ref
-    ref=$(git -C "$repo_path" symbolic-ref "refs/remotes/${upstream_remote}/HEAD" 2>/dev/null) && {
-        echo "${ref##*/}"
+    local ref prefix="refs/remotes/${upstream_remote}/" branch
+    if ref=$(git -C "$repo_path" symbolic-ref "${prefix}HEAD" 2>/dev/null); then
+        [[ "$ref" == "$prefix"?* ]] || return 1
+        printf '%s\n' "${ref#"$prefix"}"
         return 0
-    }
+    fi
 
     # Fall back to checking common branch names
     for branch in main master; do
@@ -25770,23 +25771,14 @@ get_fork_status() {
     local local_ref="refs/heads/${branch}"
     local upstream_ref="refs/remotes/${upstream_remote}/${branch}"
 
-    # Verify refs exist
-    if ! git -C "$repo_path" rev-parse --verify "$local_ref" &>/dev/null; then
+    # rev-list checks both refs while reading their common history.
+    local output ahead behind
+    if ! output=$(git -C "$repo_path" rev-list --left-right --count "${local_ref}...${upstream_ref}" -- 2>/dev/null) ||
+       [[ ! "$output" =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
         printf '0\t0\tunknown\tfalse\n'
         return 1
     fi
-    if ! git -C "$repo_path" rev-parse --verify "$upstream_ref" &>/dev/null; then
-        printf '0\t0\tunknown\tfalse\n'
-        return 1
-    fi
-
-    # Get ahead/behind counts: local...upstream
-    local output ahead=0 behind=0
-    if ! output=$(git -C "$repo_path" rev-list --left-right --count "${local_ref}...${upstream_ref}" 2>/dev/null); then
-        printf '0\t0\tunknown\tfalse\n'
-        return 1
-    fi
-    run_with_input "$output" read -r ahead behind
+    ahead="${BASH_REMATCH[1]}" behind="${BASH_REMATCH[2]}"
 
     # Determine status
     local status
@@ -25800,11 +25792,14 @@ get_fork_status() {
         status="diverged"
     fi
 
-    # Check for local changes
-    local has_changes="false"
-    if repo_is_dirty "$repo_path"; then
-        has_changes="true"
+    # Diff and ls-files predicates cannot distinguish every Git failure from a
+    # clean tree. Capture the porcelain result and its exit status together.
+    local changes has_changes=false
+    if ! changes=$(GIT_OPTIONAL_LOCKS=0 git -C "$repo_path" status --porcelain=v1 --untracked-files=normal --ignore-submodules=none 2>/dev/null); then
+        printf '0\t0\tunknown\tfalse\n'
+        return 2
     fi
+    [[ -z "$changes" ]] || has_changes=true
 
     printf '%d\t%d\t%s\t%s\n' "$ahead" "$behind" "$status" "$has_changes"
 }
@@ -25877,7 +25872,7 @@ _fork_parse_args() {
 
     _fpa_upstream="upstream"
     _fpa_repos_pattern=""
-    _fpa_do_fetch="true"
+    _fpa_do_fetch="${FETCH_REMOTES:-true}"
     _fpa_do_push="false"
     _fpa_no_rescue="false"
     _fpa_do_reset="false"
@@ -25928,198 +25923,115 @@ _fork_matches_pattern() {
 # cmd_fork_status: Show fork sync status relative to upstream
 #------------------------------------------------------------------------------
 cmd_fork_status() {
-    local empty_json='{"total":0,"checked":0,"skipped":0,"synced":0,"behind":0,"diverged":0,"polluted":0,"repos":[]}'
-    # Ensure config exists
-    if [[ ! -d "$RU_CONFIG_DIR" ]]; then
-        log_info "No configuration found. Run: ru init"
-        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-status "$empty_json" '{"exit_code":0}')"
-        exit 0
-    fi
-
-    # Parse fork args
     local upstream_remote repos_pattern do_fetch do_push no_rescue do_reset do_force strategy
     _fork_parse_args upstream_remote repos_pattern do_fetch do_push no_rescue do_reset do_force strategy
 
-    # Load all repos from config
-    local configured_repos
-    if ! configured_repos=$(get_all_repos); then
+    local configured_repos="" line
+    if [[ ! -d "$RU_CONFIG_DIR" ]]; then
+        log_info "No configuration found. Run: ru init"
+    elif ! configured_repos=$(get_all_repos); then
         log_error "Could not read configured repositories; fork status is incomplete"
         [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-status '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
         return 3
     fi
-    local repos=()
+    local -a repos=()
     while IFS= read -r line; do
-        [[ -n "$line" ]] && repos+=("$line")
+        [[ -z "$line" ]] || repos+=("$line")
     done < <(printf '%s\n' "$configured_repos")
 
-    local total=${#repos[@]}
-    if [[ "$total" -eq 0 ]]; then
-        log_info "No repositories configured."
-        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope fork-status "$empty_json" '{"exit_code":0}')"
-        exit 0
-    fi
-
-    local checked=0 synced=0 behind_count=0 diverged_count=0 polluted_count=0 skipped=0
-
-    if [[ "$JSON_OUTPUT" == "true" ]]; then
-        local repos_json="["
-        local first="true"
-
-        for repo_spec in "${repos[@]}"; do
-            local url branch custom_name local_path repo_id
-            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
-                continue
-            fi
-
-            # Filter by pattern
-            if ! _fork_matches_pattern "$repo_id" "$repos_pattern"; then
-                continue
-            fi
-
-            # Skip if not cloned
-            if [[ ! -d "$local_path" ]] || ! is_git_repo "$local_path"; then
-                continue
-            fi
-
-            # Skip if no upstream remote
-            if ! has_upstream_remote "$local_path" "$upstream_remote"; then
-                skipped=$((skipped + 1))
-                continue
-            fi
-
-            checked=$((checked + 1))
-
-            # Fetch upstream
-            if [[ "$do_fetch" == "true" ]]; then
-                git -C "$local_path" fetch "$upstream_remote" --quiet 2>/dev/null || true
-            fi
-
-            # Get upstream default branch
-            local up_branch
-            if ! up_branch=$(get_upstream_default_branch "$local_path" "$upstream_remote"); then
-                log_verbose "Cannot determine upstream branch for $repo_id"
-                continue
-            fi
-
-            # Get status
-            local status_line ahead behind fork_status has_changes
-            status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch")
-            IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status has_changes
-
-            # Detect pollution
-            local polluted="false"
-            if detect_main_pollution "$local_path" "$upstream_remote" "$up_branch"; then
-                polluted="true"
-                polluted_count=$((polluted_count + 1))
-            fi
-
-            case "$fork_status" in
-                synced)   synced=$((synced + 1)) ;;
-                behind)   behind_count=$((behind_count + 1)) ;;
-                diverged) diverged_count=$((diverged_count + 1)) ;;
-            esac
-
-            [[ "$first" == "true" ]] || repos_json+=","
-            first="false"
-            local safe_path safe_branch
-            safe_path=$(json_escape "$local_path")
-            safe_branch=$(json_escape "$up_branch")
-            repos_json+="$(printf '{"repo":"%s","path":"%s","upstream_branch":"%s","ahead":%d,"behind":%d,"status":"%s","dirty":%s,"polluted":%s}' \
-                "$repo_id" "$safe_path" "$safe_branch" "$ahead" "$behind" "$fork_status" "$has_changes" "$polluted")"
-
-            write_result "$repo_id" "fork-status" "$fork_status" "0" "ahead=$ahead behind=$behind polluted=$polluted" "$local_path"
-        done
-
-        repos_json+="]"
-        local data_json
-        data_json="$(printf '{"total":%d,"checked":%d,"skipped":%d,"synced":%d,"behind":%d,"diverged":%d,"polluted":%d,"repos":%s}' \
-            "$total" "$checked" "$skipped" "$synced" "$behind_count" "$diverged_count" "$polluted_count" "$repos_json")"
-        emit_structured "$(build_json_envelope "fork-status" "$data_json" '{"exit_code":0}')"
-    else
-        # Human-readable output
+    local total=${#repos[@]} checked=0 synced=0 ahead_count=0 behind_count=0 diverged_count=0 polluted_count=0 skipped=0 failed=0
+    local repos_json="" max_repo_len=10 repo_spec url branch custom_name local_path repo_id
+    if [[ "$JSON_OUTPUT" != true ]]; then
         log_info "Fork Status ($total repos, upstream remote: $upstream_remote)"
-        [[ "$do_fetch" == "true" ]] && log_info "Fetching upstream remotes..."
-        echo "" >&2
-
-        # Compute max repo_id width
-        local max_repo_len=10
+        if [[ "$do_fetch" == true ]]; then log_info "Fetching upstream remotes..."; else log_info "Using cached upstream refs."; fi
         for repo_spec in "${repos[@]}"; do
-            local url branch custom_name local_path repo_id
             if resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
-                [[ ${#repo_id} -gt $max_repo_len ]] && max_repo_len=${#repo_id}
+                [[ ${#repo_id} -le $max_repo_len ]] || max_repo_len=${#repo_id}
             fi
         done
-
-        printf "%-${max_repo_len}s  %-10s %-12s %s\n" "Repository" "Status" "Ahead/Behind" "Notes" >&2
-        printf "%-${max_repo_len}s  %-10s %-12s %s\n" "$(printf '%*s' "$max_repo_len" '' | tr ' ' '-')" "----------" "------------" "-----" >&2
-
-        for repo_spec in "${repos[@]}"; do
-            local url branch custom_name local_path repo_id
-            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
-                continue
-            fi
-
-            if ! _fork_matches_pattern "$repo_id" "$repos_pattern"; then
-                continue
-            fi
-
-            if [[ ! -d "$local_path" ]] || ! is_git_repo "$local_path"; then
-                continue
-            fi
-
-            if ! has_upstream_remote "$local_path" "$upstream_remote"; then
-                skipped=$((skipped + 1))
-                [[ "$VERBOSE" == "true" ]] && printf "%-${max_repo_len}s  ${DIM}no upstream${RESET}\n" "$repo_id" >&2
-                continue
-            fi
-
-            checked=$((checked + 1))
-
-            if [[ "$do_fetch" == "true" ]]; then
-                git -C "$local_path" fetch "$upstream_remote" --quiet 2>/dev/null || true
-            fi
-
-            local up_branch
-            if ! up_branch=$(get_upstream_default_branch "$local_path" "$upstream_remote"); then
-                printf "%-${max_repo_len}s  ${YELLOW}unknown${RESET}\n" "$repo_id" >&2
-                continue
-            fi
-
-            local status_line ahead behind fork_status has_changes
-            status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch")
-            IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status has_changes
-
-            local polluted="false"
-            if detect_main_pollution "$local_path" "$upstream_remote" "$up_branch"; then
-                polluted="true"
-                polluted_count=$((polluted_count + 1))
-            fi
-
-            case "$fork_status" in
-                synced)   synced=$((synced + 1)) ;;
-                behind)   behind_count=$((behind_count + 1)) ;;
-                diverged) diverged_count=$((diverged_count + 1)) ;;
-            esac
-
-            local status_display notes=""
-            case "$fork_status" in
-                synced)   status_display="${GREEN}synced${RESET}" ;;
-                ahead)    status_display="${CYAN}ahead${RESET}" ;;
-                behind)   status_display="${YELLOW}behind${RESET}" ;;
-                diverged) status_display="${RED}diverged${RESET}" ;;
-                *)        status_display="$fork_status" ;;
-            esac
-            [[ "$has_changes" == "true" ]] && status_display="${status_display}${YELLOW}*${RESET}"
-            [[ "$polluted" == "true" ]] && notes="${RED}polluted${RESET}"
-
-            printf "%-${max_repo_len}s  %-10b %-12s %b\n" "$repo_id" "$status_display" "$ahead/$behind" "$notes" >&2
-
-            write_result "$repo_id" "fork-status" "$fork_status" "0" "ahead=$ahead behind=$behind polluted=$polluted" "$local_path"
-        done
-
-        echo "" >&2
-        log_info "Summary: $checked checked, $synced synced, $behind_count behind, $diverged_count diverged, $polluted_count polluted (${skipped} skipped, no upstream)"
+        printf "\n%-${max_repo_len}s  %-10s %-12s %s\n" "Repository" "Status" "Ahead/Behind" "Notes" >&2
     fi
+
+    local up_branch status_line ahead behind fork_status dirty polluted reason status_display notes rc
+    local safe_id safe_path branch_json
+    for repo_spec in "${repos[@]}"; do
+        resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id || continue
+        _fork_matches_pattern "$repo_id" "$repos_pattern" || continue
+        if [[ ! -d "$local_path" ]] || ! is_git_repo "$local_path"; then
+            ((skipped+=1))
+            continue
+        fi
+        if ! has_upstream_remote "$local_path" "$upstream_remote"; then
+            ((skipped+=1))
+            [[ "$JSON_OUTPUT" == true || "$VERBOSE" != true ]] || printf "%-${max_repo_len}s  no upstream\n" "$repo_id" >&2
+            continue
+        fi
+        ((checked+=1))
+        up_branch="" reason="" rc=0
+        if [[ "$do_fetch" == true ]] && ! run_network_command git -C "$local_path" fetch --quiet -- "$upstream_remote" 2>/dev/null; then
+            reason=fetch_failed
+        elif ! up_branch=$(get_upstream_default_branch "$local_path" "$upstream_remote"); then
+            reason=upstream_branch_unknown
+        fi
+        if [[ -z "$reason" ]]; then
+            rc=0
+            status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch") || rc=$?
+            case "$rc" in
+                0) IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status dirty ;;
+                2) reason=worktree_status_failed ;;
+                *) reason=comparison_failed ;;
+            esac
+        fi
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            safe_id=$(json_escape "$repo_id")
+            safe_path=$(json_escape "$local_path")
+            branch_json=null
+            [[ -z "$up_branch" ]] || branch_json="\"$(json_escape "$up_branch")\""
+            [[ -z "$repos_json" ]] || repos_json+=","
+        fi
+        if [[ -n "$reason" ]]; then
+            ((failed+=1))
+            if [[ "$JSON_OUTPUT" == true ]]; then
+                repos_json+="$(printf '{"repo":"%s","path":"%s","upstream_branch":%s,"status":"failed","reason":"%s","ahead":null,"behind":null,"dirty":null,"polluted":null}' \
+                    "$safe_id" "$safe_path" "$branch_json" "$reason")"
+            else
+                printf "%-${max_repo_len}s  %-10s %-12s %s\n" "$repo_id" "failed" "-" "$reason" >&2
+            fi
+            write_result "$repo_id" "fork-status" "failed" "0" "$reason" "$local_path"
+            continue
+        fi
+
+        polluted=false notes=""
+        if [[ "$ahead" -gt 0 ]]; then
+            polluted=true
+            notes="${RED}polluted${RESET}"
+            ((polluted_count+=1))
+        fi
+        case "$fork_status" in
+            synced)  ((synced+=1)); status_display="${GREEN}synced${RESET}" ;;
+            ahead)   ((ahead_count+=1)); status_display="${CYAN}ahead${RESET}" ;;
+            behind)  ((behind_count+=1)); status_display="${YELLOW}behind${RESET}" ;;
+            diverged) ((diverged_count+=1)); status_display="${RED}diverged${RESET}" ;;
+        esac
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            repos_json+="$(printf '{"repo":"%s","path":"%s","upstream_branch":%s,"ahead":%d,"behind":%d,"status":"%s","dirty":%s,"polluted":%s}' \
+                "$safe_id" "$safe_path" "$branch_json" "$ahead" "$behind" "$fork_status" "$dirty" "$polluted")"
+        else
+            [[ "$dirty" != true ]] || status_display+="${YELLOW}*${RESET}"
+            printf "%-${max_repo_len}s  %-10b %-12s %b\n" "$repo_id" "$status_display" "$ahead/$behind" "$notes" >&2
+        fi
+        write_result "$repo_id" "fork-status" "$fork_status" "0" "ahead=$ahead behind=$behind polluted=$polluted" "$local_path"
+    done
+    local exit_code=0 data_json
+    [[ "$failed" -eq 0 ]] || exit_code=1
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        data_json=$(printf '{"total":%d,"checked":%d,"skipped":%d,"synced":%d,"ahead":%d,"behind":%d,"diverged":%d,"polluted":%d,"failed":%d,"fetch_requested":%s,"repos":[%s]}' \
+            "$total" "$checked" "$skipped" "$synced" "$ahead_count" "$behind_count" "$diverged_count" "$polluted_count" "$failed" "$do_fetch" "$repos_json")
+        emit_structured "$(build_json_envelope fork-status "$data_json" "{\"exit_code\":$exit_code}")"
+    else
+        log_info "Summary: $checked checked, $synced synced, $ahead_count ahead, $behind_count behind, $diverged_count diverged, $polluted_count polluted, $failed failed ($skipped skipped)"
+    fi
+    return "$exit_code"
 }
 
 #------------------------------------------------------------------------------
@@ -29793,16 +29705,21 @@ _robot_docs_schemas() {
       }
     },
     "fork-status": {
-      "description":"Fork position against upstream for each configured repository with an upstream remote",
+      "description":"Fork position against the tracked upstream default branch, with per-repository failures when a check cannot finish",
       "data_schema":{
-        "type":"object","required":["total","checked","skipped","synced","behind","diverged","polluted","repos"],
+        "type":"object","required":["total","checked","skipped","synced","ahead","behind","diverged","polluted","failed","fetch_requested","repos"],
         "properties":{
           "total":{"type":"integer","minimum":0},"checked":{"type":"integer","minimum":0},"skipped":{"type":"integer","minimum":0},
-          "synced":{"type":"integer","minimum":0},"behind":{"type":"integer","minimum":0},"diverged":{"type":"integer","minimum":0},"polluted":{"type":"integer","minimum":0},
-          "repos":{"type":"array","items":{"type":"object","required":["repo","path","upstream_branch","ahead","behind","status","dirty","polluted"],"properties":{
-            "repo":{"type":"string"},"path":{"type":"string"},"upstream_branch":{"type":"string"},"ahead":{"type":"integer","minimum":0},"behind":{"type":"integer","minimum":0},
-            "status":{"type":"string"},"dirty":{"type":"boolean"},"polluted":{"type":"boolean"}
-          }}}
+          "synced":{"type":"integer","minimum":0},"ahead":{"type":"integer","minimum":0},"behind":{"type":"integer","minimum":0},
+          "diverged":{"type":"integer","minimum":0},"polluted":{"type":"integer","minimum":0},"failed":{"type":"integer","minimum":0},
+          "fetch_requested":{"type":"boolean"},
+          "repos":{"type":"array","items":{"type":"object","required":["repo","path","upstream_branch","ahead","behind","status","dirty","polluted"],
+            "properties":{"repo":{"type":"string"},"path":{"type":"string"}},
+            "oneOf":[
+              {"properties":{"status":{"enum":["synced","ahead","behind","diverged"]},"upstream_branch":{"type":"string"},"ahead":{"type":"integer","minimum":0},"behind":{"type":"integer","minimum":0},"dirty":{"type":"boolean"},"polluted":{"type":"boolean"}}},
+              {"required":["reason"],"properties":{"status":{"const":"failed"},"reason":{"enum":["fetch_failed","upstream_branch_unknown","comparison_failed","worktree_status_failed"]},"upstream_branch":{"type":["null","string"]},"ahead":{"type":"null"},"behind":{"type":"null"},"dirty":{"type":"null"},"polluted":{"type":"null"}}}
+            ]
+          }}
         }
       }
     },

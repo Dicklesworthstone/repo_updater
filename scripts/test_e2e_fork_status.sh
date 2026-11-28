@@ -306,6 +306,63 @@ test_json_without_config_or_repos() {
     e2e_cleanup
 }
 
+test_fetch_failure_mixed_with_synced() {
+    e2e_setup
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    local UPSTREAM_DIR ORIGIN_DIR LOCAL_DIR output rc=0 rows
+    setup_fork_env "unreachable"
+    git -C "$LOCAL_DIR" remote set-url upstream "$E2E_TEMP_DIR/unavailable.git"
+    setup_fork_env "reachable"
+    init_fork_config "owner/unreachable"
+    printf '%s\n' 'owner/reachable' >> "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+
+    output=$("$E2E_RU_SCRIPT" fork-status --json 2>/dev/null) || rc=$?
+    assert_equals 1 "$rc" "One unavailable fork makes online status exit 1"
+    rows=$(jq -r '[._meta.exit_code, .data.checked, .data.failed, .data.synced, .data.fetch_requested] | @tsv' <<< "$output")
+    assert_equals $'1\t2\t1\t1\ttrue' "$rows" "Mixed result counts the successful and failed check"
+    rows=$(jq -c '.data.repos[] | select(.repo=="owner/unreachable") | [.status,.reason,.ahead,.behind,.dirty,.polluted]' <<< "$output")
+    assert_equals '["failed","fetch_failed",null,null,null,null]' "$rows" "Failed fetch never reports cached measurements"
+
+    rc=0
+    output=$("$E2E_RU_SCRIPT" fork-status 2>&1) || rc=$?
+    assert_equals 1 "$rc" "Human status has the same failure exit"
+    assert_contains "$output" "fetch_failed" "Human output identifies the failed check"
+    assert_contains "$output" "1 synced" "Human mode continues checking the other fork"
+
+    rc=0
+    output=$("$E2E_RU_SCRIPT" fork-status --no-fetch --json 2>/dev/null) || rc=$?
+    assert_equals 0 "$rc" "Explicit cached mode works with an unreachable remote"
+    rows=$(jq -r '[.data.failed,.data.synced,.data.fetch_requested] | @tsv' <<< "$output")
+    assert_equals $'0\t2\tfalse' "$rows" "Cached summaries identify their mode"
+    e2e_cleanup
+}
+
+test_nested_branch_and_failed_worktree_inspection() {
+    e2e_setup
+    mkdir -p "$E2E_TEMP_DIR/remotes"
+    local UPSTREAM_DIR ORIGIN_DIR LOCAL_DIR output rc=0 rows
+    setup_fork_env "nested"
+    git -C "$LOCAL_DIR" branch release/stable main
+    git -C "$LOCAL_DIR" push --quiet upstream refs/heads/release/stable
+    git --git-dir="$UPSTREAM_DIR" symbolic-ref HEAD refs/heads/release/stable
+    git -C "$LOCAL_DIR" symbolic-ref refs/remotes/upstream/HEAD refs/remotes/upstream/release/stable
+    init_fork_config "owner/nested"
+    printf '%s\n' 'untracked' > "$LOCAL_DIR/dirty.txt"
+
+    output=$("$E2E_RU_SCRIPT" fork-status --json 2>/dev/null) || rc=$?
+    assert_equals 0 "$rc" "Slashed default branch compares successfully"
+    rows=$(jq -c '.data.repos[0] | [.upstream_branch,.status,.dirty,.polluted]' <<< "$output")
+    assert_equals '["release/stable","synced",true,false]' "$rows" "Slashed branch names and untracked work are preserved"
+
+    printf '%s\n' 'invalid index fixture' > "$E2E_TEMP_DIR/invalid-index"
+    rc=0
+    output=$(GIT_INDEX_FILE="$E2E_TEMP_DIR/invalid-index" "$E2E_RU_SCRIPT" fork-status --no-fetch --json 2>/dev/null) || rc=$?
+    assert_equals 1 "$rc" "Unreadable Git index fails the check"
+    rows=$(jq -c '.data.repos[0] | [.status,.reason,.dirty]' <<< "$output")
+    assert_equals '["failed","worktree_status_failed",null]' "$rows" "Failed Git worktree inspection never claims clean or dirty"
+    e2e_cleanup
+}
+
 test_verbose_no_upstream() {
     e2e_setup
     mkdir -p "$E2E_TEMP_DIR/remotes"
@@ -348,6 +405,8 @@ run_test test_repos_filter
 run_test test_json_output
 run_test test_json_without_config_or_repos
 run_test test_verbose_no_upstream
+run_test test_fetch_failure_mixed_with_synced
+run_test test_nested_branch_and_failed_worktree_inspection
 
 print_results
 exit "$(get_exit_code)"
