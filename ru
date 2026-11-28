@@ -10402,7 +10402,7 @@ do_pull() {
     case "$strategy" in
         ff-only) pull_args+=(--ff-only) ;;
         rebase)  pull_args+=(--rebase) ;;
-        merge)   pull_args+=(--no-ff) ;;
+        merge)   pull_args+=(--no-rebase --no-ff) ;;
     esac
 
     [[ "$autostash" == "true" ]] && pull_args+=(--autostash)
@@ -10417,8 +10417,21 @@ do_pull() {
         local new_head
         new_head=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || echo "")
 
+        # Git can exit zero after fast-forwarding and failing to reapply an
+        # autostash. Unmerged index entries still need manual resolution.
+        local unmerged
+        if ! unmerged=$(git -C "$repo_path" ls-files --unmerged); then
+            log_error "Could not verify pull result: $repo_name"
+            write_result "$repo_name" "pull" "failed" "$duration" "could not read index after pull" "$repo_path"
+            return 1
+        elif [[ -n "$unmerged" ]]; then
+            log_warn "Pull left unresolved conflicts: $repo_name"
+            write_result "$repo_name" "pull" "conflict" "$duration" "$output" "$repo_path"
+            return 2
+        fi
+
         # Determine if anything changed by comparing HEADs (not by parsing strings)
-        if [[ "$old_head" == "$new_head" ]]; then
+        if [[ "$old_head" == "$new_head" && "$requested_was_current" == true ]]; then
             log_info "Current: $repo_name"
             write_result "$repo_name" "pull" "current" "$duration" "" "$repo_path"
         else
@@ -10622,7 +10635,7 @@ is_repo_completed() {
 
 # Process a single repo spec (used by both sequential and parallel modes)
 # Writes result status to stdout (for aggregation)
-# Args: repo_spec current total projects_dir layout update_strategy autostash clone_only pull_only fetch_remotes
+# Args: repo_spec projects_dir layout update_strategy autostash clone_only pull_only fetch_remotes
 process_single_repo_worker() {
     local repo_spec="$1"
     local projects_dir="$2"
@@ -10636,6 +10649,7 @@ process_single_repo_worker() {
     # Parse and resolve the repo spec
     local url branch custom_name local_path repo_id
     if ! resolve_repo_spec "$repo_spec" "$projects_dir" "$layout" url branch custom_name local_path repo_id; then
+        log_warn "Invalid repo spec: $repo_spec" >&2
         write_result "$repo_spec" "skip" "invalid" "0" "invalid repo spec" ""
         echo "FAIL:invalid:$repo_spec"
         return 1
@@ -10648,59 +10662,78 @@ process_single_repo_worker() {
     # Check if repo exists locally
     if [[ ! -d "$local_path" ]]; then
         if [[ "$pull_only" == "true" ]]; then
+            log_verbose "Skipping $repo_label (--pull-only)" >&2
             write_result "$repo_label" "skip" "skipped" "0" "pull-only mode" "$local_path"
             echo "SKIP:skipped:$repo_label"
             return 0
         fi
 
-        if do_clone "$url" "$local_path" "$repo_label" "$branch" >/dev/null 2>&1; then
+        if do_clone "$url" "$local_path" "$repo_label" "$branch" >&2; then
             echo "OK:cloned:$repo_label"
         else
             echo "FAIL:failed:$repo_label"
         fi
     else
         if [[ "$clone_only" == "true" ]]; then
+            log_verbose "Skipping $repo_label (--clone-only)" >&2
             write_result "$repo_label" "skip" "skipped" "0" "clone-only mode" "$local_path"
             echo "SKIP:skipped:$repo_label"
             return 0
         fi
 
-        if ! is_git_repo "$local_path"; then
+        # Git walks up to the enclosing worktree from an ordinary subdirectory.
+        # Only an actual checkout at the resolved destination may be updated.
+        if [[ ! -e "$local_path/.git" ]] || ! is_git_repo "$local_path"; then
+            log_warn "Not a git checkout: $local_path" >&2
             write_result "$repo_label" "skip" "not_git" "0" "" "$local_path"
             echo "CONFLICT:not_git:$repo_label"
             return 0
         fi
 
         if check_remote_mismatch "$local_path" "$url"; then
+            log_warn "Remote mismatch: $repo_label" >&2
             write_result "$repo_label" "pull" "mismatch" "0" "" "$local_path"
             echo "CONFLICT:mismatch:$repo_label"
             return 0
         fi
 
         local status_info dirty status
+        # Even a preliminary fetch updates refs and FETCH_HEAD.
+        [[ "$DRY_RUN" == true ]] && fetch_remotes=false
         status_info=$(get_repo_status "$local_path" "$fetch_remotes")
         status=$(echo "$status_info" | sed 's/.*STATUS=\([^ ]*\).*/\1/')
         dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
         if [[ "$status" == fetch_failed ]]; then
+            log_error "Requested fetch failed: $repo_label" >&2
             write_result "$repo_label" "pull" "failed" "0" "requested fetch failed" "$local_path"
             echo "FAIL:failed:$repo_label"
             return 0
         fi
 
         if [[ "$dirty" == "true" && "$autostash" != "true" ]]; then
+            log_warn "Dirty: $repo_label (uncommitted changes)" >&2
             write_result "$repo_label" "pull" "dirty" "0" "" "$local_path"
             echo "CONFLICT:dirty:$repo_label"
             return 0
         fi
 
-        if [[ "$status" == "current" ]] && repo_matches_requested_ref "$local_path" "$branch"; then
+        if [[ "$dirty" == true && -n "$(git -C "$local_path" ls-files --unmerged)" ]]; then
+            log_warn "Unresolved conflicts: $repo_label" >&2
+            write_result "$repo_label" "pull" "conflict" "0" "unmerged entries in index" "$local_path"
+            echo "CONFLICT:conflict:$repo_label"
+            return 0
+        fi
+
+        if [[ "$status" == "current" && "$DRY_RUN" != true ]] && repo_matches_requested_ref "$local_path" "$branch"; then
+            log_info "Current: $repo_label" >&2
             write_result "$repo_label" "pull" "current" "0" "" "$local_path"
             echo "OK:current:$repo_label"
             return 0
         fi
 
-        if [[ "$status" == "diverged" ]]; then
+        if [[ "$status" == "diverged" && "$update_strategy" != rebase && "$update_strategy" != merge ]]; then
+            log_warn "Diverged: $repo_label" >&2
             write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
             echo "CONFLICT:diverged:$repo_label"
             return 0
@@ -10709,7 +10742,7 @@ process_single_repo_worker() {
            ! git -C "$local_path" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
             local pin_was_current=false
             repo_matches_requested_ref "$local_path" "$branch" && pin_was_current=true
-            if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
+            if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >&2; then
                 if [[ "$pin_was_current" == true ]]; then
                     echo "OK:current:$repo_label"
                 else
@@ -10721,12 +10754,13 @@ process_single_repo_worker() {
             return 0
         fi
         if [[ "$status" == "no_upstream" ]]; then
+            log_warn "No upstream: $repo_label" >&2
             write_result "$repo_label" "pull" "no_upstream" "0" "" "$local_path"
             echo "CONFLICT:no_upstream:$repo_label"
             return 0
         fi
 
-        if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
+        if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >&2; then
             echo "OK:updated:$repo_label"
         else
             echo "FAIL:failed:$repo_label"
@@ -11754,29 +11788,11 @@ cmd_sync() {
     if [[ ${#ARGS[@]} -gt 0 ]]; then
         # User passed repo URLs directly - sync them ad-hoc
         log_step "Syncing ${#ARGS[@]} repo(s)..."
-        local repo_spec url branch custom_name path repo_id repo_label
+        local repo_spec
         for repo_spec in "${ARGS[@]}"; do
-            # Parse and resolve the repo spec
-            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name path repo_id; then
-                log_error "Invalid repo spec: $repo_spec"
-                write_result "$repo_spec" "skip" "invalid" "0" "invalid repo spec" ""
-                continue
-            fi
-            repo_label="$repo_id"
-            [[ -n "$custom_name" ]] && repo_label="${repo_id} as ${custom_name}"
-
-            if [[ -d "$path" ]]; then
-                # Exists - pull updates
-                if ! is_git_repo "$path"; then
-                    log_warn "Not a git repo: $path"
-                    write_result "$repo_label" "skip" "not_git" "0" "" "$path"
-                    continue
-                fi
-                do_pull "$path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"
-            else
-                # Missing - clone
-                do_clone "$url" "$path" "$repo_label" "$branch"
-            fi
+            log_step "Syncing $repo_spec"
+            process_single_repo_worker "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" "$UPDATE_STRATEGY" \
+                "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES" >/dev/null
         done
 
         # Aggregate results and compute proper exit code
@@ -11819,7 +11835,7 @@ cmd_sync() {
 
     local total=${#repos[@]}
     local current=0
-    local cloned=0 updated=0 skipped=0 failed=0 conflicts=0 resumed=0
+    local resumed=0
 
     # Resume support: check for interrupted sync
     SYNC_COMPLETED=()
@@ -11930,14 +11946,6 @@ cmd_sync() {
 
         run_parallel_sync pending_repos "$parallel_count"
 
-        # Get results from global variables set by run_parallel_sync
-        cloned=$PARALLEL_CLONED
-        updated=$PARALLEL_UPDATED
-        skipped=$PARALLEL_SKIPPED
-        failed=$PARALLEL_FAILED
-        conflicts=$PARALLEL_CONFLICTS
-
-        # Skip state management for parallel mode (simpler, no resume support yet)
     else
         # Sequential mode (original behavior)
         if [[ $resumed -gt 0 ]]; then
@@ -11951,117 +11959,16 @@ cmd_sync() {
         [[ -z "$repo_spec" ]] && continue
         ((current++))
 
-        # Parse and validate the repo spec
-        local url branch custom_name local_path repo_id repo_label
-        if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
-            log_warn "Invalid repo spec: $repo_spec"
-            write_result "$repo_spec" "skip" "invalid" "0" "invalid repo spec" ""
-            ((failed++))
-            continue
-        fi
-        repo_label="$repo_id"
-        [[ -n "$custom_name" ]] && repo_label="${repo_id} as ${custom_name}"
-
-        log_step "[$current/$pending_count] $repo_label"
-
-        # Check if repo exists locally
-        if [[ ! -d "$local_path" ]]; then
-            if [[ "$PULL_ONLY" == "true" ]]; then
-                log_verbose "  Skipping clone (--pull-only)"
-                ((skipped++))
-                write_result "$repo_label" "skip" "skipped" "0" "pull-only mode" "$local_path"
-                continue
-            fi
-
-            if do_clone "$url" "$local_path" "$repo_label" "$branch"; then
-                ((cloned++))
-            else
-                ((failed++))
-                continue
-            fi
-        else
-            if [[ "$CLONE_ONLY" == "true" ]]; then
-                log_verbose "  Skipping pull (--clone-only)"
-                ((skipped++))
-                write_result "$repo_label" "skip" "skipped" "0" "clone-only mode" "$local_path"
-                continue
-            fi
-
-            if ! is_git_repo "$local_path"; then
-                log_warn "Not a git repo: $local_path"
-                ((conflicts++))
-                write_result "$repo_label" "skip" "not_git" "0" "" "$local_path"
-                continue
-            fi
-
-            if check_remote_mismatch "$local_path" "$url"; then
-                log_warn "Remote mismatch: $repo_label"
-                ((conflicts++))
-                write_result "$repo_label" "pull" "mismatch" "0" "" "$local_path"
-                continue
-            fi
-
-            local status_info dirty status
-            status_info=$(get_repo_status "$local_path" "$FETCH_REMOTES")
-            status=$(echo "$status_info" | sed 's/.*STATUS=\([^ ]*\).*/\1/')
-            dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
-
-            if [[ "$status" == fetch_failed ]]; then
-                log_error "Requested fetch failed: $repo_label"
-                ((failed++))
-                write_result "$repo_label" "pull" "failed" "0" "requested fetch failed" "$local_path"
-                continue
-            fi
-
-            if [[ "$dirty" == "true" && "$AUTOSTASH" != "true" ]]; then
-                log_warn "Dirty: $repo_label (uncommitted changes)"
-                ((conflicts++))
-                write_result "$repo_label" "pull" "dirty" "0" "" "$local_path"
-                continue
-            fi
-
-            if [[ "$status" == "current" ]] && repo_matches_requested_ref "$local_path" "$branch"; then
-                log_info "Current: $repo_label"
-                ((skipped++))
-                write_result "$repo_label" "pull" "current" "0" "" "$local_path"
-                continue
-            fi
-
-            if [[ "$status" == "diverged" ]]; then
-                log_warn "Diverged: $repo_label"
-                ((conflicts++))
-                write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
-                continue
-            fi
-            if [[ "$status" == no_upstream && -n "$branch" ]] &&
-               ! git -C "$local_path" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
-                local pin_was_current=false
-                repo_matches_requested_ref "$local_path" "$branch" && pin_was_current=true
-                if do_pull "$local_path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
-                    if [[ "$pin_was_current" == true ]]; then
-                        ((skipped++))
-                    else
-                        ((updated++))
-                    fi
-                else
-                    ((failed++))
-                fi
-                continue
-            fi
-            if [[ "$status" == "no_upstream" ]]; then
-                log_warn "No upstream: $repo_label"
-                ((conflicts++))
-                write_result "$repo_label" "pull" "no_upstream" "0" "" "$local_path"
-                continue
-            fi
-
-            if do_pull "$local_path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
-                ((updated++))
-            else
-                ((failed++))
-                continue
-            fi
-        fi
+        log_step "[$current/$pending_count] $repo_spec"
+        local result
+        result=$(process_single_repo_worker "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" "$UPDATE_STRATEGY" \
+            "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES")
+        case "$result" in
+            OK:*|SKIP:*) ;;
+            *) continue ;;
+        esac
+        local url branch custom_name local_path repo_id
+        resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id || continue
 
         # Update state: mark this repo as completed (use local_path for unique ID)
         SYNC_COMPLETED+=("$local_path")

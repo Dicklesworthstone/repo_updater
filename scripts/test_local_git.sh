@@ -942,7 +942,12 @@ test_do_pull_with_autostash() {
     echo "local changes" >> "$work_dir/file.txt"
 
     # Make new commit in dev and push
-    add_commit_and_push "$dev_dir" "New commit for autostash test"
+    # This is the clean restore case. A conflicting edit to file.txt belongs
+    # in the CLI test that checks both index stages and the nonzero result.
+    printf 'upstream changes\n' > "$dev_dir/upstream.txt"
+    git -C "$dev_dir" add upstream.txt
+    git -C "$dev_dir" commit -qm "New commit for autostash test"
+    git -C "$dev_dir" push -q
 
     # Fetch first to know we're behind
     git -C "$work_dir" fetch >/dev/null 2>&1

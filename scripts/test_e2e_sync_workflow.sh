@@ -925,6 +925,122 @@ test_sync_detached_pin_dirty_autostash() {
     e2e_cleanup
 }
 
+# The positional form is often used on an existing projects directory. Exercise
+# the same protections as configured sync with real checkouts and tracking refs.
+test_adhoc_sync_respects_destination_and_flags() {
+    sync_test_setup
+    create_test_remote real project 1
+    configure_ru_repos real/project
+    sync_test_finalize_mock
+    local clone="$E2E_TEMP_DIR/projects/project" before remote branch
+    remote="${REMOTE_REGISTRY[real/project]}"
+    branch=$(git -C "$remote" symbolic-ref --short HEAD)
+
+    run_ru_sync --pull-only real/project --json
+    assert_equals 0 "$RU_EXIT_CODE" "Ad-hoc pull-only succeeds for missing checkout"
+    assert_equals skipped "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Pull-only records a skip"
+    assert_true "test ! -e '$clone'" "Pull-only does not create the checkout"
+
+    run_ru_sync real/project --json
+    assert_equals 0 "$RU_EXIT_CODE" "Ad-hoc clone creates fixture"
+    before=$(git -C "$clone" rev-parse HEAD)
+    add_commit_to_remote real/project remote-update
+    run_ru_sync --clone-only real/project --json
+    assert_equals skipped "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Clone-only skips an existing checkout"
+    assert_equals "$before" "$(git -C "$clone" rev-parse HEAD)" "Clone-only preserves checkout HEAD"
+
+    run_ru_sync other/project --json
+    assert_equals 2 "$RU_EXIT_CODE" "Ad-hoc sync refuses an unrelated origin at the same path"
+    assert_equals mismatch "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Origin mismatch has a typed result"
+    assert_equals "$before" "$(git -C "$clone" rev-parse "origin/$branch")" "Mismatched checkout is never fetched or pulled"
+
+    run_ru_sync --dry-run real/project --json
+    assert_equals "$before" "$(git -C "$clone" rev-parse "origin/$branch")" "Dry-run leaves the tracking ref unchanged"
+    printf 'untracked work\n' > "$clone/personal.txt"
+    run_ru_sync real/project --json
+    assert_equals 2 "$RU_EXIT_CODE" "Ad-hoc sync refuses dirty work even when Git could fast-forward"
+    assert_equals dirty "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Dirty checkout is reported"
+    assert_equals "$before" "$(git -C "$clone" rev-parse HEAD)" "Dirty checkout HEAD stays intact"
+    assert_equals 'untracked work' "$(cat "$clone/personal.txt")" "Untracked bytes are preserved"
+
+    mkdir "$clone/child"
+    run_ru_sync 'real/project as child in project' --autostash --json
+    assert_equals 2 "$RU_EXIT_CODE" "Existing directory inside a repository cannot stand in for a checkout"
+    assert_equals not_git "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Nested non-checkout is identified"
+    assert_equals "$before" "$(git -C "$clone" rev-parse HEAD)" "A nested request never updates the enclosing repository"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
+test_configured_sync_integrates_divergence() {
+    local parallel strategy clone remote before upstream
+    for strategy in rebase merge; do
+        for parallel in 1 2; do
+            sync_test_setup
+            create_test_remote real diverged 1
+            configure_ru_repos real/diverged
+            sync_test_finalize_mock
+            run_ru_sync --json
+            clone="$E2E_TEMP_DIR/projects/diverged"
+            remote="${REMOTE_REGISTRY[real/diverged]}"
+            git -C "$clone" config user.name Test
+            git -C "$clone" config user.email test@example.org
+            printf 'local work\n' > "$clone/local.txt"
+            git -C "$clone" add local.txt
+            git -C "$clone" commit -qm 'Preserve local work'
+            before=$(git -C "$clone" rev-parse HEAD)
+            add_commit_to_remote real/diverged upstream-update
+            upstream=$(git -C "$remote" rev-parse HEAD)
+            run_ru_sync "-j$parallel" --json
+            assert_equals 2 "$RU_EXIT_CODE" "Default ff-only leaves divergence for manual attention"
+            assert_equals "$before" "$(git -C "$clone" rev-parse HEAD)" "Default preserves the pre-sync tip"
+            if [[ "$strategy" == rebase ]]; then
+                run_ru_sync --rebase "-j$parallel" --json
+            else
+                git -C "$clone" config pull.rebase true
+                RU_UPDATE_STRATEGY=merge run_ru_sync "-j$parallel" --json
+            fi
+            assert_equals 0 "$RU_EXIT_CODE" "Configured $strategy resolves clean divergence with -j$parallel"
+            assert_equals updated "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Integrated checkout is reported updated"
+            assert_equals 'local work' "$(cat "$clone/local.txt")" "Local commit content survives $strategy"
+            assert_equals 'upstream-update' "$(cat "$clone/changes.txt" 2>/dev/null)" "Upstream content is integrated"
+            if [[ "$strategy" == rebase ]]; then
+                assert_equals "$upstream" "$(git -C "$clone" rev-parse HEAD^)" "Local commit is rebased onto the upstream tip"
+            else
+                assert_equals "$before" "$(git -C "$clone" rev-parse HEAD^1)" "Merge preserves the original first parent"
+                assert_equals "$upstream" "$(git -C "$clone" rev-parse HEAD^2 2>/dev/null)" "Merge includes upstream as its second parent"
+            fi
+            e2e_preserve_on_failure
+            e2e_cleanup
+        done
+    done
+}
+
+test_autostash_conflict_cannot_report_updated() {
+    sync_test_setup
+    create_test_remote real autostash 1
+    configure_ru_repos real/autostash
+    sync_test_finalize_mock
+    run_ru_sync --json
+    local clone="$E2E_TEMP_DIR/projects/autostash" remote="${REMOTE_REGISTRY[real/autostash]}"
+    local writer="$E2E_TEMP_DIR/writer"
+    git clone -q "$remote" "$writer"
+    printf 'incoming version\n' > "$writer/file1.txt"
+    git -C "$writer" -c user.name=Test -c user.email=test@example.org commit -qam incoming
+    git -C "$writer" push -q
+    printf 'my local version\n' > "$clone/file1.txt"
+    run_ru_sync --autostash --json
+    assert_equals 2 "$RU_EXIT_CODE" "Autostash restore conflicts require intervention"
+    assert_equals conflict "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "An unresolved index is reported as a conflict"
+    assert_equals 'incoming version' "$(git -C "$clone" show :2:file1.txt)" "Incoming file survives in the index"
+    assert_equals 'my local version' "$(git -C "$clone" show :3:file1.txt)" "Local file survives in the index"
+    run_ru_sync --autostash --json
+    assert_equals 2 "$RU_EXIT_CODE" "Repeating sync with an unresolved index still requires intervention"
+    assert_equals conflict "$(jq -r '.data.repos[0].status' <<< "$RU_STDOUT")" "Current upstream tip cannot hide unresolved conflicts"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -937,6 +1053,9 @@ run_test test_sync_with_force_clone
 run_test test_sync_with_worktree_mode
 run_test test_sync_multiple_repos
 run_test test_sync_json_output
+run_test test_adhoc_sync_respects_destination_and_flags
+run_test test_configured_sync_integrates_divergence
+run_test test_autostash_conflict_cannot_report_updated
 
 # Clone Driver Tests (bd-mlgr)
 run_test test_sync_clone_with_branch
