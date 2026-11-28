@@ -25688,8 +25688,8 @@ get_fork_status() {
     local upstream_remote="$2"
     local branch="$3"
 
-    local local_ref="${branch}"
-    local upstream_ref="${upstream_remote}/${branch}"
+    local local_ref="refs/heads/${branch}"
+    local upstream_ref="refs/remotes/${upstream_remote}/${branch}"
 
     # Verify refs exist
     if ! git -C "$repo_path" rev-parse --verify "$local_ref" &>/dev/null; then
@@ -26143,10 +26143,15 @@ cmd_fork_sync() {
 
         # Check fork status
         local status_line ahead behind fork_status has_changes
-        status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch")
+        if ! status_line=$(get_fork_status "$local_path" "$upstream_remote" "$up_branch"); then
+            log_error "Cannot compare $repo_id branch $up_branch with $upstream_remote"
+            failed=$((failed + 1))
+            write_result "$repo_id" "fork-sync" "failed" "0" "cannot compare fork branches" "$local_path"
+            continue
+        fi
         IFS=$'\t' run_with_input "$status_line" read -r ahead behind fork_status has_changes
 
-        if [[ "$fork_status" == "synced" ]]; then
+        if [[ "$fork_status" == "synced" && "$do_push" != "true" ]]; then
             log_verbose "$repo_id is already synced"
             skipped=$((skipped + 1))
             write_result "$repo_id" "fork-sync" "current" "0" "already synced" "$local_path"
@@ -26168,55 +26173,63 @@ cmd_fork_sync() {
             continue
         fi
 
-        # Determine current branch
-        local current_branch
-        current_branch=$(git -C "$local_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
-
+        local sync_action="sync via $strategy"
+        [[ "$fork_status" != synced ]] || sync_action="use the already synchronized local branch"
+        [[ "$do_push" != true ]] || sync_action+=" and push to origin/$up_branch"
         if [[ "$DRY_RUN" == "true" ]]; then
-            log_step "[dry-run] Would sync $repo_id ($up_branch): $strategy from ${upstream_remote}/${up_branch} (ahead=$ahead behind=$behind)"
-            write_result "$repo_id" "fork-sync" "dry-run" "0" "would sync via $strategy" "$local_path"
+            log_step "[dry-run] $repo_id ($up_branch): would $sync_action"
+            write_result "$repo_id" "fork-sync" "dry-run" "0" "would $sync_action" "$local_path"
             continue
         fi
 
-        # Switch to default branch if needed
-        if [[ "$current_branch" != "$up_branch" ]]; then
-            if ! git -C "$local_path" checkout "$up_branch" --quiet 2>/dev/null; then
-                log_warn "Failed to checkout $up_branch for $repo_id"
-                failed=$((failed + 1))
-                write_result "$repo_id" "fork-sync" "failed" "0" "checkout failed" "$local_path"
-                continue
+        # Local convergence and publication are independent. A push-only retry
+        # must reach the receiver without checking out the branch again.
+        local sync_ok="true"
+        if [[ "$fork_status" != synced ]]; then
+            sync_ok="false"
+            # Determine current branch
+            local current_branch
+            current_branch=$(git -C "$local_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+            # Switch to default branch if needed
+            if [[ "$current_branch" != "$up_branch" ]]; then
+                if ! git -C "$local_path" checkout "$up_branch" --quiet 2>/dev/null; then
+                    log_warn "Failed to checkout $up_branch for $repo_id"
+                    failed=$((failed + 1))
+                    write_result "$repo_id" "fork-sync" "failed" "0" "checkout failed" "$local_path"
+                    continue
+                fi
             fi
-        fi
 
-        # Apply sync strategy
-        local sync_ok="false"
-        case "$strategy" in
-            ff-only)
-                if git -C "$local_path" merge --ff-only "${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
-                    sync_ok="true"
-                fi
-                ;;
-            rebase)
-                if git -C "$local_path" rebase "${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
-                    sync_ok="true"
-                fi
-                ;;
-            merge)
-                if git -C "$local_path" merge "${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
-                    sync_ok="true"
-                fi
-                ;;
-        esac
+            # Apply sync strategy
+            case "$strategy" in
+                ff-only)
+                    if git -C "$local_path" merge --ff-only "refs/remotes/${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
+                        sync_ok="true"
+                    fi
+                    ;;
+                rebase)
+                    if git -C "$local_path" rebase "refs/remotes/${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
+                        sync_ok="true"
+                    fi
+                    ;;
+                merge)
+                    if git -C "$local_path" merge "refs/remotes/${upstream_remote}/${up_branch}" --quiet 2>/dev/null; then
+                        sync_ok="true"
+                    fi
+                    ;;
+            esac
 
-        # Restore original branch if we switched
-        if [[ "$current_branch" != "$up_branch" && -n "$current_branch" ]]; then
-            git -C "$local_path" checkout "$current_branch" --quiet 2>/dev/null || true
+            # Restore original branch if we switched
+            if [[ "$current_branch" != "$up_branch" && -n "$current_branch" ]]; then
+                git -C "$local_path" checkout "$current_branch" --quiet 2>/dev/null || true
+            fi
         fi
 
         if [[ "$sync_ok" == "true" ]]; then
             # A requested push that fails leaves the fork unsynced on origin.
             if [[ "$do_push" == "true" ]]; then
-                if ! git -C "$local_path" push origin "$up_branch" --quiet 2>/dev/null; then
+                if ! git -C "$local_path" push --quiet origin "refs/heads/$up_branch:refs/heads/$up_branch" 2>/dev/null; then
                     log_error "$repo_id synced via $strategy locally, but the push to origin failed"
                     failed=$((failed + 1))
                     write_result "$repo_id" "fork-sync" "failed" "0" "synced via $strategy; push to origin failed" "$local_path"

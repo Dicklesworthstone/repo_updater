@@ -328,6 +328,32 @@ test_push_failure_is_a_failure() {
         "the repo is reported failed, not synced"
     assert_equals "$origin_before" "$(git -C "$ORIGIN_DIR" rev-parse main)" "origin did not move"
 
+    local local_tip
+    local_tip=$(git -C "$LOCAL_DIR" rev-parse refs/heads/main)
+    assert_equals "$(git -C "$UPSTREAM_DIR" rev-parse refs/heads/main)" "$local_tip" "local sync completed before the failed push"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" fork-sync --push --json 2>/dev/null) || exit_code=$?
+    assert_equals "1" "$exit_code" "retry still fails while the receiver is unavailable"
+    assert_equals "failed" "$(jq -r '.data.repos[0].status' <<< "$out")" "a current local branch does not hide publication failure"
+
+    git -C "$LOCAL_DIR" remote set-url --push origin "$ORIGIN_DIR"
+    git -C "$LOCAL_DIR" checkout -q -b feature
+    add_local_commit "$LOCAL_DIR" "independent feature"
+    git -C "$LOCAL_DIR" tag main HEAD
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" fork-sync --push --dry-run --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "retry can be previewed"
+    assert_equals "dry-run" "$(jq -r '.data.repos[0].status' <<< "$out")" "preview reports the pending push"
+    assert_equals "$origin_before" "$(git -C "$ORIGIN_DIR" rev-parse refs/heads/main)" "preview does not publish"
+
+    exit_code=0
+    out=$("$E2E_RU_SCRIPT" fork-sync --push --json 2>/dev/null) || exit_code=$?
+    assert_equals "0" "$exit_code" "retry succeeds after restoring the receiver"
+    assert_equals "synced" "$(jq -r '.data.repos[0].status' <<< "$out")" "reports completion after the push"
+    assert_equals "$local_tip" "$(git -C "$ORIGIN_DIR" rev-parse refs/heads/main)" "publishes the exact default branch"
+    assert_equals "feature" "$(git -C "$LOCAL_DIR" symbolic-ref --short HEAD)" "push-only retry preserves the checkout"
+
     e2e_cleanup
 }
 
