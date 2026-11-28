@@ -10703,13 +10703,13 @@ save_sync_state() {
     state_file=$(get_sync_state_file)
     local tmp_file="${state_file}.tmp.$$"
 
-    ensure_dir "$(dirname "$state_file")"
+    ensure_dir "$(dirname "$state_file")" || return 3
 
     # Build JSON
     local run_id
     run_id="${SYNC_RUN_ID:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
-    local config_hash
-    if ! config_hash=$(get_config_hash); then
+    local config_hash="${sync_snapshot_hash:-}"
+    if [[ -z "$config_hash" ]] && ! config_hash=$(get_config_hash); then
         log_error "Sync checkpoint was not replaced because configuration could not be read"
         return 3
     fi
@@ -10740,14 +10740,14 @@ save_sync_state() {
         echo "  \"run_id\": \"$run_id\","
         echo "  \"status\": \"$status\","
         echo "  \"config_hash\": \"$config_hash\","
-        echo "  \"results_file\": \"${RESULTS_FILE:-}\","
+        echo "  \"results_file\": \"$(json_escape "${RESULTS_FILE:-}")\","
         echo "  \"completed\": [$completed_json],"
         echo "  \"pending\": [$pending_json]"
         echo "${_cb}"
-    ) > "$tmp_file"
+    ) > "$tmp_file" || return 3
 
     # Atomic rename
-    mv "$tmp_file" "$state_file"
+    mv "$tmp_file" "$state_file" || return 3
     SYNC_RUN_ID="$run_id"
 }
 
@@ -10911,6 +10911,18 @@ process_single_repo_worker() {
 
 # Run parallel sync with worker pool
 # Args: pending_repos array ref, parallel count
+checkpoint_completed_sync_repo() {
+    local spec="$1" url branch custom_name local_path repo_id path
+    resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id || return 3
+    local -a remaining=()
+    for path in "${SYNC_PENDING[@]+"${SYNC_PENDING[@]}"}"; do
+        [[ "$path" == "$local_path" ]] || remaining+=("$path")
+    done
+    SYNC_COMPLETED+=("$local_path")
+    SYNC_PENDING=("${remaining[@]+"${remaining[@]}"}")
+    save_sync_state in_progress SYNC_COMPLETED SYNC_PENDING
+}
+
 run_parallel_sync() {
     local repos_name="$1"
     local parallel_count=$2
@@ -10939,108 +10951,68 @@ run_parallel_sync() {
     log_info "Syncing $total repositories with $parallel_count workers..."
     echo "" >&2
 
-    # Create temporary files for work queue and results
-    local work_queue results_file lock_base progress_file
-    work_queue=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
-    results_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
-    lock_base=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
-    progress_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
-    local queue_lock_dir="${lock_base}.queue.lock"
-    local results_lock_dir="${lock_base}.results.lock"
-    local progress_lock_dir="${lock_base}.progress.lock"
-
-    # Write repos to work queue
-    printf '%s\n' "${repos[@]}" > "$work_queue"
-
-    # Initialize progress counter
-    printf '0\n' > "$progress_file"
-
-    # Launch workers
-    local worker_pids=()
-    for ((i=0; i<parallel_count; i++)); do
-        (
-            while true; do
-                # Atomically get next repo from queue
-                local repo_spec
-                if dir_lock_acquire "$queue_lock_dir" 60; then
-                    repo_spec=$(head -1 "$work_queue" 2>/dev/null)
-                    if [[ -n "$repo_spec" ]]; then
-                        # Remove from queue (portable)
-                        tail -n +2 "$work_queue" > "${work_queue}.tmp" 2>/dev/null
-                        mv "${work_queue}.tmp" "$work_queue" 2>/dev/null
+    # Each slot owns one result file. Only the parent publishes results and
+    # checkpoints. A killed worker cannot strand a shared work queue lock.
+    local receipts
+    receipts=$(mktemp_dir) || { log_error "Cannot create worker result directory"; return 3; }
+    local -a worker_pids=() worker_specs=()
+    local next=0 active=0 finished=0 slot pid spec rc=0 worker_rc row extra status
+    local status_field='"action":"[^"]+","status":"([a-z_]+)","duration":[0-9]+,'
+    while (( active > 0 )) || { (( next < total && rc == 0 )) && [[ "$SYNC_INTERRUPTED" != true ]]; }; do
+        for ((slot=0; slot<parallel_count; slot++)); do
+            pid="${worker_pids[slot]:-}"
+            if [[ -n "$pid" ]]; then
+                if kill -0 "$pid" 2>/dev/null; then continue; fi
+                worker_rc=0
+                wait "$pid" || worker_rc=$?
+                spec="${worker_specs[slot]}"
+                # Accept exactly one complete newline-terminated record from this
+                # slot, including the worker's typed invalid-spec result (exit 1).
+                status=""
+                if { IFS= read -r row && ! IFS= read -r extra && [[ -z "$extra" ]]; } < "$receipts/$slot" &&
+                   [[ "$row" == '{"repo":'* && "$row" == *'}' && "$row" =~ $status_field ]]; then
+                    status=${BASH_REMATCH[1]}
+                fi
+                if [[ -n "$status" ]] && { (( worker_rc == 0 )) || [[ "$worker_rc" == 1 && "$status" == invalid ]]; }; then
+                    if ! printf '%s\n' "$row" >> "$RESULTS_FILE"; then
+                        log_error "Cannot publish sync result for $spec"
+                        rc=3
+                    elif [[ "$status" =~ ^(ok|updated|current|dry_run|skipped)$ ]]; then
+                        checkpoint_completed_sync_repo "$spec" || rc=3
                     fi
-                    dir_lock_release "$queue_lock_dir"
                 else
-                    repo_spec=""
+                    log_error "Sync worker exited without a complete result: $spec (exit $worker_rc)"
+                    write_result "$spec" sync failed 0 "worker exited without a complete result (exit $worker_rc)" ""
+                    rc=3
                 fi
-
-                # Exit if no more work
-                [[ -z "$repo_spec" ]] && break
-
-                # Process the repo
-                local result
-                result=$(process_single_repo_worker "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" \
-                    "$UPDATE_STRATEGY" "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES")
-
-                # Append result atomically
-                if dir_lock_acquire "$results_lock_dir" 60; then
-                    printf '%s\n' "$result" >> "$results_file"
-                    dir_lock_release "$results_lock_dir"
-                else
-                    # Best-effort fallback: warn and write without lock
-                    printf '\n⚠ Warning: Could not acquire results lock, writing without lock\n' >&2
-                    printf '%s\n' "$result" >> "$results_file"
-                fi
-
-                # Update progress atomically
-                if dir_lock_acquire "$progress_lock_dir" 60; then
-                    local current
-                    current=$(cat "$progress_file")
-                    echo $((current + 1)) > "$progress_file"
-                    printf '\r→ Progress: %d/%d' "$((current + 1))" "$total" >&2
-                    dir_lock_release "$progress_lock_dir"
-                fi
-            done
-        ) &
-        worker_pids+=("${!:-}")
+                worker_pids[slot]=""
+                ((active--))
+                ((finished++))
+                printf '\r→ Progress: %d/%d' "$finished" "$total" >&2
+            fi
+            if (( next < total && rc == 0 )) && [[ "$SYNC_INTERRUPTED" != true ]]; then
+                spec="${repos[next]}"
+                worker_specs[slot]="$spec"
+                : > "$receipts/$slot" || { rc=3; continue; }
+                (
+                    RESULTS_FILE="$receipts/$slot"
+                    RESULTS_LOCK_DIR=""
+                    process_single_repo_worker "$spec" "$PROJECTS_DIR" "$LAYOUT" \
+                        "$UPDATE_STRATEGY" "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES" >/dev/null
+                ) &
+                worker_pids[slot]=$!
+                ((next++))
+                ((active++))
+            fi
+        done
+        (( active == 0 )) || sleep 0.05
     done
-
-    # Wait for all workers
-    for pid in "${worker_pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
+    printf '\n' >&2
+    for ((slot=0; slot<parallel_count; slot++)); do
+        rm -f -- "$receipts/$slot"
     done
-
-    printf '\n' >&2  # New line after progress
-
-    # Parse results
-    local cloned=0 updated=0 skipped=0 failed=0 conflicts=0
-    while IFS=: read -r status reason repo_name; do
-        case "$status" in
-            OK)
-                case "$reason" in
-                    cloned) ((cloned++)) ;;
-                    updated) ((updated++)) ;;
-                    current) ((skipped++)) ;;
-                esac
-                ;;
-            SKIP) ((skipped++)) ;;
-            FAIL) ((failed++)) ;;
-            CONFLICT) ((conflicts++)) ;;
-        esac
-    done < "$results_file"
-
-    # Cleanup temp files and lock directories
-    rm -f "$work_queue" "${work_queue}.tmp" "$results_file" "$lock_base" "$progress_file" 2>/dev/null
-    rmdir "$queue_lock_dir" "$results_lock_dir" "$progress_lock_dir" 2>/dev/null || true
-
-    # Return results via global variables (for summary)
-    PARALLEL_CLONED=$cloned
-    PARALLEL_UPDATED=$updated
-    PARALLEL_SKIPPED=$skipped
-    PARALLEL_FAILED=$failed
-    PARALLEL_CONFLICTS=$conflicts
-
-    return 0
+    rmdir "$receipts"
+    return "$rc"
 }
 
 #==============================================================================
@@ -11049,6 +11021,9 @@ run_parallel_sync() {
 
 cleanup() {
     local process_code=$?
+    if [[ -n "${SYNC_OWNED_LOCK:-}" ]]; then
+        dir_lock_release "$SYNC_OWNED_LOCK" || true
+    fi
     local initialization_format="${CLI_REQUESTED_FORMAT:-${OUTPUT_FORMAT:-${RU_OUTPUT_FORMAT:-${TOON_DEFAULT_FORMAT:-}}}}"
     initialization_format="${initialization_format,,}"
     if [[ "${COMMAND:-}" == robot-docs && ( -z "$initialization_format" || "$initialization_format" == text ) ]]; then
@@ -11976,34 +11951,42 @@ cmd_sync() {
 
     local total=${#repos[@]}
     local current=0
-    local resumed=0
+    local state_lock="$RU_STATE_DIR/sync.lock" lock_owner
+    ensure_dir "$RU_STATE_DIR" || return 3
+    if [[ -f "$state_lock/owner" ]] && IFS= read -r lock_owner < "$state_lock/owner" &&
+       [[ "$lock_owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+        dir_lock_release "$state_lock" || true
+    fi
+    if ! dir_lock_try_acquire "$state_lock"; then
+        log_error "Another sync owns the checkpoint in $RU_STATE_DIR"
+        [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"sync_in_progress"}}' '{"exit_code":5}')"
+        return 5
+    fi
+    SYNC_OWNED_LOCK="$state_lock"
+    local resumed=0 pool_rc=0
+    # Bind completion receipts to the resolved list, destination and requested work.
+    local sync_snapshot_hash
+    sync_snapshot_hash=$(printf '%s\0' "$configured_repos" "$PROJECTS_DIR" "$LAYOUT" "$CLONE_ONLY" "$PULL_ONLY" "$DRY_RUN" "$FETCH_REMOTES" "$AUTOSTASH" "$UPDATE_STRATEGY" | cksum) || return 3
 
     # Resume support: check for interrupted sync
     SYNC_COMPLETED=()
     local pending_repos=()
 
     if load_sync_state; then
-        if [[ "$SYNC_STATUS" == "in_progress" ]]; then
+        if [[ "$SYNC_STATUS" == in_progress || ( "$SYNC_STATUS" == failed && "$RESUME" == true ) ]]; then
             if [[ "$RESTART" == "true" ]]; then
                 # User wants to start fresh
                 log_info "Discarding interrupted sync state..."
-                cleanup_sync_state
+                SYNC_COMPLETED=()
+                SYNC_RUN_ID=""
                 pending_repos=("${repos[@]}")
             elif [[ "$RESUME" == "true" ]]; then
                 # Resume from where we left off
-                local completed_count=${#SYNC_COMPLETED[@]}
-                log_info "Resuming sync: ${completed_count} repos already completed"
-
-                # Check if config changed
-                local current_hash
-                if ! current_hash=$(get_config_hash); then
-                    log_error "Cannot resume sync with unreadable repository configuration"
-                    [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"config_read_failed"}}' '{"exit_code":3}')"
-                    return 3
+                if [[ "$sync_snapshot_hash" != "$SYNC_CONFIG_HASH" ]]; then
+                    log_warn "Repository configuration or sync options changed; rechecking all destinations"
+                    SYNC_COMPLETED=()
                 fi
-                if [[ "$current_hash" != "$SYNC_CONFIG_HASH" ]]; then
-                    log_warn "Repository list has changed since last sync"
-                fi
+                log_info "Resuming sync: ${#SYNC_COMPLETED[@]} repos already completed"
 
                 # Filter out completed repos (use local_path for unique identification)
                 for repo_spec in "${repos[@]}"; do
@@ -12030,7 +12013,9 @@ cmd_sync() {
                 exit 5
             fi
         else
-            # State exists but completed - start fresh
+            # An ordinary retry after a failure starts fresh.
+            SYNC_COMPLETED=()
+            SYNC_RUN_ID=""
             pending_repos=("${repos[@]}")
         fi
     else
@@ -12043,24 +12028,23 @@ cmd_sync() {
         echo "" >&2
         log_warn "Sync interrupted!"
         SYNC_INTERRUPTED="true"
-        # State is already saved after each repo
-        exit 130
+        # Stop dispatching. Drain active Git operations and report their outcomes.
     }
     trap handle_sync_interrupt INT TERM
 
     # Initialize pending repos array for state tracking (use local_path for unique ID)
-    local pending_names=()
+    SYNC_PENDING=()
     if [[ ${#pending_repos[@]} -gt 0 ]]; then
         for repo_spec in "${pending_repos[@]}"; do
             local url branch custom_name local_path repo_id
             if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
                 continue
             fi
-            pending_names+=("$local_path")
+            SYNC_PENDING+=("$local_path")
         done
 
         # Save initial state
-        if ! save_sync_state "in_progress" SYNC_COMPLETED pending_names; then
+        if ! save_sync_state "in_progress" SYNC_COMPLETED SYNC_PENDING; then
             log_error "Sync was not started because its checkpoint could not be saved"
             [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"checkpoint_save_failed"}}' '{"exit_code":3}')"
             trap - INT TERM
@@ -12085,7 +12069,7 @@ cmd_sync() {
             log_info "Parallel sync: $pending_count repositories ($resumed already completed) with $parallel_count workers"
         fi
 
-        run_parallel_sync pending_repos "$parallel_count"
+        run_parallel_sync pending_repos "$parallel_count" || pool_rc=$?
 
     else
         # Sequential mode (original behavior)
@@ -12097,6 +12081,7 @@ cmd_sync() {
         echo "" >&2
 
     for repo_spec in "${pending_repos[@]+"${pending_repos[@]}"}"; do
+        [[ "$SYNC_INTERRUPTED" == true ]] && break
         [[ -z "$repo_spec" ]] && continue
         ((current++))
 
@@ -12108,28 +12093,10 @@ cmd_sync() {
             OK:*|SKIP:*) ;;
             *) continue ;;
         esac
-        local url branch custom_name local_path repo_id
-        resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id || continue
-
-        # Update state: mark this repo as completed (use local_path for unique ID)
-        SYNC_COMPLETED+=("$local_path")
-        # Remove from pending_names (handle empty array with set -u)
-        local new_pending=()
-        if [[ ${#pending_names[@]} -gt 0 ]]; then
-            for p in "${pending_names[@]}"; do
-                [[ "$p" != "$local_path" ]] && new_pending+=("$p")
-            done
-        fi
-        pending_names=()
-        if [[ ${#new_pending[@]} -gt 0 ]]; then
-            pending_names=("${new_pending[@]}")
-        fi
-        # Save state after each repo (enables resume on interrupt)
-        if ! save_sync_state "in_progress" SYNC_COMPLETED pending_names; then
+        if ! checkpoint_completed_sync_repo "$repo_spec"; then
             log_error "Sync stopped because its checkpoint could not be saved"
-            [[ "$JSON_OUTPUT" != true ]] || emit_structured "$(build_json_envelope sync '{"error":{"reason":"checkpoint_save_failed"}}' '{"exit_code":3}')"
-            trap - INT TERM
-            return 3
+            pool_rc=3
+            break
         fi
     done
     fi  # End of sequential mode else block
@@ -12157,12 +12124,13 @@ cmd_sync() {
     compute_exit_code "$FAILED" "$CONFLICTS" "$SYSTEM_ERRORS"
     local rc=$?
 
-    if [[ "$rc" -eq 0 ]]; then
+    if (( pool_rc != 0 )); then rc=$pool_rc; fi
+    if [[ "$SYNC_INTERRUPTED" == true ]]; then
+        rc=5
+    elif [[ "$rc" -eq 0 ]]; then
         cleanup_sync_state
     else
-        # The original pending set is retained in parallel mode. Sequential
-        # failures never enter SYNC_COMPLETED and remain in pending_names.
-        if ! save_sync_state "failed" SYNC_COMPLETED pending_names; then
+        if ! save_sync_state "failed" SYNC_COMPLETED SYNC_PENDING; then
             log_error "The incomplete sync checkpoint could not be saved"
             rc=3
         else

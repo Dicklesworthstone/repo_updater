@@ -1041,12 +1041,127 @@ test_autostash_conflict_cannot_report_updated() {
     e2e_cleanup
 }
 
+test_failed_sync_resumes_only_pending_repos() {
+    local parallel state good
+    for parallel in 1 2; do
+        sync_test_setup
+        create_test_remote resume good 1
+        configure_ru_repos resume/good resume/retry
+        sync_test_finalize_mock
+        run_ru_sync "-j$parallel" --json
+        assert_equals 1 "$RU_EXIT_CODE" "Missing remote makes the first -j$parallel run partial"
+        state="$XDG_STATE_HOME/ru/sync_state.json"
+        good="$RU_PROJECTS_DIR/good"
+        assert_equals "$good" "$(jq -r '.completed | join(",")' "$state")" "Checkpoint keeps the completed checkout"
+        assert_equals "$RU_PROJECTS_DIR/retry" "$(jq -r '.pending | join(",")' "$state")" "Only the failed checkout remains pending"
+        printf 'local changes\n' > "$good/local.txt"
+        create_test_remote resume retry 1
+        sync_test_finalize_mock
+        run_ru_sync "-j$parallel" --resume --json
+        assert_equals 0 "$RU_EXIT_CODE" "Retry succeeds without touching completed dirty checkout"
+        assert_equals resume/retry "$(jq -r '.data.repos | map(.name) | join(",")' <<< "$RU_STDOUT")" "Only pending repo runs on retry"
+        assert_true "git -C '$RU_PROJECTS_DIR/retry' rev-parse HEAD >/dev/null" "Retry produces a real checkout"
+        assert_equals 'local changes' "$(cat "$good/local.txt")" "Completed checkout keeps local edits"
+        assert_true "test ! -e '$state'" "Successful resume removes its checkpoint"
+        e2e_preserve_on_failure
+        e2e_cleanup
+    done
+}
+
+test_parallel_interruption_checkpoints_completed_work() {
+    sync_test_setup
+    local name
+    for name in a b c d; do create_test_remote stop "$name" 1; done
+    configure_ru_repos stop/a stop/b stop/c stop/d
+    sync_test_finalize_mock
+    # Release in-flight clones after signaling the coordinator, so test ordering
+    # depends on the checkpoint and never on a particular clone duration.
+    cp "$E2E_MOCK_BIN/gh" "$E2E_MOCK_BIN/real-gh"
+    cat > "$E2E_MOCK_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+if [[ "$1" == repo && "$2" == clone && "$3" != stop/a ]]; then
+    gate="$(dirname "$0")/release"
+    while [[ ! -f "$gate" ]]; do sleep 0.05; done
+fi
+exec "$(dirname "$0")/real-gh" "$@"
+GH
+    local state="$XDG_STATE_HOME/ru/sync_state.json" pid rc=0 attempt
+    "$RU_SCRIPT" sync -j2 --non-interactive --json > "$E2E_TEMP_DIR/interrupted.json" 2> "$E2E_TEMP_DIR/interrupted.log" &
+    pid=$!
+    for ((attempt=0; attempt<400; attempt++)); do
+        [[ -s "$state" ]] && jq -e --arg path "$RU_PROJECTS_DIR/a" '.completed | index($path) != null' "$state" >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+    assert_true "((attempt < 400))" "Successful worker advances checkpoint while a peer is still running"
+    run_ru_sync --resume --json
+    assert_equals 5 "$RU_EXIT_CODE" "Concurrent resume cannot overwrite the active checkpoint"
+    assert_equals sync_in_progress "$(jq -r '.data.error.reason' <<< "$RU_STDOUT")" "Busy checkpoint returns an actionable result"
+    kill -TERM "$pid" 2>/dev/null
+    : > "$E2E_MOCK_BIN/release"
+    wait "$pid" || rc=$?
+    assert_equals 5 "$rc" "Signal returns the documented interrupted exit code"
+    assert_equals 5 "$(jq -r '._meta.exit_code' "$E2E_TEMP_DIR/interrupted.json")" "Partial JSON reports interruption"
+    local pending completed
+    pending=$(jq -r '.pending | length' "$state")
+    completed=$(jq -r '.completed | length' "$state")
+    assert_true "((pending > 0 && completed > 0 && pending + completed == 4))" "Checkpoint accounts for every repository exactly once"
+    assert_equals "$completed" "$(jq -r '.data.repos | length' "$E2E_TEMP_DIR/interrupted.json")" "Partial report includes each completed worker"
+    run_ru_sync --resume -j2 --json
+    assert_equals 0 "$RU_EXIT_CODE" "Interrupted parallel run resumes successfully"
+    assert_equals "$pending" "$(jq -r '.data.repos | length' <<< "$RU_STDOUT")" "Resume runs exactly the remaining repositories"
+    for name in a b c d; do assert_true "git -C '$RU_PROJECTS_DIR/$name' rev-parse HEAD >/dev/null" "Checkout $name exists after resume"; done
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
+test_resume_rechecks_changed_pin_and_clone_mode() {
+    sync_test_setup
+    create_test_remote resume pinned 2
+    local remote="${REMOTE_REGISTRY[resume/pinned]}" earlier
+    earlier=$(git -C "$remote" rev-parse HEAD^)
+    git -C "$remote" tag older "$earlier"
+    configure_ru_repos resume/pinned resume/retry
+    sync_test_finalize_mock
+    run_ru_sync --clone-only -j2 --json
+    assert_equals 1 "$RU_EXIT_CODE" "Clone-only checkpoint survives a missing remote"
+    create_test_remote resume retry 1
+    sync_test_finalize_mock
+    printf '%s\n' resume/pinned@older resume/retry > "$XDG_CONFIG_HOME/ru/repos.d/public.txt"
+    run_ru_sync --resume -j2 --json
+    assert_equals 0 "$RU_EXIT_CODE" "Changed pin can complete on resume"
+    assert_equals "$earlier" "$(git -C "$RU_PROJECTS_DIR/pinned" rev-parse HEAD)" "Previous completion at this path cannot mask the newly requested tag"
+    e2e_preserve_on_failure
+    e2e_cleanup
+
+    sync_test_setup
+    create_test_remote resume local 1
+    configure_ru_repos resume/local resume/missing
+    sync_test_finalize_mock
+    run_ru_sync resume/local --json
+    add_commit_to_remote resume/local 'new files'
+    remote="${REMOTE_REGISTRY[resume/local]}"
+    local expected_tip
+    expected_tip=$(git -C "$remote" rev-parse HEAD)
+    run_ru_sync --clone-only --json
+    assert_equals 1 "$RU_EXIT_CODE" "Clone-only records a skipped existing checkout alongside a failed clone"
+    create_test_remote resume missing 1
+    sync_test_finalize_mock
+    run_ru_sync --resume --json
+    assert_equals 0 "$RU_EXIT_CODE" "A full sync can resume after clone-only"
+    assert_equals "$expected_tip" "$(git -C "$RU_PROJECTS_DIR/local" rev-parse HEAD)" "Clone-only skip does not satisfy a later pull request"
+    e2e_preserve_on_failure
+    e2e_cleanup
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
 
 log_suite_start "E2E Tests: Sync Workflow Scenarios (bd-h0m0)"
 
+run_test test_failed_sync_resumes_only_pending_repos
+run_test test_parallel_interruption_checkpoints_completed_work
+run_test test_resume_rechecks_changed_pin_and_clone_mode
 run_test test_fresh_sync_to_empty_directory
 run_test test_incremental_sync_with_existing
 run_test test_sync_with_force_clone
