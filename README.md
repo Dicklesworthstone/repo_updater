@@ -2654,14 +2654,16 @@ and required tests before retaining each update in the original repository.
 
 ### Prerequisites
 
+A discovery preview (`--dry-run`) requires jq and the project’s package manager. Applying updates also requires the following agent tools.
+
 - **ntm** (Named Tmux Manager) - for session orchestration
 - **claude-code**, **codex**, or **gemini** CLI - for AI agent execution
-- **jq** - for JSON processing
 
 ### Supported Package Managers
 
 `ru dep-update` detects these manifests. Automatic discovery currently has
-adapters for npm, cargo (requires `cargo-outdated`), Go modules, and Composer:
+adapters for npm, Cargo (requires `cargo-outdated`), Go modules, Composer, and
+standalone Python requirements files with exact pins.
 
 | Manager | Detection Files | Discovery |
 |---------|-----------------|-----------|
@@ -2670,7 +2672,7 @@ adapters for npm, cargo (requires `cargo-outdated`), Go modules, and Composer:
 | go | `go.mod` | `go list -m -u -json all` |
 | composer | `composer.json` | `composer outdated --format=json` |
 | yarn/pnpm | `yarn.lock`, `pnpm-lock.yaml` | Explicit unsupported-scan error |
-| pip/pipenv | `pyproject.toml`, `requirements.txt`, `setup.py`, `Pipfile` | Explicit unsupported-scan error; project environment discovery is pending |
+| pip/pipenv | `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile` | `pip index versions` for a standalone root `requirements.txt` with exact package pins. Other Python manifest forms return an unsupported-scan error. |
 | bundler | `Gemfile` | Explicit unsupported-scan error |
 | maven/gradle | `pom.xml`, `build.gradle`, `build.gradle.kts` | Explicit unsupported-scan error |
 
@@ -2710,7 +2712,16 @@ gate callers retain the existing general detection precedence.
 Detection currently chooses npm when `package.json` exists, even beside a Yarn
 or pnpm lockfile. The npm scanner refuses those mixed inputs, so npm's view
 cannot classify a Yarn or pnpm project as current. Their own adapters remain pending.
-Python discovery cannot use a global `pip list` as proof about a project's manifest.
+For a standalone Python `requirements.txt`, RU reads each `name==version` pin and
+queries the indexes configured for `python3 -m pip`. It compares PEP 440
+versions for the active interpreter and platform without installing packages.
+Activate the project’s `.venv` first if it has one. If any index is unavailable,
+the scan returns a failure for the project.
+Epoch and major-release increases are included with `--major`. Constraints,
+includes, hashes, extras, markers, ranges, direct URLs, competing manifests, and
+conflicting pins need a project-specific scan. Python results are available in
+`dep-update --dry-run`. Automatic Python updates require a lockfile verification
+adapter and currently return `unsupported_update` before agent work starts.
 
 An actual update requires a successfully detected, nonempty test command or
 an explicit `--test-cmd`. Failed detection and blank commands fail the repository

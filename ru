@@ -1507,6 +1507,133 @@ _dep_scan_error() {
     return 3
 }
 
+# Read direct pins from the project. Ask pip's configured indexes about those
+# names without installing anything or treating the host environment as a lock.
+_dep_scan_pip_pins() {
+    local repo="$1" message rc=0
+    if [[ ! -f "$repo/requirements.txt" || -L "$repo/requirements.txt" ]]; then
+        _dep_scan_error pip unsupported_scan "Python discovery requires a standalone root requirements.txt"
+        return 3
+    fi
+    local other
+    for other in pyproject.toml setup.py setup.cfg Pipfile Pipfile.lock poetry.lock uv.lock pylock.toml requirements.in; do
+        if [[ -e "$repo/$other" || -L "$repo/$other" ]]; then
+            _dep_scan_error pip unsupported_scan "Cannot establish standalone requirements.txt ownership beside $other"
+            return 3
+        fi
+    done
+    if ! command -v python3 >/dev/null; then
+        _dep_scan_error pip missing_tool "Python dependency discovery requires python3 and pip"
+        return 3
+    fi
+    message=$(cd "$repo" && python3 -I - "${timeout_seconds:-900}" <<'PY'
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+try:
+    import pip
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.utils import canonicalize_name
+    from pip._vendor.packaging.version import Version
+except ImportError:
+    print("Python dependency discovery requires pip with PEP 440/508 support")
+    sys.exit(2)
+
+def fail(message, code):
+    print(message)
+    sys.exit(code)
+
+project_env = Path(".venv")
+if (project_env / "pyvenv.cfg").is_file() and project_env.resolve() != Path(sys.prefix).resolve():
+    fail("Activate this project's .venv before scanning its dependency pins", 4)
+
+pins = {}
+try:
+    with open("requirements.txt", encoding="utf-8-sig") as manifest:
+        for line_number, line in enumerate(manifest, 1):
+            line = re.sub(r"(^|\s+)#.*$", "", line).strip()
+            if not line:
+                continue
+            requirement = Requirement(line)
+            specs = list(requirement.specifier)
+            if (len(specs) != 1 or specs[0].operator != "==" or requirement.marker
+                    or requirement.extras or requirement.url or "*" in specs[0].version):
+                raise ValueError
+            name = canonicalize_name(requirement.name)
+            version = Version(specs[0].version)
+            if name in pins and pins[name] != version:
+                raise ValueError
+            pins[name] = version
+except (OSError, UnicodeError, ValueError):
+    fail("Expected exact name==version pins throughout requirements.txt (line {})".format(locals().get("line_number", 1)), 4)
+
+rows = []
+deadline = time.monotonic() + int(sys.argv[1])
+structured = Version(pip.__version__) >= Version("25.1")
+for name, current in pins.items():
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = Path(tmpdir) / "index.log"
+            args = [sys.executable, "-I", "-m", "pip", "--disable-pip-version-check",
+                    "--no-input", "--log", str(log), "index", "versions", name]
+            if structured:
+                args.append("--json")
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    universal_newlines=True, timeout=min(60, deadline - time.monotonic()))
+            # With multiple sources pip can emit a result and exit zero even
+            # when a source failed. Some fetch errors appear only at DEBUG.
+            diagnostic = log.read_text(encoding="utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        fail("Could not complete the pip index query for " + name, 5)
+    problems = re.compile(r"WARNING:|ERROR:|Could not fetch URL|Skipping page ", re.I)
+    if result.returncode or any(problems.search(line)
+            and "pip index is currently an experimental command" not in line
+            for line in (diagnostic + "\n" + result.stderr).splitlines()):
+        fail("pip could not query its configured sources for " + name, 5)
+    try:
+        if structured:
+            data = json.loads(result.stdout)
+            found, latest, releases = data["name"], data["latest"], data["versions"]
+            if not isinstance(releases, list):
+                raise ValueError
+        else:
+            # Older pip documents the heading and Available versions line.
+            lines = result.stdout.splitlines()
+            heading = re.fullmatch(r"(\S+) \(([^)]+)\)", lines[0])
+            available = [line[len("Available versions: "):] for line in lines
+                         if line.startswith("Available versions: ")]
+            if heading is None or len(available) != 1:
+                raise ValueError
+            found, latest = heading.groups()
+            releases = available[0].split(", ")
+        latest = Version(latest)
+        versions = [Version(value) for value in releases]
+        if canonicalize_name(found) != name or not versions or latest != max(versions):
+            raise ValueError
+    except (IndexError, KeyError, TypeError, ValueError):
+        fail("pip returned incomplete version data for " + name, 6)
+    if latest > current:
+        rows.append({"name": name, "current": str(current), "latest": str(latest),
+                     "major_update": (current.epoch, current.release[0]) != (latest.epoch, latest.release[0])})
+    elif current not in versions:
+        fail("The pinned version for " + name + " is absent from the available releases", 5)
+print(json.dumps({"manager": "pip", "status": "ok", "outdated": rows}))
+PY
+    ) || rc=$?
+    case "$rc" in
+        0) printf '%s\n' "$message" ;;
+        2) _dep_scan_error pip missing_tool "$message" ;;
+        4) _dep_scan_error pip unsupported_scan "$message" ;;
+        5) _dep_scan_error pip command_failed "$message" ;;
+        *) _dep_scan_error pip invalid_output "${message:-Python dependency discovery failed}" ;;
+    esac
+}
+
 # Internal function to check outdated deps for a specific manager.
 # Usage: _check_outdated_for_manager <repo_path> <manager>
 _check_outdated_for_manager() {
@@ -1548,10 +1675,12 @@ _check_outdated_for_manager() {
                  then {name:$name,current:(.current // "MISSING"),wanted,latest,type}
                  else error("Invalid npm dependency") end] end'
             ;;
-        pip|pipenv)
-            # pip list describes the invoking environment, not this manifest,
-            # and can return []/0 after failing to obtain registry candidates.
-            _dep_scan_error "$manager" unsupported_scan "Project-aware Python dependency discovery is not implemented"
+        pip)
+            _dep_scan_pip_pins "$repo_path"
+            return "$?"
+            ;;
+        pipenv)
+            _dep_scan_error "$manager" unsupported_scan "Pipfile discovery requires a Pipenv scanner"
             return 3
             ;;
         cargo)
@@ -3826,13 +3955,13 @@ cmd_dep_update() {
         return 3
     fi
 
-    if ! command -v ntm &>/dev/null; then
+    if [[ "$dry_run" != true ]] && ! command -v ntm &>/dev/null; then
         log_error "dep-update requires ntm (Named Tmux Manager)"
         log_error "Install from: https://github.com/Dicklesworthstone/ntm"
         return 3
     fi
 
-    if ! command -v "$agent_provider" &>/dev/null; then
+    if [[ "$dry_run" != true ]] && ! command -v "$agent_provider" &>/dev/null; then
         log_error "dep-update requires $agent_provider CLI for agent type '$agent_type'"
         return 3
     fi
@@ -4010,6 +4139,14 @@ cmd_dep_update() {
             continue
         fi
 
+        if printf '%s\n' "$outdated_json" | jq -e 'any(.results[]; .manager == "pip" and (.outdated | length > 0))' >/dev/null; then
+            log_error "Python pins can be previewed with --dry-run; automatic updates require verified lockfile support"
+            ((failed++))
+            results+=("$(jq -cn --arg repo "$repo_path" '{repo:$repo,status:"failed",error_code:"unsupported_update",
+                error:"Python pin discovery is available, but lockfile updates are unsupported"}')")
+            continue
+        fi
+
         # Detect or use custom test command
         local test_cmd="" test_detection_rc=0
         if [[ "$custom_test_cmd_set" == true ]]; then
@@ -4147,7 +4284,11 @@ _filter_major_updates() {
             $curr_major != $lat_major;
 
         .results = (.results // [] | map(
-            .outdated = (.outdated // [] | map(select(is_major_update | not)))
+            .manager as $manager |
+            .outdated = (.outdated // [] | map(select(
+                (if $manager == "pip" then
+                    if (.major_update | type) == "boolean" then .major_update else error("Missing PEP 440 classification") end
+                 else is_major_update end) | not)))
         )) |
         .total_outdated = ([.results[].outdated | length] | add // 0)
     ') || return 3

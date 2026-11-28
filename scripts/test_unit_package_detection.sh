@@ -56,7 +56,7 @@ extract_function() {
 }
 
 source <(extract_function "detect_package_managers" "$PROJECT_DIR/ru")
-for scan_function in _dep_scan_error _check_outdated_for_manager check_outdated_deps \
+for scan_function in _dep_scan_error _dep_scan_pip_pins _check_outdated_for_manager check_outdated_deps \
     cmd_dep_update _dep_update_skipped_json _filter_outdated_deps _filter_major_updates \
     validate_ai_session_result detect_test_command detect_dep_update_test_command run_test_gate; do
     source_ru_function "$scan_function"
@@ -728,6 +728,54 @@ test_dep_scan_other_manager_contracts() {
     )
 }
 
+test_dep_scan_pip_pins() {
+    if ! python3 -I -m pip index versions --help >/dev/null 2>&1; then
+        skip_test "pip index versions unavailable for native offline discovery"
+        return 0
+    fi
+    (
+        local before=$TF_ASSERTIONS_FAILED repo wheels result rc
+        setup_test_env
+        repo=$(create_test_project python-pins)
+        wheels=$(create_test_project python-index)
+        # Real pip's finder only reads wheel filenames here. Disable all remote
+        # indexes; a dependency outside this directory must fail the scan.
+        export PIP_CONFIG_FILE=/dev/null PIP_NO_INDEX=1 PIP_FIND_LINKS="$wheels"
+        touch "$wheels/ru_demo-1.2-py3-none-any.whl" "$wheels/ru_demo-1.10-py3-none-any.whl"
+        touch "$wheels/other-1.0-py3-none-any.whl" "$wheels/other-2.0-py3-none-any.whl"
+        printf '%s\n' '# pinned project' 'Ru.Demo==1.2 # keep this package' 'other==1.0' > "$repo/requirements.txt"
+        result=$(check_outdated_deps "$repo"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 2 and (.results[0].outdated | map(select(.name == "ru-demo")) |
+              . == [{name:"ru-demo",current:"1.2",latest:"1.10",major_update:false}])' "pip reads project pins and PEP 440 ordering"
+        result=$(_filter_major_updates "$result"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 0 \
+            '.total_outdated == 1 and .results[0].outdated[0].name == "ru-demo"' "pip excludes epoch or release-major changes by default"
+        printf '%s\n' 'ru-demo==1.10.0' > "$repo/requirements.txt"
+        result=$(check_outdated_deps "$repo"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 1 '.total_outdated == 0' "PEP 440 equivalent pin is current"
+        printf '%s\n' 'ru-demo==1.2' 'missing-package==1' > "$repo/requirements.txt"
+        result=$(check_outdated_deps "$repo"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "command_failed" and .total_outdated == 0' "pip refuses incomplete index evidence"
+        printf '%s\n' 'missing-package==1' '-r other.txt' > "$repo/requirements.txt"
+        result=$(check_outdated_deps "$repo"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "unsupported_scan"' "pip validates all project inputs before index access"
+        printf '%s\n' 'ru-demo==1.10' > "$repo/requirements.txt"
+        result=$(PIP_NO_INDEX=0 PIP_INDEX_URL="file://$wheels/missing" check_outdated_deps "$repo"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "command_failed"' "a valid local result cannot hide a missing index"
+        mkdir "$repo/.venv"
+        touch "$repo/.venv/pyvenv.cfg"
+        result=$(check_outdated_deps "$repo"); rc=$?
+        assert_dep_scan_result "$result" "$rc" 3 \
+            '.results[0].error_code == "unsupported_scan"' "refuse a different interpreter from the project virtual environment"
+        cleanup_test_env
+        [[ "$TF_ASSERTIONS_FAILED" -eq "$before" ]]
+    )
+}
+
 test_dep_scan_cargo_workspace_contract() {
     (
         local scan_failures_before=$TF_ASSERTIONS_FAILED result rc bad_payload
@@ -1202,8 +1250,11 @@ test_dep_scan_missing_tools_and_partial_results() {
 test_dep_update_counts_scan_failure() {
     (
         local scan_failures_before=$TF_ASSERTIONS_FAILED
-        ntm() { printf 'UNEXPECTED ntm execution\n' >&2; return 92; }
-        claude() { printf 'UNEXPECTED agent execution\n' >&2; return 93; }
+        # Discovery must work on a machine that has never installed agent tools.
+        command() {
+            if [[ "$1" == -v && ( "${2:-}" == ntm || "${2:-}" == claude ) ]]; then return 1; fi
+            builtin command "$@"
+        }
         run_dep_update_transactions() { printf 'UNEXPECTED transaction\n' >&2; return 94; }
         detect_package_managers() { printf '%s\n' '{"managers":["npm"]}'; }
         npm() { printf '%s' "$scan_payload"; return "$scan_tool_rc"; }
@@ -1430,6 +1481,7 @@ main() {
 
     run_test test_dep_scan_npm_contract
     run_test test_dep_scan_other_manager_contracts
+    run_test test_dep_scan_pip_pins
     run_test test_dep_scan_cargo_workspace_contract
     run_test test_cargo_workspace_test_command
     run_test test_dep_update_manager_test_selection

@@ -864,8 +864,8 @@ test_dep_update_cli_validates_options_unsupported_managers_and_missing_jq() {
     git -C "$unsup_repo" config user.email "test@example.com"
     printf '<project/>\n' > "$unsup_repo/pom.xml"
     printf 'plugins {}\n' > "$unsup_repo/build.gradle"
-    printf 'requests==2.31.0\n' > "$unsup_repo/requirements.txt"
-    git -C "$unsup_repo" add pom.xml build.gradle requirements.txt && git -C "$unsup_repo" commit -m "init" >/dev/null 2>&1
+    printf 'from setuptools import setup\nsetup(name="fixture")\n' > "$unsup_repo/setup.py"
+    git -C "$unsup_repo" add pom.xml build.gradle setup.py && git -C "$unsup_repo" commit -m "init" >/dev/null 2>&1
     rc=0
     env PATH="$env_root/controlled-bin:$E2E_ORIGINAL_PATH" CI=true RU_CHECK_UPDATES=false \
         RU_CONFIG_DIR="$env_root/config/ru" RU_STATE_DIR="$env_root/state/ru" RU_PROJECTS_DIR="$env_root/projects" \
